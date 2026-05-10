@@ -574,13 +574,33 @@ static std::vector<float> resample_16k_to_24k(const float* pcm, int n_samples) {
     return out;
 }
 
-static std::vector<float> compute_ref_mel(const float* pcm, int n_samples, int* T_out) {
+static std::vector<float> compute_ref_mel(const float* pcm, int n_samples, int input_sr, int* T_out) {
     const int n_fft = 1024, hop = 256, n_mels = 100, sr = 24000;
     const float fmin = 0.0f, fmax = 12000.0f;
 
-    // Resample 16kHz input to 24kHz
-    auto pcm_24k = resample_16k_to_24k(pcm, n_samples);
-    n_samples = (int)pcm_24k.size();
+    // Resample to 24kHz if needed
+    std::vector<float> pcm_24k;
+    if (input_sr == 16000) {
+        pcm_24k = resample_16k_to_24k(pcm, n_samples);
+        n_samples = (int)pcm_24k.size();
+    } else if (input_sr == 24000) {
+        pcm_24k.assign(pcm, pcm + n_samples);
+    } else {
+        // For other sample rates, use simple linear interpolation to 24kHz
+        double ratio = 24000.0 / (double)input_sr;
+        int out_len = (int)(n_samples * ratio);
+        pcm_24k.resize(out_len);
+        for (int i = 0; i < out_len; i++) {
+            double src = i / ratio;
+            int idx = (int)src;
+            double frac = src - idx;
+            if (idx + 1 < n_samples)
+                pcm_24k[i] = (float)((1.0 - frac) * pcm[idx] + frac * pcm[idx + 1]);
+            else if (idx < n_samples)
+                pcm_24k[i] = pcm[idx];
+        }
+        n_samples = out_len;
+    }
 
     // Debug: override resampled audio from file if INDEXTTS_AUDIO24K_FILE is set
     const char* a24k_file = getenv("INDEXTTS_AUDIO24K_FILE");
@@ -619,7 +639,8 @@ static std::vector<float> compute_ref_mel(const float* pcm, int n_samples, int* 
     p.layout = core_mel::Layout::MelsTime;
     p.fb_layout = core_mel::FbLayout::MelsFreqs;
     p.matmul = core_mel::MatmulPrecision::Double;
-    p.center_pad = true; // matches PyTorch center=True (pads n_fft//2 reflect on each side)
+    p.center_pad = true;
+    p.center_pad_reflect = true; // torchaudio center=True uses reflect padding
 
     int T = 0;
     auto mel = core_mel::compute(pcm_24k.data(), n_samples, hann.data(), n_fft, mel_fb.data(), n_freqs,
@@ -715,27 +736,22 @@ static ggml_cgraph* build_cond_enc_graph(indextts_context* c, int T_mel) {
     ggml_set_name(cur, "dbg_linear_out");
     ggml_set_output(cur);
 
-    // Scale by sqrt(d_model) then add positional encoding
-    // Python: x = x * self.xscale + pos_emb (xscale = sqrt(d_model))
+    // Scale by sqrt(d_model) — RelPositionalEncoding does NOT add pos_emb to x.
+    // Python: x = x * self.xscale (no addition; pos_emb is passed separately to attention)
     cur = ggml_scale(ctx0, cur, sqrtf((float)d));
 
+    // Load stored absolute position table for attention (T_enc entries from pe[:, 0:T])
     ggml_tensor* pe_full = core_gguf::try_get(ts, "cond_enc.embed.pos_enc.pe");
+    ggml_tensor* pos_enc = nullptr;
     if (pe_full && T_enc > 0) {
         // pe_full is [512, 5000, 1], we need [512, T_enc]
-        ggml_tensor* pe = ggml_view_2d(ctx0, pe_full, d, T_enc, pe_full->nb[1], 0);
-        pe = ggml_cast(ctx0, pe, GGML_TYPE_F32);
-        cur = ggml_add(ctx0, cur, pe);
+        pos_enc = ggml_view_2d(ctx0, pe_full, d, T_enc, pe_full->nb[1], 0);
+        pos_enc = ggml_cast(ctx0, pos_enc, GGML_TYPE_F32);
     }
 
     // Debug: output pre-transformer embeddings
     ggml_set_name(cur, "dbg_pre_transformer");
     ggml_set_output(cur);
-
-    // Build relative position sinusoidal table for self-attention
-    auto pos_data = core_conformer::make_pos_enc(d, T_enc);
-    ggml_tensor* pos_enc = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, 2 * T_enc - 1);
-    ggml_set_name(pos_enc, "cond_pos_enc");
-    ggml_set_input(pos_enc);
 
     // 6 Conformer blocks
     for (int il = 0; il < n_layers; il++) {
@@ -763,6 +779,7 @@ static ggml_cgraph* build_cond_enc_graph(indextts_context* c, int T_mel) {
                                   core_gguf::try_get(ts, fmt("sa.linear_k.bias").c_str()));
         ggml_tensor* V = mm_bias(core_gguf::try_get(ts, fmt("sa.linear_v.weight").c_str()), x,
                                  core_gguf::try_get(ts, fmt("sa.linear_v.bias").c_str()));
+        // R = linear_pos(pos_emb) — pos_emb is [d, T_enc] absolute positions
         ggml_tensor* R = ggml_mul_mat(ctx0, core_gguf::try_get(ts, fmt("sa.linear_pos.weight").c_str()), pos_enc);
 
         ggml_tensor* pos_u = core_gguf::try_get(ts, fmt("sa.pos_bias_u").c_str());
@@ -776,10 +793,12 @@ static ggml_cgraph* build_cond_enc_graph(indextts_context* c, int T_mel) {
         Q_u = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Q_u, head_dim, n_heads, T_enc), 0, 2, 1, 3);
         Q_v = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Q_v, head_dim, n_heads, T_enc), 0, 2, 1, 3);
         K_ = ggml_permute(ctx0, ggml_reshape_3d(ctx0, K_, head_dim, n_heads, T_enc), 0, 2, 1, 3);
-        R = ggml_permute(ctx0, ggml_reshape_3d(ctx0, R, head_dim, n_heads, 2 * T_enc - 1), 0, 2, 1, 3);
+        // R shape: [d, T_enc] → [head_dim, n_heads, T_enc] → permute to [head_dim, T_enc, n_heads]
+        R = ggml_permute(ctx0, ggml_reshape_3d(ctx0, R, head_dim, n_heads, T_enc), 0, 2, 1, 3);
 
-        ggml_tensor* BD_raw = ggml_mul_mat(ctx0, ggml_cont(ctx0, R), Q_v);
-        ggml_tensor* BD = core_conformer::rel_shift(ctx0, BD_raw);
+        // matrix_bd = Q_v @ R^T — already [T_enc, T_enc, n_heads] (square, no rel_shift needed)
+        // Python: rel_shift is commented out ("useless in speech recognition")
+        ggml_tensor* BD = ggml_mul_mat(ctx0, ggml_cont(ctx0, R), Q_v);
 
         const float scale = 1.0f / sqrtf((float)head_dim);
         ggml_tensor* BD_c = ggml_cont(ctx0, BD);
@@ -1037,7 +1056,7 @@ static ggml_cgraph* build_perceiver_graph(indextts_context* c, int T_enc) {
 // size (perceiver_n_latents * d_model). Stored in indextts_context for
 // reuse across prefill and latent passes.
 
-static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_n_samples) {
+static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_n_samples, int ref_sr = 24000) {
     const int D = (int)c->hp.d_model;
     const int n_latents = (int)c->hp.perceiver_n_latents;
     const int cond_d = (int)c->hp.cond_d_model;
@@ -1058,7 +1077,7 @@ static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_
 
     // Step 1: Compute reference mel spectrogram
     int T_mel = 0;
-    auto mel = compute_ref_mel(ref_pcm, ref_n_samples, &T_mel);
+    auto mel = compute_ref_mel(ref_pcm, ref_n_samples, ref_sr, &T_mel);
 
     // Debug: override mel from file if INDEXTTS_MEL_FILE is set (MelsTime format)
     const char* mel_file = getenv("INDEXTTS_MEL_FILE");
@@ -1089,6 +1108,8 @@ static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_
         fprintf(stderr, "indextts: ref mel: %d frames x 100 bands\n", T_mel);
     }
 
+    const bool dbg = getenv("INDEXTTS_DEBUG") != nullptr;
+
     // Debug: check mel values
     {
         int nnan = 0;
@@ -1102,6 +1123,13 @@ static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_
         mrms = sqrtf(mrms / std::max((size_t)1, mel.size() - nnan));
         fprintf(stderr, "indextts: mel values rms=%.4f nan=%d/%zu min=%.4f max=%.4f\n", mrms, nnan, mel.size(),
                 *std::min_element(mel.begin(), mel.end()), *std::max_element(mel.begin(), mel.end()));
+        if (dbg) {
+            // MelsTime layout: data[t + mel_band * T_mel]
+            fprintf(stderr, "indextts: mel band0 t0-4: [%.6f, %.6f, %.6f, %.6f, %.6f]\n", mel[0 + 0 * T_mel],
+                    mel[1 + 0 * T_mel], mel[2 + 0 * T_mel], mel[3 + 0 * T_mel], mel[4 + 0 * T_mel]);
+            fprintf(stderr, "indextts: mel band50 t0-2: [%.6f, %.6f, %.6f]\n", mel[0 + 50 * T_mel], mel[1 + 50 * T_mel],
+                    mel[2 + 50 * T_mel]);
+        }
     }
 
     // Step 2: Run Conformer encoder
@@ -1123,12 +1151,8 @@ static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_
                 mel_tm[m + t * 100] = mel[t + m * T_mel];
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "cond_mel"), mel_tm.data(), 0, mel_tm.size() * sizeof(float));
 
-        // Set positional encoding
-        auto pos_data = core_conformer::make_pos_enc(cond_d, T_enc);
-        ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "cond_pos_enc");
-        if (pos_t) {
-            ggml_backend_tensor_set(pos_t, pos_data.data(), 0, pos_data.size() * sizeof(float));
-        }
+        // Positional encoding is now sourced from stored pe buffer in the graph,
+        // not a runtime-computed input tensor. No setup needed.
 
         if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "indextts: Conformer compute failed\n");
@@ -1137,9 +1161,7 @@ static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_
         }
 
         // Debug: dump conv2d element map to find correct dimension ordering
-        // Python reference: y[c=0,t=0,w=0]=-0.286049, y[c=1,t=0,w=0]=-0.637862
-        //                   y[c=0,t=1,w=0]=-0.447213, y[c=0,t=0,w=1]=-0.286049
-        {
+        if (dbg) {
             ggml_tensor* dbg = ggml_graph_get_tensor(gf, "dbg_conv2d_out");
             if (dbg) {
                 int n = (int)ggml_nelements(dbg);
@@ -1167,12 +1189,12 @@ static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_
             }
         }
         // Debug: check linear output (before PE)
-        {
-            ggml_tensor* dbg = ggml_graph_get_tensor(gf, "dbg_linear_out");
-            if (dbg) {
-                int n = (int)ggml_nelements(dbg);
+        if (dbg) {
+            ggml_tensor* dt = ggml_graph_get_tensor(gf, "dbg_linear_out");
+            if (dt) {
+                int n = (int)ggml_nelements(dt);
                 std::vector<float> d(n);
-                ggml_backend_tensor_get(dbg, d.data(), 0, n * sizeof(float));
+                ggml_backend_tensor_get(dt, d.data(), 0, n * sizeof(float));
                 float s2 = 0;
                 for (float v : d)
                     s2 += v * v;
@@ -1181,12 +1203,12 @@ static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_
             }
         }
         // Debug: check pre-transformer output
-        {
-            ggml_tensor* dbg = ggml_graph_get_tensor(gf, "dbg_pre_transformer");
-            if (dbg) {
-                int n = (int)ggml_nelements(dbg);
+        if (dbg) {
+            ggml_tensor* dt = ggml_graph_get_tensor(gf, "dbg_pre_transformer");
+            if (dt) {
+                int n = (int)ggml_nelements(dt);
                 std::vector<float> d(n);
-                ggml_backend_tensor_get(dbg, d.data(), 0, n * sizeof(float));
+                ggml_backend_tensor_get(dt, d.data(), 0, n * sizeof(float));
                 int nnan = 0;
                 float s2 = 0;
                 for (float v : d) {
@@ -1201,20 +1223,21 @@ static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_
         }
 
         // Debug: per-block output comparison
-        for (int bi = 0; bi < (int)c->hp.cond_n_layers; bi++) {
-            char bname[32];
-            snprintf(bname, sizeof(bname), "dbg_block_%d", bi);
-            ggml_tensor* dbg = ggml_graph_get_tensor(gf, bname);
-            if (dbg) {
-                int n = (int)ggml_nelements(dbg);
-                std::vector<float> d(n);
-                ggml_backend_tensor_get(dbg, d.data(), 0, n * sizeof(float));
-                float s2 = 0;
-                for (float v : d)
-                    s2 += v * v;
-                // Block output is [512, T_enc]. first5 = first 5 elements of position 0
-                fprintf(stderr, "indextts: block_%d rms=%.4f first5=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", bi, sqrtf(s2 / n),
-                        d[0], d[1], d[2], d[3], d[4]);
+        if (dbg) {
+            for (int bi = 0; bi < (int)c->hp.cond_n_layers; bi++) {
+                char bname[32];
+                snprintf(bname, sizeof(bname), "dbg_block_%d", bi);
+                ggml_tensor* dt = ggml_graph_get_tensor(gf, bname);
+                if (dt) {
+                    int n = (int)ggml_nelements(dt);
+                    std::vector<float> d(n);
+                    ggml_backend_tensor_get(dt, d.data(), 0, n * sizeof(float));
+                    float s2 = 0;
+                    for (float v : d)
+                        s2 += v * v;
+                    fprintf(stderr, "indextts: block_%d rms=%.4f first5=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", bi,
+                            sqrtf(s2 / n), d[0], d[1], d[2], d[3], d[4]);
+                }
             }
         }
 
@@ -1259,12 +1282,12 @@ static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_
         }
 
         // Debug: read proj_context
-        {
-            ggml_tensor* dbg = ggml_graph_get_tensor(pgf, "dbg_perc_proj");
-            if (dbg) {
-                int n = (int)ggml_nelements(dbg);
+        if (dbg) {
+            ggml_tensor* dt = ggml_graph_get_tensor(pgf, "dbg_perc_proj");
+            if (dt) {
+                int n = (int)ggml_nelements(dt);
                 std::vector<float> d(n);
-                ggml_backend_tensor_get(dbg, d.data(), 0, n * sizeof(float));
+                ggml_backend_tensor_get(dt, d.data(), 0, n * sizeof(float));
                 float s2 = 0;
                 for (float v : d)
                     s2 += v * v;
@@ -1642,12 +1665,10 @@ static ggml_cgraph* build_gpt2_latent_graph(indextts_context* c, int n_total, in
     cur = ggml_mul(ctx0, cur, c->model.final_norm_w);
     cur = ggml_add(ctx0, cur, c->model.final_norm_b);
 
-    // Extract hidden states for mel positions: start_mel through the second-to-last
-    // mel code. Python returns mel_logits[:, :-2] on mel_emb which has (k+2) tokens
-    // [start_mel, m1..mk, stop_mel], so the latent has k positions starting at start_mel.
-    // These are the positions [start_mel, m1, ..., mk-1] — the hidden state at each
-    // position predicts the next mel code, which the vocoder uses as its input.
-    int mel_start = T - n_mel_codes - 1; // -1 to include start_mel position
+    // Extract hidden states for mel positions: [start_mel, m1, ..., mk].
+    // Python's forward(return_latent=True) returns mel_logits[:, :-2] which gives
+    // (k+1) positions from start_mel through the last generated mel code.
+    int mel_start = T - n_mel_codes; // start_mel is at (T - n_mel_codes)
     cur = ggml_view_2d(ctx0, cur, D, n_mel_codes, cur->nb[1], (size_t)mel_start * cur->nb[1]);
     cur = ggml_cont(ctx0, cur);
 
@@ -1670,11 +1691,13 @@ static float* run_gpt_latent(indextts_context* c, const std::vector<int32_t>& te
     const int text_len = (int)text_tokens.size() + 2; // +start_text +stop_text
     const int n_mel = (int)mel_codes.size();
     // Full sequence: [cond(32)] [start_text, t1..tn, stop_text] [start_mel, m1..mk]
-    // (no stop_mel appended — Python strips it via :-2)
+    // (no stop_mel appended — Python's forward() adds it internally then strips via :-2)
     const int total_len = cond_len + text_len + 1 + n_mel;
-    // Latent: extract from start_mel position through mk-1 = n_mel positions
-    // (hidden state at start_mel predicts m1, at m1 predicts m2, etc.)
-    const int n_latent = n_mel; // matches Python's mel_emb.shape[1] - 2
+    // Latent: extract (n_mel + 1) positions from start_mel through mk.
+    // Python's forward(return_latent=True) returns mel_logits[:, :-2] on the
+    // (k+2)-token mel sequence [start_mel, m1..mk, stop, stop], yielding k+1
+    // hidden states: [start_mel, m1, ..., mk].
+    const int n_latent = n_mel + 1;
 
     if (c->params.verbosity >= 1) {
         fprintf(stderr, "indextts: latent pass: total=%d (cond=%d text=%d mel=%d+1) n_latent=%d\n", total_len, cond_len,
@@ -2049,6 +2072,22 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
         ctx->cond_latents.assign((size_t)n_lat * D, 0.0f);
     }
 
+    // Debug: override conditioning from file (works even without reference audio)
+    const char* cond_file = getenv("INDEXTTS_COND_FILE");
+    if (cond_file && cond_file[0]) {
+        FILE* f = fopen(cond_file, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            size_t sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            ctx->cond_latents.resize(sz / sizeof(float));
+            size_t rd = fread(ctx->cond_latents.data(), 1, sz, f);
+            fclose(f);
+            fprintf(stderr, "indextts: DEBUG loaded conditioning from %s (%zu floats)\n", cond_file,
+                    rd / sizeof(float));
+        }
+    }
+
     // 1. Uppercase text then tokenize (IndexTTS normalizer uppercases before BPE)
     std::string text_upper;
     for (const char* p = text; *p; p++) {
@@ -2153,45 +2192,61 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
         ggml_backend_tensor_set(ctx->kv_v, v.data(), 0, v.size());
     };
 
-    // Apply rep penalty to logits based on token history
-    auto apply_rep = [&](float* lg, const std::vector<int32_t>& hist) {
-        if (rep_penalty <= 1.0f)
-            return;
-        for (int32_t t : hist) {
-            if (t >= 0 && t < mel_vocab)
-                lg[t] = (lg[t] > 0) ? lg[t] / rep_penalty : lg[t] * rep_penalty;
-        }
-    };
-
-    // Log-softmax of a single token
-    auto log_softmax_at = [&](const float* lg, int tok) -> double {
+    // Compute full log-softmax over vocabulary, then apply rep penalty to log-probs.
+    // HuggingFace beam search applies RepetitionPenaltyLogitsProcessor AFTER log_softmax:
+    //   log_probs = log_softmax(raw_logits)
+    //   for each token in history: log_probs[t] *= penalty (since log_probs <= 0, this makes them more negative)
+    // Returns a vector of penalized log-probabilities.
+    auto compute_log_probs = [&](const float* lg, const std::vector<int32_t>& hist) -> std::vector<double> {
+        std::vector<double> log_probs(mel_vocab);
+        // Log-softmax
         float mx = lg[0];
         for (int i = 1; i < mel_vocab; i++)
             mx = std::max(mx, lg[i]);
         double sum = 0;
         for (int i = 0; i < mel_vocab; i++)
             sum += std::exp((double)(lg[i] - mx));
-        return (double)(lg[tok] - mx) - std::log(sum);
+        double log_sum = std::log(sum);
+        for (int i = 0; i < mel_vocab; i++)
+            log_probs[i] = (double)(lg[i] - mx) - log_sum;
+
+        // Apply repetition penalty AFTER log_softmax (matching HF behavior).
+        // log_probs are always <= 0, so score < 0 is always true — multiply by penalty.
+        if (rep_penalty > 1.0f) {
+            for (int32_t t : hist) {
+                if (t >= 0 && t < mel_vocab) {
+                    if (log_probs[t] < 0)
+                        log_probs[t] *= (double)rep_penalty;
+                    else
+                        log_probs[t] /= (double)rep_penalty;
+                }
+            }
+        }
+        return log_probs;
     };
 
-    // Seed beams from prefill logits (no rep penalty yet — empty history)
+    // Seed beams from prefill logits (no rep penalty — empty history at first step)
     std::vector<Beam> beams;
     {
         // Save post-prefill KV
         std::vector<uint8_t> prompt_k, prompt_v;
         save_kv(prompt_k, prompt_v);
 
-        // Find top-B from prefill logits
-        std::vector<std::pair<float, int>> scored(mel_vocab);
+        // Compute log-probs (no history for first step, so no penalty applied)
+        std::vector<int32_t> empty_hist;
+        auto lp = compute_log_probs(logits, empty_hist);
+
+        // Find top-B from log-probabilities
+        std::vector<std::pair<double, int>> scored(mel_vocab);
         for (int i = 0; i < mel_vocab; i++)
-            scored[i] = {logits[i], i};
+            scored[i] = {lp[i], i};
         std::partial_sort(scored.begin(), scored.begin() + B, scored.end(),
                           [](auto& a, auto& b) { return a.first > b.first; });
 
         for (int b = 0; b < B; b++) {
             Beam beam;
             beam.tokens.push_back(scored[b].second);
-            beam.score = log_softmax_at(logits, scored[b].second);
+            beam.score = scored[b].first;
             beam.kv_k = prompt_k;
             beam.kv_v = prompt_v;
             beam.finished = (scored[b].second == stop_token);
@@ -2210,12 +2265,20 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
 
     // Beam search loop
     for (int step = 1; step < max_mel && !beams[0].finished; step++) {
-        struct Cand {
+        // Renamed from `Cand` to `BeamCand` to dodge a cppcheck
+        // false-positive: `core/beam_decode.h` declares an unrelated
+        // `struct Cand` in a different function scope, and cppcheck
+        // matches the two by name across translation units, then
+        // reports `Uninitialized struct member: c.parent` /
+        // `c.score` against the *other* Cand (which has
+        // `beam_idx`/`cum_logprob` instead). Disambiguating here
+        // silences the bogus warning without touching beam_decode.h.
+        struct BeamCand {
             int parent;
             int32_t token;
             double score;
         };
-        std::vector<Cand> cands;
+        std::vector<BeamCand> cands;
 
         for (int bi = 0; bi < (int)beams.size(); bi++) {
             auto& beam = beams[bi];
@@ -2226,8 +2289,12 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
 
             // Restore KV and step with last token
             restore_kv(beam.kv_k, beam.kv_v);
-            int mel_pos = (int)beam.tokens.size();
-            int np = prefill_len + mel_pos - 1;
+            // Python's GPT2InferenceModel uses mel_pos = attention_mask_len - mel_len.
+            // start_mel gets mel_pos[0] at prefill, then mel_pos[1] is skipped,
+            // and generated tokens get mel_pos[step+1] where step starts at 1.
+            // This matches: mel_pos = beam.tokens.size() + 1.
+            int mel_pos = (int)beam.tokens.size() + 1;
+            int np = prefill_len + (int)beam.tokens.size() - 1;
             std::vector<float> emb = build_mel_token_embed(ctx, beam.tokens.back(), mel_pos);
             float* lg = run_gpt2_kv(ctx, emb.data(), 1, np);
             if (!lg)
@@ -2236,19 +2303,18 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
             // Save post-step KV
             save_kv(beam.kv_k, beam.kv_v);
 
-            // Apply rep penalty using this beam's FULL token history
-            apply_rep(lg, beam.tokens);
+            // Compute log-probs then apply rep penalty (matching HF order)
+            auto lp = compute_log_probs(lg, beam.tokens);
+            free(lg);
 
-            // Top-B candidates from this beam
-            std::vector<std::pair<float, int>> sc(mel_vocab);
+            // Top-B candidates from this beam (scored by penalized log-probs)
+            std::vector<std::pair<double, int>> sc(mel_vocab);
             for (int i = 0; i < mel_vocab; i++)
-                sc[i] = {lg[i], i};
+                sc[i] = {lp[i], i};
             std::partial_sort(sc.begin(), sc.begin() + B, sc.end(), [](auto& a, auto& b) { return a.first > b.first; });
             for (int k = 0; k < B; k++) {
-                double lp = log_softmax_at(lg, sc[k].second);
-                cands.push_back({bi, sc[k].second, beam.score + lp});
+                cands.push_back({bi, sc[k].second, beam.score + sc[k].first});
             }
-            free(lg);
         }
 
         // Keep top-B candidates globally
@@ -2291,7 +2357,7 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
 
     if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "indextts: generated %zu mel codes:", mel_codes.size());
-        for (size_t i = 0; i < std::min(mel_codes.size(), (size_t)20); i++)
+        for (size_t i = 0; i < std::min(mel_codes.size(), (size_t)30); i++)
             fprintf(stderr, " %d", mel_codes[i]);
         if (mel_codes.size() > 20)
             fprintf(stderr, "...");
@@ -2364,7 +2430,9 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
     codes = nullptr;
 
     // Step 3: Run GPT latent extraction (second forward pass)
+    // Latent has (n_codes + 1) positions: [start_mel, m1, ..., mk]
     float* latent = run_gpt_latent(ctx, text_tokens, mel_codes_vec);
+    int n_latent = n_codes + 1; // matches Python's mel_logits[:, :-2]
     if (!latent) {
         fprintf(stderr, "indextts: latent extraction failed\n");
         return nullptr;
@@ -2411,7 +2479,7 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
             int D = 1280;
             int T = n_elem / D;
             free(latent);
-            n_codes = T;
+            n_latent = T;
             latent = (float*)malloc(sz);
             fread(latent, 1, sz, f);
             fclose(f);
@@ -2420,9 +2488,9 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
     }
 
     // Step 5: Run BigVGAN vocoder
-    // latent is [n_codes, 1280] — the vocoder expects this as-is.
+    // latent is [n_latent, 1280] — includes start_mel + all generated mel codes.
     int n_audio = 0;
-    float* pcm = indextts_voc_generate(ctx->voc, latent, n_codes, spk_emb, &n_audio);
+    float* pcm = indextts_voc_generate(ctx->voc, latent, n_latent, spk_emb, &n_audio);
     free(latent);
     free(spk_emb);
 

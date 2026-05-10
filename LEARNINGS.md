@@ -3426,6 +3426,87 @@ something downstream of T3 (likely s3gen or speech_head F32 matmul
 through some indirect path) introduces additional drift. So even F16
 isn't a clean GPU path. Auto-fallback remains.
 
+### Round 4 (2026-05-10) — kernel-level fix landed (partial bit-identity)
+
+Implemented the proper kernel-level fix:
+
+1. `kernel_quantize_q8_K_f32` (ggml-metal.metal): F32 input column →
+   Q8_K block. Each threadgroup processes 1 256-element block, 32
+   threads per group. simd_shuffle_xor reduction finds amax + signed
+   max, then `iscale = -127/max`, `qs[j] = MIN(127, round(iscale ×
+   x[j]))`, `bsums[k] = sum of qs[k*16..k*16+15]`. Mirrors CPU
+   `quantize_row_q8_K_ref` exactly.
+2. `kernel_mul_mv_q4_K_q8_K` (ggml-metal.metal): one thread per output
+   element. Mirrors CPU `ggml_vec_dot_q4_K_q8_K_generic` exactly:
+   unpack 256 Q4_K nibbles into int8 a[256], unpack 12-byte scales
+   table into 8 scale + 8 min uchars (kmask1/2/3), int32 accumulators
+   per scale lane, dmin contribution via bsums × mins, final F32
+   multiply by d_q4 × d_q8.
+3. Dispatch path in `ggml_metal_op_mul_mat`: when PREC_F32 + Q4_K
+   weight + F32 input + ne00 % 256 == 0, reserve a Q8_K scratch
+   buffer at the tail of dst (via
+   `ggml_metal_op_mul_mat_extra_q8_K` + the
+   `ggml_backend_metal_buffer_type_get_alloc_size` hook), dispatch
+   the quantize kernel to fill it, sync via
+   `ggml_metal_op_concurrency_reset`, dispatch the Q4_K×Q8_K matmul.
+4. Routed `flash_attn_ext` to CPU when PREC_F32 is set, via
+   `ggml_metal_device_supports_op` returning false. Apple's FA kernel
+   uses simdgroup_half8x8 tiles for Q×K^T regardless of K type
+   (FA_TYPES_F32 still declares Q as half), leaking ~1e-4 drift even
+   with F32 KV. Routing to CPU avoids the issue at the cost of
+   per-layer cross-device transfers.
+5. chatterbox `build_graph_t3_kv` / `build_graph_t3_gpt2_kv` graph
+   walks now tag every `GGML_OP_MUL_MAT` AND every
+   `GGML_OP_FLASH_ATTN_EXT` with `GGML_PREC_F32`.
+
+### Verification + remaining drift
+
+| Stage                   | CPU vs GPU drift                  |
+|-------------------------|-----------------------------------|
+| Layer-0 norm output     | bit-identical                     |
+| Layer-0 K weight (cast) | bit-identical (after `.h` → `.f`) |
+| Layer-0 K projection    | **bit-identical**                 |
+| Layer-0 K cache (KV[0]) | **bit-identical** through every t |
+| Layer-0 V projection    | bit-identical                     |
+| Layer-0 Q projection    | bit-identical                     |
+| Layer-0 K rope          | bit-identical                     |
+| Layer-0 attn output     | **bit-identical** (post out_proj) |
+| Layer-0 FFN output      | **bit-identical**                 |
+| Layer-1 norm output     | bit-identical                     |
+| Layer-1 K projection    | bit-identical                     |
+| Layer-1 K cache         | bit-identical at every sampled t  |
+| Layer-1 attn output     | **drifts ~1e-4** (despite all of the above being identical!) |
+| Layer-29 attn output    | drifts ~3e-3                      |
+| End-of-prefill logits   | drift ~0.1–0.2                    |
+
+AR token sequence (chatterbox seed=42, "Hello world", greedy temp=0):
+matches CPU through **decode step 11**, then diverges. Compare to:
+- Pre-#83 fix:                  matches through ~step 1
+- After kernel only:            matches through step 6
+- After kernel + FA→CPU:        matches through step 11
+
+End-to-end audio: chatterbox FORCE_GPU=1 now produces partially
+intelligible speech ("They put your" instead of empty/noise on the
+JFK clone). The auto-fallback remains the production path until the
+remaining ~1e-4 layer-1+ drift is identified and eliminated — likely
+in some Metal op the diagnostic dumps haven't yet traced through
+(candidates: rope on Q with rope_freq_factors, swiglu, an
+F32-weight matmul path I haven't covered, or an inter-kernel
+cross-device copy with subtle precision behaviour).
+
+### Status
+
+The Q4_K × Q8_K kernel infrastructure is solid and ships with diagnostic
+knobs (`CRISPASR_CHATTERBOX_DUMP_KV_LAYER`, `_DUMP_LAYER`, `_DUMP_ATTN_AT`,
+`_DUMP_FFN_AT`, `_DUMP_QPROJ_AT`, `_DUMP_VPROJ_AT`) for further
+bisection. Q5_K, Q6_K, Q8_0 use the same template — straightforward
+port once Q4_K is shaken out.
+
+The default chatterbox path (no env overrides) auto-falls-back to
+full CPU. `CRISPASR_CHATTERBOX_FORCE_GPU=1` enables the new
+kernel + FA→CPU path; tokens diverge at step 11+ but layer 0 is
+bit-identical.
+
 2. **T3 sampling can drift on long technical prompts**. The seed=0
    default is deterministic, but particular prompts produce
    degenerate output (e.g. "Stop, stop, stop" repetition or wholly
@@ -4184,3 +4265,115 @@ contract. The diff harness's top-1-match check therefore needs the
 reference dumper's `top1_label` field as the source of truth; you
 can't paper over short-input quirks by feeding longer inputs at
 diff time.
+
+---
+
+## IndexTTS-1.5 TTS backend
+
+### HuggingFace GPT-2 has TWO final LayerNorms
+
+IndexTTS uses HuggingFace's GPT2Model, which applies a built-in
+`gpt.ln_f` LayerNorm after all transformer blocks. IndexTTS then
+applies its own `final_norm` on top. Missing `gpt.ln_f` caused
+a 2.0 logit gap, demoting the correct first mel token from rank 0
+to rank 11. Both norms must be loaded into the GGUF and applied:
+transformer blocks → gpt.ln_f → final_norm → mel_head.
+
+### HF generate skips mel position 1
+
+During HuggingFace's `generate()` loop, the mel position embedding
+for generated tokens is computed as `attention_mask.shape[1] - mel_len`.
+Because `fake_inputs` has `mel_len + 1` tokens (with start_mel at
+the end), the first generated token after prefill gets mel_pos[2]
+instead of mel_pos[1]. Position 1 is never used during inference.
+The sequence is: start_mel=pos[0], gen_tok_0=pos[2], gen_tok_1=pos[3], etc.
+This is a train/inference mismatch in IndexTTS but the model works
+with it, so the C++ must match: `mel_pos = beam.tokens.size() + 1`.
+
+### Latent extraction: mel_logits[:, :-2] gives (n_mel + 1) positions
+
+Python's `forward(return_latent=True)` internally prepends start_mel
+and appends stop_mel, then strips the last 2 positions. The result
+has (n_mel + 1) positions: [start_mel_hidden, c1_hidden, ..., ck_hidden].
+The C++ latent pass must extract this exact count, not n_mel.
+
+### Reference dump tool was missing gpt.ln_f
+
+The simplified reference dump in `tools/reference_backends/indextts.py`
+manually reimplements GPT-2 but originally skipped `gpt.ln_f`,
+producing wrong reference values. Any manual reimplementation of
+HuggingFace GPT-2 must include `gpt.ln_f`.
+
+### Conformer RelPositionalEncoding does NOT add pos_emb to x
+
+WeNet/ESPnet Conformers have two positional encoding classes:
+- `PositionalEncoding.forward`: returns `(x * xscale + pos_emb, pos_emb)`
+- `RelPositionalEncoding.forward`: returns `(x * xscale, pos_emb)`
+
+IndexTTS uses `RelPositionalEncoding`. The `pos_emb` is passed
+separately to the attention layer as the R matrix — it is NEVER
+added to the input x. Adding it corrupts every subsequent block.
+
+### Conformer attention: absolute pos table, no rel_shift
+
+IndexTTS's Conformer uses `RelPositionMultiHeadedAttention` but with
+a critical deviation from the paper: `rel_shift` is commented out
+("useless in speech recognition"). The position table is the stored
+`pe[:, 0:T]` — T absolute positions, NOT a 2T-1 relative table.
+The `matrix_bd = Q_v @ R^T` is already a T×T square matrix and
+needs no shift. Using a 2T-1 sinusoidal table + rel_shift corrupts
+attention scores in all 6 blocks.
+
+### BigVGAN SnakeBeta: ggml memory layout is [c*T + t], not [t*C + c]
+
+The anti-aliased SnakeBeta activation runs as a custom `ggml_map_custom1`
+op. For a tensor with `ne[0]=T, ne[1]=C`, ggml stores element (t, c)
+at offset `c * T + t` — channel-major, time innermost. Accessing as
+`data[t * C + c]` (which is row-major [T, C]) scrambles channels
+across time, producing noise instead of speech. This single bug was
+the root cause of the vocoder producing unrecognizable audio.
+
+### BigVGAN latent input: GPT output layout vs ggml tensor layout
+
+The GPT latent extraction outputs `ne[0]=D, ne[1]=n_positions`, meaning
+each position's D=1280 values are contiguous (row-major [pos, D]).
+The vocoder's `ggml_conv_1d` needs `ne[0]=T, ne[1]=C` with time innermost.
+Copying raw bytes from the GPT tensor into a `(T, C)` ggml tensor
+transposes the data — channels become time and vice versa. Fix:
+create the input tensor as `(D, T)` matching GPT layout, then
+`ggml_transpose` + `ggml_cont` before conv operations.
+
+### Reference audio sample rate must be checked
+
+The `compute_ref_mel` function assumed 16kHz input and always
+resampled to 24kHz. If the reference WAV is already 24kHz (common),
+this double-resamples and destroys the signal. The CLI must check
+the WAV sample rate and only resample when needed.
+
+### Center-padding: reflect vs zero (the mel spectrogram root cause)
+
+The core_mel `center_pad` option originally used **zero-padding** but
+torchaudio's `center=True` uses **reflect-padding**. This caused the
+first 2 STFT frames to differ from Python, propagating through the
+6-layer Conformer into conditioning (norm 288.88 vs 288.92), then
+compounding through 24 GPT layers to flip a beam search token at step 14
+(6283 instead of 6109).
+
+The hypothesis that F16 weight precision caused the gap was WRONG — an
+F32 GGUF produced identical conditioning values. The actual root cause
+was padding mode. Fix: added `center_pad_reflect` to `core_mel::Params`.
+
+Lesson: when mel values at t=0 and t=1 differ from Python but t≥2 match
+exactly, always check center-padding mode — it's reflect vs zero.
+
+### HF beam search applies repetition penalty AFTER log_softmax
+
+HuggingFace's `_beam_search` computes log_softmax on raw logits FIRST,
+then passes the log-probabilities through `logits_processor` (which
+includes `RepetitionPenaltyLogitsProcessor`). Since log-probs are always
+≤ 0, the penalty multiplies them (making them more negative).
+
+The C++ originally applied rep penalty to raw logits BEFORE log_softmax,
+which changes beam dynamics. With `repetition_penalty=10.0`, this causes
+different beam paths to win. Fix: compute log_softmax first, then apply
+penalty to log-probs, matching HF's exact order.
