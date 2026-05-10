@@ -4,6 +4,7 @@
 // followed by a longer buffer because the KV cache wasn't reallocated.
 
 #include "vibevoice.h"
+#define _USE_MATH_DEFINES
 #include <vector>
 #include <iostream>
 #include <cmath>
