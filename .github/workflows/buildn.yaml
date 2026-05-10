@@ -1,0 +1,213 @@
+# .github/workflows/buildn.yaml
+# Windows AMD64 Vulkan build using LLVM/Clang toolchain for CrispASR
+
+name: Build Windows AMD64 Vulkan (LLVM)
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: 'Commit SHA to build (optional, leave empty for trigger commit)'
+        required: false
+        default: ''
+  push:
+    branches: [feat/ci]
+    paths:
+      - '.github/workflows/buildn.yaml'
+      - '**/CMakeLists.txt'
+      - '**/*.h'
+      - '**/*.hpp'
+      - '**/*.c'
+      - '**/*.cpp'
+      - '**/*.cu'
+      - '**/*.cuh'
+      - '**/*.cl'
+      - '**/*.comp'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/buildn.yaml'
+      - '**/CMakeLists.txt'
+      - '**/*.h'
+      - '**/*.hpp'
+      - '**/*.c'
+      - '**/*.cpp'
+      - '**/*.cu'
+      - '**/*.cuh'
+      - '**/*.cl'
+      - '**/*.comp'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  VULKAN_VERSION: 1.4.341.1
+
+jobs:
+  windows-latest-vulkan-llvm:
+    name: Windows AMD64 Vulkan (LLVM/Clang)
+    runs-on: windows-2025-vs2026
+
+    env:
+      SHOULD_SAVE_CACHE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+
+    defaults:
+      run:
+        shell: powershell
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          ref: ${{ inputs.commit_sha || github.sha }}
+
+      - name: Setup ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: windows-latest-vulkan-llvm-x64-crispasr
+          variant: ccache
+          evict-old-files: 1d
+          save: ${{ env.SHOULD_SAVE_CACHE }}
+          max-size: 2G
+
+      - name: Install Ninja
+        run: |
+          choco install ninja --no-progress -y
+          echo "C:/ProgramData/chocolatey/bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Setup Visual Studio environment
+        id: setup_vs
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            Write-Error "vswhere not found"
+            exit 1
+          }
+          $vsInstallPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $vsInstallPath) {
+            Write-Error "Visual Studio installation not found"
+            exit 1
+          }
+          $vsDevCmd = Join-Path $vsInstallPath "Common7\Tools\VsDevCmd.bat"
+          if (-not (Test-Path $vsDevCmd)) {
+            Write-Error "VsDevCmd.bat not found at $vsDevCmd"
+            exit 1
+          }
+          Write-Host "Using VS at: $vsInstallPath"
+          & cmd /c "`"$vsDevCmd`" -arch=amd64 -host_arch=amd64" | Out-Null
+          Add-Content $env:GITHUB_ENV "VS_INSTALL_PATH=$vsInstallPath"
+          Add-Content $env:GITHUB_ENV "VSCMD_ARG_TGT_ARCH=amd64"
+          Add-Content $env:GITHUB_ENV "VSCMD_ARG_HOST_ARCH=amd64"
+          Add-Content $env:GITHUB_PATH ($env:PATH)
+
+      - name: Cache Vulkan SDK
+        id: cache-vulkan
+        uses: actions/cache@v5
+        with:
+          path: C:\VulkanSDK
+          key: vulkan-sdk-${{ env.VULKAN_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+          restore-keys: |
+            vulkan-sdk-${{ env.VULKAN_VERSION }}-${{ runner.os }}-
+            vulkan-sdk-${{ env.VULKAN_VERSION }}-
+
+      - name: Install Vulkan SDK
+        if: steps.cache-vulkan.outputs.cache-hit != 'true'
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+          Write-Host "Vulkan SDK installed at: C:\VulkanSDK\${env:VULKAN_VERSION}"
+          $vulkaninfoPath = "C:\VulkanSDK\${env:VULKAN_VERSION}\bin\vulkaninfo.exe"
+          if (Test-Path $vulkaninfoPath) {
+            & $vulkaninfoPath --summary 2>&1 | Select-Object -First 5
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "vulkaninfo returned non-zero exit code (non-fatal)"
+            }
+          } else {
+            Write-Host "Warning: vulkaninfo.exe not found at expected path"
+          }
+
+      - name: Set Vulkan environment
+        run: |
+          if (-not $env:VULKAN_SDK) {
+            Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+            Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+          }
+          Write-Host "VULKAN_SDK=$env:VULKAN_SDK"
+
+      - name: Configure CMake with Vulkan + LLVM toolchain
+        id: cmake_configure
+        shell: cmd
+        run: |
+          call "%VS_INSTALL_PATH%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64
+          cmake -S . -B build ^
+            -G "Ninja" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DGGML_BACKEND_DL=OFF ^
+            -DGGML_VULKAN=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU_ALL_VARIANTS=OFF ^
+            -DGGML_CPU=ON ^
+            -DGGML_LTO=ON ^
+            -DGGML_STATIC=ON ^
+            -DGGML_LLAMAFILE=ON ^
+            -DGGML_LLAMAFILE_DEFAULT=ON ^
+            -DGGML_ACCELERATE=ON ^
+            -DGGML_OPENMP=ON ^
+            -DGGML_CUDA=OFF ^
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ^
+            -DCMAKE_PREFIX_PATH="%VULKAN_SDK%"
+
+      - name: Build CrispASR
+        id: cmake_build
+        shell: cmd
+        run: |
+          call "%VS_INSTALL_PATH%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64
+          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
+
+      - name: Compress build/bin to 7z archive
+        id: compress_artifact
+        run: |
+          $sevenZip = "7z"
+          if (-not (Get-Command $sevenZip -ErrorAction SilentlyContinue)) {
+            Write-Host "7-Zip not found in PATH, installing..."
+            choco install 7zip --no-progress -y
+            $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          }
+
+          $archiveName = "crispasr-windows-x64-vulkan-llvm-bin.7z"
+          $sourcePath = "build/bin"
+
+          Write-Host "Compressing $sourcePath to $archiveName with maximum compression..."
+          & $sevenZip a -t7z "$archiveName" "$sourcePath\*" `
+            -m0=lzma2 -mx=9 -mfb=64 -md=32m -ms=on `
+            -sse -slt -y
+
+          $archiveSize = (Get-Item $archiveName).Length / 1MB
+          Write-Host "Archive created: $archiveName ($([math]::Round($archiveSize, 2)) MB)"
+          Add-Content $env:GITHUB_ENV "ARTIFACT_ARCHIVE=$archiveName"
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crispASR-windows-x64-vulkan-llvm-${{ github.run_number }}
+          path: ${{ env.ARTIFACT_ARCHIVE }}
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-crispasr-windows-vulkan-llvm
+          path: |
+            build/Testing/Temporary/
+            *.log
+          retention-days: 14
