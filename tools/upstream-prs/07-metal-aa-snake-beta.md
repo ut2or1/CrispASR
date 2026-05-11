@@ -3,6 +3,10 @@
 **Status:** drafted, not implemented yet. Slot reserved alongside 05/06 which
 are still in flight on `issue81-phase1-uar-wip`.
 
+**Implementation handover:** see `07-metal-aa-snake-beta-HANDOVER.md` in the
+same directory — that's the file-by-file touch list, MSL kernel skeleton,
+bench-oracle pipeline, and copy-paste session prompt.
+
 ---
 
 ## What this is
