@@ -3387,3 +3387,191 @@ fra_Latn	0.983436   (lid-fasttext glotlid-v3, dim=256, 2102 labels)
 $ crispasr-lid -m lid-fasttext176-f16.gguf --text "..."
 fr	0.958174       (lid-fasttext fasttext-lid176, dim=16, 176 labels)
 ```
+
+### §84 — PLAN #89 flash_attn field migration (2026-05-10)
+
+Mechanical struct-field plumbing across every backend whose
+`*_context_params` already carried `use_gpu`. Each gained a
+`flash_attn` field (default true), threaded through
+`*_default_params()` and into `crispasr_session_open_explicit`'s
+arm via `g_open_flash_attn_tls`. The **compute graphs do not yet
+branch on the flag** — that's PLAN #86, lands per backend
+incrementally. After this slice every backend ACCEPTS the toggle
+at session-open time; honouring it at the kernel level is
+follow-up work.
+
+Backends touched (12 of 12):
+
+| Backend | Pre-existing field | New field | Notes |
+|---|---|---|---|
+| parakeet | `use_flash` | — | TLS routes to existing field |
+| canary | `use_flash` | — | TLS routes to existing field |
+| cohere | `use_flash` | — | TLS routes to existing field |
+| qwen3 (asr) | — | `flash_attn` | new |
+| voxtral | — | `flash_attn` | new |
+| voxtral4b | — | `flash_attn` | new + arm cleanup (was hard-coding verbosity=0) |
+| granite_speech | — | `flash_attn` | new |
+| vibevoice | — | `flash_attn` | new |
+| qwen3_tts | — | `flash_attn` | new |
+| orpheus | — | `flash_attn` | new |
+| kokoro | — | `flash_attn` | new |
+| chatterbox | — | `flash_attn` | new |
+
+Commit `0b7dd749`. Pairs with the open-params v2 work in §85's
+companion patch. Closes the prerequisite for PLAN #86.
+
+### §85 — PLAN #88 Kokoro length_scale + VibeVoice runtime tts_steps (2026-05-10)
+
+Two TTS backend-internal refactors that close the cross-repo
+deferred items from CrisperWeaver's May 2026 parity sweep.
+
+**Kokoro length-scale** (per-phoneme speaking-rate scalar):
+* New `length_scale` field on `kokoro_context_params` (default
+  1.0). Applied to the duration-predictor output BEFORE the
+  banker's-round + clamp-min-1 in the "durations" stage extractor
+  in `kokoro_run_predictor`, so PyTorch's `torch.round` semantics
+  (round-half-to-even) are preserved.
+* New `kokoro_set_length_scale(ctx, scale)` runtime setter clamps
+  to [0.25, 4.0]. Read on every `kokoro_synthesize` call so post-
+  init mutation just changes the next call's pacing.
+
+**VibeVoice runtime tts_steps**:
+* The `tts_steps` field (DPM-Solver++ inference steps, default 20)
+  has been on `vibevoice_context_params` since the original
+  vibevoice port, but was init-time only. New
+  `vibevoice_set_tts_steps(ctx, steps)` runtime setter mutates the
+  pre-existing field; clamps to [4, 100]. `vibevoice_synthesize`
+  reads `ctx->params.tts_steps` on every call so the setter just
+  changes the next call's schedule density.
+
+**Unified API** (`crispasr_c_api.cpp`):
+* New `crispasr_session_set_length_scale(s, scale)` export routes
+  to `kokoro_set_length_scale` on kokoro sessions; rc=-2 on
+  backends without a duration model.
+* `crispasr_session_set_tts_steps` extended to also route to
+  vibevoice (was chatterbox-only).
+* Dart binding: new `CrispasrSession.setLengthScale()` method,
+  `providesSymbol`-gated for pre-0.6.2 compatibility.
+
+Commit `cda44359`. CrisperWeaver picks this up automatically —
+the existing TTS *speed* slider on the Synthesize screen now
+drives `setLengthScale(1/speed)` IN ADDITION to the client-side
+resampler. On kokoro the duration model produces a clean
+stretch/squeeze; on every other TTS backend the client-side
+resample is the fallback.
+
+Closes PLAN #88 entirely. Both kokoro + vibevoice runtime knobs
+now reachable from any C-ABI consumer.
+
+### §86 — IndexTTS BigVGAN anti-aliased SnakeBeta on by default (2026-05-11)
+
+Spotted while A/B-benchmarking IndexTTS-1.5 across `{Q4_K, Q8_0, F16}` ×
+`{GPU, CPU, CPU+AA}` on M1. The non-AA outputs measured fine on peak/RMS
+but had ~2 000 sample-to-sample jumps exceeding 30 % FS (and several
+over 100 % FS — physically impossible for a 24 kHz band-limited signal);
+audible as broadband click/buzz on every quant. The AA path produced
+0–27 such jumps. The original `src/indextts_voc.cpp` comment claiming
+"quality impact on TTS speech is negligible" was wrong; BigVGAN v2's
+upsample→activate→downsample sandwich exists exactly to suppress the
+`sin²` harmonics SnakeBeta emits above Nyquist.
+
+Shipped:
+
+- AA is the default. `INDEXTTS_VOCODER_RAW=1` (or `INDEXTTS_VOCODER_AA=0`)
+  opts back into the aliased fast path; useful for the speed A/B and as
+  the legacy fallback if the AA op ever regresses.
+- Pre-allocated per-thread scratch (lifted three per-channel
+  `std::vector<float>` allocations out of the hot loop, capped at 64
+  workers since `GGML_N_TASKS_MAX` is the `-1` sentinel not a count).
+- Pre-scaled the upsample FIR by ×2 (zero-stuff gain) so the inner loop
+  is one mul, not two.
+- `std::memcpy`/`std::memset` replace per-element padding fills.
+
+Result on M1, JFK voice prompt, ≈ 6.7 s of audio: AA on CPU drops to
+6.65 s vocoder-only (was 6.7–9.3 s before optimization, ≈ 5 % over raw),
+and the click-detector reads 0–2 jumps > 30 % FS instead of 1 600–2 600.
+AA on GPU is 8.5 s — slowest because the CPU custom op forces a Metal →
+CPU → Metal sync per AMP block; recommend `--no-gpu` for IndexTTS until
+the AA sandwich is ported to native ggml ops (`ggml_conv_transpose_1d` +
+depthwise `ggml_conv_1d`, both Metal-capable via IM2COL).
+
+Stale GGUFs at `~/.cache/crispasr/` and `/Volumes/backups/ai/crispasr/`
+predated commit `99fca4c3` (`_shorten_gpt`) — tensor names up to 66 chars
+hit `GGML_MAX_NAME = 64` and `gguf.cpp:587` rejects the file. Re-pulled
+from `cstr/indextts-1.5-GGUF` (already ships the corrected names) for
+the bench; that's where the registry's `-m auto` path lands.
+
+Full A/B numbers + click-detector results: `LEARNINGS.md` §"BigVGAN v2
+SnakeBeta needs anti-aliasing".
+
+### §87 — IndexTTS BigVGAN AA: Step A auto-CPU + Step C-1 vDSP (2026-05-11)
+
+Follow-up to §86. Mixed-backend AA (CPU custom op inside a Metal vocoder
+graph) measured ≈ 25 % slower than CPU-only because of the
+Metal↔CPU sync per AMP block. Three optimisations attempted on the same
+M1 / q8_0 / JFK prompt:
+
+- **Step A (shipped):** when `use_aa=true`, override `use_gpu` in
+  `indextts_voc_init` and run the whole vocoder on CPU. Skips the
+  ~20 round-trips per generate. `INDEXTTS_VOC_FORCE_GPU=1` opts back into
+  the slow mixed path for benching. `INDEXTTS_BENCH=1` gate added to the
+  vocoder timing log per the repo's `<BACKEND>_BENCH` convention.
+- **Step B (attempted, deferred):** express the AA chain via native ggml
+  ops (replicate-pad + zero-stuff + `ggml_conv_1d` + SnakeBeta + replicate-pad
+  + stride-2 `ggml_conv_1d`). Blocked on (a) `ggml_conv_1d` only accepting
+  symmetric `p0`, which can't reproduce `conv_transpose_1d`'s `(T-1)·s + K`
+  output length without three extra concat nodes, and (b) `ggml_add_inplace`
+  shape-broadcast assertion firing on the downstream BigVGAN bias adds.
+  Documented in `src/indextts_voc.cpp` and LEARNINGS; the right fix is
+  Step C-2, not a different ggml-ops expression.
+- **Step C-1 (shipped):** Accelerate vDSP path inside the existing CPU
+  custom op — `vDSP_vsmul + vvsinf + vDSP_vsq + vDSP_vsma` for SnakeBeta,
+  `vDSP_desamp(decimation=2)` for the downsample FIR. ~2-3 % on the full
+  vocoder (small because AA is a fraction of the BigVGAN graph), but
+  numerically equivalent to scalar (rmsdiff ≈ 1.3 × 10⁻⁵) and free —
+  `INDEXTTS_AA_SCALAR=1` opts back to scalar for A/B.
+- **Step C-2 (drafted, not implemented):** new `GGML_OP_AA_SNAKE_BETA`
+  with a fused Metal kernel ported from upstream IndexTTS's CUDA
+  reference (`anti_alias_activation_cuda.cu`). RFC scope; one launch
+  does the whole sandwich in registers — projects vocoder ≈ 1.5-2 s on
+  M1, vs 6.65 s today (CPU). Drafted as PR slot 07 in
+  `tools/upstream-prs/07-metal-aa-snake-beta.md`. Slots 05 (CUDA per-row
+  contiguous unary) and 06 (CUDA per-head FA mask) reserved for the
+  in-flight `issue81-phase1-uar-wip` branch.
+
+Per-step bench numbers in LEARNINGS.md §"Mixed-backend custom ops…" and
+§"Accelerate vDSP_desamp…".
+
+### §88 — IndexTTS Step B-v2: native-ggml-ops AA path lands as opt-in (2026-05-11)
+
+Same-day follow-up to §87. The two blockers documented in §87 (output
+length mismatch vs `conv_transpose1d`; reshape-after-truncating-view
+shape drift) were both fixable in a few lines: `p0 = K - 1` on the
+upsample conv1d closes the K-1 gap, and `ggml_cont` between the
+truncating `ggml_view_3d` and its `ggml_reshape_2d` keeps the layout
+valid for the downstream BigVGAN bias adds.
+
+Now in `src/indextts_voc.cpp:aa_snake_beta_native`, behind
+`INDEXTTS_AA_BACKEND=native`. CPU output is bit-equivalent to the
+custom-op reference (same click pattern, ASR exact). GPU output drifts
+into the noise floor (26 inter-sample jumps > 0.3 vs 2, all max|Δ| ≤
+0.4 — Metal vs CPU float order-of-ops on the broadcast muls). ASR
+identical across all three.
+
+Wall-clock didn't move much:
+
+| Path                     | voc-only |
+| ------------------------ | -------- |
+| Step A custom-op (CPU)   | 7.87 s   |
+| Step B-v2 native (CPU)   | 7.57 s   |
+| Step B-v2 native (GPU)   | 8.01 s   |
+
+Native-on-CPU is 4 % faster, native-on-GPU is still slower than
+custom-op-on-CPU because the concat/reshape/scale graph overhead inside
+Metal eats the kernel-level GPU advantage. Default stays on the
+custom-op path; native is opt-in so the GPU pathway is unlocked for
+people who need it and for the eventual fused-kernel work
+(`tools/upstream-prs/07-metal-aa-snake-beta.md`).
+
+Step A's auto-fall-to-CPU is suppressed when `aa_use_native()` returns
+true — the whole vocoder graph stays on Metal end-to-end in that case.

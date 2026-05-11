@@ -43,6 +43,11 @@ passes 18/18 transcribe + 51/54 feature tests (3 stream skips, no failures).
 | **BLOCKED** | [#43 Fun-ASR-Nano](#43-fun-asr-nano) | Medium | License unclear |
 | **DONE** | [#75 /v1/audio/speech OpenAI parity round 1](#75-v1audiospeech-openai-feature-parity-round-1) | Small-Medium | PR #63 merged + corrective batch (`d35940b`…`85302c5`) + 75a/75b (`b932fa9`) + 75d chunking (`0bff2d7`) shipped 2026-05-05; 75c-opt-1 (server-side speed resampler) included in `b932fa9`. Pending: 75c-opt-2 native-backend duration knobs, 75e (streaming/mp3/upload) — each its own work item. → HISTORY §81 |
 | **MEDIUM** | [#80 nano-cohere-transcribe-inspired tweaks](#80-nano-cohere-transcribe-inspired-perf--chunking-tweaks) | Small | 80c done; 80b energy chunker in progress; 80a parked (measurement: <1 % of wall on Metal); 80d/80e TODO |
+| **DEFERRED** | [#81 Nemotron-Speech-Streaming-EN-0.6B](#81-nemotron-speech-streaming-en-06b--first-cache-aware-streaming-native-asr) | M-L | NVOML license, ~60–75 % reuse from parakeet/canary; the new bit is cache-aware FastConformer streaming. Wait for `--stream-json` (issue #84) to settle + a second user request (only mention so far is issue #85) before starting. |
+| **MEDIUM** | [#86 Per-backend flash-attention wiring](#86-per-backend-flash-attention-wiring-crisperweaver-driven) | 2–3 days | Plumbing shipped 0.6.2; kernel-level wiring per backend is the remaining work. Whisper done; orpheus/chatterbox-T3 are the next-best pickings. |
+| **LOW** | [#87 `gpu_backend` runtime selector](#87-gpu_backend-runtime-selector-multi-backend-ggml-build) | ~1 week | Needs ggml-side multi-backend dispatch to land first. CrisperWeaver UI placeholder ready when the C-side is. |
+| **DONE** | #88 Kokoro length-scale + vibevoice diffusion steps | 1 day combined | Both backend-internal refactors shipped → [HISTORY §85](HISTORY.md). `kokoro_set_length_scale` + `vibevoice_set_tts_steps` runtime setters on the per-backend API; `crispasr_session_set_length_scale` + `_set_tts_steps` on the unified API. CrisperWeaver's TTS speed slider drives both. |
+| **DONE** | #89 Flash-attn field migration | ~2 hours | Mechanical plumbing across 12 backends shipped → [HISTORY §84](HISTORY.md). Prereq for #86 closed. |
 
 **Recently completed** (full write-ups in HISTORY.md): **#57 chatterbox native voice clone → §82** (six-commit sprint shipping all four upstream cond extractors — VoiceEncoder LSTM, S3Tokenizer V2, CAMPPlus, 24 kHz Matcha mel — plus a Kaiser-windowed sinc resampler and atomic 5-cond install in `chatterbox_set_voice_from_wav`'s `.wav` branch; `--voice ref_24k.wav` produces real cloned speech without any python). **#69 + #72 + #73 cap-honesty + KV/layer offload knobs → §79** (14-commit session shipping `CRISPASR_KV_QUANT_K/_V` + `KV_ON_CPU` on 14 backends, `N_GPU_LAYERS` on 10 backends, gemma4/mimo GPU-residency 2.2x / 22 % faster, plus cap-honesty cleanup on parakeet/glm-asr/qwen3/gemma4/omniasr). **vibevoice #69a follow-up → §79b** (mode-aware `tts_lm.layers.` / `lm.layers.` prefix predicate). #78 Chatterbox vocoder → §78. #11 WebSocket server → §76, #63 Feature matrix parity → §72, #59 binding parity → §73, gemma4 #49 + Docker #31 → §74, tests + KV Q8_0 + cleanup → §75. Earlier: #5→§63, #16→§55, #51→§56, #51b→§60, #53→§63, #54→§61, #55→§54, #56→§63, #60d→§64.
 
@@ -2082,3 +2087,459 @@ warmup hook.
   needs a different graph shape and a real-world workload that hits
   this regime (multi-file CLI calls). Investigate when the demand
   appears.
+
+---
+
+## 81. Nemotron-Speech-Streaming-EN-0.6B — first cache-aware streaming-native ASR
+
+[`nvidia/nemotron-speech-streaming-en-0.6b`](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b)
+— NVIDIA Open Model License (NVOML), 600 M params, released
+late 2025 / early 2026. **Cache-Aware FastConformer + RNN-T**, the
+first model in the queue that's *streaming-native* rather than
+batch-with-chunked-streaming-on-top. Mentioned by an outside reporter
+in issue #85; `parakeet` and `kyutai-stt` are the closest
+streaming-capable backends we ship today and neither targets
+nemotron's latency/accuracy frontier.
+
+### Why this is interesting
+
+Quality-vs-latency curve from the published Open ASR Leaderboard
+numbers (same eval set as our existing parakeet / canary / whisper):
+
+| Chunk size | Right-context lookahead | Avg WER | Notes |
+|---|---:|---:|---|
+| 1120 ms | 13 frames (~1.04 s) | 6.93 % | best accuracy |
+| 560 ms | 6 frames (~0.48 s) | 7.07 % | |
+| 160 ms | 1 frame (~0.08 s) | 7.67 % | |
+| 80 ms | 0 frames | 8.43 % | unique low-latency point |
+
+Same `.gguf` for all four — `att_context_size=[70, R]` is a runtime
+knob, not a retraining artifact. Reference points on our current
+leaderboard:
+
+| Model (batch) | Avg WER | RTFx |
+|---|---:|---:|
+| `parakeet-tdt-0.6b-v3` (we ship this) | 6.34 % | high |
+| `nemotron-streaming-en-0.6b` (1.12 s chunk) | 6.93 % | streaming |
+| `canary-1b-v2` (we ship this) | 7.15 % | 749 |
+| `whisper-large-v3` (we ship this) | 7.44 % | 145 |
+
+Headline read: nemotron is **0.6 pp worse than batch parakeet on
+average but better than canary-1b-v2 and whisper-large-v3** — and
+crucially gets there with a fixed-size step rather than reading the
+whole utterance. On AMI (conversational meetings) it actually wins
+all of those (11.73 % vs 11.31/16.01/15.95). The 80 ms / 0-lookahead
+/ 8.4 % WER point has no equivalent in our current lineup; it's the
+real reason to consider this model.
+
+### License — NVIDIA Open Model License (NVOML)
+
+Source-available, **not** OSI-open-source.
+
+- Commercial + non-commercial use ✅
+- Derivatives + fine-tunes ✅ (you own them)
+- Redistribution ✅ with attribution: every copy must include a
+  `Notice` file containing *"Licensed by NVIDIA Corporation under
+  the NVIDIA Open Model License"*
+- No explicit field-of-use, **but** subject to NVIDIA's external
+  "Trustworthy AI" terms
+- Patent litigation = automatic termination
+- Bypassing safety guardrails (without a "substantially similar
+  Guardrail") = automatic termination
+- NVIDIA claims no rights in outputs
+
+For our purposes (publishing `cstr/nemotron-speech-streaming-en-0.6b-GGUF`):
+legally fine — same shape as Llama / Cosmos redistributions. Just
+need the NVOML attribution `Notice` in the HF README. Less
+permissive than `parakeet-tdt-0.6b` (CC-BY-4.0) so downstream users
+inherit the NVOML, not Apache.
+
+### Architecture summary
+
+```
+WAV (16 kHz mono)
+  → log-mel (80 bins, NeMo per-feature norm)
+  → 4× conv subsampling pre-encode
+  → 24× Cache-Aware FastConformer block
+       · macaron FFN
+       · multi-head SA w/ rel-pos shift  ← cache-aware (cached K/V from prior chunks)
+       · depth-wise conv (kernel 9)      ← cache-aware (8-frame overlap-cache per layer)
+       · macaron FFN
+  → predictor LSTM (1-layer)
+  → joint network + softmax
+  → RNN-T blank/non-blank greedy (no TDT durations)
+```
+
+Frame stride after the 4× subsampling is 80 ms. Native PnC
+(punctuation + capitalization). 530 k hours of training data
+(NVIDIA Riva ASR set + Granary, including YouTube-Commons 109 k h,
+YODAS2 102 k h, LibriLight 49 k h, Mosel 14 k h plus the standard
+LibriSpeech / Fisher / WSJ / VoxPopuli / MLS / Common Voice /
+Earnings22 mix).
+
+### What we already have (~60–75 % reuse)
+
+| Piece | Status | Where |
+|---|---|---|
+| FastConformer encoder body (24L, macaron FFN, SA + rel-pos, DW conv) | ✅ ready | `src/core/fastconformer.h` (shared by parakeet, canary, canary_ctc) |
+| 4× conv subsampling pre-encode | ✅ ready | `core_conformer::build_pre_encode` |
+| RNN-T predictor LSTM + joint head + greedy decode | ✅ ready (as TDT, where pure RNN-T = `n_tdt_durations=0`) | `src/parakeet.cpp` |
+| Log-mel preprocessor (NeMo-style, 80 bins, per-feature normalization) | ✅ ready | `src/core/mel.cpp` |
+| KV-cache infrastructure (`kv_cache_write` + offset-indexed reads) | ✅ ready | `src/core/attention.h` |
+| Streaming CLI pipeline (`--stream`, `--stream-json` after #84) | ✅ ready | `examples/cli/crispasr_run.cpp` |
+| BPE tokenizer (NeMo SentencePiece) | ✅ ready (parakeet pattern) | `src/core/bpe.h` |
+| Streaming-aware backend example (per-layer state, chunk-by-chunk graph rebuild) | ✅ partial | `src/moonshine_streaming.cpp` |
+| GGUF converter for NeMo `.nemo` checkpoints | ✅ partial | `models/convert-parakeet-to-gguf.py` template |
+
+### What's missing — the actual new work
+
+1. **Cache-aware FastConformer encoder graph.** Existing
+   `core_conformer::build_block` consumes the whole `T` and emits
+   the whole `T`; for streaming we need a variant that takes
+   `(cached_K, cached_V, conv_state)` per layer and emits new K/V +
+   new conv state alongside the audio output. Probably lives next
+   to `fastconformer.h` as `fastconformer_streaming.h` so we don't
+   regress parakeet/canary's bit-identical batch graphs.
+2. **Per-layer streaming state on the context.** Modeled on
+   `moonshine_streaming`'s pattern — per-layer K/V tensors persisted
+   across `transcribe()` calls.
+3. **`att_context_size` runtime knob.** Trivial — controls how many
+   frames feed the encoder per step and the left-cache trim policy.
+   No retraining, just masking + cache management differ.
+4. **`.nemo` → GGUF converter.** ~80 % shared with parakeet's
+   converter; cache-aware blocks have the same tensor names plus
+   new metadata (`encoder.streaming.att_context_left_frames`,
+   `encoder.streaming.dw_conv_state_size`, etc.).
+5. **`examples/cli/crispasr_backend_nemotron.cpp`.** Thin adapter
+   driving the streaming encoder per chunk and running the existing
+   RNN-T greedy decode on each chunk's output. Shape is between
+   `crispasr_backend_parakeet.cpp` and
+   `crispasr_backend_moonshine_streaming.cpp`.
+6. **`--live` integration.** Once the backend exists, `--stream` and
+   `--stream-json` (#84) Just Work. The new backend would be a much
+   better fit for `--live` than the current chunked-batch backends
+   because per-chunk cost is constant rather than `O(window²)`.
+
+### Effort breakdown
+
+| Component | LOC | Reuse |
+|---|---:|---|
+| 80-bin log-mel front-end | ~30 | full reuse from parakeet |
+| Cache-aware SA layer (K/V append + trim, rel-pos shift on `[cache | new]`) | ~120 | **new** — conceptually small but graph-topology-sensitive |
+| Cache-aware DW conv layer (last 8 frames cached) | ~80 | **new** — pattern is identical to RNN state, just per-layer |
+| Per-layer streaming state struct + lifecycle | ~60 | **new** — `nemotron_stream_state` on context |
+| `att_context_size=[70,R]` runtime knob | ~30 | **new** — masking + trim policy |
+| RNN-T predictor + joint + greedy (no durations) | ~50 | full reuse from parakeet |
+| `.nemo` → GGUF converter | ~200 | ~80 % parakeet template + new streaming metadata |
+| Diff harness reference (mel, enc per chunk, predictor, joint) | ~150 | parakeet template |
+| Backend wrapper for main CLI | ~250 | midway between parakeet + moonshine_streaming |
+| HF README + NVOML notice + auto-download registry entry | ~80 | template |
+| **Total** | ~**1000–1300 LOC** | smaller than #58 (no LM body, no DeepStack injection) |
+
+Headline new helper: a **streaming-aware FastConformer block builder**
+that's reusable for any future cache-aware NeMo model (the same
+streaming protocol covers Parakeet-Streaming, Canary-Streaming,
+FastConformer-CTC-streaming if NVIDIA ever ships those — they're
+rumored in the NeMo 26.x roadmap).
+
+### What we'd need to dump from the Python ref for the diff harness
+
+Stage taps:
+- `mel_in` `[T_mel, 80]` — first chunk only
+- `enc_pre_encode` `[T_enc, 512]` — after 4× subsampling
+- `enc_block_0_post_sa` `[T_enc, 512]` — after first SA block
+  (validates rel-pos + cache concat)
+- `enc_block_0_post_conv` `[T_enc, 512]` — after first DW conv
+  (validates conv-state cache)
+- `enc_out` `[T_enc, 512]` — final encoder output for the chunk
+- `predictor_state_after_blank` `[1, 640]`
+- `joint_logits_step0` `[1, vocab+1]`
+
+Six stages — a touch lighter than parakeet's diff harness because we
+share the mel front-end. Multi-chunk validation needs the diff
+harness to run twice with carried state (or a third entry point that
+takes a list of chunks); the current `crispasr-diff` is single-shot
+so this is a small extension to the harness itself.
+
+### Risks / open questions
+
+1. **Cache layout in the GGUF.** NeMo's `.nemo` archive embeds the
+   streaming config but not the runtime cache shape. Need to pin
+   the cache tensor layout (per-layer `[Dh, 70, n_heads]` for SA K
+   and V, `[8, d_model]` for DW conv state) and check it survives
+   the converter round-trip.
+2. **Rel-pos shift on `[cache | new]`.** The existing
+   `core_conformer::rel_shift` operates on a square `(2T-1, T)`
+   tensor; with cached frames the table is `(2(L+R+1)-1, R+1)` —
+   different layout, different shift indexing. Either extend
+   `rel_shift` with a left-context offset or build a streaming-
+   specific variant.
+3. **Decoder state across chunks.** RNN-T predictor is autoregressive
+   over emitted tokens, not over time; its LSTM state carries
+   forward across chunks naturally. Confirm with the Python ref
+   that emit-token-then-blank-to-advance still works at chunk
+   boundaries (the joint sees encoder output for the current
+   chunk; the predictor sees its state from the last emitted
+   token, which may be from a previous chunk).
+4. **Runtime tradeoff at 80 ms.** A 5-chunk window of left context
+   + 1 frame new = 71 frames per encoder forward. On Apple Silicon
+   Metal the per-launch overhead at that small a `T` may dominate
+   — measure before claiming the 8.4 % WER point is actually usable
+   live. CUDA path likely fine (graph capture amortizes the launch
+   cost the way nano-cohere relied on, see #80a).
+5. **PnC-stripped vs PnC-emitting WER comparison.** Open ASR
+   Leaderboard scoring strips PnC; the 6.93 % avg is on stripped
+   text. Our `firered_punc` post-processor adds PnC to backends that
+   don't emit it natively — for nemotron we'd want to *not* run it
+   (the model emits PnC already and re-punctuating can hurt). Wire
+   a backend capability flag so `--punctuation` is a no-op when the
+   backend is PnC-native.
+
+### When to do this
+
+**Not yet.** Two reasons to wait:
+
+1. The streaming pipeline only just got `--stream-json` (issue #84)
+   and the rolling-buffer fix; we want a few weeks of real wrappers
+   building on it before we add a backend that's specifically
+   tailored to it. If the structured-output API needs to evolve
+   (e.g., adding word-level probability streams), better to find
+   that out before nemotron locks in expectations.
+2. The user demand is one outside-reporter mention so far (issue
+   #85). Worth waiting until either a second user asks or a
+   concrete production use case (live captioning, voice agent)
+   needs sub-200 ms ASR. The 6.93 % batch number isn't an
+   improvement over what we ship — only the streaming-native
+   property is.
+
+When demand materializes: **realistic estimate 3–5 days of focused
+work** for someone who's already touched parakeet/canary, plus
+benchmarking against the upstream Open ASR Leaderboard table to
+confirm parity on the published WERs.
+
+---
+
+## 86. Per-backend flash-attention wiring (CrisperWeaver-driven)
+
+**Status:** open. Plumbing complete in 0.6.2 (commit `ff5536a6`),
+kernel-level wiring per backend is the remaining work.
+
+### Context
+
+CrisperWeaver's *Settings → Performance → ASR flash-attention*
+toggle ships via `crispasr_session_open_with_params` (open params
+struct v2 added in 0.6.2). The toggle threads through to a thread-
+local `g_open_flash_attn_tls` that every backend's init arm can
+read to set `cparams.flash_attn` on its context_params struct.
+
+**Today only whisper actually consumes the flag at the kernel
+level** — `whisper_context_params` already has a `flash_attn` field
+that whisper.cpp branches on internally (it switches to
+`ggml_flash_attn_ext` for the QKV → softmax → V product when set).
+
+Other backends accept the toggle but their compute graphs still
+build the historical `ggml_soft_max_ext(KQ)` path. For users on
+Metal, that's a measurable perf gap on every long-running LLM
+backend (orpheus, voxtral, qwen3 ASR, qwen3-tts, granite-speech,
+chatterbox-T3, gemma4-e2b).
+
+### Per-backend status
+
+| Backend | Has `use_gpu` field | Has `flash_attn` field | Compute graph branch | Effort |
+|---|---|---|---|---|
+| whisper | ✅ (whisper.cpp upstream) | ✅ | ✅ | DONE |
+| parakeet | ✅ | ❌ | — | Small (Conformer encoder) |
+| canary | ✅ | ❌ | — | Small (encoder SA + decoder XA) |
+| qwen3 (asr) | ✅ | ❌ | — | Medium (Whisper-like enc + Qwen3 LLM) |
+| cohere | ✅ | ❌ | — | Small (Conformer encoder) |
+| granite_speech | ✅ | ❌ | — | Medium (Conformer + Granite LLM) |
+| voxtral | ✅ | ❌ | — | Medium (Whisper enc + Mistral 3B) |
+| voxtral4b | ✅ | ❌ | — | Medium (causal enc + SWA decoder) |
+| vibevoice | ✅ | ❌ | — | Small (σ-VAE encoder + Qwen2.5 talker) |
+| qwen3_tts | ✅ | ❌ | — | Medium (talker + code-predictor) |
+| orpheus | ✅ | ❌ | — | Small-Medium (Llama 3.2 3B AR loop) |
+| kokoro | ✅ | ❌ | — | Small (StyleTTS2-derived; less impact) |
+| chatterbox | ✅ | ❌ | — | Medium (T3 AR + S3Gen flow-matching) |
+
+### Approach (per-backend recipe)
+
+For each backend with a transformer attention block:
+
+1. Add `bool flash_attn` to `*_context_params` (default-init to true
+   in `*_context_default_params()`).
+2. Plumb `g_open_flash_attn_tls → cparams.flash_attn` in
+   `crispasr_session_open_explicit`'s arm for that backend (mirror
+   the existing `cparams.use_gpu` line).
+3. In the compute graph, swap the QKV path:
+   - Before: `ggml_soft_max_ext(ggml_mul_mat(K, Q), scale)` then
+     `ggml_mul_mat(V_T, softmax_out)`.
+   - After: branch on `cparams.flash_attn`:
+     - true → `ggml_flash_attn_ext(Q, K, V, mask, scale, ...)`
+     - false → keep the historical path.
+4. Verify the Metal kernel for `flash_attn_ext` exists for the
+   relevant head dim. Most are covered (D ∈ {64, 80, 96, 112, 128})
+   but check before committing.
+5. Diff-harness round-trip: dump pre/post-attention tensors with
+   the flag on vs off, confirm the kernels agree to 1e-3 (Metal
+   F16 fast-math drift is the typical failure mode — use
+   `GGML_PREC_F32` op_param if needed; same fix as #83).
+
+### Recommended order
+
+1. **orpheus + chatterbox-T3** — Llama-style AR loops, biggest
+   wall-clock win on long generations (3 B Llama / T3 dominate
+   the synth budget). Reuses the same `ggml_flash_attn_ext` pattern
+   per-block.
+2. **voxtral / voxtral4b / qwen3 ASR / granite-speech** — LLM-based
+   ASR backends where flash-attn helps both the Whisper-style
+   encoder and the LLM decoder.
+3. **qwen3-tts** — talker is Qwen3-style transformer; same recipe
+   as qwen3 ASR.
+4. **parakeet / canary / cohere** — Conformer encoders. Lower per-
+   call benefit but sums up for batch-transcribe users.
+5. **vibevoice / kokoro** — smallest impact; do last or skip.
+
+### Effort estimate
+
+~4–6 hours per LLM backend (orpheus/voxtral/qwen3/granite/chatterbox),
+~2 hours per Conformer (parakeet/canary/cohere). Total realistic
+sweep: 2–3 focused days, can be split across separate PRs since
+each backend is independent.
+
+---
+
+## 87. `gpu_backend` runtime selector (multi-backend ggml build)
+
+**Status:** open. Needs ggml-side support to land first.
+
+### Context
+
+CrisperWeaver's *Settings → Performance* exposes an "ASR on GPU"
+boolean today. The deeper knob — picking BETWEEN Metal, CUDA,
+Vulkan at runtime when more than one is built into libcrispasr —
+isn't doable yet because each `*_init_from_file` calls a single
+`ggml_backend_*_init()` directly, and the CMake flag picks which
+ggml backend gets compiled in.
+
+### What ggml supports today
+
+`ggml_backend_*_init()` returns a per-backend handle. Multiple
+backends CAN compile into one binary (`-DGGML_METAL=ON
+-DGGML_VULKAN=ON` builds both); each backend's init function lives
+behind its own `#ifdef`, and the runtime can call any of them. What
+ggml doesn't yet have is a uniform "auto-pick the best available"
+selector — that's the missing piece.
+
+### Approach when we tackle it
+
+1. Add `crispasr_select_backend(const char* hint)` helper that
+   resolves a hint string (`"auto" / "metal" / "cuda" / "vulkan" /
+   "cpu"`) to a `ggml_backend_t` using `#ifdef GGML_METAL` /
+   `#ifdef GGML_CUDA` / `#ifdef GGML_VULKAN` chains. `auto`
+   prefers Metal on macOS, CUDA on Linux+NV, Vulkan on Linux+AMD
+   or Windows, CPU as fallback.
+2. Refactor every per-backend `*_init_from_file()` to take a
+   `ggml_backend_t* preferred_backend` param (or read a thread-
+   local set by a new `crispasr_session_open_params_v3`).
+3. Add `gpu_backend_hint` (string field) to the open params struct
+   v3.
+4. Plumb through CrisperWeaver's `AdvancedTranscribeOptions` →
+   `LoadModel` → `openWithParams`.
+
+### Effort estimate
+
+~1 week of focused work — touches every backend's init path. Best
+done as a separate phased PR, one backend per commit.
+
+---
+
+## ~~88. Kokoro length-scale + vibevoice diffusion-step runtime knobs~~ — **DONE → [HISTORY §85](HISTORY.md)**
+
+---
+
+## ~~89. Per-backend `flash_attn` field migration~~ — **DONE → [HISTORY §84](HISTORY.md)**
+
+---
+
+## 90. Session-API beam_size — per-backend wiring
+
+May 2026:
+  * Shipped `crispasr_session_set_beam_size` (commit 958e6bd7).
+  * Whisper consumes it natively (switches sampling strategy to
+    BEAM_SEARCH with the supplied width).
+  * **Five backends wired** via runtime `<backend>_set_beam_size`
+    setters in their per-backend C API:
+    - kyutai-stt (also kyutai / moshi-stt aliases) — setter
+      pre-existed; just needed to be called from
+      `transcribe_single`.
+    - moonshine — same.
+    - omniasr (LLM variant; CTC ignores) — same.
+    - **glm-asr** — added `glm_asr_set_beam_size` (new public
+      symbol) + dispatch wire.
+    - **firered** — added `firered_asr_set_beam_size` (new
+      public symbol) + dispatch wire.
+  * CrisperWeaver's batch worker pool drives all six (whisper +
+    five) end-to-end via its sticky-setter protocol; beamSearch
+    is pool-eligible across that whole set.
+  * `nm libcrispasr` confirms all five `<backend>_set_beam_size`
+    plus the unified `crispasr_session_set_beam_size` are
+    exported.
+
+**Still gapped** — three backend families need new C surface on
+their high-level transcribe API before the session wrapper can
+plumb `s->beam_size` through. Each is more substantial than the
+"add a runtime setter" pattern above because the beam-decode
+path doesn't live in the backend library; the CLI wraps it
+externally:
+
+| Backend | What's needed |
+|---|---|
+| granite / granite-4.1 / granite-4.1-plus / granite-4.1-nar | The granite library exposes `granite_speech_transcribe(ctx, samples, n_samples)` — no beam, no params struct, just text. The CLI wrapper at `crispasr_backend_granite.cpp` runs its OWN beam decode via `core_beam_decode::run_with_probs(ctx_, logits, replay, cfg)` after pulling logits out of granite. Wiring beam search into the session API needs either: (a) move the `core_beam_decode` call into the granite library + new public `granite_speech_transcribe_with_beam(ctx, samples, n_samples, beam_size)`, or (b) expose granite's logits + replay buffer publicly so the session dispatcher can run `core_beam_decode` itself. Option (a) is cleaner — ~3-4 hours per granite variant. |
+| voxtral / voxtral4b | Beam search via internal `voxtral_decode_beam` (not exposed). Same options: (a) public `voxtral_transcribe_with_params(ctx, samples, n_samples, voxtral_decode_params{beam_size, ...})` or (b) expose internal beam decoder. |
+| qwen3-asr | Same shape — internal beam, no public surface. |
+
+Each needs ~3-4 hours of careful per-backend work (read beam
+path, decide a/b, write the new surface, wire from
+`transcribe_single`, add a Catch2 smoke test). Total estimate
+~1-1.5 days for the remaining three families. Each is
+independent — can ship one at a time.
+
+---
+
+## 91. CrispASR CLI features missing from CrisperWeaver
+
+While auditing the feature matrix for §90 we found a handful of
+CLI knobs CrisperWeaver doesn't expose. Tracked here so the
+gap is visible:
+
+* `--offset-t MS` / `--duration MS` — process only a time window
+  of the audio. Useful for "transcribe minute 5–10" workflows.
+  Needs an engine-side `audio[t0:t0+d]` slice + timestamp shift
+  (similar mechanics to the existing resume-offset routing).
+  Estimate: 1 day end-to-end (CrispASR Dart binding + UI).
+* `--alt N` / `--alt-n N` — alternative token candidates with
+  probabilities. Power-user feature for transcript correction.
+  C surface: would need an "alternates" array on the
+  segment/word structs, plus a runtime cap. ~2 days end-to-end.
+* Whisper decoder fallback knobs (`--word-thold`,
+  `--entropy-thold`, `--logprob-thold`, `--no-speech-thold`,
+  `--no-fallback`, `--temperature-inc`) — already in the Dart
+  binding's TranscribeOptions, just not exposed in
+  CrisperWeaver's Advanced Options widget. Trivial — half a day
+  to add the UI rows + localised strings.
+* Subtitle line formatting (`--max-len`, `--split-on-word`,
+  `--split-on-punct`) — whisper context-params field today;
+  CrisperWeaver formats post-hoc instead. Quality-of-life win
+  for SRT export. ~1 day.
+* Token suppression (`--suppress-nst`, `--suppress-regex`) —
+  niche; whisper-specific.
+* `--carry-initial-prompt` — sticky vs reset behaviour for the
+  initial prompt across segments. Edge case, ~1 hour.
+* `--print-confidence` — per-token confidence in JSON / WTS
+  exports. Segments already carry a `confidence` field;
+  exporters could surface per-token.
+
+None of these are blocking; they're listed so the next
+parity-pass audit doesn't have to re-discover them.
+
+---

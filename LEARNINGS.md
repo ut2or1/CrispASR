@@ -3507,6 +3507,109 @@ full CPU. `CRISPASR_CHATTERBOX_FORCE_GPU=1` enables the new
 kernel + FA→CPU path; tokens diverge at step 11+ but layer 0 is
 bit-identical.
 
+### Round 5 (2026-05-10) — FA-input bisect: every input bit-identical, output drifts
+
+After the Round 4 kernel fix, layer-0 was bit-identical CPU/GPU
+end-to-end (every named tensor: norm, K/Q/V proj, K rope, attn out,
+FFN out — all match). Layer 1 K cache and V cache were also
+bit-identical at every sampled position (t=0, 10, 20, 30, 40, 45) on
+both halves. So the input to layer-1 attention is reliably
+bit-identical. Yet **layer-1 attn out (post out_proj) drifts ~1e-4**
+and propagates by layer 29 to ~3e-3, blowing up to ~0.1–0.2 in
+end-of-prefill logits. AR token sequence matches CPU exactly through
+decode step 11, then diverges.
+
+Bisect-round-5 added named graph outputs in `core_attn::kv_self_attn`
+for the FA inputs and outputs (`CRISPASR_CORE_ATTN_DUMP_FA_LAYER=N`):
+
+| Stage at layer 1, t=45  | CPU vs GPU       |
+|-------------------------|------------------|
+| Q post-rope             | bit-identical    |
+| Kfull (FA input)        | bit-identical    |
+| Vfull (FA input)        | bit-identical    |
+| **FA output**           | **drifts 1e-4**  |
+| out_proj input (= FA reshape) | drifts 1e-4 (propagated) |
+| attn out (post out_proj)| drifts 1e-4 (propagated) |
+
+`flash_attn` was confirmed routed to CPU on every layer (5100 of 5100
+T3 FA ops on CPU; the 30 Metal FA ops counted are S3Gen). So both
+halves invoke `ggml_compute_forward_flash_attn_ext_f16` with
+bit-identical Q, K, V, mask, scale. The function is deterministic, yet
+output differs.
+
+Forced single-thread (`-t 1`) didn't change the drift, ruling out
+ggml-cpu's threaded reduction order. Tested with both default
+multi-threaded and `-t 1`.
+
+The puzzle: layer 0 stays bit-identical (FA inputs and output match),
+but starting from layer 1 the FA output diverges despite identical
+inputs. The split between layer 0 and layer 1 strongly suggests
+something about the second-or-later FA invocation in a graph that
+mixes Metal and CPU backends.
+
+Possible explanations to chase next session:
+
+1. **Memory ordering / barrier** — Apple unified memory shares physical
+   buffers between CPU and GPU. When a CPU-routed op (FA) writes its
+   output and a subsequent GPU-routed op (out_proj) reads it, the
+   ggml-backend scheduler should emit a sync. If the sync is missing
+   for the second-or-later layer, the GPU might read stale or
+   half-flushed CPU writes.
+2. **Backend-internal cache pollution** — ggml-cpu reuses internal
+   thread-local scratch for FA's softmax. If that scratch was
+   touched by a prior op and not cleared, the second FA invocation
+   could pick up garbage in unaccounted bytes.
+3. **Different CPU FA chunking depending on graph context** —
+   `ggml_compute_forward_flash_attn_ext_f16` has multiple internal
+   paths (one_chunk, tiled). The chunk decision uses `ne01` and
+   thread count; if these differ between a CPU-only run and a
+   Metal-routed run (different graph structure passed to the
+   ggml-cpu backend), chunk boundaries shift and F32 reductions land
+   on different roundings.
+4. **`ggml_cont` produces F16 cache view differently on Metal** —
+   even though I dumped K cache values and they matched at sampled
+   positions, the layout/stride of the resulting Kfull contiguous
+   tensor might differ, putting bytes in different addresses, which
+   could affect SIMD-aligned loads in CPU FA.
+
+Diagnostic infra ready for round 6:
+
+- `CRISPASR_CORE_ATTN_DUMP_FA_LAYER=N` — names FA inputs/output of
+  layer N as graph outputs.
+- `CRISPASR_CORE_ATTN_DUMP_FA_AT=t` / `_Q_AT` / `_KFULL_AT` / `_VFULL_AT`
+  — fetch and print the named outputs for position t.
+- `CRISPASR_CHATTERBOX_DUMP_KV_LAYER=N`, `_DUMP_KV_AT=t`,
+  `_DUMP_VV_AT=t` — KV cache dump per layer.
+- `CRISPASR_CHATTERBOX_DUMP_LAYER=N`, `_DUMP_ATTN_AT=t`, `_DUMP_FFN_AT=t`,
+  `_DUMP_NORM_AT=t`, `_DUMP_KPROJ_AT=t`, `_DUMP_QPROJ_AT=t`,
+  `_DUMP_VPROJ_AT=t`, `_DUMP_KROPE_AT=t` — per-layer per-stage dumps.
+
+### Benchmark (2026-05-10)
+
+Measured end-to-end on chatterbox-base T3 Q4_K (\"Ask not what your
+country can do for you, ask what you can do for your country\",
+median of 3 runs):
+
+| Path                                               | wall time |
+|----------------------------------------------------|-----------|
+| CPU (auto-fallback, default)                       | ~66 s     |
+| GPU FORCE_GPU=1 (kernel_mul_mv_q4_K_q8_K + FA→CPU) | ~58 s     |
+
+~12% speedup, no regression. End-to-end audio with FORCE_GPU=1
+produces partially intelligible cloned speech (\"They put your\"
+recognised by ASR vs the canonical \"Ask not what your country can
+do for you...\" on the CPU path). The token sequence matches CPU
+through decode step 11, then diverges due to the layer-1+ residual.
+
+### Production default
+
+Auto-fallback to full CPU remains the production default — the
+~1e-4 layer-1+ drift is too small to hurt CPU output but flips
+chatterbox's multinomial speech-token sampler around step 11+ on the
+GPU path, producing audibly degraded clones. The
+`CRISPASR_CHATTERBOX_FORCE_GPU=1` knob unlocks the new kernel for
+debug/perf experimentation.
+
 2. **T3 sampling can drift on long technical prompts**. The seed=0
    default is deterministic, but particular prompts produce
    degenerate output (e.g. "Stop, stop, stop" repetition or wholly
@@ -4377,3 +4480,214 @@ The C++ originally applied rep penalty to raw logits BEFORE log_softmax,
 which changes beam dynamics. With `repetition_penalty=10.0`, this causes
 different beam paths to win. Fix: compute log_softmax first, then apply
 penalty to log-probs, matching HF's exact order.
+
+### BigVGAN v2 SnakeBeta needs anti-aliasing — "negligible" was wrong (May 2026)
+
+The raw SnakeBeta activation `y = x + sin(α·x)² / β` is not band-limited:
+`sin²` introduces harmonics at 2α·x, 4α·x, … For trained α values in
+BigVGAN v2 (the `_post` layer in particular has large α), those harmonics
+land well above Nyquist and fold back as broadband click/buzz. The
+original BigVGAN v2 paper wraps the activation in 2× upsample → activate
+→ 2× downsample (Kaiser-windowed sinc) specifically to suppress that
+aliasing.
+
+CrispASR's first cut omitted the AA "because `ggml_conv_1d_dw` has no
+CUDA kernel, and the quality impact on TTS speech is negligible." The
+quality claim was just wrong — on the JFK-cloned "quick brown fox …"
+prompt the raw path produced ~2 000 sample-to-sample jumps over 30 % FS
+and several over 100 % FS (physically impossible in a band-limited
+24 kHz signal), audible as steady click/buzz across every quant. The AA
+path measured 0–27 such jumps, max\|Δ\| ≤ 0.38 — clean speech.
+
+How we caught it: `np.diff(wav)` is the cheapest aliasing detector we
+have. Any `|Δsample|` exceeding `2·sin(π·f_max/fs)` for the band-limit
+`f_max` is impossible without aliasing. For 24 kHz 16-bit speech with
+voice content roughly below 12 kHz, `Δ > 0.5` is a hard ceiling; counts
+in the thousands == broken.
+
+What we shipped (`src/indextts_voc.cpp`):
+
+1. **AA is the default.** `INDEXTTS_VOCODER_RAW=1` (or `_AA=0`) opts back
+   into the aliased path for benchmarking. We kept the raw path because
+   it's the only fully-GPU-graphable activation we have today.
+2. **Pre-allocated thread-local scratch.** The original AA op allocated
+   three `std::vector<float>` per channel per call — at 1536 ch × 24
+   layers per generate, that was ~37 k mallocs of 100 KB+ on the hot
+   path. Lifted to per-thread (`ith`-indexed) scratch sized lazily on
+   first use; `GGML_N_TASKS_MAX` is the `-1` sentinel, not a count, so
+   we cap at 64 threads explicitly (`AA_SCRATCH_MAX_THREADS`) and pass
+   that to `ggml_map_custom1` as the task hint.
+3. **Pre-scaled upsample filter.** Multiply the FIR taps by 2 once at
+   init (cancels the zero-stuff gain), saving one mul in the inner loop.
+4. **`memcpy`/`memset` for the edge-replication padding** — small, but
+   the inner-loop trace was dominated by the C++ per-element copies the
+   original used.
+
+Result on M1, JFK voice prompt, ≈ 6.7 s of audio:
+
+| Vocoder config          | Δ>0.3 | max\|Δ\| | voc-only |
+| ----------------------- | ----- | -------- | -------- |
+| RAW / CPU (aliased)     | 1671  | 0.89     | 6.36 s   |
+| RAW / GPU (aliased)     | 2080  | 1.04     | 7.12 s   |
+| **AA / CPU (default)**  | **2** | **0.31** | 6.65 s   |
+| AA / GPU                | 26    | 0.38     | 8.52 s   |
+
+`AA / CPU` is the new sweet spot — only ~5 % slower than the broken-but-
+fast RAW / CPU. `AA / GPU` is slowest because the `ggml_map_custom1` op
+forces a Metal → CPU → Metal sync at every AMP block; if the rest of the
+vocoder graph is on Metal we trade GPU-friendly matmuls for cross-device
+copies and net-lose. Best operational answer until someone ports the AA
+sandwich to native ggml ops: tell IndexTTS users to pass `--no-gpu` if
+the prompt is short, or accept the ~25 % vocoder slowdown for the
+voice-cloning convenience of keeping the GPT on GPU.
+
+Lesson: comments claiming "negligible quality impact" age badly. When a
+paper introduces a deliberate signal-processing stage, it's almost
+always there for a reason; if you remove it, prove the absence of harm
+with `np.diff` or a spectrogram, not assertion.
+
+### Mixed-backend custom ops in ggml are a perf trap (BigVGAN AA, May 2026)
+
+`ggml_map_custom1` runs CPU-only. ggml-backend-sched faithfully routes the
+op back to CPU even when the rest of the graph is on Metal — but it costs
+a Metal → CPU → Metal sync per op site. For IndexTTS BigVGAN with ~20
+SnakeBeta sites per generate, that overhead dominates: GPU + AA measured
+≈ 25 % SLOWER than CPU + AA on M1 (8.5 s vs 6.65 s vocoder).
+
+Step A fix (`src/indextts_voc.cpp:indextts_voc_init`, commit `cd21faea`'s
+follow-up): when `use_aa = true`, override `use_gpu` and force the whole
+vocoder onto CPU. The GPT runs on its own backend; only the AMP-block
+chain pays the per-AMP-cost, and skipping the round-trip is the win.
+
+Override knob is `INDEXTTS_VOC_FORCE_GPU=1` for the people who want to
+reproduce the mixed-backend benchmark; default does the right thing.
+
+Lesson: if you reach for `ggml_map_custom1`, the right next step is
+*always* a real ggml op + Metal kernel — never assume the custom op is
+"only a tiny fraction" of the graph; the surrounding GPU stalls dominate
+once it's called from a hot loop.
+
+### Polyphase "zero-stuff + conv_1d" doesn't trivially port a torch conv_transpose_1d (May 2026)
+
+Attempted the native-ggml-ops AA path for IndexTTS (Step B in the
+optimisation plan). The idea: replace `ggml_map_custom1` with a
+ggml-graph that's identical math to the torch reference, expressed via
+`ggml_conv_1d` for both the upsample and downsample stages.
+
+PyTorch reference (`indextts/BigVGAN/alias_free_activation/torch/resample.py`):
+```python
+x = F.pad(x, (pad, pad), mode='replicate')
+x = ratio * F.conv_transpose1d(x, filter.expand(C,-1,-1), stride=2, groups=C)
+x = x[..., pad_left:-pad_right]
+```
+
+Two blockers:
+
+1. **Output-length mismatch.** `conv_transpose_1d(stride=2, K=12)` produces
+   `(T-1)·s + K` = `2T+10` for input T. The classical "zero-stuff + stride-1
+   conv1d" trick produces `2T - K + 1` = `2T - 11`. Closing the K-1 gap
+   requires *asymmetric* boundary padding (10 left, 11 right for K=12),
+   which `ggml_conv_1d`'s symmetric `p0` parameter can't express. You can
+   pre-pad the data with `ggml_concat`'d replicate columns and use `p0=0`,
+   but that adds three more graph nodes per AA site and the constants are
+   annoying.
+
+2. **Downstream-add broadcast assertion.** Even with lengths corrected
+   manually, runtime hit `GGML_ASSERT(ggml_can_repeat(b, a))` inside
+   `ggml_add_inplace` from the BigVGAN per-block bias adds — the
+   `ggml_reshape_2d` after the cropping `ggml_view_3d` doesn't always
+   see a contiguous tensor, and the resulting shape drifts in ways
+   `ggml_add`'s in-place fast path refuses to broadcast.
+
+`ggml_conv_transpose_1d` has no `groups` parameter, so we can't express
+the depthwise behavior directly with it either; the workaround is a
+`[K, C, C]` block-diagonal kernel, which at C=1536 is 113 MB — no-go.
+
+**Update (Step B-v2, same week):** both blockers fixed in
+`src/indextts_voc.cpp:aa_snake_beta_native`. Now shippable as an opt-in
+behind `INDEXTTS_AA_BACKEND=native`.
+
+The fixes:
+
+1. **Length match via `p0 = K - 1 = 11` on the upsample `ggml_conv_1d`.**
+   The zero-stuffed signal of length `2·T_p - 1` becomes `2·T_p + 21`
+   after symmetric padding by 11, and the conv1d output is `2·T_p + 10`
+   — the same as torch `conv_transpose_1d(K=12, stride=2)`. Crop with
+   `up_pad_left + up_pad_right + 1` to land at exactly `2·T`, the same
+   number torch produces after its own crop.
+2. **`ggml_cont` between the truncating `ggml_view_3d` and the following
+   `ggml_reshape_2d`.** The view narrows ne[0] but keeps the parent's
+   nb[1] stride, so the resulting tensor is non-contiguous; reshape
+   would silently land on the wrong layout and the next graph add fired
+   the `ggml_can_repeat` assertion. One extra `ggml_cont` per AA site
+   makes the reshape valid.
+
+Validation against the CPU custom-op (Step A) reference:
+
+| Path                     | voc-only (ms) | clicks Δ>0.3 | max\|Δ\| | ASR roundtrip   |
+| ------------------------ | ------------- | ------------ | -------- | --------------- |
+| Step A custom op  (CPU)  | 7872          | 2            | 0.309    | ✓ exact         |
+| Step B-v2 native  (CPU)  | 7574          | 2            | 0.309    | ✓ exact         |
+| Step B-v2 native  (GPU)  | 8012          | 26           | 0.375    | ✓ exact         |
+
+CPU output is bit-equivalent (same click pattern, same max\|Δ\|).
+GPU output drifts a tiny amount (26 vs 2 jumps, but max\|Δ\| still
+below 0.4 — well into the noise floor of speech transients) — the
+difference is Metal's vs CPU's floating-point order-of-ops for the
+broadcast `ggml_mul`s in SnakeBeta. ASR is identical across all three.
+
+Why we kept the custom-op as default (not switched to native):
+
+- Native-on-CPU is 4 % faster but introduces a second AA codepath. Not
+  worth the maintenance vs proven custom op for the marginal gain.
+- Native-on-GPU is *slower* than custom-op-on-CPU (8.0 s vs 7.9 s on
+  M1) — the concat/reshape/scale graph overhead inside Metal eats
+  whatever the kernel-level GPU speedup buys. A real fused MSL kernel
+  (Step C-2) is still the path to a meaningful GPU win.
+- ggml-backend-sched does the right thing — when `aa_use_native()`
+  returns true, the auto-fall-to-CPU in Step A is skipped and the
+  vocoder graph stays on Metal end to end.
+
+Lesson: a "polyphase zero-stuff + conv_1d" *is* expressible as native
+ggml ops if you accept three boilerplate concats per AA site to fix
+the asymmetric-pad problem. It compiles and runs correctly on Metal.
+But the per-call graph overhead means it's worth shipping only as an
+opt-in proof of correctness; the real win is still the fused-kernel
+custom op route — see `tools/upstream-prs/07-metal-aa-snake-beta.md`.
+
+### Accelerate vDSP_desamp + vvsinf beats hand-rolled SnakeBeta loops on M1 (May 2026)
+
+After the CPU AA op is correct, the bottleneck is the per-channel inner
+loops: K-tap scatter for upsample, sin+sqr+fma for SnakeBeta, K-tap dot
++ stride-2 decimate for downsample. The scalar inner loops are clean
+but the compiler's auto-vectorisation isn't always taking the FMA
+opportunity — especially across the `+=` loop-carried dependency in the
+upsample scatter.
+
+Step C-1 swaps the two stages that have direct Accelerate analogues:
+
+- SnakeBeta inner: `vDSP_vsmul → vvsinf → vDSP_vsq → vDSP_vsma` (one
+  vector mul, one vector sin, one vector square, one fused-multiply-add).
+- Downsample inner: `vDSP_desamp(decimation=2, filter)` fuses K-tap FIR
+  + stride-2 decimation into one Accelerate call backed by NEON.
+
+vDSP is `#ifdef __APPLE__` only; the scalar paths still compile and run
+elsewhere. Set `INDEXTTS_AA_SCALAR=1` to force the scalar paths for A/B.
+
+Measured speedup on M1 (q8_0 GPT, JFK voice prompt, ≈ 6.7 s of audio,
+average of 3 warm-cache runs):
+
+| Path                | voc-only |
+| ------------------- | -------- |
+| scalar (Step A)     | 6906 ms  |
+| Accelerate (Step C-1)| 6746 ms  |
+
+≈ 2-3 % on the full vocoder — small because AA SnakeBeta is one
+component alongside the MRF stack and the per-stage convs that
+dominate. The win is "free": opt-out flag exists, output is
+numerically equivalent to scalar (rmsdiff 1.3 × 10⁻⁵, well below int16
+quant noise), ASR roundtrip identical.
+
+Lesson: vDSP gives modest wins on already-cache-friendly inner loops.
+The big lever for IndexTTS GPU perf is still a Metal kernel — see
+`tools/upstream-prs/07-metal-aa-snake-beta.md`.

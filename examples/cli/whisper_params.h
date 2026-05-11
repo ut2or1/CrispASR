@@ -90,6 +90,11 @@ struct whisper_params {
     bool vad = false;
     std::string vad_model = "";
     float vad_threshold = 0.5f;
+    // Issue #83 follow-up: tracks whether the user passed `-vt` /
+    // `--vad-threshold` explicitly. Backends with non-Silero probability
+    // calibration (whisper-vad-encdec) auto-lower the threshold when this
+    // is false so the out-of-the-box default doesn't drop most speech.
+    bool vad_threshold_explicit = false;
     int vad_min_speech_duration_ms = 250;
     int vad_min_silence_duration_ms = 100;
     float vad_max_speech_duration_s = FLT_MAX;
@@ -162,6 +167,27 @@ struct whisper_params {
     // pause length for live captions / translation handoff and matches
     // the example in the issue. Only relevant with --stream-json.
     int32_t stream_final_silence_ms = 800;
+    // Issue #84 round 2 (CKwasd retest): how to compute `final.text`
+    // when an utterance closes. The round-1 design just echoed the
+    // last rolling-window partial — wrong because the rolling window
+    // evicts old audio, so for utterances longer than `--stream-length`
+    // the tail of the latest partial does not cover the full
+    // utterance. Two modes:
+    //   "redecode" (default) — buffer the utterance's PCM (capped at
+    //     stream_utterance_max_sec) and run one extra `transcribe()`
+    //     on the whole buffer at finalize time. Best quality, costs
+    //     one encoder pass per utterance + ~4 MB / utterance memory.
+    //   "prefix" — keep the round-1 cost (no extra transcribe) but
+    //     accumulate stable text via longest-common-prefix matching
+    //     across consecutive partials. Lower quality for utterances
+    //     longer than the rolling window, useful when re-decoding
+    //     would blow latency or compute budget. The latest partial
+    //     beyond the committed prefix is concatenated at finalize.
+    std::string stream_final_mode = "redecode";
+    // Hard cap on how much PCM we buffer per utterance in redecode
+    // mode. Force-finalize when exceeded so memory stays bounded on
+    // monologues. 60 s × 16 kHz × 4 bytes ≈ 3.84 MB.
+    int32_t stream_utterance_max_sec = 60;
     // Issue #84: gate the noisy `firered_vad: N frames, max_prob=…`
     // and `fbank[0,:3]=…` stderr dumps in src/firered_vad.cpp behind
     // an explicit opt-in. Set by --firered-vad-debug (or the

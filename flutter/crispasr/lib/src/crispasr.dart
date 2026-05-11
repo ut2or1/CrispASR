@@ -1571,6 +1571,88 @@ class CrispasrSession {
     }
   }
 
+  /// Open a session with explicit runtime knobs (CrispASR 0.6.1+).
+  ///
+  /// Wraps `crispasr_session_open_with_params`. Use this when the host
+  /// app wants to toggle GPU offload or verbosity per session — the
+  /// historical [open] factory always defaulted to GPU-on / silent.
+  ///
+  /// `useGpu = false` forces every backend that has a `use_gpu` field
+  /// in its context_params to take the CPU path. Backends without that
+  /// field (whisper-via-context, kyutai-stt, firered-asr, glm-asr,
+  /// moonshine-streaming, gemma4-e2b, m2m100, mimo-asr, omniasr,
+  /// canary-ctc, voxtral4b, wav2vec2) ignore the toggle silently —
+  /// their GPU path is decided at compile time.
+  ///
+  /// Throws [UnsupportedError] when the loaded dylib predates 0.6.1
+  /// (no `crispasr_session_open_with_params` symbol). Falls back to
+  /// the regular [open] in that case via the binding's caller, not
+  /// here.
+  factory CrispasrSession.openWithParams(
+    String modelPath, {
+    int nThreads = 4,
+    bool useGpu = true,
+    int verbosity = 0,
+    /// CrispASR 0.6.2+: enable flash-attention on backends that have
+    /// a flash-attn path (whisper today; LLM backends incrementally).
+    /// Defaults true to match the ggml convention.
+    bool flashAttn = true,
+    /// CrispASR 0.6.2+: cap on GPU-offloaded transformer layers for
+    /// LLM-based backends. -1 = "as many as possible" (the C-side
+    /// sentinel); 0 = CPU-only LLM inference; >0 = bounded.
+    int nGpuLayers = -1,
+    String? backend,
+    String? libPath,
+  }) {
+    final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
+    if (!lib.providesSymbol('crispasr_session_open_with_params')) {
+      throw UnsupportedError(
+          'crispasr_session_open_with_params missing — needs CrispASR 0.6.1+. '
+          'Use CrispasrSession.open() for older builds.');
+    }
+    // ABI struct layout (see crispasr_open_params_v1 in
+    // src/crispasr_c_api.cpp): int32 abi_version, n_threads, use_gpu,
+    // verbosity, flash_attn, n_gpu_layers + 6 reserved int32. Total
+    // 48 bytes — same size as the v1 layout (we used 2 of the 8
+    // reserved slots).
+    final paramsPtr = calloc<Uint8>(48);
+    final ints = paramsPtr.cast<Int32>();
+    ints[0] = 2;          // abi_version (v2 — opt into flash_attn / n_gpu_layers)
+    ints[1] = nThreads;   // n_threads
+    ints[2] = useGpu ? 1 : 0;
+    ints[3] = verbosity;
+    ints[4] = flashAttn ? 1 : 0;
+    ints[5] = nGpuLayers;
+    final pathPtr = modelPath.toNativeUtf8();
+    final bePtr = backend != null && backend.isNotEmpty
+        ? backend.toNativeUtf8()
+        : nullptr;
+    try {
+      final fn = lib.lookupFunction<
+          Pointer<Void> Function(
+              Pointer<Utf8>, Pointer<Utf8>, Pointer<Uint8>),
+          Pointer<Void> Function(Pointer<Utf8>, Pointer<Utf8>,
+              Pointer<Uint8>)>('crispasr_session_open_with_params');
+      final handle = fn(pathPtr, bePtr.cast<Utf8>(), paramsPtr);
+      if (handle == nullptr) {
+        throw Exception(
+            'crispasr_session_open_with_params returned null — either the '
+            'GGUF backend isn\'t one of ${_availableBackends(lib).join(", ")} '
+            'or the file is unreadable.');
+      }
+      final backendFn = lib.lookupFunction<
+          Pointer<Utf8> Function(Pointer<Void>),
+          Pointer<Utf8> Function(Pointer<Void>)>('crispasr_session_backend');
+      final bp = backendFn(handle);
+      final be = bp == nullptr ? '' : bp.toDartString();
+      return CrispasrSession._(lib, handle, be);
+    } finally {
+      calloc.free(pathPtr);
+      if (bePtr != nullptr) calloc.free(bePtr);
+      calloc.free(paramsPtr);
+    }
+  }
+
   /// List of backend names compiled into the loaded libwhisper.
   /// Always includes 'whisper'. Non-Whisper backends are added as they
   /// get linked in (parakeet, canary, qwen3, …).
@@ -1962,6 +2044,29 @@ class CrispasrSession {
     if (rc != 0) throw Exception('setBestOf failed (rc=$rc)');
   }
 
+  /// Beam-search width. `n > 1` enables beam search on backends whose
+  /// session-API transcribe path consults `s->beam_size` — whisper
+  /// today, with the other beam-capable backends per the feature
+  /// matrix (granite, voxtral, qwen3, glm-asr, kyutai-stt, firered,
+  /// moonshine, omniasr) tracked as a follow-up that needs per-
+  /// backend high-level-transcribe API surface for beam_size before
+  /// the session wrapper can plumb it through. `n <= 1` (the default)
+  /// keeps greedy sampling, and `setBestOf(N)` still controls the
+  /// alternate "N greedy decodes, pick highest-confidence" path on
+  /// every other backend. Setter is unconditional — backends that
+  /// don't consume `beam_size` just see no behaviour change.
+  void setBeamSize(int n) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_beam_size')) {
+      throw UnsupportedError(
+          'crispasr_session_set_beam_size not present in this libcrispasr build');
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
+        int Function(Pointer<Void>, int)>('crispasr_session_set_beam_size');
+    final rc = fn(_handle, n);
+    if (rc != 0) throw Exception('setBeamSize failed (rc=$rc)');
+  }
+
   /// Set decoder temperature on backends that support runtime control
   /// (canary, cohere, parakeet, moonshine). Other backends silently no-op.
   /// `seed` is the RNG seed; pass 0 for time-based.
@@ -1976,6 +2081,171 @@ class CrispasrSession {
     // rc == -2 means no backend in this session supports temperature — soft no-op.
     if (rc != 0 && rc != -2) {
       throw Exception('setTemperature failed (rc=$rc)');
+    }
+  }
+
+  /// Set the diffusion / CFM step count for diffusion-based TTS
+  /// backends (chatterbox today). Higher = better fidelity, slower.
+  /// Returns silently when the active backend has no diffusion stage
+  /// (rc=-2 from the C side maps to a soft no-op here).
+  void setTtsSteps(int steps) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_tts_steps')) {
+      // Older libcrispasr without the symbol — silent no-op so the
+      // UI slider still works when bound against pre-0.6.1 dylibs.
+      return;
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
+        int Function(Pointer<Void>, int)>('crispasr_session_set_tts_steps');
+    final rc = fn(_handle, steps);
+    if (rc != 0 && rc != -2) {
+      throw Exception('setTtsSteps failed (rc=$rc)');
+    }
+  }
+
+  /// Top-p nucleus sampling threshold (0.0..1.0). Honoured by
+  /// chatterbox; other backends no-op.
+  void setTopP(double topP) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_top_p')) return;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Float),
+        int Function(Pointer<Void>, double)>('crispasr_session_set_top_p');
+    final rc = fn(_handle, topP);
+    if (rc != 0 && rc != -2) throw Exception('setTopP failed (rc=$rc)');
+  }
+
+  /// Min-p sampling threshold (0.0..1.0). Honoured by chatterbox.
+  void setMinP(double minP) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_min_p')) return;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Float),
+        int Function(Pointer<Void>, double)>('crispasr_session_set_min_p');
+    final rc = fn(_handle, minP);
+    if (rc != 0 && rc != -2) throw Exception('setMinP failed (rc=$rc)');
+  }
+
+  /// Repetition penalty (1.0 = no penalty; >1 discourages repeats).
+  void setRepetitionPenalty(double r) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_repetition_penalty')) return;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Float),
+            int Function(Pointer<Void>, double)>(
+        'crispasr_session_set_repetition_penalty');
+    final rc = fn(_handle, r);
+    if (rc != 0 && rc != -2) {
+      throw Exception('setRepetitionPenalty failed (rc=$rc)');
+    }
+  }
+
+  /// Classifier-free-guidance weight (chatterbox). 0 disables CFG;
+  /// 0.5 is the upstream default.
+  void setCfgWeight(double cfg) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_cfg_weight')) return;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Float),
+        int Function(Pointer<Void>, double)>('crispasr_session_set_cfg_weight');
+    final rc = fn(_handle, cfg);
+    if (rc != 0 && rc != -2) throw Exception('setCfgWeight failed (rc=$rc)');
+  }
+
+  /// Emotion-exaggeration scalar (chatterbox). 0.5 default.
+  void setExaggeration(double exaggeration) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_exaggeration')) return;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Float),
+            int Function(Pointer<Void>, double)>(
+        'crispasr_session_set_exaggeration');
+    final rc = fn(_handle, exaggeration);
+    if (rc != 0 && rc != -2) {
+      throw Exception('setExaggeration failed (rc=$rc)');
+    }
+  }
+
+  /// Upper bound on speech tokens generated per synthesize call
+  /// (chatterbox). Default 1000 ≈ 20 s.
+  void setMaxSpeechTokens(int n) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_max_speech_tokens')) return;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
+            int Function(Pointer<Void>, int)>(
+        'crispasr_session_set_max_speech_tokens');
+    final rc = fn(_handle, n);
+    if (rc != 0 && rc != -2) {
+      throw Exception('setMaxSpeechTokens failed (rc=$rc)');
+    }
+  }
+
+  /// Per-phoneme length-scale / speaking-rate scalar for TTS
+  /// backends with a duration model. Honoured by kokoro today
+  /// (PLAN #88); other backends silently no-op. 1.0 = upstream
+  /// default; >1.0 = slower / longer; <1.0 = faster / shorter.
+  /// Clamped to [0.25, 4.0] on the C side.
+  void setLengthScale(double scale) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_length_scale')) return;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Float),
+            int Function(Pointer<Void>, double)>(
+        'crispasr_session_set_length_scale');
+    final rc = fn(_handle, scale);
+    if (rc != 0 && rc != -2) {
+      throw Exception('setLengthScale failed (rc=$rc)');
+    }
+  }
+
+  /// Text-to-text translation via this session's backend.
+  ///
+  /// Routes through the C-side `crispasr_session_translate_text`, which
+  /// dispatches to whichever translation-capable backend the session
+  /// loaded — `m2m100` (and `m2m-100` / `translate` aliases) today, plus
+  /// `gemma4-e2b` for backends that include a translation head. The
+  /// session must have been opened against a model that supports
+  /// translation; calling this on an ASR-only session returns `null`
+  /// (or an empty string on the C side).
+  ///
+  /// [srcLang] and [tgtLang] are ISO 639-1 codes (`en`, `de`, `fr`, …).
+  /// [maxTokens] caps the output length; pass 0 to use the C-side
+  /// default of 200.
+  ///
+  /// Throws [UnsupportedError] when the loaded dylib is pre-0.6.0 and
+  /// doesn't ship the symbol. Returns `null` when the C side rejects
+  /// the request (no translation-capable backend in this session).
+  String? translateText(String text, String srcLang, String tgtLang,
+      {int maxTokens = 0}) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_translate_text')) {
+      throw UnsupportedError(
+          'translateText not in this libcrispasr — needs CrispASR 0.6.0+');
+    }
+    final fn = _lib.lookupFunction<
+        Pointer<Utf8> Function(
+            Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Int32),
+        Pointer<Utf8> Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>,
+            Pointer<Utf8>, int)>('crispasr_session_translate_text');
+    final freeFn = _lib.providesSymbol('crispasr_session_free_text')
+        ? _lib.lookupFunction<Void Function(Pointer<Utf8>),
+            void Function(Pointer<Utf8>)>('crispasr_session_free_text')
+        : null;
+    final textPtr = text.toNativeUtf8();
+    final srcPtr = srcLang.toNativeUtf8();
+    final tgtPtr = tgtLang.toNativeUtf8();
+    try {
+      final res = fn(_handle, textPtr, srcPtr, tgtPtr, maxTokens);
+      if (res == nullptr) return null;
+      final out = res.toDartString();
+      // Older builds free with the same allocator that allocated; on
+      // builds that don't expose the symbol we fall back to `free` via
+      // calloc.free, which on glibc/macOS libc is byte-compatible with
+      // strdup-style malloc'd output.
+      if (freeFn != null) {
+        freeFn(res);
+      } else {
+        calloc.free(res);
+      }
+      return out;
+    } finally {
+      calloc.free(textPtr);
+      calloc.free(srcPtr);
+      calloc.free(tgtPtr);
     }
   }
 
@@ -2180,6 +2450,71 @@ class CrispasrSession {
       calloc.free(textPtr);
       calloc.free(nPtr);
     }
+  }
+
+  /// Open a streaming decode session against this session's backend.
+  ///
+  /// Backed by `crispasr_session_stream_open` on the C side, which
+  /// dispatches the rolling-window protocol to whichever backend the
+  /// session loaded (whisper, kyutai-stt, moonshine-streaming, …).
+  /// Same shape as [CrispASR.openStream] (Whisper-only) but works for
+  /// every backend that publishes a streaming entry point.
+  ///
+  /// Throws [UnsupportedError] when the loaded dylib predates
+  /// `crispasr_session_stream_open`, [StateError] when the session
+  /// is already closed, and [Exception] when the backend has no
+  /// streaming arm (the C side returns null in that case).
+  StreamingSession openStream({
+    int stepMs = 3000,
+    int lengthMs = 10000,
+    int keepMs = 200,
+    int nThreads = 4,
+    String? language,
+    bool translate = false,
+  }) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_stream_open')) {
+      throw UnsupportedError(
+          'Session-level streaming not in this libcrispasr — needs CrispASR 0.6+.');
+    }
+    final fn = _lib.lookupFunction<
+        Pointer<Void> Function(
+            Pointer<Void>, Int32, Int32, Int32, Int32, Pointer<Utf8>, Int32),
+        Pointer<Void> Function(Pointer<Void>, int, int, int, int,
+            Pointer<Utf8>, int)>('crispasr_session_stream_open');
+    final langPtr = (language == null || language.isEmpty || language == 'auto')
+        ? nullptr
+        : language.toNativeUtf8();
+    final handle = fn(_handle, nThreads, stepMs, lengthMs, keepMs,
+        langPtr.cast<Utf8>(), translate ? 1 : 0);
+    if (langPtr != nullptr) calloc.free(langPtr);
+    if (handle == nullptr) {
+      throw Exception(
+          'crispasr_session_stream_open returned null — backend "$_backend" '
+          'has no streaming entry point.');
+    }
+    final feedFn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Float>, Int32),
+        int Function(Pointer<Void>, Pointer<Float>, int)>('crispasr_stream_feed');
+    final flushFn = _lib.providesSymbol('crispasr_stream_flush')
+        ? _lib.lookupFunction<Int32 Function(Pointer<Void>),
+            int Function(Pointer<Void>)>('crispasr_stream_flush')
+        : null;
+    final getTextFn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Utf8>, Int32, Pointer<Double>,
+            Pointer<Double>, Pointer<Int64>),
+        int Function(Pointer<Void>, Pointer<Utf8>, int, Pointer<Double>,
+            Pointer<Double>, Pointer<Int64>)>('crispasr_stream_get_text');
+    final closeFn = _lib.lookupFunction<Void Function(Pointer<Void>),
+        void Function(Pointer<Void>)>('crispasr_stream_close');
+
+    return StreamingSession._(
+      handle: handle,
+      feed: feedFn,
+      flush: flushFn,
+      getText: getTextFn,
+      close: closeFn,
+    );
   }
 
   void close() {

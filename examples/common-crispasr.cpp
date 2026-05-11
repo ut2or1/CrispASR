@@ -21,13 +21,18 @@
 #endif
 #endif
 
-#define MA_NO_DEVICE_IO
-#define MA_NO_THREADING
-#define MA_NO_ENCODING
-#define MA_NO_GENERATION
-#define MA_NO_RESOURCE_MANAGER
-#define MA_NO_NODE_GRAPH
-#define MINIAUDIO_IMPLEMENTATION
+// `src/crispasr_audio.cpp` already defines `MINIAUDIO_IMPLEMENTATION`
+// for the crispasr library (full version, with device IO for mic
+// capture). Defining it here too produced duplicate `ma_*` symbols
+// in both `common.lib` and `crispasr.lib`, causing MSVC LNK2005 on
+// crispasr-cli (release.yml `build-windows-cpu` / `-legacy`) and
+// MinGW-style multiple-definition errors that the previous
+// `--allow-multiple-definition` workaround patched (0f83a731) — but
+// the MSVC linker isn't covered by that hack. Drop the implementation
+// here; consumers of `common-crispasr.cpp` already link against
+// `crispasr` (which carries the symbols), so `ma_decoder_*` etc.
+// resolve at executable-link time. Header-only include keeps the
+// declarations visible.
 #include "miniaudio.h"
 
 #ifdef _WIN32
@@ -221,5 +226,14 @@ bool speak_with_file(const std::string & command, const std::string & text, cons
 #endif
 }
 
-#undef STB_VORBIS_HEADER_ONLY
-#include "stb_vorbis.c"
+// Previously expanded the stb_vorbis.c implementation here so
+// miniaudio's Vorbis decoder (compiled in via MINIAUDIO_IMPLEMENTATION
+// above) had its underlying symbols. Now that
+// MINIAUDIO_IMPLEMENTATION is gone (delegated to
+// src/crispasr_audio.cpp), the Vorbis backend isn't compiled into
+// common-crispasr.cpp at all, and re-expanding stb_vorbis.c here
+// produced ld multiple-definition errors against the same set of
+// symbols already provided by crispasr_audio.cpp on Linux/macOS
+// (Release / build-linux + build-macos failures on v0.6.1 release.yml).
+// crispasr_audio.cpp's `#undef STB_VORBIS_HEADER_ONLY; #include
+// "../examples/stb_vorbis.c"` block remains the single owner.

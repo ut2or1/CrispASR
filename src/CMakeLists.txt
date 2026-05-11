@@ -1002,7 +1002,37 @@ if (TARGET orpheus)
     target_link_libraries(crispasr PUBLIC orpheus)
 endif()
 if (TARGET chatterbox)
-    target_link_libraries(crispasr PUBLIC chatterbox)
+    # libcrispasr.so calls chatterbox_set_temperature / set_top_p /
+    # set_min_p / set_repetition_penalty / set_max_speech_tokens from
+    # crispasr_c_api.cpp. With BUILD_SHARED_LIBS=ON on Linux (the
+    # default the Docker Smoke build hits), ld leaves those refs
+    # unresolved in libcrispasr.so because chatterbox.cpp.o that
+    # defines them wasn't being pulled in from libchatterbox.a at
+    # SO-link time. Static archive members after a shared library on
+    # the executable link line can't satisfy the shared library's
+    # externals, so the exec link then errored:
+    #   "libcrispasr.so.0.6.2: undefined reference to chatterbox_set_temperature"
+    # (Docker Smoke failure on ff7bcc50 → d0d95e48 attempted fix.)
+    #
+    # The d0d95e48 attempt was `-Wl,--whole-archive chatterbox -Wl,--no-whole-archive`,
+    # but CMake deduplicated the `chatterbox` target out of the wrap
+    # (treating it as a library name) and put it elsewhere on the link
+    # line — leaving an empty `-Wl,--whole-archive -Wl,--no-whole-archive`
+    # pair, so the wrap had no effect. Using `$<TARGET_FILE:chatterbox>`
+    # passes the resolved `.a` file path as a literal, which CMake
+    # doesn't recognise as a library and therefore doesn't deduplicate
+    # against the original `target_link_libraries(... chatterbox)` call.
+    # add_dependencies() restores the build-order edge the generator
+    # expression alone wouldn't establish.
+    if (UNIX AND NOT APPLE AND BUILD_SHARED_LIBS)
+        target_link_libraries(crispasr PUBLIC
+            "-Wl,--whole-archive"
+            "$<TARGET_FILE:chatterbox>"
+            "-Wl,--no-whole-archive")
+        add_dependencies(crispasr chatterbox)
+    else()
+        target_link_libraries(crispasr PUBLIC chatterbox)
+    endif()
 endif()
 if (TARGET indextts)
     target_link_libraries(crispasr PUBLIC indextts)
