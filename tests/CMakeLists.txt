@@ -189,6 +189,24 @@ catch_discover_tests(test-params
     PROPERTIES LABELS "unit"
 )
 
+# ─── test - stream - finalize — Catch2 unit tests for the streaming
+# `final.text` stitcher used by `--stream-json` finalize_utterance.
+# Header-only target (no crispasr lib needed): the helper is a pure
+# string function in examples/cli/crispasr_stream_finalize.h.
+add_executable(test-stream-finalize
+    test-stream-finalize.cpp
+)
+target_include_directories(test-stream-finalize PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-stream-finalize PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-stream-finalize
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;regression-84"
+)
+
 # ─── test - punctuation - policy — Catch2 unit tests for punctuation auto - enable
 #policy.Pure logic, no model load.
 add_executable(test-punctuation-policy
@@ -452,6 +470,21 @@ target_link_libraries(test_qwen3_tts_talker PRIVATE qwen3_tts)
 #./ build / tests / test_qwen3_audio_tower model.gguf samples / jfk.raw #> tests / fixtures / qwen3_audio_tower_jfk.txt
 #./ build / tests / test_qwen3_audio_tower -- check model.gguf samples / jfk.raw
 #> tests / fixtures / qwen3_audio_tower_jfk.txt
+
+# ─── test-chat-ggml — end-to-end smoke for the crispasr_chat_* C ABI
+#
+# Loads a small GGUF chat model (env CRISPASR_CHAT_TEST_MODEL → path) and
+# verifies open / generate (one-shot) / generate_stream / reset / close.
+# Skipped when the env var is unset so unrelated builds stay green.
+add_executable(test-chat-ggml test-chat-ggml.cpp)
+target_link_libraries(test-chat-ggml PRIVATE
+    Catch2::Catch2WithMain
+    crispasr
+)
+catch_discover_tests(test-chat-ggml
+    TEST_SPEC "[chat]"
+    PROPERTIES LABELS "chat;integration"
+)
 
 # ─── test - backends — integration tests for all CrispASR backends ────────────
 #Requires network(downloads models).Not run in CI by default.

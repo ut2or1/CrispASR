@@ -456,6 +456,34 @@ extern "C" {
     pub fn crispasr_session_set_target_language(s: *mut CrispasrSession, lang: *const c_char) -> c_int;
     pub fn crispasr_session_set_punctuation(s: *mut CrispasrSession, enable: c_int) -> c_int;
     pub fn crispasr_session_set_translate(s: *mut CrispasrSession, enable: c_int) -> c_int;
+    // --- Text-to-text translation (m2m100 / m2m100-wmt21 / madlad / gemma4-e2b) ---
+    //
+    // Distinct from `crispasr_session_set_translate` above, which is the
+    // *audio-side* Whisper sticky flag (PCM input → English text out).
+    // This one translates an already-extracted Rust string between
+    // arbitrary language pairs via whichever MT-capable backend the
+    // session loaded.  Returns a malloc'd UTF-8 buffer that the caller
+    // MUST release via `crispasr_session_translate_text_free` (mirrors
+    // the punc-side ownership pattern).  Returns nullptr on:
+    //   * any input pointer being null,
+    //   * the session not having a CAP_TRANSLATE backend loaded,
+    //   * the backend's internal translate routine erroring out.
+    //
+    // `max_tokens` caps the decoder output length.  Pass `<= 0` to
+    // fall back to the C++ default (200 for m2m100).
+    pub fn crispasr_session_translate_text(
+        s: *mut CrispasrSession,
+        text: *const c_char,
+        src_lang: *const c_char,
+        tgt_lang: *const c_char,
+        max_tokens: c_int,
+    ) -> *mut c_char;
+    // Free a buffer previously returned by `crispasr_session_translate_text`.
+    // No-op when `text` is null.  Calling `libc::free` directly also works
+    // (the C++ side just delegates to `free()`), but routing through this
+    // symbol keeps ownership symmetric and protects callers if the C++
+    // side ever switches allocators.
+    pub fn crispasr_session_translate_text_free(text: *mut c_char);
     pub fn crispasr_session_set_temperature(
         s: *mut CrispasrSession,
         temperature: c_float,
@@ -470,6 +498,29 @@ extern "C" {
         out_lang: *mut c_char,
         out_lang_cap: c_int,
         out_prob: *mut c_float,
+    ) -> c_int;
+
+    // --- Text-LID (P13.5 Phase 7) ---
+    //
+    // Detect the language of a UTF-8 text string via the internal
+    // `text_lid_dispatch` façade — routes to CLD3 (ISO 639-1, 109
+    // labels) or GlotLID-V3 / LID-176 fastText (ISO 639-3 + script,
+    // 2102 or 176 labels) based on the GGUF's architecture key.
+    // Label format follows whichever backend the GGUF loads as —
+    // see the C-API doc-comment for normalisation guidance.
+    //
+    // Returns:
+    //   *  0 — success; `out_label_buf` + `out_confidence` populated.
+    //   * -1 — invalid args (null pointer or out_label_cap <= 0).
+    //   *  1 — dispatcher init / predict failure.
+    //   *  2 — output buffer too small for the predicted label.
+    pub fn crispasr_text_detect_language(
+        text: *const c_char,
+        model_path: *const c_char,
+        n_threads: c_int,
+        out_label_buf: *mut c_char,
+        out_label_cap: c_int,
+        out_confidence: *mut c_float,
     ) -> c_int;
 
     pub fn crispasr_detect_backend_from_gguf(
@@ -504,4 +555,34 @@ extern "C" {
         out_picked: *mut c_char,
         out_picked_len: c_int,
     ) -> c_int;
+
+    // TitaNet speaker verification
+    pub fn crispasr_titanet_init(model_path: *const c_char, n_threads: i32) -> *mut c_void;
+    pub fn crispasr_titanet_free(ctx: *mut c_void);
+    pub fn crispasr_titanet_embed(
+        ctx: *mut c_void,
+        pcm_16k: *const c_float,
+        n_samples: i32,
+        out: *mut c_float,
+    ) -> i32;
+    pub fn crispasr_titanet_cosine_sim(a: *const c_float, b: *const c_float, dim: i32) -> c_float;
+
+    // Speaker profile database
+    pub fn crispasr_speaker_db_load(dir_path: *const c_char) -> *mut c_void;
+    pub fn crispasr_speaker_db_free(db: *mut c_void);
+    pub fn crispasr_speaker_db_count(db: *const c_void) -> i32;
+    pub fn crispasr_speaker_db_match(
+        db: *const c_void,
+        embedding: *const c_float,
+        dim: i32,
+        threshold: c_float,
+        out_name: *mut c_char,
+        out_cap: i32,
+    ) -> c_float;
+    pub fn crispasr_speaker_db_enroll(
+        dir_path: *const c_char,
+        name: *const c_char,
+        embedding: *const c_float,
+        dim: i32,
+    ) -> i32;
 }

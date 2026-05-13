@@ -497,6 +497,7 @@ extern "C" {
         GGML_OP_CONCAT,
         GGML_OP_SILU_BACK,
         GGML_OP_NORM, // normalize
+        GGML_OP_NORM_AFFINE, // fused normalize + affine (w*norm(x)+b)
         GGML_OP_RMS_NORM,
         GGML_OP_RMS_NORM_BACK,
         GGML_OP_GROUP_NORM,
@@ -577,6 +578,11 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // CrispASR patch (PR #07-metal-aa-snake-beta): fused BigVGAN v2
+        // anti-aliased SnakeBeta (upsample 2× + sin²(α·x)/β + downsample 2×).
+        // MUST RE-APPLY after every ggml bump.
+        GGML_OP_AA_SNAKE_BETA,
+
         GGML_OP_COUNT,
     };
 
@@ -614,6 +620,7 @@ extern "C" {
         GGML_GLU_OP_SWIGLU_OAI,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
+        GGML_GLU_OP_SIGLU,
 
         GGML_GLU_OP_COUNT,
     };
@@ -1310,6 +1317,14 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    GGML_API struct ggml_tensor * ggml_siglu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    GGML_API struct ggml_tensor * ggml_siglu_swapped(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
     // A: n columns, r rows,
     // B: n columns, r rows,
     GGML_API struct ggml_tensor * ggml_glu_split(
@@ -1343,6 +1358,11 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    GGML_API struct ggml_tensor * ggml_siglu_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
     GGML_API struct ggml_tensor * ggml_swiglu_oai(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -1359,6 +1379,14 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_norm_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
+            float                 eps);
+
+    // fused: w * norm(a, eps) + b   (LayerNorm affine in one kernel)
+    GGML_API struct ggml_tensor * ggml_norm_affine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * b,
             float                 eps);
 
     GGML_API struct ggml_tensor * ggml_rms_norm(
@@ -2037,6 +2065,24 @@ extern "C" {
             int                   s0,  // stride
             int                   p0,  // padding
             int                   d0); // dilation
+
+    // CrispASR patch (PR #07-metal-aa-snake-beta): BigVGAN v2 anti-aliased
+    // SnakeBeta — fused upsample 2× + sin²(α·x)/β + downsample 2×.
+    // All inputs F32; output same shape as `x`.
+    //   x        : [T, C]      — time-fastest, channel-major
+    //   log_alpha: [C]         — per-channel α frequency, log-scale
+    //   log_beta : [C]         — per-channel β amplitude, log-scale
+    //   us_filter: [K, 1, 1]   — Kaiser-windowed sinc, sum=1
+    //   ds_filter: [K, 1, 1]   — Kaiser-windowed sinc, sum=1
+    // K must be 12 (asserted in the CPU forward).
+    // MUST RE-APPLY after every ggml bump.
+    GGML_API struct ggml_tensor * ggml_aa_snake_beta(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * log_alpha,
+            struct ggml_tensor  * log_beta,
+            struct ggml_tensor  * us_filter,
+            struct ggml_tensor  * ds_filter);
 
     GGML_API struct ggml_tensor * ggml_conv_2d(
             struct ggml_context * ctx,

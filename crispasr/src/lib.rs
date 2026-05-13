@@ -684,6 +684,69 @@ impl Session {
         Ok(())
     }
 
+    /// Translate `text` from `src_lang` to `tgt_lang` via whichever
+    /// MT-capable backend this session loaded (m2m100, m2m100-wmt21,
+    /// madlad, gemma4-e2b).  Distinct from [`Self::set_translate`] —
+    /// that one is the whisper *audio-side* EN-only translate flag,
+    /// applied to PCM input; this one is text→text with arbitrary
+    /// language pairs.
+    ///
+    /// `max_tokens` caps the decoder output length.  Pass `<= 0` to
+    /// fall back to the C++ default (200 tokens for m2m100, etc.).
+    ///
+    /// Backend selection guidance (from the README feature matrix):
+    /// - **m2m100** — 100 languages, any-to-any (default for the long
+    ///   tail like Bosnian, Swahili, …).
+    /// - **m2m100-wmt21** — English-paired only (EN ↔ {zh, de, fr,
+    ///   ja, ru, is, ha}), direction-specific checkpoints.  Higher
+    ///   quality on those pairs.
+    /// - **madlad** — 419 languages via target-language prefix tag
+    ///   (handled internally; caller still passes `tgt_lang`).
+    /// - **gemma4-e2b** — Dual ASR+MT (140+ langs).
+    ///
+    /// Errors when:
+    /// - `text`, `src_lang`, or `tgt_lang` contain interior NULs;
+    /// - the session has no MT-capable backend loaded (returns
+    ///   `nullptr` from the C-ABI, surfaced as a clear error);
+    /// - the backend's internal translate routine errored out.
+    pub fn translate_text(
+        &self,
+        text: &str,
+        src_lang: &str,
+        tgt_lang: &str,
+        max_tokens: i32,
+    ) -> Result<String, String> {
+        let ctext = CString::new(text).map_err(|e| format!("text contains NUL: {e}"))?;
+        let csrc = CString::new(src_lang).map_err(|e| format!("src_lang contains NUL: {e}"))?;
+        let ctgt = CString::new(tgt_lang).map_err(|e| format!("tgt_lang contains NUL: {e}"))?;
+        let ptr = unsafe {
+            crispasr_sys::crispasr_session_translate_text(
+                self.handle,
+                ctext.as_ptr(),
+                csrc.as_ptr(),
+                ctgt.as_ptr(),
+                max_tokens,
+            )
+        };
+        if ptr.is_null() {
+            return Err(format!(
+                "translate_text returned no output (backend {:?} may not be MT-capable, \
+                 or the pair {}→{} is unsupported)",
+                self.backend(),
+                src_lang,
+                tgt_lang
+            ));
+        }
+        // Same CStr → owned String pattern as `PuncModel::process` — the
+        // C side malloc'd this buffer and we own it until we hand it
+        // back through `crispasr_session_translate_text_free`.
+        let out = unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crispasr_sys::crispasr_session_translate_text_free(ptr) };
+        Ok(out)
+    }
+
     /// Open a rolling-window streaming decoder for this session
     /// (PLAN #62). Currently whisper-only at the C-ABI level; other
     /// backends return an error. `step_ms` is how often to commit a
@@ -1371,6 +1434,94 @@ pub fn detect_language_pcm(
         lang_code: code,
         confidence: conf as f32,
     })
+}
+
+// =========================================================================
+// Text-LID — P13.5 Phase 7 (C-ABI 0.5.2+)
+// =========================================================================
+
+/// Result of [`text_detect_language`].  Label format depends on the
+/// loaded GGUF: CLD3 returns ISO 639-1 (`"en"`, `"de"`, `"zh-Latn"`)
+/// across 109 labels; GlotLID-V3 / LID-176 fastText return ISO 639-3
+/// with a script tag (`"eng_Latn"`, `"sco_Latn"`) across 2102 or 176
+/// labels respectively.  Callers needing ISO 639-1 normalisation
+/// must do it on their side — the dispatcher preserves the model's
+/// native space because the script tag carries real information
+/// (e.g. `zh-Latn` ≠ `zh-Hans`).
+#[derive(Clone, Debug)]
+pub struct TextLidResult {
+    /// Predicted language label.  Empty on failure.  See type docs
+    /// for the format details.
+    pub label: String,
+    /// Posterior probability on the argmax label.  `-1.0` on
+    /// dispatcher failures, otherwise `[0.0, 1.0]`.
+    pub confidence: f32,
+}
+
+/// Detect the language of a UTF-8 text string via the internal
+/// `text_lid_dispatch` (peek the GGUF's `general.architecture` →
+/// route to CLD3 or fastText).
+///
+/// `model_path` must be a concrete on-disk path; auto-resolution
+/// from the registry is the caller's job (use
+/// `registry_lookup("lid-cld3" / "lid-glotlid" / "lid-fasttext176")`
+/// + `cache_ensure_file` for the same shape the ASR side already
+/// uses).
+///
+/// Errors when:
+/// - any input string contains an interior NUL,
+/// - the GGUF can't be opened or has an unsupported architecture,
+/// - the predict path errors out,
+/// - the output buffer (256 bytes here — fits CLD3's longest
+///   `zh-Latn` and fastText's longest `<3-letter>_<4-letter>`
+///   labels with room to spare) overflows.
+pub fn text_detect_language(
+    text: &str,
+    model_path: &str,
+    n_threads: i32,
+) -> Result<TextLidResult, String> {
+    let ctext = CString::new(text).map_err(|e| format!("text contains NUL: {e}"))?;
+    let cmodel =
+        CString::new(model_path).map_err(|e| format!("model_path contains NUL: {e}"))?;
+
+    // 256-byte buffer comfortably fits every label format the
+    // dispatcher emits — CLD3's longest is ~10 bytes (`zh-Latn`),
+    // fastText's longest is ~12 bytes (`<3letter>_<4letter>`).
+    let mut buf = [0u8; 256];
+    let mut conf: c_float = -1.0;
+    let rc = unsafe {
+        crispasr_sys::crispasr_text_detect_language(
+            ctext.as_ptr(),
+            cmodel.as_ptr(),
+            n_threads,
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len() as i32,
+            &mut conf,
+        )
+    };
+    match rc {
+        0 => {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            let label = std::str::from_utf8(&buf[..end])
+                .map_err(|e| format!("text-LID returned non-UTF8 bytes: {e}"))?
+                .to_string();
+            Ok(TextLidResult {
+                label,
+                confidence: conf as f32,
+            })
+        }
+        -1 => Err("text-LID: invalid args (null pointer or bad buffer size)".to_string()),
+        1 => Err(format!(
+            "text-LID dispatcher init/predict failed for model {model_path} \
+             (check the GGUF's architecture key — must be `lid-cld3` or `lid-fasttext`)"
+        )),
+        2 => Err(
+            "text-LID label exceeded 256-byte output buffer — file an issue, this shouldn't happen \
+             with the dispatcher's current label spaces"
+                .to_string(),
+        ),
+        other => Err(format!("text-LID returned unexpected status code {other}")),
+    }
 }
 
 // =========================================================================

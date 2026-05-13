@@ -3,13 +3,14 @@
 Pending roadmap items. Each is self-contained with files, approach, and
 effort estimate. Completed items have been moved to `HISTORY.md`.
 
-**Current state (May 2026, v0.5.5):** 20 ASR + 3 TTS backends (+ Chatterbox T3 in progress), unified CLI,
+**Current state (May 2026, v0.6.2):** 20 ASR + 3 TTS + 1 speaker-verification backends (+ Chatterbox T3 in progress), unified CLI,
 OpenAI-compatible server + WebSocket streaming, shared `src/core/` library, FireRedPunc
-post-processor, C-ABI + Go/Java/Ruby/JS/Python bindings, CI on 6 platforms.
+post-processor, C-ABI + Go/Java/Ruby/JS/Python/Dart bindings, CI on 6 platforms.
 All backends support `-m auto --auto-download`. Three new ggml ops
 (`conv_1d_cf`, `conv_1d_dw_cf`, `conv_1d_group`). ggml bumped to 0.10.0.
-Feature matrix expanded to 21 backends (README). test-all-backends.py
-passes 18/18 transcribe + 51/54 feature tests (3 stream skips, no failures).
+Feature matrix expanded to 21 backends (README). Speaker identification via
+TitaNet embeddings + profile DB, integrated into diarize pipeline.
+test-all-backends.py passes 18/18 transcribe + 51/54 feature tests (3 stream skips, no failures).
 
 > **‼️ Tooling pin: `clang-format` MUST be v18.** CI pins it
 > (`.github/workflows/lint.yml`). Homebrew's default `clang-format` and
@@ -48,6 +49,7 @@ passes 18/18 transcribe + 51/54 feature tests (3 stream skips, no failures).
 | **LOW** | [#87 `gpu_backend` runtime selector](#87-gpu_backend-runtime-selector-multi-backend-ggml-build) | ~1 week | Needs ggml-side multi-backend dispatch to land first. CrisperWeaver UI placeholder ready when the C-side is. |
 | **DONE** | #88 Kokoro length-scale + vibevoice diffusion steps | 1 day combined | Both backend-internal refactors shipped → [HISTORY §85](HISTORY.md). `kokoro_set_length_scale` + `vibevoice_set_tts_steps` runtime setters on the per-backend API; `crispasr_session_set_length_scale` + `_set_tts_steps` on the unified API. CrisperWeaver's TTS speed slider drives both. |
 | **DONE** | #89 Flash-attn field migration | ~2 hours | Mechanical plumbing across 12 backends shipped → [HISTORY §84](HISTORY.md). Prereq for #86 closed. |
+| **DONE** | #90 TitaNet speaker verification + speaker ID | 1 day | TitaNet-Large GGUF converter + pure-CPU runtime + speaker profile DB + CLI + C-ABI + wrappers. cos=0.9999 vs NeMo. → [HISTORY §89](HISTORY.md) |
 
 **Recently completed** (full write-ups in HISTORY.md): **#57 chatterbox native voice clone → §82** (six-commit sprint shipping all four upstream cond extractors — VoiceEncoder LSTM, S3Tokenizer V2, CAMPPlus, 24 kHz Matcha mel — plus a Kaiser-windowed sinc resampler and atomic 5-cond install in `chatterbox_set_voice_from_wav`'s `.wav` branch; `--voice ref_24k.wav` produces real cloned speech without any python). **#69 + #72 + #73 cap-honesty + KV/layer offload knobs → §79** (14-commit session shipping `CRISPASR_KV_QUANT_K/_V` + `KV_ON_CPU` on 14 backends, `N_GPU_LAYERS` on 10 backends, gemma4/mimo GPU-residency 2.2x / 22 % faster, plus cap-honesty cleanup on parakeet/glm-asr/qwen3/gemma4/omniasr). **vibevoice #69a follow-up → §79b** (mode-aware `tts_lm.layers.` / `lm.layers.` prefix predicate). #78 Chatterbox vocoder → §78. #11 WebSocket server → §76, #63 Feature matrix parity → §72, #59 binding parity → §73, gemma4 #49 + Docker #31 → §74, tests + KV Q8_0 + cleanup → §75. Earlier: #5→§63, #16→§55, #51→§56, #51b→§60, #53→§63, #54→§61, #55→§54, #56→§63, #60d→§64.
 
@@ -69,6 +71,7 @@ Convert + upload to HuggingFace:
 - `moonshine-streaming-tiny/small/medium` — different architecture, needs new runtime
 - ~~`moonshine-tiny-{ja,ar,ko,zh,vi,uk}` (multilingual)~~ **DONE** (12 repos on HF)
 - ~~`moonshine-base-{ja,uk,vi,zh,ar,ko}` (multilingual)~~ **DONE** (12 repos on HF)
+- ~~`moonshine-{base,tiny}-de` German fine-tunes~~ **DONE** — fidoriel (6.9%/11.4% WER, NC-SA) + dattazigzag (MIT)
 
 Converter fix: 1D tensors (norms, biases) forced to F32; conv_1d_f32 mul_mat
 argument order fixed for F16 kernels.
@@ -939,8 +942,13 @@ Probable kickoff: mid-to-late May 2026 if the queue clears.
 | Model | License | Type | Priority |
 |---|---|---|---|
 | FireRedPunc | Apache-2.0 | BERT punct (zh+en) | **DONE** |
-| fullstop-multilingual | MIT | XLM-R punct (en/de/fr/it) | Medium |
-| bert-restore-punctuation | MIT | BERT punct+truecase (en) | Medium |
+| fullstop-multilingual | MIT | XLM-R punct (en/de/fr/it) | **DONE** — runtime in fireredpunc.cpp |
+| punctuate-all (kredor) | MIT | XLM-R-base punct (12 langs) | **DONE** — `--punc-model punctuate-all` |
+| 1-800-BAD-CODE PCS | Apache-2.0 | XLM-R punc+truecase+SBD (47 langs) | **DONE** — `--punc-model pcs` |
+| truecaser-lstm (BiLSTM) | Apache-2.0 | mayhewsw char-level BiLSTM (3.2 MB, 97.9% F1) | **DONE** — `--truecase-model lstm` (recommended) |
+| truecaser-crf | MIT | CRF + context features (24 MB) | **DONE** — `--truecase-model crf` |
+| truecaser-de (statistical) | MIT | Wikipedia word-freq (375K entries, 9 MB) | **DONE** — `--truecase-model auto` |
+| bert-restore-punctuation | MIT | BERT punct+truecase (en) | Low |
 | xashru/punctuation | Apache-2.0 | XLM-R+BiLSTM-CRF (40+ langs) | Low |
 
 ### Optimizations (cross-cutting, from survey + CrispEmbed comparison)
@@ -2543,3 +2551,182 @@ None of these are blocking; they're listed so the next
 parity-pass audit doesn't have to re-discover them.
 
 ---
+
+
+
+
+## 92. All-backend regression suite (nightly CI)
+
+**Status:** seed shipped (`parakeet-tdt-0.6b-ja` end-to-end);
+expand by adding manifest entries + uploading reference dumps.
+
+**Why:** the ggml-assertion-hardening regression in 0.6.x cycle
+demonstrated that we silently inherit upstream behaviour changes —
+both in ggml and in HF-hosted weights — without any test catching
+them. A nightly regression that pins every artifact to a specific
+revision SHA closes that gap.
+
+**Architecture (shipped, see `tests/regression/`):**
+
+```
+manifest.json    per-backend pins: GGUF revision + reference path
+                 + expected transcript + cosine thresholds
+run_one.py       driver: HF download (pinned) → crispasr (assert
+                 transcript) → crispasr-diff (assert cos_min)
+regression.yml   nightly cron at 04:00 UTC, matrix per backend
+```
+
+Reference dumps live in
+[`cstr/crispasr-regression-fixtures`](https://huggingface.co/cstr/crispasr-regression-fixtures);
+the `fixtures.revision` SHA in `manifest.json` pins the whole
+fixture set together so a re-dump can't silently shift CI's
+expectations.
+
+**Next steps (each ~1 hour per backend):**
+
+1. **Add parakeet-tdt-0.6b-v3** (English). Need to cache the
+   `.nemo` source locally first; `nvidia/parakeet-tdt-0.6b-v3`
+   isn't downloaded on the dev box right now.
+2. **Add canary** + **cohere** + **kyutai-stt** + **moonshine**.
+   All have reference modules in `tools/reference_backends/`.
+3. **Add the TTS family** (kokoro, indextts, qwen3-tts, chatterbox,
+   vibevoice). These need WAV-output checksums or an
+   ASR-roundtrip rather than transcript equality.
+4. **Promote to release gating.** Once stable, hook into
+   `release.yml`'s pre-publish job so a regression aborts the
+   tag.
+
+**Time budget per nightly run:** ~5-15 min per backend (download
++ build cache hit + run). With matrix fan-out, wall time stays
+under 30 min for the full suite.
+
+**Storage:** fixtures repo grows by ~1-50 MB per backend. After
+20+ backends still well under 1 GB. The GGUF cache lives in
+`$RUNNER_TEMP` and is discarded with the runner — no GitHub
+Actions cache eviction concerns.
+
+**Cost on free tier:** public-repo Actions minutes are unlimited,
+so the only constraint is wall-clock fairness on the shared
+runner pool. Nightly cadence is the sweet spot — catches
+regressions within 24 h without burning capacity that would
+delay PR feedback.
+
+
+
+
+## 93. CMake target rename: `crispasr` → `crispasr-lib`
+
+**Status:** open, low-risk mechanical rename. Recommended after
+the next release cycle so external consumers can absorb it.
+
+**Why:** the CMake target `crispasr` produces the **library**
+(`libcrispasr.so`), while the CLI **binary** is produced by target
+`crispasr-cli` (which outputs `bin/crispasr`). The target name vs.
+output binary name divergence is a long-standing trap that has now
+caused two CI regressions this session:
+
+  - GH regression workflow run 25735206584 — built only the library,
+    found `bin/crispasr` absent (fixed in commit `08d1872f`).
+  - Kaggle `crispasr-regression-suite` run on 2026-05-12 14:34 —
+    same root cause (fixed in this commit, applied to
+    `tools/kaggle/crispasr-regression.py`).
+
+Both fixes are one-line and obvious **after** you know — but the
+trap reliably re-bites anyone writing a new CI workflow because
+the natural mental model is "target `crispasr` builds the
+`crispasr` binary." Renaming the library target makes the
+distinction explicit.
+
+**Plan:**
+
+1. `src/CMakeLists.txt`: rename `add_library(crispasr ...)` →
+   `add_library(crispasr-lib ...)`. Update every
+   `target_link_libraries(... crispasr ...)` and any
+   `target_*(crispasr ...)` call elsewhere in the tree.
+2. Preserve the **output binary name** `libcrispasr.{so,dylib,a}`
+   via `set_target_properties(crispasr-lib PROPERTIES OUTPUT_NAME
+   crispasr)` — no .so/.dylib filename change, no ABI break.
+3. Update consumers that use the CMake target name:
+   - `bindings/go/whisper.go` cgo LDFLAGS (currently `-lcrispasr`,
+     unchanged since OUTPUT_NAME stays `crispasr`).
+   - `bindings/ruby/ext/dependencies.rb` graphviz walk (queries by
+     target name `crispasr` — needs a 1-line update).
+   - `.github/workflows/{ci,release,regression}.yml` `--target`
+     args (mostly already use `crispasr-cli` for the CLI binary,
+     but any `--target crispasr` referring to the library needs
+     the rename).
+   - `tools/kaggle/crispasr-regression.py` similarly.
+4. Add a CMake alias for one release cycle:
+   `add_library(crispasr ALIAS crispasr-lib)` so external repos
+   that depend on `target_link_libraries(... crispasr)` keep
+   working while they migrate.
+
+**Effort:** ~2 hours including consumer audit + CI re-runs.
+Drop-in once green on every workflow.
+
+**Don't do this in a patch release.** Even with the alias the
+churn is visible to anyone bisecting a build issue. Schedule for
+the next minor (0.7.0).
+
+
+
+
+## 94. Auto-generate Go bindings `#cgo LDFLAGS` from CMake graphviz
+
+**Status:** open, ~half-day. Recommended before the v0.7.0 cycle.
+
+**Why:** the hand-maintained `#cgo LDFLAGS` in `bindings/go/whisper.go`
+has now bitten three releases in a row — v0.6.3 (`-ltitanet`
+missing → commit `acda0622`), v0.6.4 implicitly (would have failed
+if the Rust translate path tested), and v0.6.4 actually
+(`-ltext-lid-dispatch -llid-fasttext -llid-cld3 -lindextts
+-lt5_translate` missing → Bindings Tests (Go) #82). The fail mode
+is repetitive and the fix is mechanical, which is exactly the
+shape that should be automated.
+
+The Ruby binding already solved this — `bindings/ruby/ext/dependencies.rb`
+asks CMake for a `--graphviz` dependency dot, walks the graph
+reachable from the `crispasr` target, and emits the right
+`-l<name>.a` list. Result: every new `target_link_libraries(crispasr
+PUBLIC <X>)` in `src/CMakeLists.txt` propagates to Ruby consumers
+with zero edits on the binding side.
+
+**Plan:**
+
+1. Move the graphviz-walk logic out of `bindings/ruby/ext/`
+   into a shared `tools/cmake_graphviz_targets.py` (~80 LOC).
+   Takes a target name + dot path; returns the topologically-
+   sorted list of static-lib targets reachable from it.
+2. New step in the Go binding's build pipeline: before
+   `go build`, run
+   `cmake --graphviz=/tmp/crispasr.dot -S . -B build_go ...`
+   and `python tools/cmake_graphviz_targets.py crispasr
+   /tmp/crispasr.dot > bindings/go/cgo_libs.txt`. The .txt
+   becomes a generated artifact; `whisper.go` reads it via
+   `//go:embed cgo_libs.txt` and a small init() that splits
+   it into the `#cgo LDFLAGS` slice at build time.
+3. Drawback: `//go:embed` doesn't compose with `#cgo
+   LDFLAGS:` directives — those are evaluated at the cgo
+   preprocessing stage, before any Go code runs. So we'd
+   actually need to **generate `whisper.go`'s `#cgo` block
+   from the .txt at build time**, or use a separate
+   `bindings/go/cgo_ldflags.go` with `#cgo LDFLAGS: ${ldflags}`
+   and have a `go generate` step that writes it. Either is
+   ~30 LOC + a Makefile/CMake target.
+4. Mirror the same generated list in `bindings/go/whisper.go`'s
+   darwin `#cgo` line.
+5. CI: add a check that detects drift — if the hand-edited
+   `whisper.go` `#cgo LDFLAGS` doesn't match
+   `cmake_graphviz_targets.py crispasr` output, fail the lint
+   job with a clear message. Best of both worlds: humans can
+   still edit if needed but drift is loud.
+
+**Why not just always run codegen instead of letting humans edit:**
+Go's tooling makes generated source files awkward (e.g., `go
+fmt` may not run on them, IDE jump-to-symbol may miss them).
+Keeping a hand-maintained file with a drift-check is the
+least-intrusive path for Go consumers who pull via `go get`.
+
+**Tracking:** every commit message that fixes the next round
+of "missing -lX" should reference this section and cross-check
+whether the auto-gen is finally in place.

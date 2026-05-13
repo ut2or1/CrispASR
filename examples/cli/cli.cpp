@@ -371,6 +371,8 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.punctuation = false;
     } else if (arg == "--punc-model") {
         params.punc_model = ARGV_NEXT;
+    } else if (arg == "--truecase-model") {
+        params.truecase_model = ARGV_NEXT;
     } else if (arg == "--flush-after") {
         params.flush_after = std::stoi(ARGV_NEXT);
     } else if (arg == "-am" || arg == "--aligner-model") {
@@ -399,6 +401,14 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.sherpa_embedding_model = ARGV_NEXT;
     } else if (arg == "--sherpa-num-clusters") {
         params.sherpa_num_clusters = std::stoi(ARGV_NEXT);
+    } else if (arg == "--speaker-db") {
+        params.speaker_db = ARGV_NEXT;
+    } else if (arg == "--enroll-speaker") {
+        params.enroll_speaker = ARGV_NEXT;
+    } else if (arg == "--titanet-model" || arg == "--spk-model") {
+        params.titanet_model = ARGV_NEXT;
+    } else if (arg == "--speaker-threshold" || arg == "-st") {
+        params.speaker_threshold = std::stof(ARGV_NEXT);
     } else if (arg == "--cache-dir") {
         params.cache_dir = ARGV_NEXT;
     } else if (arg == "--alt") {
@@ -466,6 +476,15 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.tts_max_input_chars = std::stoi(ARGV_NEXT);
     } else if (arg == "--cors-origin") {
         params.server_cors_origin = ARGV_NEXT;
+    } else if (arg == "--chat-model") {
+        // Optional GGUF chat model — enables POST /v1/chat/completions
+        // on the server. Independent of the primary --model so a
+        // server can host ASR + chat off two different GGUFs.
+        params.chat_model = ARGV_NEXT;
+    } else if (arg == "--chat-ctx") {
+        params.chat_n_ctx = std::stoi(ARGV_NEXT);
+    } else if (arg == "--chat-gpu-layers") {
+        params.chat_n_gpu_layers = std::stoi(ARGV_NEXT);
     } else if (arg == "--tts-trim-silence") {
         params.tts_trim_silence = true;
     } else if (arg == "--text") {
@@ -742,8 +761,11 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.target_lang.c_str());
     fprintf(stderr, "             --no-punctuation       [%-7s] disable punctuation (canary, cohere)\n",
             params.punctuation ? "false" : "true");
-    fprintf(stderr, "             --punc-model FNAME     [%-7s] FireRedPunc GGUF (or 'auto' to download)\n",
+    fprintf(stderr,
+            "             --punc-model FNAME     [%-7s] punctuation GGUF: auto|firered|fullstop|punctuate-all\n",
             params.punc_model.c_str());
+    fprintf(stderr, "             --truecase-model FNAME [%-7s] truecaser: auto (de) or path to .bin\n",
+            params.truecase_model.c_str());
     fprintf(stderr, "             --flush-after N        [%-7d] flush SRT to stdout every N segments (0=all at end)\n",
             params.flush_after);
     fprintf(stderr, "  -am FNAME, --aligner-model FNAME  [%-7s] CTC aligner GGUF (LLM backends word timestamps)\n",
@@ -865,6 +887,15 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.tts_max_input_chars);
     fprintf(stderr, "             --cors-origin ORIGIN     server: opt-in CORS for browser clients "
                     "('*' for any, or scheme://host[:port])\n");
+    fprintf(stderr, "             --chat-model PATH        server: enable POST /v1/chat/completions backed by "
+                    "this GGUF chat model (independent of --model)\n");
+    fprintf(stderr,
+            "             --chat-ctx N             [%-7d] server: context window in tokens for the chat model\n",
+            params.chat_n_ctx);
+    fprintf(stderr,
+            "             --chat-gpu-layers N      [%-7d] server: GPU layers for the chat model "
+            "(-1 = all, 0 = CPU only)\n",
+            params.chat_n_gpu_layers);
     fprintf(stderr, "             --tts-steps N            [%-7d] DPM-Solver++ steps (10-20, vibevoice only)\n",
             params.tts_steps);
     fprintf(stderr, "             --tts-trim-silence       [%-7s] trim leading silence from TTS output\n",
@@ -1681,6 +1712,17 @@ int main(int argc, char** argv) {
         fprintf(stderr, "error: no input files specified\n");
         whisper_print_usage(argc, argv, params);
         return 2;
+    }
+
+    // Speaker enrollment: extract TitaNet embedding from audio, save to DB, exit.
+    // This is a standalone operation that doesn't need any ASR backend.
+    if (!params.enroll_speaker.empty() && !params.fname_inp.empty()) {
+        // Enrollment needs: audio → TitaNet → speaker_db_enroll → exit
+        // Route through the unified dispatch which has the enrollment code.
+        if (params.backend.empty())
+            params.backend = "whisper"; // any backend, enrollment exits before init
+        const int rc = crispasr_run_backend(params);
+        return rc;
     }
 
     // crispasr backend dispatch ---------------------------------------------

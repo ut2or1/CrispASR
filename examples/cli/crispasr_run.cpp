@@ -21,8 +21,15 @@
 #include "crispasr_lid.h" // crispasr_lid_free_cache()
 #include "crispasr_diarize_cli.h"
 #include "crispasr_mem.h"
+#include "crispasr_stream_finalize.h"
 #include "whisper_params.h"
 #include "fireredpunc.h"
+#include "truecaser.h"
+#include "truecaser_crf.h"
+#include "truecaser_lstm.h"
+#include "pcs.h"
+#include "titanet.h"
+#include "speaker_db.h"
 
 #include "common-crispasr.h" // read_audio_data
 
@@ -50,6 +57,58 @@ static void apply_punc_model(fireredpunc_context* punc_ctx, std::vector<crispasr
         return;
     for (auto& seg : segs) {
         char* result = fireredpunc_process(punc_ctx, seg.text.c_str());
+        if (result) {
+            seg.text = result;
+            free(result);
+        }
+    }
+}
+
+// Apply PCS (punctuation + capitalization + segmentation) to all segments.
+static void apply_pcs_model(pcs_context* pcs_ctx, std::vector<crispasr_segment>& segs) {
+    if (!pcs_ctx)
+        return;
+    for (auto& seg : segs) {
+        char* result = pcs_process(pcs_ctx, seg.text.c_str());
+        if (result) {
+            seg.text = result;
+            free(result);
+        }
+    }
+}
+
+// Apply statistical truecaser to all segments.
+static void apply_truecase_model(truecaser_context* tc_ctx, std::vector<crispasr_segment>& segs) {
+    if (!tc_ctx)
+        return;
+    for (auto& seg : segs) {
+        char* result = truecaser_process(tc_ctx, seg.text.c_str());
+        if (result) {
+            seg.text = result;
+            free(result);
+        }
+    }
+}
+
+// Apply CRF truecaser to all segments.
+static void apply_truecase_crf_model(truecaser_crf_context* tc_crf_ctx, std::vector<crispasr_segment>& segs) {
+    if (!tc_crf_ctx)
+        return;
+    for (auto& seg : segs) {
+        char* result = truecaser_crf_process(tc_crf_ctx, seg.text.c_str());
+        if (result) {
+            seg.text = result;
+            free(result);
+        }
+    }
+}
+
+// Apply BiLSTM truecaser to all segments.
+static void apply_truecase_lstm_model(truecaser_lstm_context* tc_lstm_ctx, std::vector<crispasr_segment>& segs) {
+    if (!tc_lstm_ctx)
+        return;
+    for (auto& seg : segs) {
+        char* result = truecaser_lstm_process(tc_lstm_ctx, seg.text.c_str());
         if (result) {
             seg.text = result;
             free(result);
@@ -123,7 +182,9 @@ std::mutex g_stdout_mutex;
 // per-thread backend instances. Returns 0 on success, non-zero on
 // failure.
 int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, const std::string& fname_out,
-                      whisper_params params, fireredpunc_context* punc_ctx = nullptr) {
+                      whisper_params params, fireredpunc_context* punc_ctx = nullptr,
+                      truecaser_context* tc_ctx = nullptr, pcs_context* pcs_ctx = nullptr,
+                      truecaser_crf_context* tc_crf_ctx = nullptr, truecaser_lstm_context* tc_lstm_ctx = nullptr) {
     // Resolve the output path base for this input. -of FNAME (passed via
     // `fname_out`) wins; otherwise we strip the audio extension off the
     // input path and append the format extension. Mirrors the whisper
@@ -193,6 +254,41 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     if (!params.no_prints) {
         fprintf(stderr, "crispasr: audio: %d samples (%.1f s) @ %d Hz, %d threads\n", (int)samples.size(),
                 (double)samples.size() / SR, SR, params.n_threads);
+    }
+
+    // Speaker enrollment mode: extract TitaNet embedding, save to DB, exit.
+    if (!params.enroll_speaker.empty()) {
+        std::string tmodel = params.titanet_model;
+        if (tmodel.empty() || tmodel == "auto") {
+            tmodel =
+                crispasr_resolve_model("auto", "titanet", params.no_prints, params.cache_dir, params.auto_download, "");
+        }
+        if (tmodel.empty()) {
+            fprintf(stderr, "crispasr: error: cannot resolve TitaNet model for enrollment\n");
+            return 21;
+        }
+        auto* tctx = titanet_init(tmodel.c_str(), params.n_threads);
+        if (!tctx) {
+            fprintf(stderr, "crispasr: error: failed to load TitaNet model '%s'\n", tmodel.c_str());
+            return 22;
+        }
+        float emb[192];
+        int dim = titanet_embed(tctx, samples.data(), (int)samples.size(), emb);
+        titanet_free(tctx);
+        if (dim <= 0) {
+            fprintf(stderr, "crispasr: error: TitaNet embedding extraction failed\n");
+            return 23;
+        }
+        std::string db_dir = params.speaker_db;
+        if (db_dir.empty())
+            db_dir = params.cache_dir.empty()
+                         ? std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.cache/crispasr/speakers"
+                         : params.cache_dir + "/speakers";
+        if (!speaker_db_enroll(db_dir.c_str(), params.enroll_speaker.c_str(), emb, dim)) {
+            fprintf(stderr, "crispasr: error: failed to enroll speaker '%s'\n", params.enroll_speaker.c_str());
+            return 24;
+        }
+        return 0;
     }
 
     // Optional language-identification pre-step.
@@ -329,6 +425,11 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
         auto all_segs = merge_segments(std::move(stitched_per_slice), slices);
 
         apply_punc_model(punc_ctx, all_segs);
+        apply_truecase_model(tc_ctx, all_segs);
+        apply_truecase_crf_model(tc_crf_ctx, all_segs);
+        apply_truecase_lstm_model(tc_lstm_ctx, all_segs);
+
+        apply_pcs_model(pcs_ctx, all_segs);
         if (!params.punctuation) {
             for (auto& seg : all_segs)
                 crispasr_strip_punctuation(seg);
@@ -385,6 +486,37 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
                 std::vector<float> mono_slice(samples.begin() + sl.start, samples.begin() + sl.end);
                 crispasr_apply_diarize(mono_slice, mono_slice,
                                        /*is_stereo=*/false, sl.t0_cs, segs, params);
+            }
+        }
+
+        // Speaker identification: match diarized speakers against profile DB.
+        // Also supports standalone speaker ID (without diarize) when --speaker-db is set.
+        if (!params.speaker_db.empty() && !segs.empty()) {
+            static titanet_context* spk_ctx = nullptr;
+            static speaker_db* spk_db = nullptr;
+            if (!spk_ctx) {
+                std::string tm = params.titanet_model;
+                if (tm.empty() || tm == "auto")
+                    tm = crispasr_resolve_model("auto", "titanet", params.no_prints, params.cache_dir,
+                                                params.auto_download, "");
+                if (!tm.empty())
+                    spk_ctx = titanet_init(tm.c_str(), params.n_threads);
+            }
+            if (!spk_db)
+                spk_db = speaker_db_load(params.speaker_db.c_str());
+            if (spk_ctx && spk_db && speaker_db_count(spk_db) > 0) {
+                // Extract embedding for the whole slice and match
+                float emb[192];
+                int dim = titanet_embed(spk_ctx, samples.data() + sl.start, sl.end - sl.start, emb);
+                if (dim > 0) {
+                    float score = 0;
+                    const char* name = speaker_db_match(spk_db, emb, dim, params.speaker_threshold, &score);
+                    if (name) {
+                        std::string label = std::string("(") + name + ") ";
+                        for (auto& seg : segs)
+                            seg.speaker = label;
+                    }
+                }
             }
         }
 
@@ -476,6 +608,11 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             // Post-process this slice immediately
             auto slice_segs = std::move(per_slice[i]);
             apply_punc_model(punc_ctx, slice_segs);
+            apply_truecase_model(tc_ctx, slice_segs);
+            apply_truecase_crf_model(tc_crf_ctx, slice_segs);
+            apply_truecase_lstm_model(tc_lstm_ctx, slice_segs);
+
+            apply_pcs_model(pcs_ctx, slice_segs);
             if (!params.punctuation) {
                 for (auto& seg : slice_segs)
                     crispasr_strip_punctuation(seg);
@@ -528,6 +665,11 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             }
             auto all_segs = merge_segments(std::move(per_slice_redo), slices);
             apply_punc_model(punc_ctx, all_segs);
+            apply_truecase_model(tc_ctx, all_segs);
+            apply_truecase_crf_model(tc_crf_ctx, all_segs);
+            apply_truecase_lstm_model(tc_lstm_ctx, all_segs);
+
+            apply_pcs_model(pcs_ctx, all_segs);
             if (!params.punctuation)
                 for (auto& seg : all_segs)
                     crispasr_strip_punctuation(seg);
@@ -556,6 +698,11 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     auto all_segs = merge_segments(std::move(per_slice), slices);
 
     apply_punc_model(punc_ctx, all_segs);
+    apply_truecase_model(tc_ctx, all_segs);
+    apply_truecase_crf_model(tc_crf_ctx, all_segs);
+    apply_truecase_lstm_model(tc_lstm_ctx, all_segs);
+
+    apply_pcs_model(pcs_ctx, all_segs);
     if (!params.punctuation) {
         for (auto& seg : all_segs) {
             crispasr_strip_punctuation(seg);
@@ -937,6 +1084,19 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 "fireredpunc-q4_k.gguf",
                 "https://huggingface.co/cstr/fireredpunc-GGUF/resolve/main/fireredpunc-q4_k.gguf", params.no_prints,
                 "crispasr[punc]", params.cache_dir);
+        } else if (punc_path == "fullstop") {
+            punc_path = crispasr_cache::ensure_cached_file(
+                "fullstop-punc-q4_k.gguf",
+                "https://huggingface.co/cstr/fullstop-punc-multilang-GGUF/resolve/main/fullstop-punc-q4_k.gguf",
+                params.no_prints, "crispasr[punc]", params.cache_dir);
+        } else if (punc_path == "punctuate-all") {
+            punc_path = crispasr_cache::ensure_cached_file(
+                "punctuate-all-q4_k.gguf",
+                "https://huggingface.co/cstr/punctuate-all-GGUF/resolve/main/punctuate-all-q4_k.gguf", params.no_prints,
+                "crispasr[punc]", params.cache_dir);
+        } else if (punc_path == "pcs" || punc_path.find("pcs") != std::string::npos) {
+            // PCS is handled separately below — skip fireredpunc loading
+            punc_path.clear();
         }
         if (!punc_path.empty()) {
             punc_ctx.reset(fireredpunc_init(punc_path.c_str()));
@@ -945,6 +1105,111 @@ int crispasr_run_backend(const whisper_params& params_in) {
                         punc_path.c_str());
             } else if (!params.no_prints) {
                 fprintf(stderr, "crispasr: loaded punctuation model '%s'\n", punc_path.c_str());
+            }
+        }
+    }
+
+    // PCS model (punctuation + capitalization + segmentation in one model).
+    // `--punc-model pcs` loads the 1-800-BAD-CODE XLM-RoBERTa model which
+    // handles punc, truecasing, and SBD together. When PCS is active, it
+    // replaces both fireredpunc and the statistical truecaser.
+    // PCS: detect from keyword or filename containing "pcs"
+    std::unique_ptr<pcs_context, decltype(&pcs_free)> pcs_ctx(nullptr, pcs_free);
+    {
+        std::string pcs_path;
+        if (params.punc_model == "pcs") {
+            pcs_path = crispasr_cache::ensure_cached_file(
+                "pcs-xlmr-base-q4_k.gguf",
+                "https://huggingface.co/cstr/pcs-xlmr-base-GGUF/resolve/main/pcs-xlmr-base-q4_k.gguf", params.no_prints,
+                "crispasr[pcs]", params.cache_dir);
+        } else if (params.punc_model.find("pcs") != std::string::npos &&
+                   params.punc_model.find(".gguf") != std::string::npos) {
+            // Direct path to a PCS GGUF file
+            pcs_path = params.punc_model;
+        }
+        if (!pcs_path.empty()) {
+            pcs_ctx.reset(pcs_init(pcs_path.c_str()));
+            if (pcs_ctx) {
+                punc_ctx.reset(); // PCS replaces fireredpunc
+                if (!params.no_prints)
+                    fprintf(stderr, "crispasr: loaded PCS model '%s'\n", pcs_path.c_str());
+            }
+        }
+    }
+
+    // Optional truecaser post-processor.
+    // `--truecase-model auto` / `de` → statistical German truecaser (~9 MB).
+    // `--truecase-model crf`  → CRF German truecaser with context (~25 MB).
+    // `--truecase-model lstm` → BiLSTM character-level truecaser (~3 MB, best quality).
+    std::unique_ptr<truecaser_context, decltype(&truecaser_free)> tc_ctx(nullptr, truecaser_free);
+    std::unique_ptr<truecaser_crf_context, decltype(&truecaser_crf_free)> tc_crf_ctx(nullptr, truecaser_crf_free);
+    std::unique_ptr<truecaser_lstm_context, decltype(&truecaser_lstm_free)> tc_lstm_ctx(nullptr, truecaser_lstm_free);
+    {
+        std::string tc_path = params.truecase_model;
+        if (tc_path == "none" || tc_path == "off")
+            tc_path.clear();
+        if (tc_path == "lstm" || tc_path == "lstm-de" || tc_path == "lstm-en" || tc_path == "lstm-es" ||
+            tc_path == "lstm-ru") {
+            // Map language suffix to filename
+            std::string lang = "de";
+            if (tc_path == "lstm-en")
+                lang = "en";
+            else if (tc_path == "lstm-es")
+                lang = "es";
+            else if (tc_path == "lstm-ru")
+                lang = "ru";
+            std::string fname = "truecaser-lstm-" + lang + ".bin";
+            std::string url = "https://huggingface.co/cstr/truecaser-de/resolve/main/" + fname;
+            tc_path =
+                crispasr_cache::ensure_cached_file(fname, url, params.no_prints, "crispasr[tc]", params.cache_dir);
+            if (!tc_path.empty()) {
+                tc_lstm_ctx.reset(truecaser_lstm_init(tc_path.c_str()));
+                if (tc_lstm_ctx && !params.no_prints)
+                    fprintf(stderr, "crispasr: loaded BiLSTM truecaser '%s'\n", tc_path.c_str());
+            }
+            tc_path.clear();
+        } else if (tc_path == "crf" || tc_path == "crf-de") {
+            tc_path = crispasr_cache::ensure_cached_file(
+                "truecaser-crf-de.bin", "https://huggingface.co/cstr/truecaser-de/resolve/main/truecaser-crf-de.bin",
+                params.no_prints, "crispasr[tc]", params.cache_dir);
+            if (!tc_path.empty()) {
+                tc_crf_ctx.reset(truecaser_crf_init(tc_path.c_str()));
+                if (tc_crf_ctx && !params.no_prints)
+                    fprintf(stderr, "crispasr: loaded CRF truecaser '%s'\n", tc_path.c_str());
+            }
+            tc_path.clear();
+        } else if (!tc_path.empty() && tc_path != "auto" && tc_path != "de") {
+            // Direct path — detect format by magic bytes
+            FILE* probe = fopen(tc_path.c_str(), "rb");
+            if (probe) {
+                char magic[4] = {};
+                fread(magic, 1, 4, probe);
+                fclose(probe);
+                if (memcmp(magic, "LSTM", 4) == 0) {
+                    tc_lstm_ctx.reset(truecaser_lstm_init(tc_path.c_str()));
+                    if (tc_lstm_ctx && !params.no_prints)
+                        fprintf(stderr, "crispasr: loaded BiLSTM truecaser '%s'\n", tc_path.c_str());
+                    tc_path.clear();
+                } else if (memcmp(magic, "CRF1", 4) == 0) {
+                    tc_crf_ctx.reset(truecaser_crf_init(tc_path.c_str()));
+                    if (tc_crf_ctx && !params.no_prints)
+                        fprintf(stderr, "crispasr: loaded CRF truecaser '%s'\n", tc_path.c_str());
+                    tc_path.clear();
+                }
+            }
+        }
+        if (tc_path == "auto" || tc_path == "de") {
+            tc_path = crispasr_cache::ensure_cached_file(
+                "truecaser-de.bin", "https://huggingface.co/cstr/truecaser-de/resolve/main/truecaser-de.bin",
+                params.no_prints, "crispasr[tc]", params.cache_dir);
+        }
+        if (!tc_path.empty()) {
+            tc_ctx.reset(truecaser_init(tc_path.c_str()));
+            if (!tc_ctx) {
+                fprintf(stderr, "crispasr: warning: failed to load truecaser '%s' — continuing without\n",
+                        tc_path.c_str());
+            } else if (!params.no_prints) {
+                fprintf(stderr, "crispasr: loaded truecaser '%s'\n", tc_path.c_str());
             }
         }
     }
@@ -1056,10 +1321,34 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // `last_speech_end_sample` is the stream-timeline sample where
         // VAD last saw speech; `--stream-final-on-silence-ms` is checked
         // against `now - last_speech_end_sample`, not "all-empty steps".
+        //
+        // Round 3 (CKwasd retest after round 2) addresses four remaining
+        // semantic issues in the JSON stream:
+        //   1. After finalize, the rolling `pcm_window` still contains
+        //      the finished utterance's speech for up to `--stream-length`,
+        //      and VAD re-discovers it every step. `finalized_until_sample`
+        //      bookmarks the upper bound of the finalized region so
+        //      re-discovered slices can't seed a new utterance with the
+        //      previous text.
+        //   2. The trailing-silence check used to be gated on
+        //      `step_slice_text.empty()`, which a re-discovered old slice
+        //      can keep non-empty for a full window length. Finalization
+        //      now fires purely on `now - last_speech_end_sample`.
+        //   3. Multiple VAD slices in one step each called
+        //      `on_partial_text`, producing competing partials for the
+        //      same `utterance_id`. Round 3 coalesces all slice texts
+        //      that belong to the open utterance into a single partial
+        //      per utterance per step.
+        //   4. `utterance_pcm` accumulated every step's new samples
+        //      (including post-`last_speech_end` silence). Finalize now
+        //      trims it to `[utterance_start_sample, last_speech_end_sample]`
+        //      so the redecode input matches the [t0..t1] interval the
+        //      final event advertises.
         int64_t utterance_id = 0;
         bool have_open_utterance = false;
         int64_t utterance_start_sample = 0;
         int64_t last_speech_end_sample = 0;
+        int64_t finalized_until_sample = 0;
         std::vector<float> utterance_pcm;
         std::string prefix_committed;
         std::string last_partial_text; // dedupe key + prefix-mode tail
@@ -1127,6 +1416,14 @@ int crispasr_run_backend(const whisper_params& params_in) {
             if (!stream_vad_path.empty()) {
                 const auto slices = crispasr_compute_vad_slices(pcm_window.data(), (int)pcm_window.size(), SR,
                                                                 stream_vad_path.c_str(), stream_vad_opts);
+                // Snapshot for the straddling-slice subrange decode below.
+                // `cumulative_samples` has already been advanced by
+                // `n_new` for this step, so the rolling window currently
+                // covers [window_start_sample_now, cumulative_samples).
+                // finalized_until_sample is updated inside the JSON state
+                // machine *after* this loop runs, so it reflects the
+                // upper bound of all utterances finalized before this step.
+                const int64_t window_start_sample_now = cumulative_samples - (int64_t)pcm_window.size();
                 for (const auto& sl : slices) {
                     auto slice_segs =
                         backend->transcribe(pcm_window.data() + sl.start, sl.end - sl.start, sl.t0_cs, params);
@@ -1136,8 +1433,59 @@ int crispasr_run_backend(const whisper_params& params_in) {
                         // utterance state machine. The aggregate gets the
                         // same treatment after the loop, so plain-text
                         // mode behavior is unchanged.
-                        std::vector<crispasr_segment> sl_for_text = slice_segs;
+                        std::vector<crispasr_segment> sl_for_text;
+
+                        // Round 3 (CKwasd #1 corner): if the VAD slice
+                        // straddles a previously-finalized boundary
+                        // (s_start < finalized_until_sample < s_end), the
+                        // full-slice decode covers audio that belongs to
+                        // the prior utterance — emitting it as a partial
+                        // for the new utterance_id leaks prior text into
+                        // the live stream. Re-decode just the post-
+                        // finalized subrange so partial.text describes
+                        // only the new utterance's interval. This costs
+                        // one extra encoder pass per straddling slice
+                        // (bounded to ~window_length / stream_step steps
+                        // after a finalize, until the rolling window
+                        // evicts the old audio).
+                        const int64_t s_start_abs = window_start_sample_now + (int64_t)sl.start;
+                        // Some backends (moonshine's stacked conv1d
+                        // encoder, for example) abort on inputs shorter
+                        // than a few hundred ms — `OW > 0` from
+                        // `ggml_im2col`. Gate the subrange decode on a
+                        // generous min so we don't crash; fall back to
+                        // suppressing the partial in that case so we
+                        // don't leak the prior utterance's text either.
+                        // 32000 samples = 2 s @ 16 kHz, comfortably
+                        // above every supported backend's encoder
+                        // minimum.
+                        constexpr int kStraddleMinSamples = 32000;
+                        if (s_start_abs < finalized_until_sample) {
+                            const int sub_start = (int)(finalized_until_sample - window_start_sample_now);
+                            const int sub_end = (int)sl.end;
+                            const int sub_len = sub_end - sub_start;
+                            if (sub_start >= 0 && sub_len >= kStraddleMinSamples && sub_end <= (int)pcm_window.size()) {
+                                whisper_params decode_params = params;
+                                decode_params.vad = false;
+                                decode_params.vad_model.clear();
+                                sl_for_text =
+                                    backend->transcribe(pcm_window.data() + sub_start, sub_len, 0, decode_params);
+                            }
+                            // else: sl_for_text stays empty → empty
+                            // partial text for this slice, which
+                            // `flush_pending_partial` will skip. The
+                            // straddling slice's prior-utterance audio
+                            // never reaches the wrapper; the genuine
+                            // new audio will be picked up on a later
+                            // step once the subrange exceeds the min.
+                        } else {
+                            sl_for_text = slice_segs;
+                        }
                         apply_punc_model(punc_ctx.get(), sl_for_text);
+                        apply_truecase_model(tc_ctx.get(), sl_for_text);
+                        apply_truecase_crf_model(tc_crf_ctx.get(), sl_for_text);
+                        apply_truecase_lstm_model(tc_lstm_ctx.get(), sl_for_text);
+                        apply_pcs_model(pcs_ctx.get(), sl_for_text);
                         if (!params.punctuation) {
                             for (auto& seg : sl_for_text)
                                 crispasr_strip_punctuation(seg);
@@ -1155,6 +1503,10 @@ int crispasr_run_backend(const whisper_params& params_in) {
             }
 
             apply_punc_model(punc_ctx.get(), segs);
+            apply_truecase_model(tc_ctx.get(), segs);
+            apply_truecase_crf_model(tc_crf_ctx.get(), segs);
+            apply_truecase_lstm_model(tc_lstm_ctx.get(), segs);
+            apply_pcs_model(pcs_ctx.get(), segs);
             if (!params.punctuation) {
                 for (auto& seg : segs) {
                     crispasr_strip_punctuation(seg);
@@ -1191,13 +1543,40 @@ int crispasr_run_backend(const whisper_params& params_in) {
             if (params.stream_json) {
                 const int64_t now_sample = cumulative_samples;
                 const int64_t window_start_sample = cumulative_samples - (int64_t)pcm_window.size();
+                // Track whether this step produced a `partial` or `final`
+                // event so the silence heartbeat at the bottom only fires
+                // when nothing else did. With the round-3 issue-1 skip,
+                // `step_slice_text.empty()` is no longer a reliable proxy
+                // (slices can be present but all filtered as old).
+                bool emitted_event_this_step = false;
 
                 auto finalize_utterance = [&]() {
                     if (!have_open_utterance)
                         return;
+                    // Round 3 (CKwasd #4): trim utterance_pcm to the
+                    // VAD-determined speech region [t0..t1] before the
+                    // redecode pass. The buffer unconditionally appends
+                    // every step's new samples (including post-speech
+                    // silence) so finalize sees a buffer that can extend
+                    // past last_speech_end_sample. Resizing to the actual
+                    // speech-region length makes the redecode input
+                    // match the final event's advertised interval.
+                    if (last_speech_end_sample > utterance_start_sample) {
+                        const int64_t want = last_speech_end_sample - utterance_start_sample;
+                        if ((int64_t)utterance_pcm.size() > want)
+                            utterance_pcm.resize((size_t)want);
+                    }
+                    // Build final_text. In `redecode` mode the primary path
+                    // re-runs the backend on the VAD-trimmed utterance PCM;
+                    // when that's skipped (sub-2-s buffer below the encoder
+                    // min — see crispasr::kStreamRedecodeMinSamples) or
+                    // returns empty, fall back to the prefix-mode stitcher
+                    // so a non-empty partial visible to a UI never gets
+                    // replaced by an empty final. (Round 4 of #84: CKwasd
+                    // report 2026-05-11 "empty finals on sub-2-s utterances".)
                     std::string final_text;
                     if (params.stream_final_mode == "redecode") {
-                        if (!utterance_pcm.empty()) {
+                        if ((int)utterance_pcm.size() >= crispasr::kStreamRedecodeMinSamples) {
                             // Disable nested VAD: utterance_pcm is already
                             // the speech region we identified, no need to
                             // re-segment it (and the nested VAD path would
@@ -1208,6 +1587,10 @@ int crispasr_run_backend(const whisper_params& params_in) {
                             auto utt_segs =
                                 backend->transcribe(utterance_pcm.data(), (int)utterance_pcm.size(), 0, decode_params);
                             apply_punc_model(punc_ctx.get(), utt_segs);
+                            apply_truecase_model(tc_ctx.get(), utt_segs);
+                            apply_truecase_crf_model(tc_crf_ctx.get(), utt_segs);
+                            apply_truecase_lstm_model(tc_lstm_ctx.get(), utt_segs);
+                            apply_pcs_model(pcs_ctx.get(), utt_segs);
                             if (!params.punctuation) {
                                 for (auto& seg : utt_segs)
                                     crispasr_strip_punctuation(seg);
@@ -1215,18 +1598,11 @@ int crispasr_run_backend(const whisper_params& params_in) {
                             for (const auto& s : utt_segs)
                                 final_text += s.text;
                         }
+                        if (final_text.empty())
+                            final_text = crispasr::stitch_partial_accumulator(prefix_committed, last_partial_text);
                     } else {
                         // prefix mode: stitch committed prefix + last partial tail
-                        if (!last_partial_text.empty() && last_partial_text.size() >= prefix_committed.size() &&
-                            last_partial_text.compare(0, prefix_committed.size(), prefix_committed) == 0) {
-                            final_text = last_partial_text;
-                        } else if (prefix_committed.empty()) {
-                            final_text = last_partial_text;
-                        } else if (last_partial_text.empty()) {
-                            final_text = prefix_committed;
-                        } else {
-                            final_text = prefix_committed + " " + last_partial_text;
-                        }
+                        final_text = crispasr::stitch_partial_accumulator(prefix_committed, last_partial_text);
                     }
                     const double t0 = (double)utterance_start_sample / (double)SR;
                     const double t1 = (double)last_speech_end_sample / (double)SR;
@@ -1234,6 +1610,13 @@ int crispasr_run_backend(const whisper_params& params_in) {
                             "{\"type\":\"final\",\"utterance_id\":%lld,\"text\":\"%s\",\"t0\":%.3f,\"t1\":%.3f}\n",
                             (long long)utterance_id, crispasr_json_escape(final_text).c_str(), t0, t1);
                     fflush(stdout);
+                    emitted_event_this_step = true;
+                    // Round 3 (CKwasd #1): bookmark the finalized
+                    // boundary so the slice loop can skip slices the
+                    // rolling window still holds from this utterance.
+                    // Monotonic: finalized_until_sample only grows.
+                    if (last_speech_end_sample > finalized_until_sample)
+                        finalized_until_sample = last_speech_end_sample;
                     have_open_utterance = false;
                     utterance_pcm.clear();
                     prefix_committed.clear();
@@ -1288,6 +1671,22 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 const bool was_open_at_step_start = have_open_utterance;
                 bool utterance_just_opened = false;
 
+                // Round 3 (CKwasd #3): coalesce slice texts into a single
+                // partial per utterance per step. Multiple slices in one
+                // step belonging to the same open utterance previously
+                // emitted one partial each (competing hypotheses to the
+                // wrapper); now they're concatenated into one partial.
+                // A mid-step finalize flushes the pending partial first
+                // so the prior utterance's partial isn't dropped.
+                std::string step_open_partial;
+                auto flush_pending_partial = [&]() {
+                    if (have_open_utterance && !step_open_partial.empty()) {
+                        on_partial_text(step_open_partial);
+                        emitted_event_this_step = true;
+                    }
+                    step_open_partial.clear();
+                };
+
                 // Drive the utterance state machine over the per-slice
                 // results we collected above. For VAD-on, each slice is
                 // a real VAD speech region; for VAD-off, there's at
@@ -1296,30 +1695,68 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     const int64_t s_start = window_start_sample + (int64_t)sl.start;
                     const int64_t s_end = window_start_sample + (int64_t)sl.end;
 
+                    // Round 3 (CKwasd #1): skip slices fully inside the
+                    // already-finalized region. Without this guard the
+                    // rolling pcm_window's lingering tail of a finalized
+                    // utterance re-opens a fresh utterance_id seeded with
+                    // the previous text.
+                    if (s_end <= finalized_until_sample)
+                        continue;
+                    // Straddling slice (s_start < finalized < s_end) with
+                    // a post-finalized tail shorter than the encoder min
+                    // (kStraddleMinSamples in the slice-building loop)
+                    // can't be re-decoded standalone, so its sl_text was
+                    // suppressed above. Skip it here too: opening a new
+                    // utterance from a straddling slice while its new
+                    // content is below the encoder min would create a
+                    // spurious utterance with empty final.text. Wait
+                    // for a later step where enough new audio has
+                    // accumulated to clear the gate.
+                    if (s_start < finalized_until_sample && (s_end - finalized_until_sample) < 32000)
+                        continue;
+
                     // Silence-driven finalize: if the gap between the
                     // last speech end and this slice's start is wider
                     // than the threshold, close the open utterance
-                    // before opening a new one for this slice.
+                    // before opening a new one for this slice. Flush
+                    // the pending partial first so its text reaches
+                    // the wrapper before the final lands.
                     if (have_open_utterance && params.stream_final_silence_ms > 0 &&
                         (s_start - last_speech_end_sample) * 1000 / SR >= params.stream_final_silence_ms) {
+                        flush_pending_partial();
                         finalize_utterance();
                     }
 
                     if (!have_open_utterance) {
                         // Open utterance starting from this slice's
-                        // window-relative start. (For the no-VAD
-                        // synthetic slice this is offset 0 = start of
-                        // the rolling buffer, which is the best we can
-                        // do without VAD timing.)
-                        open_utterance_at((int)sl.start, s_start);
+                        // window-relative start, clamped to the
+                        // finalized boundary so a straddling slice
+                        // (VAD min-silence wider than ours, so VAD did
+                        // not break across the just-finalized utterance)
+                        // doesn't pull the prior speech into the new
+                        // utterance's redecode buffer. (For the no-VAD
+                        // synthetic slice this still degrades cleanly:
+                        // open_start = max(window_start, finalized).)
+                        const int64_t open_start = std::max(s_start, finalized_until_sample);
+                        int window_offset = (int)(open_start - window_start_sample);
+                        if (window_offset < (int)sl.start)
+                            window_offset = (int)sl.start;
+                        open_utterance_at(window_offset, open_start);
                         utterance_just_opened = true;
                     }
 
                     if (s_end > last_speech_end_sample)
                         last_speech_end_sample = s_end;
 
-                    on_partial_text(sl_text);
+                    // Round 3 (CKwasd #3): accumulate into the per-step
+                    // partial buffer instead of emitting per slice.
+                    if (!sl_text.empty()) {
+                        if (!step_open_partial.empty())
+                            step_open_partial += ' ';
+                        step_open_partial += sl_text;
+                    }
                 }
+                flush_pending_partial();
 
                 // Append this step's NEW samples to utterance_pcm (only
                 // when the utterance was already open at step start —
@@ -1337,24 +1774,42 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     finalize_utterance();
                 }
 
-                // End-of-step trailing-silence check: handles the case
-                // where this step had no speech at all (step_slice_text
-                // empty) but an utterance is open and trailing silence
-                // has accumulated beyond the threshold.
-                if (have_open_utterance && step_slice_text.empty() && params.stream_final_silence_ms > 0 &&
+                // End-of-step trailing-silence check.
+                // Round 3 (CKwasd #2): no longer gated on
+                // `step_slice_text.empty()`. The rolling pcm_window
+                // keeps the last utterance's speech for up to
+                // `--stream-length` ms after the speaker stops; VAD
+                // keeps re-discovering that lingering slice every
+                // step, which made `step_slice_text` non-empty and
+                // blocked finalization for the full window length
+                // (~18 s for `--stream-length 18000`). With the
+                // round-3 issue-1 skip, those lingering slices are
+                // already filtered out of the loop above, so by the
+                // time we get here `last_speech_end_sample` is the
+                // genuine end of the open utterance and the gap to
+                // `now_sample` is the actual trailing silence. Fire
+                // finalize whenever that gap crosses the threshold,
+                // independent of whether anything was decoded this
+                // step.
+                if (have_open_utterance && params.stream_final_silence_ms > 0 && last_speech_end_sample > 0 &&
                     (now_sample - last_speech_end_sample) * 1000 / SR >= params.stream_final_silence_ms) {
                     finalize_utterance();
                 }
 
                 // Heartbeat silence event for consumers that need
-                // timing even during pauses.
-                if (step_slice_text.empty()) {
+                // timing even during pauses. Round 3: gate on
+                // "no partial/final this step" rather than
+                // "step_slice_text empty" so the wrapper still gets
+                // a heartbeat when VAD found a slice but it was
+                // filtered (fully-old) or its straddling subrange was
+                // too short for the encoder.
+                if (!emitted_event_this_step) {
                     fprintf(stdout, "{\"type\":\"silence\",\"t\":%.3f}\n", (double)now_sample / (double)SR);
                     fflush(stdout);
                 }
 
                 if (params.stream_monitor) {
-                    fprintf(stderr, step_slice_text.empty() ? "" : "\xE2\x9C\x93");
+                    fprintf(stderr, emitted_event_this_step ? "\xE2\x9C\x93" : "");
                     fflush(stderr);
                 }
                 continue;
@@ -1403,15 +1858,33 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // finalize. `t1` falls back to `cumulative_samples / SR` when
         // we never saw a "speech ended" event before the pipe closed.
         if (params.stream_json && have_open_utterance) {
+            // Round 3 (CKwasd #4): same trim as the in-loop finalize
+            // so the EOF-flushed final's text covers exactly its
+            // advertised [t0..t1] interval. If we never saw a VAD
+            // speech-end before EOF (last_speech_end_sample == 0),
+            // skip the trim and let the full buffer drive the
+            // redecode — t1 also falls back to `cumulative_samples`
+            // below in that case.
+            if (last_speech_end_sample > utterance_start_sample) {
+                const int64_t want = last_speech_end_sample - utterance_start_sample;
+                if ((int64_t)utterance_pcm.size() > want)
+                    utterance_pcm.resize((size_t)want);
+            }
+            // EOF path: identical redecode→stitch-fallback contract to the
+            // in-loop finalize_utterance. See crispasr_stream_finalize.h.
             std::string final_text;
             if (params.stream_final_mode == "redecode") {
-                if (!utterance_pcm.empty()) {
+                if ((int)utterance_pcm.size() >= crispasr::kStreamRedecodeMinSamples) {
                     whisper_params decode_params = params;
                     decode_params.vad = false;
                     decode_params.vad_model.clear();
                     auto utt_segs =
                         backend->transcribe(utterance_pcm.data(), (int)utterance_pcm.size(), 0, decode_params);
                     apply_punc_model(punc_ctx.get(), utt_segs);
+                    apply_truecase_model(tc_ctx.get(), utt_segs);
+                    apply_truecase_crf_model(tc_crf_ctx.get(), utt_segs);
+                    apply_truecase_lstm_model(tc_lstm_ctx.get(), utt_segs);
+                    apply_pcs_model(pcs_ctx.get(), utt_segs);
                     if (!params.punctuation) {
                         for (auto& seg : utt_segs)
                             crispasr_strip_punctuation(seg);
@@ -1419,17 +1892,10 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     for (const auto& s : utt_segs)
                         final_text += s.text;
                 }
+                if (final_text.empty())
+                    final_text = crispasr::stitch_partial_accumulator(prefix_committed, last_partial_text);
             } else {
-                if (!last_partial_text.empty() && last_partial_text.size() >= prefix_committed.size() &&
-                    last_partial_text.compare(0, prefix_committed.size(), prefix_committed) == 0) {
-                    final_text = last_partial_text;
-                } else if (prefix_committed.empty()) {
-                    final_text = last_partial_text;
-                } else if (last_partial_text.empty()) {
-                    final_text = prefix_committed;
-                } else {
-                    final_text = prefix_committed + " " + last_partial_text;
-                }
+                final_text = crispasr::stitch_partial_accumulator(prefix_committed, last_partial_text);
             }
             const double t0 = (double)utterance_start_sample / (double)SR;
             const double t1 = last_speech_end_sample > 0 ? (double)last_speech_end_sample / (double)SR
@@ -1499,7 +1965,9 @@ int crispasr_run_backend(const whisper_params& params_in) {
                         break;
                     const std::string fout =
                         (idx < (int)params.fname_out.size()) ? params.fname_out[idx] : std::string{};
-                    const int file_rc = process_one_input(be, params.fname_inp[idx], fout, params, punc_ctx.get());
+                    const int file_rc =
+                        process_one_input(be, params.fname_inp[idx], fout, params, punc_ctx.get(), tc_ctx.get(),
+                                          pcs_ctx.get(), tc_crf_ctx.get(), tc_lstm_ctx.get());
                     if (file_rc != 0)
                         agg_rc.store(file_rc);
                 }
@@ -1517,7 +1985,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
     for (size_t i = 0; i < params.fname_inp.size(); i++) {
         const std::string& fname_inp = params.fname_inp[i];
         const std::string fout = (i < params.fname_out.size()) ? params.fname_out[i] : std::string{};
-        const int file_rc = process_one_input(*backend, fname_inp, fout, params, punc_ctx.get());
+        const int file_rc = process_one_input(*backend, fname_inp, fout, params, punc_ctx.get(), tc_ctx.get(),
+                                              pcs_ctx.get(), tc_crf_ctx.get(), tc_lstm_ctx.get());
         if (file_rc != 0)
             rc = file_rc;
     }
@@ -1699,6 +2168,11 @@ int crispasr_run_backend(const whisper_params& params_in) {
         auto all_segs = merge_segments(std::move(per_slice), slices);
 
         apply_punc_model(punc_ctx, all_segs);
+        apply_truecase_model(tc_ctx, all_segs);
+        apply_truecase_crf_model(tc_crf_ctx, all_segs);
+        apply_truecase_lstm_model(tc_lstm_ctx, all_segs);
+        
+        apply_pcs_model(pcs_ctx, all_segs);
 
         // Optional post-processing: strip punctuation when --no-punctuation
         // is set. Cohere and canary pass p.punctuation through to their C

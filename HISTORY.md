@@ -333,6 +333,18 @@ Moved here once shipped. See git history for code diffs.
 - **Qwen Omni ASR** — NOT PLANNED (split GGUF, too large, already in llama.cpp).
 - **#30 PazaBench assessment** — 16 model families assessed. 7 already covered, 4 easy wins identified.
 
+### v0.6.7 (May 2026)
+
+**German Moonshine ASR + text post-processing:**
+- **moonshine-de** / **moonshine-tiny-de**: fidoriel German fine-tunes (6.9% / 11.4% WER, CC-BY-NC-SA-4.0) wired as registered backends with `-m auto` support. Also converted dattazigzag/moonshine-tiny-de (MIT, 36.7% WER)
+- **punctuate-all**: kredor/punctuate-all (XLM-RoBERTa-base, 12 languages, MIT, 154 MB Q4_K) — `--punc-model punctuate-all`
+- **PCS model**: 1-800-BAD-CODE XLM-RoBERTa punc+truecase+SBD (47 languages, Apache-2.0) — ONNX→GGUF converter + 4-head C++ runtime: post-punc, pre-punc, sentence boundary, per-character truecasing. `--punc-model pcs`
+- **truecaser-lstm**: BiLSTM character-level truecaser (mayhewsw/pytorch-truecaser, Apache-2.0, 3.2 MB, 97.9% F1). Handles adjective/noun distinction ("braune Katze"), formal "Ihnen", compound words — `--truecase-model lstm` (recommended)
+- **truecaser-crf**: CRF with context features (word, prev/next, article, suffix), Viterbi decode — `--truecase-model crf`
+- **truecaser-de**: Statistical word-frequency truecaser (375K entries, 9 MB) — `--truecase-model auto`
+- **License field**: Registry entries carry optional license tag; NC models emit a stderr note on download
+- **--punc-model** shortcuts: `auto`/`firered`/`fullstop`/`punctuate-all`/`pcs`
+
 ### v0.5.4 (April 2026)
 
 **Maintenance:**
@@ -3575,3 +3587,127 @@ people who need it and for the eventual fused-kernel work
 
 Step A's auto-fall-to-CPU is suppressed when `aa_use_native()` returns
 true — the whole vocoder graph stays on Metal end-to-end in that case.
+
+### §89 — TitaNet-Large speaker verification + speaker profile DB (2026-05-11)
+
+Added NVIDIA TitaNet-Large (23M params, CC-BY-4.0) as a standalone
+speaker verification / embedding extractor backend. Produces 192-d
+L2-normalized speaker embeddings with 0.66% EER on VoxCeleb1-O cleaned.
+
+**Architecture:** 5 Jasper-style blocks with depthwise separable Conv1d +
+Squeeze-and-Excite + residual connections. Decoder: Attentive Statistical
+Pooling (ASP) → BN → Linear(6144→192) → L2-normalize.
+
+**Implementation:**
+- `models/convert-titanet-to-gguf.py` — .nemo → GGUF converter (~45 MB)
+- `src/titanet.{h,cpp}` — pure-CPU runtime (init/embed/free/cosine_sim)
+- `src/speaker_db.{h,cpp}` — file-per-speaker profile database (.spkr format)
+- `tools/reference_backends/titanet.py` — NeMo diff-testing backend
+- `tests/test-titanet.cpp` — standalone smoke test binary
+
+**CLI integration:**
+- `--enroll-speaker <name>` — extract embedding, save to speaker DB, exit
+- `--speaker-db <path>` — match transcription speakers against profile DB
+- `--titanet-model <path>` — model path or "auto" for auto-download
+- `--speaker-threshold <float>` — cosine sim threshold (default 0.7)
+- Speaker ID runs as a post-step after diarize, relabeling anonymous
+  `(speaker N)` with matched names like `(alice)`
+
+**C-ABI:** `crispasr_titanet_init/embed/free` + `crispasr_speaker_db_load/
+match/enroll/count/free`. Wrapper bindings added for Python, Dart/Flutter,
+and Rust.
+
+**Model registry:** `titanet-large.gguf` at `cstr/titanet-large-GGUF`.
+Auto-download via `--titanet-model auto`.
+
+**Parity validation — 6 bugs found and fixed during diff-testing:**
+
+| Bug | Symptom | Fix |
+|---|---|---|
+| BN epsilon | NeMo uses ε=0.001 for encoder (not 1e-5) | Store in GGUF metadata, use per-stage |
+| Missing mout ReLU | JasperBlock applies ReLU AFTER SE+residual | Add `apply_relu` after residual add |
+| ReLU on last sub-block | Last sub-block has no activation before SE | Skip ReLU for sub R-1 |
+| STFT window centering | PyTorch centers window at (n_fft−win)/2 | Center window in frame |
+| Missing pre-emphasis | NeMo applies x[t] -= 0.97·x[t-1] before STFT | Add pre-emphasis filter |
+| Wrong STFT padding | NeMo uses pad_mode="constant" (zero-pad) | Changed from reflect to zero |
+
+Final parity: **cos = 0.9999** on both test samples (an255: 0.999978,
+cen7: 0.999917). Encoder+decoder isolated: cos = 0.999997 with mel
+injection.
+
+Commits: `dc5f01b`, `3d12359`, `b54b92e`.
+
+### §90 — Chat C ABI: text-LLM surface on libcrispasr (2026-05-11)
+
+Spec: `docs/prompts/chat-abi.md`. Phases 0–6 landed in one pass.
+
+**Phase 0 — `crispasr-llama-core` static lib.** Lifted the 50+
+llama.cpp source files under `examples/talk-llama/` (`llama.cpp`,
+`llama-{adapter,arch,batch,chat,context,…}.cpp`, `unicode*.cpp`,
+`models/*.cpp`) out of the SDL2-gated `crispasr-talk-llama` example
+and into a STATIC lib defined in `src/CMakeLists.txt`. Built
+unconditionally with hidden visibility (`CXX_VISIBILITY_PRESET hidden
++ VISIBILITY_INLINES_HIDDEN ON`) so `llama_*` / unicode helpers don't
+leak from `libcrispasr.dylib`'s export table. `examples/talk-llama/
+CMakeLists.txt` simplified to a single `add_executable(crispasr-talk-
+llama talk-llama.cpp)` that links against the new lib — one source
+set, two consumers.
+
+**Phase 1+2+3 — `crispasr_chat_*` ABI.** Public header at
+`include/crispasr_chat.h` (POD structs + opaque handle only, no
+`llama.h` types). Implementation `src/chat.cpp` linked PRIVATE into
+`libcrispasr` so external consumers see only the `crispasr_chat_*`
+surface. Covers open / close / reset / generate (one-shot) /
+generate_stream (on_token callback) / memory_estimate / template_name
+/ n_ctx / string_free. Sampler chain composed via
+`llama_sampler_chain_init + temp / top_k / top_p / min_p /
+repeat_penalty / dist` from upstream `examples/main` — full sampling
+config landed in one pass rather than churning ABI between Phase 1
+and Phase 2. Multi-turn KV cache reuse via a per-session token
+history; divergent prompts trigger `llama_memory_clear` + re-prefill,
+matching prefixes skip re-decode.
+
+**Phase 4 — `crispasr-chat` CLI.** `examples/cli/crispasr_chat_main.cpp`
+— minimal stdin → stdout binary. Auto-detects TTY vs piped stdin: TTY
+gives an interactive REPL with streaming deltas, pipe gives a one-shot
+"read all of stdin → print reply" mode. No SDL2 dep. Links against
+`crispasr` only.
+
+**Phase 5 — `POST /v1/chat/completions` in the server.** Added to
+`examples/cli/crispasr_server.cpp` (the active server with the
+existing `/v1/audio/*` OpenAI surface). New `--chat-model PATH` /
+`--chat-ctx N` / `--chat-gpu-layers N` flags; the session lazy-opens
+on first request and re-uses across calls (one process-wide handle,
+session-internal mutex serialises overlapping requests). Supports
+both `stream: false` (plain `chat.completion` JSON) and `stream: true`
+(SSE deltas + `data: [DONE]`). OpenAI-shape `{role, content}` arrays
+accepted; multimodal content arrays are collapsed to their text-only
+joined form for now.
+
+**Phase 6 — Dart binding.** `flutter/crispasr/lib/src/chat.dart`. New
+`CrispasrChatSession` class mirrors `CrispasrSession`'s shape:
+`Finalizer` for free-on-GC, explicit `close()` for deterministic
+cleanup, `generate()` returns `Future<String>`, `reset()` flushes KV.
+`generateStream` intentionally NOT exposed — the C ABI's `on_token`
+callback passes a `const char*` only valid for the duration of the
+synchronous call, which is incompatible with Dart's
+`NativeCallable.listener` (async delivery → dangling pointer by the
+time the Dart closure runs). The recommended Dart streaming path is
+the HTTP `/v1/chat/completions` SSE endpoint from Phase 5. SDK
+constraint bumped to `>=3.1.0` for `Array<Int8>` inline struct fields.
+
+**Tests.** `tests/test-chat-ggml.cpp` Catch2 smoke verifies open →
+n_ctx → template_name → generate (one-shot) → reset → generate_stream
+→ close. Streamed output equals one-shot under greedy + fixed seed.
+Gated on `CRISPASR_CHAT_TEST_MODEL` env var pointing at a tiny GGUF
+chat model — skipped when unset so plain builds stay green. Verified
+locally against `HuggingFaceTB/SmolLM2-360M-Instruct-Q8_0.gguf`
+(386 MB) on M1 Metal; 13 assertions pass, Metal pipeline cache picks
+up the chat code path automatically.
+
+**Won't-fix this session.** Phase 7 (CrisperWeaver integration) is in
+a different repo and stays out of scope. The Dart `generateStream`
+absence is documented in the binding's source comment; closing it
+properly needs an ABI tweak so `on_token` pointers stay valid past
+the C callback's return (e.g. malloc-per-chunk + Dart-side
+`crispasr_chat_string_free`).

@@ -144,6 +144,12 @@ add_library(crispasr
             # CLI keeps the TTY prompting shim; the library does the
             # non-interactive resolve.
             crispasr_model_registry.cpp
+            # Text-LLM chat C ABI (docs/prompts/chat-abi.md). Calls into
+            # the private crispasr-llama-core static lib; the public
+            # surface lives in include/crispasr_chat.h and exposes only
+            # POD structs + opaque handles — no llama.h types leak out.
+            chat.cpp
+            ../include/crispasr_chat.h
             )
 add_library(whisper ALIAS crispasr)
 
@@ -333,6 +339,88 @@ if(NOT MSVC)
     target_compile_options(crispasr-core PRIVATE -O3)
 endif()
 set_target_properties(crispasr-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# ---------------------------------------------------------------------------
+# crispasr-llama-core — vendored llama.cpp built as a private STATIC lib
+# so the chat / text-LLM C-ABI (src/chat.cpp, include/crispasr_chat.h) can
+# call into it without exposing `llama.h` types in the public surface and
+# without pulling a second copy of ggml.
+#
+# Sources live under `examples/talk-llama/` (they originally landed there
+# only to power the SDL2-gated `crispasr-talk-llama` example). The example
+# now consumes this lib too — one source set, two targets — see
+# examples/talk-llama/CMakeLists.txt.
+#
+# Audio-LLM backends (voxtral / qwen3_asr / granite_speech / …) ship their
+# own hand-rolled ggml graph builders and intentionally do NOT link this
+# target; they stay free of the per-architecture llama-model code.
+# ---------------------------------------------------------------------------
+set(LLAMA_CORE_DIR ${CMAKE_SOURCE_DIR}/examples/talk-llama)
+file(GLOB LLAMA_CORE_MODELS CONFIGURE_DEPENDS ${LLAMA_CORE_DIR}/models/*.cpp)
+add_library(crispasr-llama-core STATIC
+            ${LLAMA_CORE_DIR}/llama.cpp
+            ${LLAMA_CORE_DIR}/llama-adapter.cpp
+            ${LLAMA_CORE_DIR}/llama-arch.cpp
+            ${LLAMA_CORE_DIR}/llama-batch.cpp
+            ${LLAMA_CORE_DIR}/llama-chat.cpp
+            ${LLAMA_CORE_DIR}/llama-context.cpp
+            ${LLAMA_CORE_DIR}/llama-cparams.cpp
+            ${LLAMA_CORE_DIR}/llama-grammar.cpp
+            ${LLAMA_CORE_DIR}/llama-graph.cpp
+            ${LLAMA_CORE_DIR}/llama-hparams.cpp
+            ${LLAMA_CORE_DIR}/llama-impl.cpp
+            ${LLAMA_CORE_DIR}/llama-io.cpp
+            ${LLAMA_CORE_DIR}/llama-kv-cache.cpp
+            ${LLAMA_CORE_DIR}/llama-kv-cache-iswa.cpp
+            ${LLAMA_CORE_DIR}/llama-memory.cpp
+            ${LLAMA_CORE_DIR}/llama-memory-recurrent.cpp
+            ${LLAMA_CORE_DIR}/llama-memory-hybrid.cpp
+            ${LLAMA_CORE_DIR}/llama-memory-hybrid-iswa.cpp
+            ${LLAMA_CORE_DIR}/llama-mmap.cpp
+            ${LLAMA_CORE_DIR}/llama-model-loader.cpp
+            ${LLAMA_CORE_DIR}/llama-model-saver.cpp
+            ${LLAMA_CORE_DIR}/llama-model.cpp
+            ${LLAMA_CORE_DIR}/llama-quant.cpp
+            ${LLAMA_CORE_DIR}/llama-sampler.cpp
+            ${LLAMA_CORE_DIR}/llama-vocab.cpp
+            ${LLAMA_CORE_DIR}/unicode.cpp
+            ${LLAMA_CORE_DIR}/unicode-data.cpp
+            ${LLAMA_CORE_MODELS})
+# Headers live next to the .cpp files. PUBLIC so src/chat.cpp (built into
+# libcrispasr) sees llama.h, but the header is NOT installed — only the
+# `crispasr_chat_*` ABI in include/crispasr_chat.h is.
+target_include_directories(crispasr-llama-core PUBLIC ${LLAMA_CORE_DIR})
+target_compile_features   (crispasr-llama-core PUBLIC cxx_std_17)
+target_link_libraries     (crispasr-llama-core PUBLIC ggml ggml-base Threads::Threads)
+set_target_properties(crispasr-llama-core PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    # Hide llama.cpp's C ABI from libcrispasr's export table — chat.cpp
+    # calls into it INTERNALLY via the static-archive link, but external
+    # consumers of libcrispasr.dylib only see the crispasr_chat_* surface.
+    # Without this, hundreds of llama_* / ggml_* symbols leak and could
+    # collide with another llama.cpp linked into the same process.
+    CXX_VISIBILITY_PRESET hidden
+    C_VISIBILITY_PRESET   hidden
+    VISIBILITY_INLINES_HIDDEN ON)
+if(NOT MSVC)
+    target_compile_options(crispasr-llama-core PRIVATE -O3)
+    # Vendored upstream code — silence the strict warnings we apply to
+    # our own sources so a ggml/llama.cpp bump doesn't break CI lint.
+    target_compile_options(crispasr-llama-core PRIVATE
+        -Wno-cast-qual
+        -Wno-unused-function
+        -Wno-unused-parameter
+        -Wno-unused-variable
+        -Wno-shadow
+        -Wno-missing-declarations
+        -Wno-missing-noreturn
+        -Wno-pedantic
+        -Wno-deprecated-declarations)
+endif()
+if(WIN32)
+    # llama-mmap.cpp uses PrefetchVirtualMemory which needs Win 8.1+.
+    target_compile_definitions(crispasr-llama-core PRIVATE _WIN32_WINNT=0x0602)
+endif()
 
 # ---------------------------------------------------------------------------
 # Parakeet TDT — nvidia/parakeet-tdt-0.6b-v3 (FastConformer encoder + TDT decoder)
@@ -680,6 +768,15 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# titanet — TitaNet-Large speaker verification + speaker profile DB
+# ---------------------------------------------------------------------------
+add_library(titanet STATIC titanet.h titanet.cpp speaker_db.h speaker_db.cpp)
+set_target_properties(titanet PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(titanet PUBLIC .)
+target_compile_features   (titanet PUBLIC cxx_std_17)
+target_link_libraries     (titanet PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+
+# ---------------------------------------------------------------------------
 # vibevoice — Microsoft VibeVoice-ASR (σ-VAE tokenizers + Qwen2 LM)
 # ---------------------------------------------------------------------------
 add_library(vibevoice STATIC vibevoice.h vibevoice.cpp)
@@ -896,6 +993,51 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# truecaser — statistical truecaser from word-frequency data
+# ---------------------------------------------------------------------------
+add_library(truecaser STATIC truecaser.h truecaser.cpp)
+set_target_properties(truecaser PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(truecaser PUBLIC .)
+target_compile_features   (truecaser PUBLIC cxx_std_17)
+if(NOT MSVC)
+    target_compile_options(truecaser PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# truecaser_crf — CRF-based truecaser with context features
+# ---------------------------------------------------------------------------
+add_library(truecaser_crf STATIC truecaser_crf.h truecaser_crf.cpp)
+set_target_properties(truecaser_crf PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(truecaser_crf PUBLIC .)
+target_compile_features   (truecaser_crf PUBLIC cxx_std_17)
+if(NOT MSVC)
+    target_compile_options(truecaser_crf PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# truecaser_lstm — BiLSTM character-level truecaser (mayhewsw/pytorch-truecaser)
+# ---------------------------------------------------------------------------
+add_library(truecaser_lstm STATIC truecaser_lstm.h truecaser_lstm.cpp)
+set_target_properties(truecaser_lstm PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(truecaser_lstm PUBLIC .)
+target_compile_features   (truecaser_lstm PUBLIC cxx_std_17)
+if(NOT MSVC)
+    target_compile_options(truecaser_lstm PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# pcs — Punctuation + Capitalization + Segmentation (1-800-BAD-CODE XLM-R)
+# ---------------------------------------------------------------------------
+add_library(pcs STATIC pcs.h pcs.cpp)
+set_target_properties(pcs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(pcs PUBLIC .)
+target_compile_features   (pcs PUBLIC cxx_std_17)
+target_link_libraries     (pcs PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(pcs PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # ctc-align — CTC forced alignment (Viterbi DP, CPU-only, no ggml dependency)
 # ---------------------------------------------------------------------------
 add_library(ctc-align STATIC align.h align.cpp)
@@ -980,6 +1122,9 @@ endif()
 if (TARGET ecapa-lid)
     target_link_libraries(crispasr PUBLIC ecapa-lid)
 endif()
+if (TARGET titanet)
+    target_link_libraries(crispasr PUBLIC titanet)
+endif()
 if (TARGET moonshine)
     target_link_libraries(crispasr PUBLIC moonshine)
 endif()
@@ -1049,6 +1194,18 @@ endif()
 if (TARGET fireredpunc)
     target_link_libraries(crispasr PUBLIC fireredpunc)
 endif()
+if (TARGET truecaser)
+    target_link_libraries(crispasr PUBLIC truecaser)
+endif()
+if (TARGET truecaser_crf)
+    target_link_libraries(crispasr PUBLIC truecaser_crf)
+endif()
+if (TARGET truecaser_lstm)
+    target_link_libraries(crispasr PUBLIC truecaser_lstm)
+endif()
+if (TARGET pcs)
+    target_link_libraries(crispasr PUBLIC pcs)
+endif()
 # Pyannote segmentation is not a backend; it's consumed by
 # crispasr_diarize.cpp for the "pyannote" method. Still needs linking in
 # so the native diarizer's symbols resolve at libcrispasr load time.
@@ -1070,7 +1227,17 @@ if (TARGET text-lid-dispatch)
     target_link_libraries(crispasr PUBLIC text-lid-dispatch)
 endif()
 
+# Text-LLM chat backend — PRIVATE link: llama.h identifiers are
+# absorbed into libcrispasr and don't bleed into the public surface.
+# Symbols downstream consumers see are only the `crispasr_chat_*` ABI
+# from include/crispasr_chat.h. See docs/prompts/chat-abi.md.
+if (TARGET crispasr-llama-core)
+    target_link_libraries(crispasr PRIVATE crispasr-llama-core)
+endif()
+
 install(TARGETS crispasr LIBRARY)
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../include/crispasr_chat.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 # Convenience alias: produce `libwhisper.{dylib,so,dll}` as a symlink (or
 # copy on Windows) next to `libcrispasr`, pointing at the same file. Lets
