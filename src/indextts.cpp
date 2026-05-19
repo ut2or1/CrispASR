@@ -44,6 +44,27 @@
 #include <unordered_map>
 #include <vector>
 
+// External text-normalizer hook is available on macOS host + Linux only:
+//   * iOS / tvOS / watchOS / visionOS: system() is __API_UNAVAILABLE(ios)
+//     in the SDK (sandbox restriction).
+//   * Windows: no <unistd.h>, no mkstemp(); the POSIX subprocess plumbing
+//     this hook uses doesn't port cleanly. Windows users who need the
+//     wetext bridge can run the build under WSL.
+// Same guard pattern as src/crispasr_cache.cpp (curl/wget fallback) and
+// src/crispasr_mic.cpp / src/crispasr_audio.cpp (miniaudio device IO).
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(_WIN32)
+#define INDEXTTS_HAS_SUBPROCESS 0
+#else
+#define INDEXTTS_HAS_SUBPROCESS 1
+#endif
+
+#if INDEXTTS_HAS_SUBPROCESS
+#include <unistd.h> // unlink, close, write (external normalizer hook only)
+#endif
+
 namespace {
 
 // ── Hyperparameters ──────────────────────────────────────────────
@@ -130,6 +151,266 @@ struct indextts_tokenizer {
     std::vector<float> scores;
     bool loaded = false;
 };
+
+// UTF-8 helpers + upstream IndexTTS text preprocessing
+// (indextts/utils/front.py: TextNormalizer.char_rep_map → common.py:
+// tokenize_by_CJK_char). Without this, CJK characters run together and the
+// SentencePiece Viterbi produces a 29-token stream where upstream produces 53
+// (▁ separator between every CJK char), garbling Chinese output (issue #75
+// follow-up). English (ASCII-only) text is unaffected: no codepoint hits the
+// CJK ranges, so the pipeline collapses to "uppercase ASCII" — same as before.
+
+static int utf8_decode(const char* s, uint32_t& cp) {
+    unsigned char c = (unsigned char)s[0];
+    if (c < 0x80) {
+        cp = c;
+        return 1;
+    }
+    if ((c & 0xE0) == 0xC0) {
+        cp = ((uint32_t)(c & 0x1F) << 6) | (uint32_t)((unsigned char)s[1] & 0x3F);
+        return 2;
+    }
+    if ((c & 0xF0) == 0xE0) {
+        cp = ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)((unsigned char)s[1] & 0x3F) << 6) |
+             (uint32_t)((unsigned char)s[2] & 0x3F);
+        return 3;
+    }
+    if ((c & 0xF8) == 0xF0) {
+        cp = ((uint32_t)(c & 0x07) << 18) | ((uint32_t)((unsigned char)s[1] & 0x3F) << 12) |
+             ((uint32_t)((unsigned char)s[2] & 0x3F) << 6) | (uint32_t)((unsigned char)s[3] & 0x3F);
+        return 4;
+    }
+    cp = '?';
+    return 1;
+}
+
+static void utf8_encode(std::string& out, uint32_t cp) {
+    if (cp < 0x80) {
+        out += (char)cp;
+    } else if (cp < 0x800) {
+        out += (char)(0xC0 | (cp >> 6));
+        out += (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += (char)(0xE0 | (cp >> 12));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    } else {
+        out += (char)(0xF0 | (cp >> 18));
+        out += (char)(0x80 | ((cp >> 12) & 0x3F));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    }
+}
+
+// CJK_RANGE_PATTERN from upstream indextts/utils/common.py — Hangul Jamo,
+// CJK Unified + radicals + Bopomofo + kana + hangul syllables, CJK
+// compatibility, halfwidth katakana, CJK Extensions B–F.
+static bool is_cjk_codepoint(uint32_t cp) {
+    return (cp >= 0x1100 && cp <= 0x11FF) || (cp >= 0x2E80 && cp <= 0xA4CF) || (cp >= 0xA840 && cp <= 0xD7AF) ||
+           (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFE30 && cp <= 0xFE4F) || (cp >= 0xFF65 && cp <= 0xFFDC) ||
+           (cp >= 0x20000 && cp <= 0x2FFFF);
+}
+
+// TextNormalizer.char_rep_map (front.py) — CJK punctuation → ASCII. Critical:
+// 。 (U+3002, full-width period) is inside the CJK Unicode range used by
+// tokenize_by_CJK_char, so it MUST be mapped to "." BEFORE the range check
+// or the tokenizer splits it as a CJK character. With it mapped, the final
+// punct lands as SentencePiece piece "▁." (id 10203), matching upstream
+// behaviour and the model's expectation of a sentence-ending token. Without
+// it, the model produces an extra trailing syllable on Chinese inputs.
+//
+// We skip the full wetext normalizer (numbers→hanzi, English contractions,
+// pinyin tones) — that needs a real rule engine and is not blocking the
+// basic Chinese roundtrip.
+static uint32_t normalize_cjk_punct(uint32_t cp) {
+    switch (cp) {
+    case 0xFF1A:
+        return ','; // ：
+    case 0xFF1B:
+        return ','; // ；
+    case 0xFF0C:
+        return ','; // ，
+    case 0x3002:
+        return '.'; // 。
+    case 0xFF01:
+        return '!'; // ！
+    case 0xFF1F:
+        return '?'; // ？
+    case 0x3001:
+        return ','; // 、
+    case 0x00B7:
+        return '-'; // ·
+    case 0x201C:
+        return '\''; // “
+    case 0x201D:
+        return '\''; // ”
+    case 0x2018:
+        return '\''; // ‘
+    case 0x2019:
+        return '\''; // ’
+    case 0x300C:
+        return '\''; // 「
+    case 0x300D:
+        return '\''; // 」
+    case 0xFF08:
+        return '\''; // （
+    case 0xFF09:
+        return '\''; // ）
+    case 0x300A:
+        return '\''; // 《
+    case 0x300B:
+        return '\''; // 》
+    case 0x3010:
+        return '\''; // 【
+    case 0x3011:
+        return '\''; // 】
+    case 0x2014:
+        return '-'; // —
+    case 0xFF5E:
+        return '-'; // ～
+    default:
+        return 0;
+    }
+}
+
+// Optional external text-normalizer hook. When INDEXTTS_TEXT_NORMALIZER is
+// set, the input text is piped through that shell command (stdin → stdout)
+// before our in-process CJK preprocessor runs. Intended bridge for the
+// upstream wetext zh_normalizer (numbers→hanzi, dates, pinyin tones, etc.)
+// which we deliberately don't vendor — the WFST runtime + OpenFST
+// dependency is not worth carrying for a feature most TTS prompts don't
+// need.
+//
+// Recommended invocation (see tools/wetext-normalize.py):
+//   INDEXTTS_TEXT_NORMALIZER="python /path/to/tools/wetext-normalize.py"
+//
+// Any non-zero exit, empty stdout, or fork/exec failure silently falls back
+// to the raw text. The hook is not gated by language detection — users opt
+// in per invocation, and a no-op normalizer is no worse than not having
+// the hook at all.
+//
+// Security: the env var IS executed via system() — the user is the one
+// setting it. Don't expose this hook to untrusted input sources.
+//
+// iOS-family platforms (iOS, tvOS, watchOS, visionOS) cannot fork/exec
+// from a sandboxed app — system() is __API_UNAVAILABLE(ios) in the SDK
+// and the static-library build fails to link if we reference it. On
+// those platforms maybe_external_normalize collapses to a pass-through;
+// the env var, if set, is silently ignored.
+#if !INDEXTTS_HAS_SUBPROCESS
+static std::string maybe_external_normalize(const std::string& text) {
+    return text;
+}
+#else
+static std::string maybe_external_normalize(const std::string& text) {
+    const char* cmd = getenv("INDEXTTS_TEXT_NORMALIZER");
+    if (!cmd || !cmd[0]) {
+        return text;
+    }
+
+    char in_path[] = "/tmp/crispasr-tn-in-XXXXXX";
+    char out_path[] = "/tmp/crispasr-tn-out-XXXXXX";
+    int in_fd = mkstemp(in_path);
+    if (in_fd < 0) {
+        fprintf(stderr, "indextts: INDEXTTS_TEXT_NORMALIZER: mkstemp(in) failed; using raw text\n");
+        return text;
+    }
+    int out_fd = mkstemp(out_path);
+    if (out_fd < 0) {
+        close(in_fd);
+        unlink(in_path);
+        fprintf(stderr, "indextts: INDEXTTS_TEXT_NORMALIZER: mkstemp(out) failed; using raw text\n");
+        return text;
+    }
+    ssize_t wrote = write(in_fd, text.data(), text.size());
+    close(in_fd);
+    close(out_fd);
+    if (wrote != (ssize_t)text.size()) {
+        unlink(in_path);
+        unlink(out_path);
+        fprintf(stderr, "indextts: INDEXTTS_TEXT_NORMALIZER: short write; using raw text\n");
+        return text;
+    }
+
+    std::string shell_cmd = std::string(cmd) + " < " + in_path + " > " + out_path;
+    int rc = system(shell_cmd.c_str());
+
+    std::string out;
+    if (rc == 0) {
+        FILE* f = fopen(out_path, "rb");
+        if (f) {
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+                out.append(buf, n);
+            }
+            fclose(f);
+            // Strip trailing whitespace (a single trailing newline from print()
+            // is the common case, but be defensive).
+            while (!out.empty() &&
+                   (out.back() == '\n' || out.back() == '\r' || out.back() == ' ' || out.back() == '\t')) {
+                out.pop_back();
+            }
+        }
+    } else {
+        fprintf(stderr, "indextts: INDEXTTS_TEXT_NORMALIZER exited %d; using raw text\n", rc);
+    }
+    unlink(in_path);
+    unlink(out_path);
+
+    if (out.empty()) {
+        return text;
+    }
+    return out;
+}
+#endif // INDEXTTS_HAS_SUBPROCESS
+
+// Match Python upstream order: punct map → tokenize_by_CJK_char → upper().
+static std::string preprocess_indextts_text(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() * 2);
+    bool last_was_sep = true; // suppress a leading separator
+
+    for (size_t i = 0; i < text.size();) {
+        uint32_t cp = 0;
+        int n = utf8_decode(text.c_str() + i, cp);
+        if (n <= 0) {
+            break;
+        }
+        i += (size_t)n;
+
+        if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r') {
+            if (!last_was_sep) {
+                out += ' ';
+                last_was_sep = true;
+            }
+            continue;
+        }
+
+        if (uint32_t r = normalize_cjk_punct(cp)) {
+            cp = r;
+        }
+
+        if (is_cjk_codepoint(cp)) {
+            if (!last_was_sep) {
+                out += ' ';
+            }
+            utf8_encode(out, cp);
+            out += ' ';
+            last_was_sep = true;
+        } else {
+            if (cp >= 'a' && cp <= 'z') {
+                cp -= 32;
+            }
+            utf8_encode(out, cp);
+            last_was_sep = false;
+        }
+    }
+    while (!out.empty() && out.back() == ' ') {
+        out.pop_back();
+    }
+    return out;
+}
 
 // Simple character-level fallback tokenizer when BPE vocab is not available.
 // Each UTF-8 byte becomes its own token ID (clamped to vocab size).
@@ -2091,25 +2372,26 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
         }
     }
 
-    // 1. Uppercase text then tokenize (IndexTTS normalizer uppercases before BPE)
-    std::string text_upper;
-    for (const char* p = text; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-        if (c >= 'a' && c <= 'z')
-            text_upper += (char)(c - 32);
-        else
-            text_upper += (char)c;
-    }
+    // 1. Run upstream-equivalent text preprocessing (CJK punct map + CJK
+    //    char split + ASCII upper), then SentencePiece-encode.
+    std::string text_prepped = preprocess_indextts_text(maybe_external_normalize(text ? text : ""));
 
     std::vector<int32_t> text_tokens;
     if (ctx->tokenizer.loaded) {
-        text_tokens = tokenize_bpe(ctx->tokenizer, text_upper);
+        text_tokens = tokenize_bpe(ctx->tokenizer, text_prepped);
     } else {
-        text_tokens = tokenize_fallback(ctx->tokenizer, text_upper, ctx->hp.text_vocab_size);
+        text_tokens = tokenize_fallback(ctx->tokenizer, text_prepped, ctx->hp.text_vocab_size);
     }
 
     if (ctx->params.verbosity >= 1) {
-        fprintf(stderr, "indextts: text \"%s\" -> %zu tokens\n", text_upper.c_str(), text_tokens.size());
+        fprintf(stderr, "indextts: text \"%s\" -> %zu tokens\n", text_prepped.c_str(), text_tokens.size());
+    }
+    if (ctx->params.verbosity >= 2) {
+        fprintf(stderr, "indextts: text_ids[");
+        for (size_t i = 0; i < text_tokens.size(); i++) {
+            fprintf(stderr, "%s%d", i == 0 ? "" : ",", (int)text_tokens[i]);
+        }
+        fprintf(stderr, "]\n");
     }
 
     // 2. Allocate KV cache
@@ -2168,31 +2450,111 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
         fprintf(stderr, "\n");
     }
 
-    // 5. AR decode — beam search with per-beam KV snapshots and rep penalty.
-    // Matches Python's generate(num_beams=3, do_sample=False, repetition_penalty=10.0).
+    // 5. AR decode — beam search with rep penalty. Matches Python's
+    // generate(num_beams=3, do_sample=False, repetition_penalty=10.0).
     std::vector<int32_t> mel_codes;
     const int mel_vocab = (int)ctx->hp.mel_vocab_size;
     const int stop_token = (int)ctx->hp.stop_mel_token;
     const float rep_penalty = ctx->params.repetition_penalty;
-    const int B = 3; // beam size matching Python
+
+    // Beam size. Python uses 3 by default. Each step snapshots+restores the
+    // full ~158 MiB KV cache per beam. INDEXTTS_BEAM_SIZE=1 skips the swap
+    // entirely (greedy, ~2× faster).
+    int B = 3;
+    if (const char* bs = getenv("INDEXTTS_BEAM_SIZE")) {
+        int v = atoi(bs);
+        if (v >= 1 && v <= 16) {
+            B = v;
+        }
+    }
+
+    // Two KV-snapshot modes:
+    //   - host get/set into std::vector<uint8_t> per beam (default — what
+    //     IndexTTS originally shipped). Measured fastest on Apple Silicon
+    //     Metal: unified memory means the "host round-trip" is already a
+    //     shared-RAM memcpy with no extra blit-encoder overhead.
+    //   - device tensor_copy into a pool of B same-backend slot tensors
+    //     (opt-in via INDEXTTS_KV_DEVICE_COPY=1). Expected to win on
+    //     CUDA/Vulkan with discrete VRAM where get/set traverses real
+    //     PCIe; needs measurement on those backends before flipping the
+    //     default. Refcount-recycles slots when beam candidates share
+    //     a parent (children inherit parent's KV, only spend a copy when
+    //     siblings split off the same parent).
+    bool use_device_kv = false;
+    if (const char* e = getenv("INDEXTTS_KV_DEVICE_COPY")) {
+        use_device_kv = (atoi(e) != 0);
+    }
 
     struct Beam {
         std::vector<int32_t> tokens;
-        double score = 0.0;              // cumulative log-probability
-        std::vector<uint8_t> kv_k, kv_v; // KV snapshot
+        double score = 0.0;
+        std::vector<uint8_t> kv_k, kv_v; // host snapshot (host mode)
+        int slot_idx = -1;               // pool slot index (device mode)
         bool finished = false;
     };
 
-    auto save_kv = [&](std::vector<uint8_t>& k, std::vector<uint8_t>& v) {
-        k.resize(ggml_nbytes(ctx->kv_k));
-        v.resize(ggml_nbytes(ctx->kv_v));
-        ggml_backend_tensor_get(ctx->kv_k, k.data(), 0, k.size());
-        ggml_backend_tensor_get(ctx->kv_v, v.data(), 0, v.size());
+    struct BeamPool {
+        ggml_context* ctx = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+        std::vector<ggml_tensor*> k, v;
+        ~BeamPool() {
+            if (buf) {
+                ggml_backend_buffer_free(buf);
+            }
+            if (ctx) {
+                ggml_free(ctx);
+            }
+        }
+    } beam_pool;
+    if (use_device_kv) {
+        const int hd = (int)ctx->hp.head_dim;
+        const int n_h = (int)ctx->hp.n_heads;
+        const int nl = (int)ctx->hp.n_layers;
+        struct ggml_init_params ip = {(size_t)(2 * B * ggml_tensor_overhead()), nullptr, true};
+        beam_pool.ctx = ggml_init(ip);
+        if (!beam_pool.ctx) {
+            fprintf(stderr, "indextts: failed to init beam KV pool\n");
+            return nullptr;
+        }
+        beam_pool.k.resize(B);
+        beam_pool.v.resize(B);
+        for (int i = 0; i < B; i++) {
+            beam_pool.k[i] = ggml_new_tensor_4d(beam_pool.ctx, GGML_TYPE_F32, hd, ctx->kv_max_ctx, n_h, nl);
+            beam_pool.v[i] = ggml_new_tensor_4d(beam_pool.ctx, GGML_TYPE_F32, hd, ctx->kv_max_ctx, n_h, nl);
+        }
+        beam_pool.buf = ggml_backend_alloc_ctx_tensors(beam_pool.ctx, ctx->backend);
+        if (!beam_pool.buf) {
+            fprintf(stderr, "indextts: failed to alloc beam KV pool buffer (B=%d, %d MiB)\n", B,
+                    (int)(B * (ggml_nbytes(ctx->kv_k) + ggml_nbytes(ctx->kv_v)) / 1048576));
+            return nullptr;
+        }
+        if (ctx->params.verbosity >= 1) {
+            size_t per_slot = ggml_nbytes(ctx->kv_k) + ggml_nbytes(ctx->kv_v);
+            fprintf(stderr, "indextts: beam KV pool: B=%d × %d MiB = %d MiB device-resident (device-copy mode)\n", B,
+                    (int)(per_slot / 1048576), (int)(B * per_slot / 1048576));
+        }
+    }
+
+    auto save_kv = [&](Beam& beam) {
+        if (use_device_kv) {
+            ggml_backend_tensor_copy(ctx->kv_k, beam_pool.k[beam.slot_idx]);
+            ggml_backend_tensor_copy(ctx->kv_v, beam_pool.v[beam.slot_idx]);
+        } else {
+            beam.kv_k.resize(ggml_nbytes(ctx->kv_k));
+            beam.kv_v.resize(ggml_nbytes(ctx->kv_v));
+            ggml_backend_tensor_get(ctx->kv_k, beam.kv_k.data(), 0, beam.kv_k.size());
+            ggml_backend_tensor_get(ctx->kv_v, beam.kv_v.data(), 0, beam.kv_v.size());
+        }
     };
 
-    auto restore_kv = [&](const std::vector<uint8_t>& k, const std::vector<uint8_t>& v) {
-        ggml_backend_tensor_set(ctx->kv_k, k.data(), 0, k.size());
-        ggml_backend_tensor_set(ctx->kv_v, v.data(), 0, v.size());
+    auto restore_kv = [&](const Beam& beam) {
+        if (use_device_kv) {
+            ggml_backend_tensor_copy(beam_pool.k[beam.slot_idx], ctx->kv_k);
+            ggml_backend_tensor_copy(beam_pool.v[beam.slot_idx], ctx->kv_v);
+        } else {
+            ggml_backend_tensor_set(ctx->kv_k, beam.kv_k.data(), 0, beam.kv_k.size());
+            ggml_backend_tensor_set(ctx->kv_v, beam.kv_v.data(), 0, beam.kv_v.size());
+        }
     };
 
     // Compute full log-softmax over vocabulary, then apply rep penalty to log-probs.
@@ -2228,18 +2590,28 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
         return log_probs;
     };
 
-    // Seed beams from prefill logits (no rep penalty — empty history at first step)
+    // Seed beams from prefill logits (no rep penalty — empty history at first step).
     std::vector<Beam> beams;
     {
-        // Save post-prefill KV
+        // Snapshot the post-prefill KV state. Host mode: one get to a shared
+        // scratch buffer reused by all initial beams; device mode: copy
+        // ctx->kv_k into every pool slot up front.
         std::vector<uint8_t> prompt_k, prompt_v;
-        save_kv(prompt_k, prompt_v);
+        if (!use_device_kv) {
+            prompt_k.resize(ggml_nbytes(ctx->kv_k));
+            prompt_v.resize(ggml_nbytes(ctx->kv_v));
+            ggml_backend_tensor_get(ctx->kv_k, prompt_k.data(), 0, prompt_k.size());
+            ggml_backend_tensor_get(ctx->kv_v, prompt_v.data(), 0, prompt_v.size());
+        } else {
+            for (int b = 0; b < B; b++) {
+                ggml_backend_tensor_copy(ctx->kv_k, beam_pool.k[b]);
+                ggml_backend_tensor_copy(ctx->kv_v, beam_pool.v[b]);
+            }
+        }
 
-        // Compute log-probs (no history for first step, so no penalty applied)
         std::vector<int32_t> empty_hist;
         auto lp = compute_log_probs(logits, empty_hist);
 
-        // Find top-B from log-probabilities
         std::vector<std::pair<double, int>> scored(mel_vocab);
         for (int i = 0; i < mel_vocab; i++)
             scored[i] = {lp[i], i};
@@ -2250,8 +2622,12 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
             Beam beam;
             beam.tokens.push_back(scored[b].second);
             beam.score = scored[b].first;
-            beam.kv_k = prompt_k;
-            beam.kv_v = prompt_v;
+            if (use_device_kv) {
+                beam.slot_idx = b;
+            } else {
+                beam.kv_k = prompt_k;
+                beam.kv_v = prompt_v;
+            }
             beam.finished = (scored[b].second == stop_token);
             beams.push_back(std::move(beam));
         }
@@ -2290,8 +2666,7 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
                 continue;
             }
 
-            // Restore KV and step with last token
-            restore_kv(beam.kv_k, beam.kv_v);
+            restore_kv(beam);
             // Python's GPT2InferenceModel uses mel_pos = attention_mask_len - mel_len.
             // start_mel gets mel_pos[0] at prefill, then mel_pos[1] is skipped,
             // and generated tokens get mel_pos[step+1] where step starts at 1.
@@ -2303,8 +2678,7 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
             if (!lg)
                 continue;
 
-            // Save post-step KV
-            save_kv(beam.kv_k, beam.kv_v);
+            save_kv(beam);
 
             // Compute log-probs then apply rep penalty (matching HF order)
             auto lp = compute_log_probs(lg, beam.tokens);
@@ -2325,20 +2699,67 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
                           [](auto& a, auto& b) { return a.score > b.score; });
         int keep = std::min((int)cands.size(), B);
 
+        // Build the next generation. In host mode each child gets a vector
+        // copy of its parent's snapshot. In device mode each child needs a
+        // pool slot, and we recycle: a slot that no surviving child still
+        // references becomes free, and siblings that all want the same
+        // parent slot duplicate via ggml_backend_tensor_copy into a free
+        // slot. Slot math: |children| == B, distinct parents referenced
+        // == P; free slots == B - P; sibling copies needed == B - P;
+        // balanced.
         std::vector<Beam> next;
-        for (int i = 0; i < keep; i++) {
-            auto& c = cands[i];
-            Beam nb;
-            nb.tokens = beams[c.parent].tokens;
-            nb.kv_k = beams[c.parent].kv_k;
-            nb.kv_v = beams[c.parent].kv_v;
-            nb.score = c.score;
-            if (c.token == stop_token) {
-                nb.finished = true;
-            } else {
-                nb.tokens.push_back(c.token);
+        if (use_device_kv) {
+            std::vector<int> slot_refs(B, 0);
+            for (int i = 0; i < keep; i++) {
+                slot_refs[beams[cands[i].parent].slot_idx]++;
             }
-            next.push_back(std::move(nb));
+            std::vector<int> free_slots;
+            for (int s = 0; s < B; s++) {
+                if (slot_refs[s] == 0) {
+                    free_slots.push_back(s);
+                }
+            }
+            std::vector<uint8_t> claimed(B, 0);
+            for (int i = 0; i < keep; i++) {
+                auto& c = cands[i];
+                int parent_slot = beams[c.parent].slot_idx;
+                int child_slot;
+                if (!claimed[parent_slot]) {
+                    child_slot = parent_slot;
+                    claimed[parent_slot] = 1;
+                } else {
+                    GGML_ASSERT(!free_slots.empty() && "beam KV slot accounting bug");
+                    child_slot = free_slots.back();
+                    free_slots.pop_back();
+                    ggml_backend_tensor_copy(beam_pool.k[parent_slot], beam_pool.k[child_slot]);
+                    ggml_backend_tensor_copy(beam_pool.v[parent_slot], beam_pool.v[child_slot]);
+                }
+                Beam nb;
+                nb.tokens = beams[c.parent].tokens;
+                nb.slot_idx = child_slot;
+                nb.score = c.score;
+                if (c.token == stop_token) {
+                    nb.finished = true;
+                } else {
+                    nb.tokens.push_back(c.token);
+                }
+                next.push_back(std::move(nb));
+            }
+        } else {
+            for (int i = 0; i < keep; i++) {
+                auto& c = cands[i];
+                Beam nb;
+                nb.tokens = beams[c.parent].tokens;
+                nb.kv_k = beams[c.parent].kv_k;
+                nb.kv_v = beams[c.parent].kv_v;
+                nb.score = c.score;
+                if (c.token == stop_token) {
+                    nb.finished = true;
+                } else {
+                    nb.tokens.push_back(c.token);
+                }
+                next.push_back(std::move(nb));
+            }
         }
         beams = std::move(next);
     }
@@ -2415,17 +2836,15 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
         return nullptr;
     }
 
-    // Step 2: Re-tokenize text (uppercased) for latent pass
-    std::string text_upper2;
-    for (const char* p = text; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-        text_upper2 += (c >= 'a' && c <= 'z') ? (char)(c - 32) : (char)c;
-    }
+    // Step 2: Re-tokenize text for latent pass — must match the prefill
+    // tokenization, otherwise the latent positions don't align with the
+    // hidden states the GPT actually saw during generate().
+    std::string text_prepped2 = preprocess_indextts_text(maybe_external_normalize(text ? text : ""));
     std::vector<int32_t> text_tokens;
     if (ctx->tokenizer.loaded) {
-        text_tokens = tokenize_bpe(ctx->tokenizer, text_upper2);
+        text_tokens = tokenize_bpe(ctx->tokenizer, text_prepped2);
     } else {
-        text_tokens = tokenize_fallback(ctx->tokenizer, text_upper2, ctx->hp.text_vocab_size);
+        text_tokens = tokenize_fallback(ctx->tokenizer, text_prepped2, ctx->hp.text_vocab_size);
     }
 
     std::vector<int32_t> mel_codes_vec(codes, codes + n_codes);
@@ -2447,17 +2866,24 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
     if (ref_pcm && ref_n_samples > 0 && ctx->voc) {
         spk_emb = indextts_voc_speaker_embed(ctx->voc, ref_pcm, ref_n_samples);
         if (spk_emb) {
-            // L2-normalize the speaker embedding to match Python's output magnitude (~0.9).
-            // Our ECAPA BN produces 3x-4x the norm of Python's, likely due to
-            // subtle BatchNorm differences. Normalizing prevents the vocoder from
-            // being overwhelmed by the speaker conditioning signal.
-            float norm = 0.0f;
+            float raw_norm = 0.0f;
             for (int i = 0; i < 512; i++)
-                norm += spk_emb[i] * spk_emb[i];
-            norm = sqrtf(norm);
-            if (norm > 1e-6f) {
-                float target_norm = 0.9f; // Python's typical speaker embedding norm
-                float scale = target_norm / norm;
+                raw_norm += spk_emb[i] * spk_emb[i];
+            raw_norm = sqrtf(raw_norm);
+
+            // Upstream BigVGAN feeds the raw ECAPA output (no L2 norm) into
+            // cond_layer/conds. The previous "clamp to 0.9" workaround masked a
+            // suspected ECAPA BN magnitude bug at the cost of fixing the speaker
+            // conditioning energy. INDEXTTS_SPK_NORM controls the behaviour:
+            //   unset / "raw"   → pass through unchanged (matches upstream)
+            //   "0.9" / "1.0" …→ rescale to that L2 norm (old behaviour)
+            const char* spk_norm_env = getenv("INDEXTTS_SPK_NORM");
+            float target_norm = 0.0f;
+            if (spk_norm_env && spk_norm_env[0] && strcmp(spk_norm_env, "raw") != 0) {
+                target_norm = (float)atof(spk_norm_env);
+            }
+            if (target_norm > 0.0f && raw_norm > 1e-6f) {
+                float scale = target_norm / raw_norm;
                 for (int i = 0; i < 512; i++)
                     spk_emb[i] *= scale;
             }
@@ -2465,7 +2891,8 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
                 float n2 = 0;
                 for (int i = 0; i < 512; i++)
                     n2 += spk_emb[i] * spk_emb[i];
-                fprintf(stderr, "indextts: speaker embedding norm = %.4f (normalized)\n", sqrtf(n2));
+                fprintf(stderr, "indextts: speaker embedding norm = %.4f (raw=%.4f, target=%s)\n", sqrtf(n2), raw_norm,
+                        target_norm > 0.0f ? "clamped" : "raw");
             }
         }
     }

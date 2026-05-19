@@ -31,7 +31,8 @@ public:
         // get nothing. With the cap absent, `-dl` correctly routes
         // through the whisper-tiny pre-step.
         return CAP_TIMESTAMPS_NATIVE | CAP_WORD_TIMESTAMPS | CAP_TOKEN_CONFIDENCE | CAP_FLASH_ATTN |
-               CAP_PUNCTUATION_TOGGLE | CAP_TEMPERATURE | CAP_DIARIZE | CAP_PARALLEL_PROCESSORS | CAP_AUTO_DOWNLOAD;
+               CAP_PUNCTUATION_TOGGLE | CAP_TEMPERATURE | CAP_DIARIZE | CAP_PARALLEL_PROCESSORS | CAP_AUTO_DOWNLOAD |
+               CAP_UNBOUNDED_INPUT;
     }
 
     bool init(const whisper_params& p) override {
@@ -45,6 +46,16 @@ public:
         if (!ctx_) {
             fprintf(stderr, "crispasr[parakeet]: failed to load model '%s'\n", p.model.c_str());
             return false;
+        }
+        // CTC decode mode (hybrid TDT+CTC models).
+        if (p.parakeet_decoder == "ctc") {
+            if (parakeet_has_ctc(ctx_)) {
+                parakeet_set_ctc_mode(ctx_, true);
+                if (!p.no_prints)
+                    fprintf(stderr, "crispasr[parakeet]: using CTC decoder\n");
+            } else {
+                fprintf(stderr, "crispasr[parakeet]: --parakeet-decoder ctc requested but model has no CTC head\n");
+            }
         }
         return true;
     }

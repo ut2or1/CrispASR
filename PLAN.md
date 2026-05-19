@@ -28,28 +28,19 @@ test-all-backends.py passes 18/18 transcribe + 51/54 feature tests (3 stream ski
 | Priority | Item | Effort | Status |
 |---|---|---|---|
 | **MEDIUM** | [#52 Qwen3-TTS](#52-qwen3-tts) — perf pass | Medium | talker + code_predictor + codec + ECAPA + codec_encoder all done; only step-4 perf pass open (~137 ms/frame → real-time) |
-| **HIGH** | [#57 Commercial-friendly TTS expansion](#57-commercial-friendly-tts-backend-expansion) | Phased | Phases 1-3 DONE; Turbo WORKING (2026-05-04) — 5 encoder bugs fixed, encoder exact match, ASR "Hello world" p=0.939; F0 wired in; native voice cloning DONE 2026-05-09 (modules 2/3/4 + atomic install → HISTORY §82); chatterbox auto-falls-back to CPU (#83 ggml-Metal F16 drift workaround — `CRISPASR_CHATTERBOX_FORCE_GPU=1` to override); remaining: **#83 ggml-Metal F16 drift** (root cause LOCALIZED 2026-05-10 — `ggml/src/ggml-metal/ggml-metal.metal` legacy `kernel_mul_mm` line 9590 explicitly rounds F32 input B to F16 in shmem before the simdgroup matmul → ~1e-3 K-projection drift over K=1024 dot products; LEARNINGS §"Root cause located — ggml-metal kernel_mul_mm legacy path"; fix = add `_hp` mul_mm variants with `S0=S1=float`, dispatch via `GGML_PREC_F32` op_param flag, hint chatterbox QKV/out/FFN projections), C API, quant GGUFs, Kartoffelbox_Turbo DE |
+| **HIGH** | [#57 Commercial-friendly TTS expansion](#57-commercial-friendly-tts-backend-expansion) | Phased | Phases 1-3 DONE; Turbo WORKING; F0 wired in; native voice cloning shipped → HISTORY §82; **#83 GPU-Metal drift re-bisected 2026-05-19 → HISTORY 2026-05-19** — T3 round-4 kernel fixes (Q4_K×Q8_K + `_hp` mul_mm + PREC_F32) clean T3 on GPU; the remaining user-audible bug lives in S3Gen UNet1D compound Metal precision drift across mul_mat/FA/norm/add/gelu/tanh/softplus, not a single op (op-bisect via `CRISPASR_S3GEN_UNET_PIN_CPU_OP=<op>`). Metal default flipped to full CPU (T3 launch overhead × 86 AR steps makes M1 GPU 1.5× slower than CPU); `CRISPASR_CHATTERBOX_T3_GPU=1` opts back in. Remaining: deep ggml-metal precision audit for the S3Gen UNet kernels (or wait for M3/M4 + CUDA bisect), Kartoffelbox_Turbo DE |
 | **MEDIUM** | [#51c MiMo-V2.5-ASR F16 step decode](#51c-f16-step-decode) | Small | F16 step-decode validation blocked behind ≥32 GB box (see PLAN #51c); base runtime + Q4_K shipped → HISTORY §56 |
 | **MEDIUM** | [#56 Kokoro multilingual phonemizer](#56-kokoro-multilingual-phonemizer-espeak-ng) | Small | espeak-ng + DE backbone shipped; HF GGUFs published 2026-05-01; auto-download wired; only Mandarin tones / JA kanji + diff-harness phonemizer-step polish remain |
 | **MEDIUM** | [#58 MOSS-Audio-4B-Instruct](#58-moss-audio-4b-instruct) | Large | first audio-understanding (not just ASR) backend; introduces DeepStack cross-layer feature injection |
 | **MEDIUM** | [#59 Cross-binding C-ABI parity](#59-cross-binding-c-abi-parity) | Medium | Go now has full surface (✅ all 11 capabilities). Java has transcribe+align+LID. Ruby has transcribe. JS needs WebAssembly approach |
-| **DONE** | [#60 llama.cpp/llamafile perf trick ports](#60-cross-backend-perf-tricks-llamacpp--llamafile-ports) | 14 items | 60a-g DONE; 60e Q8_0 KV validated on 7 backends (all bit-exact or WER=0%); 60h-n parked/skip → HISTORY §63, §64, §71, §75 |
-| **DONE** | #41 Moonshine IPA / phoneme | — | Superseded by kokoro espeak-ng phonemizer (#56) |
 | **PARKED** | [#9 Parakeet TDT GPU](#9-parakeet-tdt-decoder-gpu) | Medium | Encoder 85%+ of time; LSTM+joint <0.7s; sequential steps limit GPU benefit |
-| **DONE** | [#11 WebSocket server](#11-websocket-streaming-server) | Medium | RFC 6455 WS on port+1, binary PCM in, JSON text out |
-| **DONE** | [#7 voxtral4b streaming](#7-native-voxtral4b-streaming) | High | Phases 1-4 shipped → HISTORY §71 |
-| **DONE** | [#62 Streaming + mic library API](#62-streaming--mic-library-api) | M-L | All wrappers ship it → HISTORY §73, §76 |
-| **DONE** | [#63 Feature matrix parity](#63-feature-matrix-parity) | Phased | All 9 phases → HISTORY §72 |
 | **BLOCKED** | [#42 VibeVoice-ASR 7B](#42-vibevoice-asr-7b) | High | Needs ≥16 GB RAM |
 | **BLOCKED** | [#43 Fun-ASR-Nano](#43-fun-asr-nano) | Medium | License unclear |
-| **DONE** | [#75 /v1/audio/speech OpenAI parity round 1](#75-v1audiospeech-openai-feature-parity-round-1) | Small-Medium | PR #63 merged + corrective batch (`d35940b`…`85302c5`) + 75a/75b (`b932fa9`) + 75d chunking (`0bff2d7`) shipped 2026-05-05; 75c-opt-1 (server-side speed resampler) included in `b932fa9`. Pending: 75c-opt-2 native-backend duration knobs, 75e (streaming/mp3/upload) — each its own work item. → HISTORY §81 |
 | **MEDIUM** | [#80 nano-cohere-transcribe-inspired tweaks](#80-nano-cohere-transcribe-inspired-perf--chunking-tweaks) | Small | 80c done; 80b energy chunker in progress; 80a parked (measurement: <1 % of wall on Metal); 80d/80e TODO |
 | **DEFERRED** | [#81 Nemotron-Speech-Streaming-EN-0.6B](#81-nemotron-speech-streaming-en-06b--first-cache-aware-streaming-native-asr) | M-L | NVOML license, ~60–75 % reuse from parakeet/canary; the new bit is cache-aware FastConformer streaming. Wait for `--stream-json` (issue #84) to settle + a second user request (only mention so far is issue #85) before starting. |
 | **MEDIUM** | [#86 Per-backend flash-attention wiring](#86-per-backend-flash-attention-wiring-crisperweaver-driven) | 2–3 days | Plumbing shipped 0.6.2; kernel-level wiring per backend is the remaining work. Whisper done; orpheus/chatterbox-T3 are the next-best pickings. |
 | **LOW** | [#87 `gpu_backend` runtime selector](#87-gpu_backend-runtime-selector-multi-backend-ggml-build) | ~1 week | Needs ggml-side multi-backend dispatch to land first. CrisperWeaver UI placeholder ready when the C-side is. |
-| **DONE** | #88 Kokoro length-scale + vibevoice diffusion steps | 1 day combined | Both backend-internal refactors shipped → [HISTORY §85](HISTORY.md). `kokoro_set_length_scale` + `vibevoice_set_tts_steps` runtime setters on the per-backend API; `crispasr_session_set_length_scale` + `_set_tts_steps` on the unified API. CrisperWeaver's TTS speed slider drives both. |
-| **DONE** | #89 Flash-attn field migration | ~2 hours | Mechanical plumbing across 12 backends shipped → [HISTORY §84](HISTORY.md). Prereq for #86 closed. |
-| **DONE** | #90 TitaNet speaker verification + speaker ID | 1 day | TitaNet-Large GGUF converter + pure-CPU runtime + speaker profile DB + CLI + C-ABI + wrappers. cos=0.9999 vs NeMo. → [HISTORY §89](HISTORY.md) |
+| **LOW** | [#95 IndexTTS Chinese TN binary alternative](#95-indextts-15-chinese-tn--binary-alternative-to-the-python-wetext-hook) | survey only | Python `INDEXTTS_TEXT_NORMALIZER` hook shipped 2026-05-19. Hand-roll (#95a) is the right next step *when* a user reports a digit/date prompt that breaks; OpenFST vendoring (#95b) only after #95a grows past ~5 cases. |
 
 **Recently completed** (full write-ups in HISTORY.md): **#57 chatterbox native voice clone → §82** (six-commit sprint shipping all four upstream cond extractors — VoiceEncoder LSTM, S3Tokenizer V2, CAMPPlus, 24 kHz Matcha mel — plus a Kaiser-windowed sinc resampler and atomic 5-cond install in `chatterbox_set_voice_from_wav`'s `.wav` branch; `--voice ref_24k.wav` produces real cloned speech without any python). **#69 + #72 + #73 cap-honesty + KV/layer offload knobs → §79** (14-commit session shipping `CRISPASR_KV_QUANT_K/_V` + `KV_ON_CPU` on 14 backends, `N_GPU_LAYERS` on 10 backends, gemma4/mimo GPU-residency 2.2x / 22 % faster, plus cap-honesty cleanup on parakeet/glm-asr/qwen3/gemma4/omniasr). **vibevoice #69a follow-up → §79b** (mode-aware `tts_lm.layers.` / `lm.layers.` prefix predicate). #78 Chatterbox vocoder → §78. #11 WebSocket server → §76, #63 Feature matrix parity → §72, #59 binding parity → §73, gemma4 #49 + Docker #31 → §74, tests + KV Q8_0 + cleanup → §75. Earlier: #5→§63, #16→§55, #51→§56, #51b→§60, #53→§63, #54→§61, #55→§54, #56→§63, #60d→§64.
 
@@ -78,20 +69,6 @@ argument order fixed for F16 kernels.
 
 ---
 
-## ~~41. Moonshine phoneme / IPA output~~ — **SUPERSEDED by kokoro espeak-ng phonemizer (#56)**
-
----
-
-## ~~5. Reference backends for parakeet/canary/cohere~~ — **DONE → [HISTORY §63](HISTORY.md)**
-
----
-
-## ~~7. Native voxtral4b streaming~~ — **DONE → [HISTORY §71](HISTORY.md)**
-
-Phases 1-4 shipped (batch-encoder-at-flush, incremental encoder, fused QKV, live captions, decoder thread). First-text-token: 2674 ms → 650 ms. Phase 5 (dual-sched Metal parallelism) deferred.
-
----
-
 ## 9. Parakeet TDT decoder GPU
 
 Port LSTM predictor + joint head from CPU loops to ggml graphs. LSTM
@@ -111,18 +88,6 @@ speedup from GPU is already the dominant improvement.
 **Effort:** ~150 LOC. Small gain.
 
 ---
-
-## ~~11. WebSocket streaming server~~ — **DONE → [HISTORY §76](HISTORY.md)**
-
----
-
-
-## ~~16. Shaw RPE for granite graph~~ — **DONE → [HISTORY §55](HISTORY.md)**
-
-`GRANITE_DISABLE_ENCODER_GRAPH=1` is the unified escape hatch.
-
----
-
 
 ## 42. VibeVoice-ASR 7B
 
@@ -144,13 +109,12 @@ No response. HF model card has no license field.
 
 ---
 
-## ~~51. MiMo-V2.5-ASR runtime~~ — **DONE → [HISTORY §56](HISTORY.md) + [§64](HISTORY.md)**
+## 51c. MiMo-V2.5-ASR F16 step decode — open
 
-Base runtime + Q4_K + fused-QKV layout shipped. Sub-items 51a (mmap
-loader → [HISTORY §62](HISTORY.md), env flag `CRISPASR_GGUF_MMAP=1`)
-and 51b (step-decode KV cache reuse → [HISTORY §60](HISTORY.md))
-also DONE. Only 51c (F16 step decode) is still open — blocked
-behind ≥32 GB RAM for end-to-end validation.
+Base runtime + Q4_K + fused-QKV layout shipped → HISTORY §56 + §64.
+Sub-items 51a (mmap loader → HISTORY §62) and 51b (step-decode KV
+cache reuse → HISTORY §60) also DONE. Only this F16 step decode is
+still open — blocked behind ≥32 GB RAM for end-to-end validation.
 
 ### 51c. F16 step decode
 
@@ -248,20 +212,11 @@ share enough that landing one substantially de-risks the other.
 
 ---
 
-## ~~54. granite-speech-4.1 plus / nar variants~~ — **DONE → [HISTORY §61](HISTORY.md)**
+## 54-follow-up. granite-speech-4.1 plus speaker labels + word timestamps — open
 
-All three variants (`granite-4.1`, `granite-4.1-plus`, `granite-4.1-nar`) shipped bit-exact on JFK; HF GGUFs published. Open follow-up: speaker labels + word-level timestamps for the `plus` variant via chat_template (~50 LOC, template-only).
-
----
-
-## ~~53. Two narrow extractions for shared TTS-codec patterns~~ — **DONE → [HISTORY §63](HISTORY.md)**
-
-`core_act::snake_beta` + `core_convt::convt1d_crop` shipped (qwen3-tts codec + SNAC both delegate).
-
----
-
-
-## ~~55. granite-family DRY refactor~~ — **DONE → [HISTORY §54](HISTORY.md)**
+Variants 4.1 / 4.1-plus / 4.1-nar shipped bit-exact on JFK → HISTORY
+§61. Remaining: speaker labels + word-level timestamps for the `plus`
+variant via chat_template (~50 LOC, template-only).
 
 ---
 
@@ -1202,9 +1157,12 @@ for the pattern: `4f476c3` (TTS surface sweep) and `65e0a61`
 
 ---
 
-## ~~60. Cross-backend perf tricks (llama.cpp / llamafile ports)~~ — **DONE → [HISTORY §63, §64, §71, §75](HISTORY.md)**
+## 60o. MTLBinaryArchive Metal pipeline cache — open
 
-60a-g shipped (madvise WILLNEED, wrap_iface, preload, fused QKV, KV Q8_0 on 9 backends, mlock, MADV_RANDOM). 60h-n parked/skip. 60o (MTLBinaryArchive pipeline cache) remains OPEN — see below.
+Parent #60 (cross-backend perf tricks) shipped 60a–g → HISTORY §63 /
+§64 / §71 / §75 (madvise WILLNEED, wrap_iface, preload, fused QKV,
+KV Q8_0 on 9 backends, mlock, MADV_RANDOM). 60h–n parked. Only 60o
+below is still open.
 
 ### 60o (OPEN). MTLBinaryArchive Metal pipeline cache
 
@@ -1257,12 +1215,12 @@ weight loads.
 
 ---
 
-## ~~65. Session-API word-confidence parity~~ — **DONE → [HISTORY §65](HISTORY.md)**
+## 65-residual. JS / emscripten word-accessor surface — open
 
-Main batch + 65a (vibevoice / moonshine-streaming) + 65a-residue
-(gemma4-e2b token-prob API) all landed. Go/Java/Ruby brought to
-parity in `5534588` + `d963e3a`. **Only residual:** JS / emscripten
-word-accessor surface — leaving until a JS consumer asks (the
+Parent #65 (session-API word-confidence parity) shipped → HISTORY §65
+(main batch + vibevoice / moonshine-streaming + gemma4-e2b token-prob
+API + Go/Java/Ruby parity in `5534588` + `d963e3a`). Only residual:
+JS/emscripten word accessors — leaving until a JS consumer asks (the
 current JS binding is TTS-focused).
 
 ---
@@ -1374,12 +1332,6 @@ sampler can constrain output. Pure plumbing per backend.
 Each step must pass: golden JFK transcript unchanged, the new ✔
 shows up in `crispasr --list-backends`, README matrix line updated,
 `warn_unsupported` no longer fires for the toggled flag.
-
----
-
-## ~~62. Streaming + mic library API~~ — **DONE → [HISTORY §73, §76](HISTORY.md)**
-
-All streaming + mic sub-items shipped. Session stream API, Python/Rust/Dart/Go wrappers, miniaudio mic, kyutai-stt + moonshine chunked-batch streaming, voxtral4b native streaming (PLAN #7). Init-only flag refactor deferred.
 
 ---
 
@@ -1548,319 +1500,6 @@ any build-matrix combination there isn't covered by the new
 
 ---
 
-## ~~63. Feature matrix parity~~ — **DONE → [HISTORY §72](HISTORY.md)**
-
-All 9 phases shipped: beam search (granite + qwen3), flash-attn declarations (6 backends), auto-download (omniasr + mimo-asr), CTC timestamps (5 backends), auto-punctuation (4 CTC backends), best-of-N SDK surface, capability declaration fixes, vibevoice CLI adapter confirmed, translation investigated (not feasible for cohere/glm-asr).
-
-
-## ~~69. Layer + KV CPU-offload knobs (llama.cpp parity)~~ — FUNCTIONALLY SHIPPED 2026-05-04 → [HISTORY §79](HISTORY.md)
-
-#69b (KV-on-CPU) and #69e (asymmetric K/V quant) shipped on **14 backends**. #69a (layer offload) shipped on **10 backends** (vibevoice closed via §79b — mode-aware prefix predicate). Three knobs stack — see §79 for the combined-config example.
-
-Original detailed write-up retained below for reference:
-
-
-
-**Effort:** Medium-large per backend (~150-200 LOC for the
-weight-residency-aware variant — see scope note below). Originally
-estimated at 50-80 LOC; that turned out to be the *compute-only*
-pattern, which doesn't actually solve the VRAM-pressure problem
-this PLAN entry exists for.
-
-**Two valid designs, only one is useful for #60's case.**
-
-**(a) Compute-only offload** (~50 LOC, kokoro / vibevoice pattern).
-Walk the built graph, call
-`ggml_backend_sched_set_tensor_backend(sched, node, backend_cpu)`
-on the output tensors of layers `il >= n_gpu_layers`. The sched
-handles GPU↔CPU transfers at the op boundary. Weights stay on
-GPU buffer; only the compute moves. Useful for "this op is broken
-on this GPU" (Metal conv_transpose_1d hang, Intel Vulkan workgroup
-limit), useless for "model doesn't fit."
-
-**(b) Weight-residency offload** (~150-200 LOC, llama.cpp's
-`--n-gpu-layers` pattern). Allocate two backend buffers at load
-time: first N layers go on `c->backend` (GPU), rest on
-`c->backend_cpu`. Each `voxtral4b_block` stores tensor pointers
-that already live on the right backend. Graph builder produces
-ops naturally placed by sched (each op's compute follows its
-input weights). Properly fits the VRAM use case — N can be tuned
-down until the GPU residence fits in available VRAM.
-
-**For #60's voxtral4b VRAM problem, only (b) is useful.** The user
-worked around it with `CRISPASR_KV_QUANT=q4_0 + CRISPASR_GGUF_MMAP=1`
-(both already shipped); that combo is the recommended interim
-answer until (b) lands.
-
-**Background.** External feature request via #60: Voxtral 4B
-specifically needs the ability to offload N transformer blocks to
-CPU and / or pin the KV cache to CPU on GPU-weight builds. llama.cpp
-exposes `--n-gpu-layers N` for this; we currently have no
-equivalent. Today's escape hatches against VRAM pressure are:
-
-- `CRISPASR_KV_QUANT=q8_0|q4_0` — halve / quarter the KV cache
-  (already shipped, PLAN #60e, 9+ backends incl. voxtral4b)
-- `CRISPASR_GGUF_MMAP=1` — don't double-allocate weights on load
-  (already shipped, PLAN #51a / HISTORY §62)
-
-That covers steady-state footprint, but not the case where the
-model itself doesn't fit in VRAM. For that we'd need per-block
-placement.
-
-### 69a. N-layer CPU offload — `--n-gpu-layers` / env equivalent — VOXTRAL4B SHIPPED 2026-05-04, REST OPEN
-
-The pattern to mirror is `src/kokoro.cpp:2174`'s per-op CPU pinning,
-generalised to "first N transformer blocks":
-
-```cpp
-const int n_gpu_layers = env_int_default("CRISPASR_N_GPU_LAYERS", -1);  // -1 = all
-if (n_gpu_layers >= 0 && n_gpu_layers < (int)hp.n_layers) {
-    for (int il = n_gpu_layers; il < (int)hp.n_layers; il++) {
-        // Pin block `il`'s Q/K/V/O/FFN tensors to backend_cpu via
-        // ggml_backend_sched_set_tensor_backend().
-    }
-}
-```
-
-Where: per-backend graph builder (`build_graph_llm_kv` for voxtral4b,
-analogous for voxtral / qwen3_asr / glm_asr / granite_speech /
-gemma4_e2b / orpheus / mimo_asr / omniasr-llm). Tag the layer index
-on each block's tensors when constructing the graph; the loop above
-walks them and CPU-pins at sched-alloc time.
-
-CLI plumbing: `whisper_params.n_gpu_layers` (already exists from
-upstream whisper at `examples/common.h:25`!) → forward into each
-backend's `init()` path, threaded through to the graph builder.
-
-Per-backend implementation list (rough order: highest-VRAM first):
-
-1. **voxtral4b** (3.4 B LLM) — direct request from #60. Largest VRAM
-   footprint of the LLM-decode backends.
-2. **voxtral** (3 B Mistral)
-3. **qwen3_asr** (0.6 B Qwen3)
-4. **granite_speech** + granite-4.1 / 4.1-plus / 4.1-nar
-5. **gemma4_e2b** (E2B = ~5 B effective; widening capabilities just
-   landed in cf20c08, layer offload would be the natural follow-up)
-6. **glm_asr**
-7. **orpheus** (Llama 3.2 3 B talker)
-8. **mimo_asr**
-9. **omniasr-llm**
-10. **vibevoice-tts** — Qwen2 7B; may need the most help on VRAM
-
-Skip: ASR-only encoders (parakeet, canary, cohere, fc-ctc, wav2vec2,
-firered-asr, moonshine) — encoder graphs aren't layered the same way
-and the VRAM footprint isn't a problem.
-
-#### Voxtral4b status (2026-05-04)
-
-Shipped end-to-end:
-
-- New `core_gguf::load_weights_split(path, gpu, cpu, is_gpu_fn,
-  user, tag, &out)` in `src/core/gguf_loader.{h,cpp}` partitions
-  tensors into two backend buffers by predicate. Manual per-tensor
-  alignment + offset; no mmap on the split path (the mmap fast paths
-  in load_weights() require contiguous tensor regions, which the
-  partition can't satisfy — acceptable, users hitting VRAM pressure
-  are accepting the alloc-and-copy hit to fit at all).
-- voxtral4b reads `CRISPASR_N_GPU_LAYERS=N` (default -1 = legacy
-  single-backend load). When N is in [0, 26), tensors named
-  `blk.<il>.*` go to GPU iff `il < N`; everything else (audio enc,
-  projection, embeddings, output_norm) stays on GPU.
-- ggml_backend_sched picks up the per-tensor backend assignment
-  automatically and routes compute to follow weights — no graph-
-  builder changes needed.
-
-Validated on JFK (11 s / 26 layers / Q4_K weights):
-
-```
-N=-1 default :  weight residency: legacy GPU buffer
-N=0          :  gpu=763 MiB (428 tensors), cpu=1643 MiB (286 tensors)
-N=13         :  gpu=1585 MiB (571 tensors), cpu=821 MiB (143 tensors)
-N=26         :  legacy single-backend load (not split)
-```
-
-All four configs produce bit-identical correct transcripts.
-
-#### Remaining work for #69a
-
-Same plumbing applied to the other 9 LLM-decode backends from the
-list above. Each backend needs:
-
-1. A small `<backend>_layer_of(tensor_name)` helper to extract the
-   layer index from its naming scheme (most use `blk.<N>.*`).
-2. The split-load env-var dispatch in its `load_model` path.
-3. The `model.buf_cpu` field + free-on-shutdown.
-4. Pass `backend_cpu` through to the load_model signature.
-
-Mechanical and bounded. Worth doing per-backend on demand rather
-than preemptively — voxtral4b was the requesting user's actual ask
-(#60), and the test surface for each backend's layered tensor
-naming + `backend_cpu` setup is its own verification.
-
-### ~~69b. KV-only CPU offload (`CRISPASR_KV_ON_CPU=1`)~~ — SHIPPED 2026-05-04
-
-Allocates `ctx->kv_buf` on `ctx->backend_cpu` instead of `ctx->backend`
-even when GPU weights are active. Useful for users with very long
-context where even Q4_0 KV won't fit in VRAM. Implementation pattern:
-
-```cpp
-ggml_backend_t kv_backend = core_attn::kv_backend_from_env(
-    ctx->backend, ctx->backend_cpu, "<backend_tag>");
-ctx->kv_buf = ggml_backend_alloc_buffer(kv_backend, k_size + v_size);
-```
-
-The helper falls back to `gpu_backend` when `CRISPASR_KV_ON_CPU` is
-unset or `0`, and warns if CPU offload is requested but no CPU
-backend is available. Verbose log identifies whether the KV cache is
-on `cpu` or `gpu`.
-
-The expensive part isn't the alloc — every attention step copies the
-KV slice GPU↔CPU↔GPU. Typically slower than just using `KV_QUANT=q4_0`
-to fit KV in VRAM. Documented in `docs/cli.md` Memory footprint as
-"try KV_QUANT first."
-
-Stacks cleanly with #69e — verified `CRISPASR_KV_ON_CPU=1
-CRISPASR_KV_QUANT_K=q8_0 CRISPASR_KV_QUANT_V=q4_0` on voxtral4b
-produces 169 MiB on CPU with the correct transcript.
-
-Per-backend coverage (extended 2026-05-04 from 6 → 10): voxtral,
-voxtral4b, omniasr, qwen3_asr, granite_speech, orpheus, glm_asr,
-gemma4_e2b, mimo_asr, qwen3_tts.
-
-### ~~69e. Asymmetric K-vs-V cache quantization (llama.cpp parity)~~ — SHIPPED 2026-05-04
-
-Today our `KV_QUANT=<type>` flag (#60e, shipped) applies the same
-precision to both K and V. llama.cpp exposes the two halves
-independently (`--cache-type-k` / `--cache-type-v`) because the
-sensitivity profiles are very different:
-
-- **V** quantizes down well — it gets used as `softmax(QK^T) · V`.
-  The softmax already concentrates probability mass, so per-element
-  errors get averaged across attended positions. `q4_0` V is
-  typically indistinguishable from F16 in PPL.
-- **K** is the fragile half — `QK^T / sqrt(d)` produces attention
-  scores *before* the softmax, and softmax exponentiates. Errors
-  here distort *which* positions get attended to. K usually wants
-  Q8_0 or higher for the same PPL floor.
-
-The common llama.cpp recipe is `-ctk q8_0 -ctv q4_0` — about 40 %
-more KV memory savings than symmetric Q8_0, with PPL barely moved
-on Llama-class models. We have headroom to push V lower than the
-Q8_0 we shipped in #60e.
-
-Most useful on the LLM-decode backends where KV is the dominant
-memory pressure (voxtral4b, granite-speech-4.x, qwen3, mimo-asr).
-
-#### Implementation
-
-Split the env knob:
-
-```
-CRISPASR_KV_QUANT       (legacy; sets both)  → keep for back-compat
-CRISPASR_KV_QUANT_K     (new; overrides KV_QUANT for K only)
-CRISPASR_KV_QUANT_V     (new; overrides KV_QUANT for V only)
-```
-
-In each backend's `kv_init`, pick `k_type` and `v_type` independently
-from these env vars (default both to `KV_QUANT`, default that to
-F16). The K and V buffers already get separate `ggml_tensor`s in
-all current backends, so the change is:
-
-```cpp
-ggml_type k_type = parse_kv_quant("CRISPASR_KV_QUANT_K", default_kv);
-ggml_type v_type = parse_kv_quant("CRISPASR_KV_QUANT_V", default_kv);
-ctx->kv_k = ggml_new_tensor_3d(meta, k_type, ...);
-ctx->kv_v = ggml_new_tensor_3d(meta, v_type, ...);
-```
-
-(parse_kv_quant() falls back to `CRISPASR_KV_QUANT` when its
-type-specific var is unset.)
-
-#### Status (2026-05-04)
-
-Plumbing landed across 10 LLM-decode backends:
-voxtral, voxtral4b, omniasr, qwen3_asr, granite_speech, orpheus,
-glm_asr, gemma4_e2b, mimo_asr, qwen3_tts. The first 6 went in
-together; the tier-1 expansion (glm_asr / gemma4_e2b / mimo_asr /
-qwen3_tts — they already used `kv_dtype_from_env`, so the upgrade
-to the pair-aware helper was 5 LOC each) followed in the same
-session.
-The legacy `CRISPASR_KV_QUANT` keeps working unchanged; the new
-`CRISPASR_KV_QUANT_K` / `_V` overrides take precedence per half.
-Sanity-checked on JFK against voxtral4b and granite-speech-4.0-1b:
-
-```
-voxtral4b  F16/F16:        416 MiB
-voxtral4b  Q8_0/Q8_0:      221 MiB  (47 % vs F16)
-voxtral4b  Q8_0/Q4_0:      169 MiB  (59 % vs F16, 23 % vs sym Q8_0)
-voxtral4b  Q4_0/Q4_0:      117 MiB  (72 % vs F16)
-granite    Q8_0/Q4_0:      130 MiB
-```
-
-All four configs produced bit-identical correct transcripts on
-JFK (short, English, easy). Deeper validation against longer
-LibriSpeech clips + WER=0 floor regression is deferred — the
-mechanism is correct and the fail-safe (legacy KV_QUANT) is
-unchanged, so users can opt in conservatively.
-
-Documentation: `docs/cli.md` Memory footprint section, llama.cpp
-parity table.
-
-#### Open follow-ups
-
-- WER=0 floor validation on a long-context clip (LibriSpeech /
-  longer than JFK's 11 s) for the Q8_0/Q4_0 asymmetric pair.
-  Belongs in the #60e regression flow.
-- Per-layer K/V quant (some llama.cpp users go finer — e.g.
-  lower precision in middle layers). Adds a third dimension of
-  ablation surface that isn't justified until the whole-cache
-  asymmetric pair has WER=0 evidence on long context.
-
-### Approach (do these in order)
-
-1. ~~Land `CRISPASR_N_GPU_LAYERS` for voxtral4b~~ — DONE 2026-05-04.
-   New `core_gguf::load_weights_split()` helper + voxtral4b dispatch.
-   Validated bit-identical on JFK at N=-1, 0, 13, 26. Other 9
-   LLM-decode backends remain — track per-backend, not preemptive.
-   *(#69a)*
-2. ~~Land `CRISPASR_KV_ON_CPU`~~ — DONE 2026-05-04, shipped across
-   all 6 LLM-decode backends in one go alongside #69e. Helper
-   `core_attn::kv_backend_from_env(gpu, cpu, tag)` lives in
-   `src/core/attention.h`. Verified on voxtral4b that KV cache lands
-   on CPU with the correct transcript and stacks with asymmetric
-   KV_QUANT_K/_V. *(#69b)*
-3. ~~Land `CRISPASR_KV_QUANT_K` / `_V`~~ — DONE 2026-05-04, shipped
-   across all 6 LLM-decode backends in one go (voxtral, voxtral4b,
-   omniasr, qwen3_asr, granite_speech, orpheus). Plumbing is
-   mechanical and identical per backend, so the per-backend rollout
-   risk that gates 69a doesn't apply here. WER=0 long-context
-   validation is the open piece. *(#69e)*
-
-### Files touched (per backend, approximate)
-
-```
-include/crispasr.h                       — public API tweak (n_gpu_layers field)
-src/<backend>.{h,cpp}                    — graph builder layer tag
-                                            + kv_init backend pick
-examples/cli/whisper_params.h            — already has n_gpu_layers
-examples/cli/cli.cpp                     — surface --n-gpu-layers flag
-                                            (or rely on env var only)
-examples/cli/crispasr_backend_<name>.cpp — forward params.n_gpu_layers
-                                            into init()
-docs/cli.md                              — document the new flag(s)
-```
-
-### Out of scope
-
-- A `--cpu-mask` style fine-grained tensor offload (per-tensor CPU
-  pinning across the whole graph): too much UI surface for the
-  user-side win.
-- Per-tensor mmap-from-disk inference (`memory-mapped weights` with
-  cold-loaded tensors): that's a separate, larger feature — track as
-  its own item if it ever becomes a priority.
-
----
-
 ## 70. Streaming TTS via chunked VAE decode (latency win, vibevoice / qwen3-tts)
 
 **Effort:** Medium-large.
@@ -1976,17 +1615,14 @@ chunked transfer.
 - Any changes to AR decoding itself — the AR loop stays
   unchanged; only the post-AR codec / VAE side is chunked.
 
-## ~~71. Test-runner under-invocation + cap-honesty audit~~ — SHIPPED 2026-05-04 → [HISTORY §79](HISTORY.md)
+## 73-follow-up. Long-context cohere FA vs cast-on-read benchmark — open
 
-## ~~72. gemma4_e2b / mimo_asr: GPU residency for Q4_K weights~~ — SHIPPED 2026-05-04 → [HISTORY §79](HISTORY.md)
-
-Apple Silicon Metal: gemma4-e2b 8.52 s → 3.95 s (2.2x), mimo-asr 27.13 s → 21.18 s (-22 %). One-line change per backend (load_weights to ctx->backend instead of ctx->backend_cpu). Linux/CUDA validation deferred — hardware-blocked from current host; expect at least the same range since dGPUs dominate CPU on matmul throughput even more than Apple Silicon.
-
-## ~~73. Quant-safe KV cache write for canary / cohere / kyutai_stt~~ — SHIPPED 2026-05-04 → [HISTORY §79](HISTORY.md)
-
-New core_attn::kv_cache_write helper (F16 → ggml_cpy(view) fast path; Q8_0/Q4_0 → ggml_set_rows(indices)). Migrated kyutai_stt (single-token decode), then canary + cohere (multi-token prefill, used existing position graph input as the row-index source). Read path: cast-on-read fallback then full ggml_flash_attn_ext migration on canary + cohere — drops the cast tax for full bandwidth saving on quant K/V.
-
-Open follow-up: long-context perf comparison of cohere flash-attn vs cast-on-read (JFK is too short to surface the long-context win).
+Parent #73 (quant-safe KV cache write for canary / cohere / kyutai_stt)
+shipped → HISTORY §79. #71 + #72 also there (test-runner under-invocation
++ cap-honesty audit; gemma4_e2b / mimo_asr GPU residency for Q4_K weights
+— gemma4 2.2× on M1, mimo-asr -22 %, Linux/CUDA validation deferred).
+Only residual: long-context perf comparison of cohere flash-attn vs
+cast-on-read — JFK is too short to surface the long-context win.
 
 ## 74. Feature-matrix uplift round 2 — chatterbox family + matrix tooling
 
@@ -2020,9 +1656,12 @@ Chatterbox T3 AR decode currently uses sampling (temp / top_p / min_p / repetiti
 
 ---
 
-## ~~75. /v1/audio/speech OpenAI feature-parity round 1~~ — **DONE → HISTORY §81**
+## 75-followups. /v1/audio/speech OpenAI round 2 — open
 
-Round 1 shipped: PR #63 merged (`cd30c46`), corrective batch (`d35940b`...`85302c5`), 75a/75b (`b932fa9`), 75d chunking (`0bff2d7`). 75c-opt-1 (server-side speed resampler) included. Remaining follow-ups (75c-opt-2 native duration knobs, 75e streaming/mp3/upload) are separate work items.
+Parent #75 round 1 shipped → HISTORY §81 (PR #63 merged + corrective
+batch + 75a/75b + 75d chunking + 75c-opt-1 server-side speed
+resampler). Remaining follow-ups: 75c-opt-2 (native-backend duration
+knobs) and 75e (streaming / mp3 / upload).
 
 Remaining gaps documented in follow-up items: 75c-opt-2 (native-backend duration knobs), 75e (streaming response, mp3/opus encoding, voice upload/delete).
 
@@ -2507,14 +2146,6 @@ done as a separate phased PR, one backend per commit.
 
 ---
 
-## ~~88. Kokoro length-scale + vibevoice diffusion-step runtime knobs~~ — **DONE → [HISTORY §85](HISTORY.md)**
-
----
-
-## ~~89. Per-backend `flash_attn` field migration~~ — **DONE → [HISTORY §84](HISTORY.md)**
-
----
-
 ## 90. Session-API beam_size — per-backend wiring
 
 May 2026:
@@ -2821,3 +2452,141 @@ least-intrusive path for Go consumers who pull via `go get`.
 **Tracking:** every commit message that fixes the next round
 of "missing -lX" should reference this section and cross-check
 whether the auto-gen is finally in place.
+
+---
+
+## 95. IndexTTS-1.5 Chinese TN — binary alternative to the Python `wetext` hook
+
+**Status: open.** Today CrispASR ships `INDEXTTS_TEXT_NORMALIZER=<shell
+cmd>` plus `tools/wetext-normalize.py` (commit `1bfe7c5a`,
+2026-05-19). That covers users who already have Python + wetext
+installed. Some deployments (single-binary distribution, Windows
+without Python, embedded) need a no-Python path. This section
+catalogs the realistic options so the next person doesn't have to
+re-do the survey.
+
+### The actual functionality gap
+
+Default in-process `preprocess_indextts_text()` handles:
+- CJK char split (port of upstream `tokenize_by_CJK_char`)
+- Subset of `char_rep_map`: `，。：；！？、…“”‘’（）《》【】「」—～·` → ASCII
+  before the CJK splitter
+- ASCII upper-case
+
+What it does NOT handle (full `wetext.Normalizer(lang='zh', operator='tn')`):
+- Arabic numeral → hanzi (`2025年` → `二零二五年`, `123` → `一百二十三`)
+- Pinyin tone-digit restoration (`xuan4`, `受不liao3` patterns)
+- Dates (`2025/01/11` → `二零二五年一月十一日`)
+- Times (`8:00` → `八点`)
+- Currency (`¥12999` → `一万二千九百九十九元`)
+- Phone numbers (`13800001234` digit-by-digit)
+- Math / measurements / fractions / percent
+- English contractions inside Chinese text
+
+The model itself can't pronounce raw digits cleanly — it often fails
+to emit `stop_mel_token` on un-pronounceable inputs and burns through
+`max_mel_tokens=600` before giving up. So this isn't pure cosmetics:
+TN is what makes digit-containing Chinese prompts actually work.
+
+### Options, in order of pragmatic preference
+
+**95a. Hand-roll the high-leverage rules in C++** (recommended first
+step). Target the failures that actually break TTS — start with
+digit-string → hanzi for the 1-billion range (`零一二三四五六七八九`
+plus units `十百千万亿`), the `年/月/日` pattern, the `点/分` time
+pattern, and pinyin tone-digit lookup. Estimated 300-600 LOC of
+focused C++, no external dependency. Covers ~90 % of real prompts.
+Edge cases (currency formats, mixed math, address parsing) silently
+stay un-normalized. Lives in `src/indextts.cpp:preprocess_indextts_text`
+or a sibling helper.
+
+Files:
+- `src/indextts.cpp` — extend the preprocessor with a
+  `normalize_chinese_numbers()` pass that runs before the existing
+  CJK split.
+- `tests/` — golden inputs for the digit/date/time cases (just
+  string-in, string-out; no model needed).
+- `LEARNINGS.md` — new sub-section once the first user-reported
+  edge-case lands so the next contributor knows what's covered.
+
+When to do it: when an issue lands like "我有 3 个苹果 → weird audio"
+or `2025年` produces a hang. Don't start it speculatively.
+
+**95b. Vendor `kaldifst` (the C++ WFST runtime) + OpenFST + ship the
+compiled `.fst` rule data.** The byte-identical-to-upstream path.
+
+Ingredients:
+- `kaldifst` C++ class `TextNormalizer` (k2-fsa/kaldifst on GitHub,
+  a few thousand LOC of C++ wrapped around OpenFST). Apache-2.0.
+- `OpenFST` (~30-50 K LOC of well-defined C++). Apache-2.0.
+  Builds cleanly as a CMake subproject but the build profile cost
+  is real — CrispASR today has no WFST dependency.
+- Chinese TN rule data from `pengzhendong/wetext`:
+  `fsts/zh/tn/tagger.fst` (812 KB) + `fsts/zh/tn/verbalizer.fst`
+  (88 KB) + optionally `verbalizer_remove_erhua.fst` (88 KB).
+  Plus the orchestration glue from `wetext.utils.normalize` (the
+  preprocess → tagger → token-parser → verbalizer → postprocess
+  flow) — `token_parser.py` is ~200 lines of recursive-descent
+  parsing of the tagger output that would need to be rewritten in
+  C++.
+
+Estimated effort: 3-5 days of focused work for someone comfortable
+with OpenFST. Result: same output as `wetext.Normalizer` byte for
+byte, no Python at runtime.
+
+When to do it: only after #95a has grown past ~5 hand-rolled cases
+and the maintenance burden becomes visible — or if a downstream
+deployment specifically can't take a Python dependency. Don't
+speculate.
+
+Files:
+- `third_party/openfst/` — submodule (~50 K LOC, large diff).
+- `third_party/kaldifst/` — submodule (~5 K LOC).
+- `models/indextts-zh-tn.fsts` or co-distributed via `-m auto` —
+  the ~1 MB of compiled FST data.
+- `src/indextts.cpp` — new `normalize_chinese_wetext()` function
+  invoked when `INDEXTTS_TEXT_NORMALIZER=wetext` (a sentinel
+  value) is set, alongside the existing shell-command form.
+- CMakeLists.txt — `add_subdirectory(third_party/openfst)` +
+  link against kaldifst.
+
+**95c. Static-bundle the Python sidecar via PyInstaller /
+cibuildwheel.** Ship Python + wetext + dependencies as a
+~50-80 MB single binary co-distributed with `crispasr`. Solves
+the "no Python on the box" use case without porting any code.
+
+Major downsides:
+- Build system gets meaningfully more complex (a separate Python
+  bundling pipeline per platform).
+- ~50-80 MB of bloat per release.
+- Not idiomatic for a C++ project; CrispASR's distribution story
+  today is "one binary + model files".
+
+Almost certainly **not** worth doing. Listed only so future
+contributors don't spend time discovering it independently.
+
+### What looks like an alternative but isn't
+
+- **ICU `Transliterator`** — does Unicode normalization (NFC, NFKC,
+  case folding) and pre-defined transforms like `Han-Latin`. No
+  number → hanzi, no date parsing, no rule set comparable to wetext.
+- **`libnumber2chinese` / `cn2an` / `pypinyin`** — Python libraries
+  with no coherent C/C++ port. Fragments exist, no drop-in.
+- **HuggingFace `tokenizers` normalizers** — tokenizer-side
+  normalization (lowercase, NFC, strip accents), nowhere near
+  wetext-equivalent rule coverage.
+
+### Trigger to start work
+
+This section sits idle until **one of**:
+
+1. A user files an issue with a digit/date/pinyin-tone-digit prompt
+   that produces broken audio. Then go to #95a; pick the smallest
+   rule set that fixes the reported case.
+2. The hand-rolled list grows past ~5 cases (track in
+   `src/indextts.cpp`). At that point the marginal cost of #95b
+   (vendoring OpenFST) becomes lower than continuing to grow the
+   hand-rolled rules. Cross the threshold deliberately.
+
+Don't pre-emptively vendor OpenFST. CrispASR's clean "ggml + minor
+deps" profile is a feature.

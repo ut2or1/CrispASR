@@ -88,6 +88,19 @@ const char* parakeet_token_to_str(struct parakeet_context* ctx, int token_id);
 // until the next call. seed == 0 means time-based RNG.
 void parakeet_set_temperature(struct parakeet_context* ctx, float temperature, uint64_t seed);
 
+// CTC decode mode (hybrid TDT+CTC models only).
+void parakeet_set_ctc_mode(struct parakeet_context* ctx, bool ctc);
+bool parakeet_has_ctc(struct parakeet_context* ctx);
+
+// Split encode / decode for full-audio-encode + chunked-decode.
+// parakeet_encode: mel → encoder, returns malloc'd float[T_enc * d_model].
+// parakeet_decode_frames: run TDT/CTC decode on pre-encoded frames.
+// Caller must free() the returned encoder buffer.
+float* parakeet_encode(struct parakeet_context* ctx, const float* samples, int n_samples, int* out_T_enc,
+                       int* out_d_model);
+struct parakeet_result* parakeet_decode_frames(struct parakeet_context* ctx, const float* enc_frames, int T_enc,
+                                               int d_model, int64_t t_offset_cs);
+
 // Hyper-parameters needed by callers (frame duration for stamping etc.)
 int parakeet_frame_dur_cs(struct parakeet_context* ctx); // centiseconds per encoder frame
 int parakeet_n_mels(struct parakeet_context* ctx);

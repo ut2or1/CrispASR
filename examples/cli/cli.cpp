@@ -391,6 +391,10 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
     } else if (arg == "-ck" || arg == "--chunk-seconds") {
         params.chunk_seconds = std::stoi(ARGV_NEXT);
         params.chunk_seconds_explicit = true;
+    } else if (arg == "--chunk-overlap") {
+        params.chunk_overlap_seconds = std::stof(ARGV_NEXT);
+    } else if (arg == "--parakeet-decoder") {
+        params.parakeet_decoder = ARGV_NEXT;
     } else if (arg == "--lid-backend") {
         params.lid_backend = ARGV_NEXT;
     } else if (arg == "--lid-model") {
@@ -921,6 +925,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.max_new_tokens);
     fprintf(stderr, "  -ck N,     --chunk-seconds N      [%-7d] fallback chunk size when VAD is disabled\n",
             params.chunk_seconds);
+    fprintf(stderr, "             --chunk-overlap F      [%-7.1f] overlap context (sec) at chunk boundaries\n",
+            params.chunk_overlap_seconds);
     fprintf(stderr, "             -m auto                        download a default model for the chosen backend\n");
     // Text-To-Speech (TTS) parameters — vibevoice and qwen3-tts backends
     fprintf(stderr, "\nText-to-speech (TTS) options:\n");

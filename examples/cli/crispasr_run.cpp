@@ -357,20 +357,49 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     // the ASR backend allocates its own model + KV cache (#35 OOM fix).
     crispasr_lid_free_cache();
 
-    // Issue #89: non-whisper backends (parakeet, canary, moonshine, …) use
-    // bidirectional encoders that lose context at fixed chunk boundaries,
-    // causing text loss at the start of each chunk. Whisper needs 30 s
-    // chunks because its positional-encoding encoder is trained on exactly
-    // 30 s windows; every other backend can handle arbitrary-length input.
+    // Issue #89: backends with CAP_UNBOUNDED_INPUT (parakeet, canary,
+    // wav2vec2, firered-asr, fastconformer-ctc, granite-nar) use
+    // non-autoregressive encoders (FastConformer, CTC) that handle
+    // arbitrary-length audio without chunking. Fixed 30 s chunk
+    // boundaries cause text loss at chunk starts because bidirectional
+    // encoders lose context at the cut points.
+    //
+    // Backends WITHOUT CAP_UNBOUNDED_INPUT (whisper, cohere, moonshine,
+    // voxtral, granite, qwen3, glm-asr, kyutai-stt, mimo-asr, gemma4,
+    // omniasr) use either fixed-window encoders (whisper) or
+    // autoregressive decoders with KV cache that grow with input
+    // length — these need chunking to avoid OOM on long audio.
+    //
     // When the user didn't explicitly pass --chunk-seconds, disable
-    // chunking for non-whisper backends so the full audio is processed in
-    // one encoder pass.
+    // chunking for unbounded-input backends so the full audio is
+    // processed in one encoder pass.
+    // Issue #89: CAP_UNBOUNDED_INPUT backends (parakeet, canary, wav2vec2,
+    // firered-asr, fastconformer-ctc, granite-nar) use bidirectional
+    // encoders that produce inferior features when chunked (7-9% text
+    // loss). Default to full-audio encoding for best quality.
+    //
+    // When the user explicitly passes --chunk-seconds, honor it — they
+    // need chunking to avoid OOM on very long audio. Overlap-save
+    // context (--chunk-overlap) mitigates boundary artifacts but the
+    // encoder quality loss from reduced context is inherent to the
+    // architecture.
     int effective_chunk_seconds = params.chunk_seconds;
-    if (!params.chunk_seconds_explicit && !(backend.capabilities() & CAP_VAD_INTERNAL)) {
+    if (!params.chunk_seconds_explicit && (backend.capabilities() & CAP_UNBOUNDED_INPUT)) {
         effective_chunk_seconds = 0;
-        if (!params.no_prints && (int)samples.size() > params.chunk_seconds * SR) {
-            fprintf(stderr, "crispasr: %s backend — processing full audio without chunking "
-                            "(use --chunk-seconds N to override)\n", backend.name());
+    }
+    if (!params.no_prints) {
+        if (effective_chunk_seconds == 0 && (int)samples.size() > params.chunk_seconds * SR &&
+            (backend.capabilities() & CAP_UNBOUNDED_INPUT)) {
+            fprintf(stderr,
+                    "crispasr: %s backend — full-audio encoding "
+                    "(use --chunk-seconds N if OOM)\n",
+                    backend.name());
+        } else if (params.chunk_seconds_explicit && (backend.capabilities() & CAP_UNBOUNDED_INPUT) &&
+                   (int)samples.size() > params.chunk_seconds * SR) {
+            fprintf(stderr,
+                    "crispasr: %s backend — chunking at %ds may reduce quality; "
+                    "remove --chunk-seconds for best results\n",
+                    backend.name(), params.chunk_seconds);
         }
     }
 
@@ -543,26 +572,87 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
         }
     }
 
-    // Each slice is transcribed with its own audio only. Boundaries are placed
-    // by audio_chunking::split_at_energy_minima at the quietest 100 ms within
-    // each chunk window, so chunk seams already fall in pauses; we don't need
-    // to extend the slice with neighbour audio.
+    // Issue #89 overlap-save chunking: when slicing is active, extend
+    // each chunk by context_s seconds on each side so the bidirectional
+    // encoder has left/right context at chunk boundaries. Only the
+    // center region (the original slice range) is committed; words in
+    // the extension zones are discarded via word-level filtering.
     //
-    // Issue #89 history: an earlier round (617cd02) added ±2 s of context to
-    // every slice and then filtered the result back to the original window by
-    // word timestamp. Two failure modes surfaced on parakeet-tdt-0.6b-ja: (1)
-    // the TDT decoder's emission frame for the same audio shifts by 1–2
-    // frames between context windows, so words at the boundary could land
-    // outside *both* slices' ranges and be silently dropped; (2) the trim's
-    // segment-text rebuild inserted a space before every word that didn't
-    // start with one, which for Japanese (no-space tokenizer) split every
-    // kana with a space. Both bugs disappear when each slice is fed the bare
-    // audio.
+    // Earlier attempt (617cd02) failed because (a) TDT emission frames
+    // shift ±1-2 frames between contexts, dropping boundary words when
+    // strict t0 filtering is used, and (b) segment text rebuild
+    // inserted spaces before every word, breaking Japanese. Fixes:
+    // (a) use a tolerance margin of 200 ms at boundaries so shifted
+    // frames aren't lost; (b) concatenate word texts without inserting
+    // spaces (the tokenizer already includes leading spaces where
+    // appropriate).
+    const float kChunkContextS = params.chunk_overlap_seconds;
+    constexpr int64_t kBoundaryToleranceCs = 20; // 200 ms tolerance for TDT frame shift
+    const bool use_chunk_context = slices.size() > 1 && kChunkContextS > 0.0f;
+
     auto process_slice = [&](size_t i, CrispasrBackend& be) {
         const auto& sl = slices[i];
 
+        // Optionally extend the slice with acoustic context.
+        int ext_start = sl.start;
+        int ext_end = sl.end;
+        if (use_chunk_context) {
+            const int ctx_samples = (int)(kChunkContextS * SR);
+            ext_start = std::max(0, sl.start - ctx_samples);
+            ext_end = std::min((int)samples.size(), sl.end + ctx_samples);
+        }
+        const int64_t ext_t0_cs = (int64_t)((double)ext_start / SR * 100.0);
+
         std::vector<crispasr_segment> segs =
-            be.transcribe(samples.data() + sl.start, sl.end - sl.start, sl.t0_cs, params);
+            be.transcribe(samples.data() + ext_start, ext_end - ext_start, ext_t0_cs, params);
+
+        // Trim back to the original slice range when context was added.
+        if (use_chunk_context && !segs.empty()) {
+            const bool is_first = (i == 0);
+            const bool is_last = (i == slices.size() - 1);
+            // Left boundary: first slice keeps everything, others trim.
+            const int64_t left_cs = is_first ? 0 : (sl.t0_cs - kBoundaryToleranceCs);
+            // Right boundary: last slice keeps everything, others trim.
+            const int64_t right_cs = is_last ? INT64_MAX : (sl.t1_cs + kBoundaryToleranceCs);
+
+            for (auto& seg : segs) {
+                if (seg.words.empty()) {
+                    // No word-level data — filter at segment level.
+                    // Keep the segment if its center is in range.
+                    const int64_t mid = (seg.t0 + seg.t1) / 2;
+                    if (mid < left_cs || mid >= right_cs)
+                        seg.text.clear();
+                    continue;
+                }
+                // Word-level filtering: keep words whose t0 is in range.
+                std::vector<crispasr_word> kept;
+                for (auto& w : seg.words) {
+                    if (w.t0 >= left_cs && w.t0 < right_cs)
+                        kept.push_back(std::move(w));
+                }
+                // Rebuild segment text from surviving words without
+                // inserting spaces (fixes the JA kana-spacing bug from
+                // 617cd02). The tokenizer already includes leading
+                // spaces in word text where appropriate (Latin style).
+                std::string rebuilt;
+                for (const auto& w : kept)
+                    rebuilt += w.text;
+                // Strip leading space if present (first word of segment
+                // may have a leading space from BPE convention).
+                if (!rebuilt.empty() && rebuilt[0] == ' ')
+                    rebuilt = rebuilt.substr(1);
+                seg.text = std::move(rebuilt);
+                seg.words = std::move(kept);
+                if (!seg.words.empty()) {
+                    seg.t0 = seg.words.front().t0;
+                    seg.t1 = seg.words.back().t1;
+                }
+            }
+            // Remove empty segments.
+            segs.erase(
+                std::remove_if(segs.begin(), segs.end(), [](const crispasr_segment& s) { return s.text.empty(); }),
+                segs.end());
+        }
 
         if (params.diarize && !segs.empty()) {
             const CrispasrPyannoteCache* cache_ptr = pyannote_cache.valid() ? &pyannote_cache : nullptr;
@@ -1596,8 +1686,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                                 decode_params.vad_model.clear();
                                 partial_decode_attempted_this_step = true;
                                 const int64_t abs_offset_cs = (window_start_sample_now + (int64_t)sub_start) * 100 / SR;
-                                sl_for_text =
-                                    backend->transcribe(pcm_window.data() + sub_start, sub_len, abs_offset_cs, decode_params);
+                                sl_for_text = backend->transcribe(pcm_window.data() + sub_start, sub_len, abs_offset_cs,
+                                                                  decode_params);
                             }
                             // else: sl_for_text stays empty → empty
                             // partial text for this slice, which
@@ -1641,8 +1731,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 if (partial_decode_attempted_this_step)
                     last_partial_decode_sample = cumulative_samples;
             } else {
-                const int64_t no_vad_window_start_cs =
-                    (cumulative_samples - (int64_t)pcm_window.size()) * 100 / SR;
+                const int64_t no_vad_window_start_cs = (cumulative_samples - (int64_t)pcm_window.size()) * 100 / SR;
                 segs = backend->transcribe(pcm_window.data(), (int)pcm_window.size(), no_vad_window_start_cs, params);
                 if (!segs.empty())
                     decoded_segments_this_step = true;
