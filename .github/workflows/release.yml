@@ -88,6 +88,59 @@ jobs:
           name: crispasr-linux-x86_64-avx512
           path: release/crispasr-linux-x86_64-avx512.tar.gz
 
+  # ── Linux x86_64 CLI — CUDA variant ─────────────────────────────────────────
+  # Static CLI binary linked with CUDA 12.8. Useful for Kaggle / Colab /
+  # any Linux box with an NVIDIA GPU: download, chmod +x, run — no build step.
+  # Targets sm_75 (T4), sm_86 (A100/3090), sm_89 (L4/4090), sm_120 (Blackwell)
+  # plus sm_120 virtual for future compat. Ships as a self-contained tarball
+  # alongside crispasr-quantize so users can convert + run in one download.
+  build-linux-x86_64-cuda:
+    runs-on: ubuntu-latest
+    env:
+      CUDA_VERSION: "12.8.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev
+
+      - name: Install CUDA Toolkit 12.8.0
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: '12.8.0'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "nvrtc-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev"]'
+
+      - name: Build
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_CUDA=ON \
+            -DGGML_OPENBLAS=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real;120-virtual" \
+            -DCRISPASR_BUILD_TESTS=OFF \
+            -DCRISPASR_BUILD_EXAMPLES=ON \
+            -DCRISPASR_BUILD_SERVER=OFF
+          cmake --build build --target crispasr-cli crispasr-quantize -j $(nproc)
+
+      - name: Package
+        run: |
+          mkdir -p release/crispasr-linux-x86_64-cuda
+          cp build/bin/crispasr release/crispasr-linux-x86_64-cuda/
+          cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-cuda/
+          cd release && tar czf crispasr-linux-x86_64-cuda.tar.gz crispasr-linux-x86_64-cuda/
+          ls -lh crispasr-linux-x86_64-cuda.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-linux-x86_64-cuda
+          path: release/crispasr-linux-x86_64-cuda.tar.gz
+
   # ── Linux ARM64 CLI binaries ─────────────────────────────────────────────────
   # Mirror of build-linux on GitHub's ubuntu-24.04-arm runner. NEON is the
   # native SIMD path on aarch64, so OpenBLAS adds little — keep it on (same
@@ -1118,7 +1171,7 @@ jobs:
           path: release/crispasr-android-arm64-v8a.tar.gz
 
   publish:
-    needs: [build-linux, build-linux-x86_64-avx512, build-linux-arm64, build-python-linux, build-python-linux-arm64, build-macos, build-libs-macos-arm64, build-libs-linux-x86_64, build-libs-linux-x86_64-avx512, build-libs-linux-arm64, build-libs-linux-x86_64-cuda, build-libs-windows-x86_64, build-libs-windows-x86_64-vulkan, build-libs-windows-x86_64-cuda, build-libs-windows-x86_64-cpu-legacy, build-windows-cpu, build-windows-cpu-legacy, build-windows-cuda, build-windows-vulkan, build-android-arm64]
+    needs: [build-linux, build-linux-x86_64-avx512, build-linux-x86_64-cuda, build-linux-arm64, build-python-linux, build-python-linux-arm64, build-macos, build-libs-macos-arm64, build-libs-linux-x86_64, build-libs-linux-x86_64-avx512, build-libs-linux-arm64, build-libs-linux-x86_64-cuda, build-libs-windows-x86_64, build-libs-windows-x86_64-vulkan, build-libs-windows-x86_64-cuda, build-libs-windows-x86_64-cpu-legacy, build-windows-cpu, build-windows-cpu-legacy, build-windows-cuda, build-windows-vulkan, build-android-arm64]
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:

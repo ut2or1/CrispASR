@@ -12,6 +12,7 @@ Redacted descriptions in own voice.
 | 05 | `ggml-cuda : per-row-contiguous unary (Phase 1 UAR)` | WIP on branch `issue81-phase1-uar-wip` | drafted, not yet filed |
 | 06 | `ggml-cuda : per-head mask in flash_attn_ext` | WIP on branch `issue81-phase1-uar-wip` | drafted, not yet filed |
 | 07 | `metal : kernel_aa_snake_beta — fused AA SnakeBeta for BigVGAN v2` | drafted from upstream IndexTTS CUDA reference (Apache 2.0) — needs implementation | RFC scope only; new ggml op |
+| 08 | `metal : fix cross-simdgroup reduction in kernel_norm / kernel_rms_norm / kernel_l2_norm` | yours — bisected from kokoro short-input audio regression; see [`tests/test_metal_norm_repro.cpp`](../../tests/test_metal_norm_repro.cpp) | drafted, not yet filed |
 
 The `.patch` files are clean diffs; they are reference shape, not
 literal `git am` payloads — line numbers are relative to our vendored

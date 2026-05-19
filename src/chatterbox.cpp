@@ -246,60 +246,54 @@ static std::vector<int32_t> tokenize_text_bpe(const cb_tokenizer& tok, const std
     const auto& be = core_bpe::byte_encoder();
     std::vector<int32_t> result;
 
-    // GPT-2 pre-tokenizer: split on whitespace boundaries (simplified)
-    // Each word gets a leading Ġ (U+0120) if preceded by space
-    std::string buf;
-    for (size_t i = 0; i < text.size(); i++) {
-        if (i > 0 && text[i] != ' ' && text[i - 1] == ' ') {
-            // Encode accumulated word
-            if (!buf.empty()) {
-                std::string encoded;
-                for (uint8_t b : buf) {
-                    int cp = be[b];
-                    if (cp < 128)
-                        encoded += (char)cp;
-                    else {
-                        // UTF-8 encode the codepoint
-                        if (cp < 0x80)
-                            encoded += (char)cp;
-                        else if (cp < 0x800) {
-                            encoded += (char)(0xC0 | (cp >> 6));
-                            encoded += (char)(0x80 | (cp & 0x3F));
-                        } else {
-                            encoded += (char)(0xE0 | (cp >> 12));
-                            encoded += (char)(0x80 | ((cp >> 6) & 0x3F));
-                            encoded += (char)(0x80 | (cp & 0x3F));
-                        }
-                    }
-                }
-                core_bpe::bpe_one(tok.token_to_id, tok.merge_rank, encoded, result);
-                buf.clear();
-            }
-            // Start new word with Ġ prefix (byte 0x20 = space maps to Ġ = U+0120)
-        }
-        if (text[i] != ' ' || i == 0 || text[i - 1] != ' ') {
-            buf += text[i];
-        }
-    }
-    // Encode remaining
-    if (!buf.empty()) {
+    // GPT-2 pre-tokenizer: split into "(optional leading space) + (non-space
+    // run)" chunks matching the ` ?\p{L}+` arm of the GPT-2 regex. byte_encoder
+    // maps byte 0x20 to U+0120 ("Ġ"), so a chunk like " world" encodes as
+    // "Ġworld" — the trained vocab entry. Issue #94 follow-up: the previous
+    // implementation appended the trailing space to the *previous* word
+    // (yielding "helloĠ" + bare "world") which produced unseen BPE pieces
+    // and audibly broken synthesis for less-common words ("hello chatterbox
+    // turbo" came out as "henay…"). See tools/tok_test.py for the diff.
+    auto encode_chunk = [&](const char* begin, const char* end) {
+        if (begin == end)
+            return;
         std::string encoded;
-        for (uint8_t b : buf) {
-            int cp = be[b];
-            if (cp < 128)
+        for (const char* p = begin; p < end; ++p) {
+            const int cp = be[(uint8_t)*p];
+            if (cp < 0x80) {
                 encoded += (char)cp;
-            else {
-                if (cp < 0x800) {
-                    encoded += (char)(0xC0 | (cp >> 6));
-                    encoded += (char)(0x80 | (cp & 0x3F));
-                } else {
-                    encoded += (char)(0xE0 | (cp >> 12));
-                    encoded += (char)(0x80 | ((cp >> 6) & 0x3F));
-                    encoded += (char)(0x80 | (cp & 0x3F));
-                }
+            } else if (cp < 0x800) {
+                encoded += (char)(0xC0 | (cp >> 6));
+                encoded += (char)(0x80 | (cp & 0x3F));
+            } else {
+                encoded += (char)(0xE0 | (cp >> 12));
+                encoded += (char)(0x80 | ((cp >> 6) & 0x3F));
+                encoded += (char)(0x80 | (cp & 0x3F));
             }
         }
         core_bpe::bpe_one(tok.token_to_id, tok.merge_rank, encoded, result);
+    };
+
+    size_t i = 0;
+    while (i < text.size()) {
+        const size_t start = i;
+        if (text[i] == ' ') {
+            // Consume one leading space if it's followed by a non-space char
+            // (the " ?\p{L}+" arm). Multiple consecutive spaces are emitted as
+            // one whitespace chunk (the "\s+" arm), so the BPE merger can
+            // recover any multi-Ġ vocab entry the trained tokenizer used.
+            if (i + 1 < text.size() && text[i + 1] != ' ') {
+                ++i;
+            } else {
+                while (i < text.size() && text[i] == ' ')
+                    ++i;
+                encode_chunk(text.data() + start, text.data() + i);
+                continue;
+            }
+        }
+        while (i < text.size() && text[i] != ' ')
+            ++i;
+        encode_chunk(text.data() + start, text.data() + i);
     }
     return result;
 }
@@ -424,113 +418,238 @@ static double rand_uniform_torch_u32(mt19937_state& rng) {
     return (double)mt19937_next(rng) * (1.0 / 4294967296.0);
 }
 
-static int32_t sample_token(const float* logits, int vocab_size, float temperature, float min_p, float top_p,
+static int32_t sample_token(const float* logits, int vocab_size, float temperature, int top_k, float min_p, float top_p,
                             float rep_penalty, const std::vector<int32_t>& prev_tokens, mt19937_state& rng) {
+    // Issue #94: two distinct LogitsProcessorList orderings exist in the
+    // chatterbox python reference, and they're not interchangeable:
+    //
+    //   base inference (t3.py:309-378):  rep_penalty → temperature → min_p → top_p
+    //   inference_turbo (t3.py:415-490): temperature → top_k → top_p → rep_penalty
+    //
+    // Selecting on `top_k > 0` keeps base bit-equivalent to the prior C++
+    // (top_k defaults to 0) while giving turbo the right ordering. The
+    // turbo path skips min_p entirely (turbo defaults set min_p=0); the
+    // base path skips top_k (defaults to 0). Both paths share the final
+    // softmax → torch.multinomial implementation.
     std::vector<float> probs(vocab_size);
+    const float kNegInf = -std::numeric_limits<float>::infinity();
+    const bool use_hf_turbo_order = (top_k > 0);
 
-    // Apply repetition penalty
-    for (int i = 0; i < vocab_size; i++) {
-        probs[i] = logits[i];
-    }
-    if (rep_penalty != 1.0f) {
-        std::vector<uint8_t> seen((size_t)vocab_size, 0);
-        for (int32_t tok : prev_tokens) {
-            if (tok >= 0 && tok < vocab_size) {
-                if (seen[(size_t)tok]) {
-                    continue;
+    if (!use_hf_turbo_order) {
+        // --- Base order: rep_penalty → temperature → min_p → top_p ----
+        for (int i = 0; i < vocab_size; i++) {
+            probs[i] = logits[i];
+        }
+        if (rep_penalty != 1.0f) {
+            std::vector<uint8_t> seen((size_t)vocab_size, 0);
+            for (int32_t tok : prev_tokens) {
+                if (tok >= 0 && tok < vocab_size) {
+                    if (seen[(size_t)tok]) {
+                        continue;
+                    }
+                    seen[(size_t)tok] = 1;
+                    if (probs[tok] > 0)
+                        probs[tok] /= rep_penalty;
+                    else
+                        probs[tok] *= rep_penalty;
                 }
-                seen[(size_t)tok] = 1;
-                if (probs[tok] > 0)
-                    probs[tok] /= rep_penalty;
-                else
-                    probs[tok] *= rep_penalty;
             }
         }
-    }
 
-    // Temperature
-    if (temperature <= 0.0f) {
-        // Greedy
-        return (int32_t)(std::max_element(probs.begin(), probs.end()) - probs.begin());
-    }
-    if (temperature != 1.0f) {
-        for (int i = 0; i < vocab_size; i++) {
-            probs[i] /= temperature;
+        if (temperature <= 0.0f) {
+            return (int32_t)(std::max_element(probs.begin(), probs.end()) - probs.begin());
         }
-    }
+        if (temperature != 1.0f) {
+            for (int i = 0; i < vocab_size; i++) {
+                probs[i] /= temperature;
+            }
+        }
 
-    // Min-p filtering
-    if (min_p > 0.0f) {
-        float max_val = *std::max_element(probs.begin(), probs.end());
+        if (min_p > 0.0f) {
+            float max_val = *std::max_element(probs.begin(), probs.end());
+            float sum = 0.0f;
+            for (int i = 0; i < vocab_size; i++) {
+                probs[i] = std::exp(probs[i] - max_val);
+                sum += probs[i];
+            }
+            for (int i = 0; i < vocab_size; i++) {
+                probs[i] /= sum;
+            }
+
+            float max_prob = *std::max_element(probs.begin(), probs.end());
+            float threshold = max_prob * min_p;
+            std::vector<uint8_t> to_remove((size_t)vocab_size, 0);
+            for (int i = 0; i < vocab_size; i++) {
+                if (probs[i] < threshold) {
+                    to_remove[(size_t)i] = 1;
+                }
+            }
+            auto best_it = std::max_element(probs.begin(), probs.end());
+            if (best_it != probs.end()) {
+                to_remove[(size_t)(best_it - probs.begin())] = 0;
+            }
+            for (int i = 0; i < vocab_size; i++) {
+                if (to_remove[(size_t)i]) {
+                    probs[i] = 0.0f;
+                }
+            }
+        }
+
+        if (top_p < 1.0f) {
+            std::vector<int> indices(vocab_size);
+            for (int i = 0; i < vocab_size; i++)
+                indices[i] = i;
+            std::sort(indices.begin(), indices.end(), [&](int a, int b) { return probs[a] < probs[b]; });
+            std::vector<uint8_t> to_remove((size_t)vocab_size, 0);
+            float cumsum = 0.0f;
+            for (int idx : indices) {
+                cumsum += probs[idx];
+                if (cumsum <= (1.0f - top_p)) {
+                    to_remove[(size_t)idx] = 1;
+                }
+            }
+            if (!indices.empty()) {
+                to_remove[(size_t)indices.back()] = 0;
+            }
+            for (int i = 0; i < vocab_size; i++) {
+                if (to_remove[(size_t)i]) {
+                    probs[i] = 0.0f;
+                }
+            }
+        }
+
+        float sum = 0.0f;
+        bool already_probs = (min_p > 0.0f);
+        if (!already_probs) {
+            float max_val = *std::max_element(probs.begin(), probs.end());
+            for (int i = 0; i < vocab_size; i++) {
+                probs[i] = std::exp(probs[i] - max_val);
+            }
+        }
+        for (int i = 0; i < vocab_size; i++) {
+            sum += probs[i];
+        }
+        if (sum <= 0.0f) {
+            return (int32_t)(std::max_element(logits, logits + vocab_size) - logits);
+        }
+        for (int i = 0; i < vocab_size; i++) {
+            probs[i] /= sum;
+        }
+    } else {
+        // --- HF turbo order: temperature → top_k → top_p → rep_penalty ---
+        // Operates on logits (not softmaxed probs) until the final softmax.
+        // Matches HF LogitsProcessorList composition in T3.inference_turbo
+        // (chatterbox/models/t3/t3.py:415-490): rep_penalty is applied
+        // AFTER top_k/top_p, so masked tokens (-inf) stay masked even if
+        // they were previously seen.
+        std::vector<float> work(vocab_size);
+        for (int i = 0; i < vocab_size; i++) {
+            work[i] = logits[i];
+        }
+
+        if (temperature <= 0.0f) {
+            return (int32_t)(std::max_element(work.begin(), work.end()) - work.begin());
+        }
+        if (temperature != 1.0f) {
+            for (int i = 0; i < vocab_size; i++) {
+                work[i] /= temperature;
+            }
+        }
+
+        if (top_k < vocab_size) {
+            // HF TopKLogitsWarper: indices_to_remove = scores < topk(scores, k).values[-1]
+            std::vector<int> idx(vocab_size);
+            for (int i = 0; i < vocab_size; i++)
+                idx[i] = i;
+            std::nth_element(idx.begin(), idx.begin() + (top_k - 1), idx.end(),
+                             [&](int a, int b) { return work[a] > work[b]; });
+            const float kth_value = work[idx[top_k - 1]];
+            for (int i = 0; i < vocab_size; i++) {
+                if (work[i] < kth_value) {
+                    work[i] = kNegInf;
+                }
+            }
+        }
+
+        if (top_p < 1.0f) {
+            // HF TopPLogitsWarper sorts logits ascending, softmaxes the
+            // sorted vector, and drops indices whose cumulative softmax
+            // probability is <= (1 - top_p). min_tokens_to_keep=1 means
+            // the top-1 token is always retained.
+            float max_val = kNegInf;
+            for (int i = 0; i < vocab_size; i++) {
+                if (work[i] > max_val) {
+                    max_val = work[i];
+                }
+            }
+            std::vector<float> sm(vocab_size);
+            float sum = 0.0f;
+            for (int i = 0; i < vocab_size; i++) {
+                sm[i] = std::exp(work[i] - max_val);
+                sum += sm[i];
+            }
+            if (sum > 0.0f) {
+                for (int i = 0; i < vocab_size; i++) {
+                    sm[i] /= sum;
+                }
+                std::vector<int> indices(vocab_size);
+                for (int i = 0; i < vocab_size; i++)
+                    indices[i] = i;
+                std::sort(indices.begin(), indices.end(), [&](int a, int b) { return sm[a] < sm[b]; });
+                float cumsum = 0.0f;
+                for (size_t k = 0; k + 1 < indices.size(); k++) {
+                    cumsum += sm[indices[k]];
+                    if (cumsum <= (1.0f - top_p)) {
+                        work[indices[k]] = kNegInf;
+                    }
+                }
+            }
+        }
+
+        if (rep_penalty != 1.0f) {
+            std::vector<uint8_t> seen((size_t)vocab_size, 0);
+            for (int32_t tok : prev_tokens) {
+                if (tok >= 0 && tok < vocab_size) {
+                    if (seen[(size_t)tok]) {
+                        continue;
+                    }
+                    seen[(size_t)tok] = 1;
+                    if (work[tok] == kNegInf) {
+                        continue;
+                    }
+                    if (work[tok] > 0)
+                        work[tok] /= rep_penalty;
+                    else
+                        work[tok] *= rep_penalty;
+                }
+            }
+        }
+
+        // Final softmax. Tokens masked to -inf become 0 cleanly via exp().
+        float max_val = kNegInf;
+        for (int i = 0; i < vocab_size; i++) {
+            if (work[i] > max_val) {
+                max_val = work[i];
+            }
+        }
+        if (max_val == kNegInf) {
+            return (int32_t)(std::max_element(logits, logits + vocab_size) - logits);
+        }
         float sum = 0.0f;
         for (int i = 0; i < vocab_size; i++) {
-            probs[i] = std::exp(probs[i] - max_val);
+            probs[i] = std::exp(work[i] - max_val);
             sum += probs[i];
+        }
+        if (sum <= 0.0f) {
+            return (int32_t)(std::max_element(logits, logits + vocab_size) - logits);
         }
         for (int i = 0; i < vocab_size; i++) {
             probs[i] /= sum;
         }
 
-        float max_prob = *std::max_element(probs.begin(), probs.end());
-        float threshold = max_prob * min_p;
-        std::vector<uint8_t> to_remove((size_t)vocab_size, 0);
-        for (int i = 0; i < vocab_size; i++) {
-            if (probs[i] < threshold) {
-                to_remove[(size_t)i] = 1;
-            }
-        }
-        auto best_it = std::max_element(probs.begin(), probs.end());
-        if (best_it != probs.end()) {
-            to_remove[(size_t)(best_it - probs.begin())] = 0;
-        }
-        for (int i = 0; i < vocab_size; i++) {
-            if (to_remove[(size_t)i]) {
-                probs[i] = 0.0f;
-            }
-        }
-    }
-
-    // Top-p filtering
-    if (top_p < 1.0f) {
-        std::vector<int> indices(vocab_size);
-        for (int i = 0; i < vocab_size; i++)
-            indices[i] = i;
-        std::sort(indices.begin(), indices.end(), [&](int a, int b) { return probs[a] < probs[b]; });
-        std::vector<uint8_t> to_remove((size_t)vocab_size, 0);
-        float cumsum = 0.0f;
-        for (int idx : indices) {
-            cumsum += probs[idx];
-            if (cumsum <= (1.0f - top_p)) {
-                to_remove[(size_t)idx] = 1;
-            }
-        }
-        if (!indices.empty()) {
-            to_remove[(size_t)indices.back()] = 0;
-        }
-        for (int i = 0; i < vocab_size; i++) {
-            if (to_remove[(size_t)i]) {
-                probs[i] = 0.0f;
-            }
-        }
-    }
-
-    // Softmax / re-normalize after filtering
-    float sum = 0.0f;
-    bool already_probs = (min_p > 0.0f);
-    if (!already_probs) {
-        float max_val = *std::max_element(probs.begin(), probs.end());
-        for (int i = 0; i < vocab_size; i++) {
-            probs[i] = std::exp(probs[i] - max_val);
-        }
-    }
-    for (int i = 0; i < vocab_size; i++) {
-        sum += probs[i];
-    }
-    if (sum <= 0.0f) {
-        return (int32_t)(std::max_element(logits, logits + vocab_size) - logits);
-    }
-    for (int i = 0; i < vocab_size; i++) {
-        probs[i] /= sum;
+        // Suppress unused-warning for min_p on this branch (turbo defaults
+        // set min_p=0, so this is intentional).
+        (void)min_p;
     }
 
     // Faithful CPU torch.multinomial(probs, num_samples=1) port:
@@ -1733,6 +1852,21 @@ static ggml_cgraph* build_graph_t3_gpt2_kv(chatterbox_context* c, int n_past, in
 
     ggml_tensor* cur = embeds;
 
+    // Issue #94 follow-up: per-layer hidden-state dump for the GPT-2 graph.
+    // Set CRISPASR_CHATTERBOX_DUMP_GPT2_LAYERS=1 to mark each
+    // post-attn-residual and post-FFN-residual as graph outputs. The runner
+    // side reads them by name and writes raw float32 to
+    // /tmp/cb_gpt2_step_<n_past>_LNN_post_{attn,ffn}.bin. Lets us bisect
+    // which transformer layer first diverges from the HuggingFace reference
+    // at the T == 1 decoding step.
+    //
+    // Note: the input tensor (`inputs_embeds`) is *not* dumped — set_output
+    // on a set_input tensor is ignored by the scheduler in practice and the
+    // memory gets repurposed after layer 0 reads it. Verify the input via a
+    // stderr print of `tok_embed.data()` first10 in the AR-loop call site if
+    // you need to compare it against speech_emb(tok) + wpe(pos).
+    const bool dump_layers = (std::getenv("CRISPASR_CHATTERBOX_DUMP_GPT2_LAYERS") != nullptr);
+
     for (uint32_t il = 0; il < hp.n_layers; il++) {
         const auto& b = c->t3.gpt2_blocks[il];
         ggml_tensor* residual = cur;
@@ -1790,15 +1924,42 @@ static ggml_cgraph* build_graph_t3_gpt2_kv(chatterbox_context* c, int n_past, in
         // Permute Q to (hd, T, n_h)
         Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
 
-        // Flash attention
-        ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, Kfull, Vfull, (T == 1) ? nullptr : causal_mask, attn_scale,
-                                                /*max_bias*/ 0.0f, /*logit_softcap*/ 0.0f);
-        attn = ggml_reshape_2d(ctx0, attn, D, T);
+        // Attention. CRISPASR_CHATTERBOX_NAIVE_ATTN=1 swaps ggml_flash_attn_ext
+        // for an explicit softmax(QK^T)V path. Useful for isolating flash_attn
+        // accumulator-order differences from other bugs. Layout follows
+        // src/qwen3_asr.cpp:895-924: scores = mul_mat(K, Q); soft_max_ext
+        // (fused scale + mask + softmax); V is permuted (Lk, hd, n_h) for the
+        // attn = mul_mat(V', scores) step that contracts over Lk. The result
+        // is (hd, T, n_h) which must be permuted (0, 2, 1, 3) to (hd, n_h, T)
+        // before reshape_2d(D, T) so the head dim packs correctly for the WO
+        // projection — flash_attn_ext outputs (hd, n_h, T) natively per its
+        // ggml.h docs, so skipping the permute here gave wrong outputs in an
+        // earlier attempt.
+        ggml_tensor* attn;
+        if (std::getenv("CRISPASR_CHATTERBOX_NAIVE_ATTN")) {
+            ggml_tensor* scores = ggml_mul_mat(ctx0, Kfull, Q);
+            scores = ggml_soft_max_ext(ctx0, scores, (T > 1) ? causal_mask : nullptr, attn_scale, 0.0f);
+            ggml_tensor* Vp = ggml_cont(ctx0, ggml_permute(ctx0, Vfull, 1, 0, 2, 3));
+            attn = ggml_mul_mat(ctx0, Vp, scores);
+            attn = ggml_cont(ctx0, ggml_permute(ctx0, attn, 0, 2, 1, 3));
+            attn = ggml_reshape_2d(ctx0, attn, D, T);
+        } else {
+            attn = ggml_flash_attn_ext(ctx0, Q, Kfull, Vfull, (T == 1) ? nullptr : causal_mask, attn_scale,
+                                       /*max_bias*/ 0.0f, /*logit_softcap*/ 0.0f);
+            attn = ggml_reshape_2d(ctx0, attn, D, T);
+        }
 
         // Output projection + residual
         attn = ggml_mul_mat(ctx0, b.attn_output_w, attn);
         attn = ggml_add(ctx0, attn, b.attn_output_b);
         cur = ggml_add(ctx0, residual, attn);
+        if (dump_layers) {
+            char nm[32];
+            std::snprintf(nm, sizeof nm, "L%02u_post_attn", il);
+            ggml_set_name(cur, nm);
+            ggml_set_output(cur);
+            ggml_build_forward_expand(gf, cur);
+        }
 
         // FFN
         residual = cur;
@@ -1814,6 +1975,13 @@ static ggml_cgraph* build_graph_t3_gpt2_kv(chatterbox_context* c, int n_past, in
         mlp = ggml_add(ctx0, mlp, b.ffn_proj_b);
 
         cur = ggml_add(ctx0, residual, mlp);
+        if (dump_layers) {
+            char nm[32];
+            std::snprintf(nm, sizeof nm, "L%02u_post_ffn", il);
+            ggml_set_name(cur, nm);
+            ggml_set_output(cur);
+            ggml_build_forward_expand(gf, cur);
+        }
     }
 
     // Final LayerNorm
@@ -1886,6 +2054,38 @@ static float* run_t3_gpt2_kv(chatterbox_context* c, const float* embeds, int n_t
     if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "kartoffelbox: T3 GPT-2 compute failed\n");
         return nullptr;
+    }
+    // Issue #94 follow-up: optional per-layer hidden-state dump for bisecting
+    // T3 step >= 1 divergence vs the HF reference. The graph builder names
+    // L_in_emb, LNN_post_attn, LNN_post_ffn. Files are written to
+    // /tmp/cb_gpt2_step_<n_past>_<name>.bin as raw little-endian float32 of
+    // size D*T (T is usually 1 on the AR-step call). The runner doesn't know
+    // whether the graph builder added these names (env-gated), so we tolerate
+    // misses.
+    if (std::getenv("CRISPASR_CHATTERBOX_DUMP_GPT2_LAYERS")) {
+        auto dump = [&](const char* nm) {
+            ggml_tensor* t = ggml_graph_get_tensor(gf, nm);
+            if (!t) {
+                return;
+            }
+            size_t nbytes = ggml_nbytes(t);
+            std::vector<uint8_t> buf(nbytes);
+            ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
+            char path[256];
+            std::snprintf(path, sizeof path, "/tmp/cb_gpt2_step_%d_%s.bin", n_past, nm);
+            FILE* fp = std::fopen(path, "wb");
+            if (fp) {
+                std::fwrite(buf.data(), 1, nbytes, fp);
+                std::fclose(fp);
+            }
+        };
+        for (uint32_t il = 0; il < c->hp.n_layers; il++) {
+            char nm1[32], nm2[32];
+            std::snprintf(nm1, sizeof nm1, "L%02u_post_attn", il);
+            std::snprintf(nm2, sizeof nm2, "L%02u_post_ffn", il);
+            dump(nm1);
+            dump(nm2);
+        }
     }
     ggml_tensor* out = ggml_graph_get_tensor(gf, "logits");
     float* r = (float*)malloc((size_t)vocab * sizeof(float));
@@ -2045,6 +2245,7 @@ extern "C" struct chatterbox_context_params chatterbox_context_default_params(vo
     p.repetition_penalty = 1.2f;
     p.min_p = 0.05f;
     p.top_p = 1.0f;
+    p.top_k = 0;
     p.max_speech_tokens = 1000;
     p.cfm_steps = 10;
     // PLAN #89: flash_attn defaults to true (lost in commit ff5536ae;
@@ -2083,6 +2284,24 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
 
     const bool is_gpt2 = (c->hp.arch == "chatterbox_turbo" || c->hp.arch == "kartoffelbox");
 
+    // Issue #94 follow-up: chatterbox-turbo's Python tts_turbo.generate()
+    // explicitly disables CFG (cfg_weight=0.0 default, plus a log line
+    // "CFG, min_p and exaggeration are not supported by Turbo version"
+    // when set). It also runs a different sampler stack from base
+    // chatterbox: HF inference_turbo wires `temperature → top_k=1000 →
+    // top_p=0.95 → repetition_penalty` (tts_turbo.py:248-260,
+    // chatterbox/models/t3/t3.py:415-490). top_k=1000 is what filters
+    // the long-tail garbage that an isolated top_p=0.95 lets through —
+    // without it, the multinomial pick at step 1 lands on S3GEN_SIL
+    // (4299) on most prompts, producing the "IN-and-Hello…" /
+    // "HI Low World Test" prefix artifact users were hearing.
+    if (is_gpt2) {
+        c->params.cfg_weight = 0.0f;
+        c->params.min_p = 0.0f;
+        c->params.top_p = 0.95f;
+        c->params.top_k = 1000;
+    }
+
     if (params.verbosity >= 1) {
         fprintf(stderr, "chatterbox: arch=%s T3 %uL d=%u h=%u hd=%u ff=%u text_vocab=%u speech_vocab=%u\n",
                 c->hp.arch.c_str(), c->hp.n_layers, c->hp.hidden_size, c->hp.n_heads, c->hp.head_dim,
@@ -2097,64 +2316,77 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
         }
     }
 
-    // Backend. The chatterbox T3 graph accumulates ~1e-2 logit drift on
-    // Metal/GPU vs CPU per forward pass — small per pass but past ~16
-    // decode steps the multinomial sampler crosses a probability
-    // threshold and the whole sequence diverges into garbled / repeating
-    // speech. Confirmed reproducible at every chatterbox commit since
-    // voice cloning landed (`86ac98eb`); root cause is some op in the
-    // 30-layer Llama graph (mul_mat / flash_attn / norm path) where
-    // Metal accumulator order differs from CPU enough to bite the
-    // sampler. Until the responsible kernel is patched in ggml-metal,
-    // chatterbox auto-falls-back to CPU for the T3 forward — the user
-    // sees clean cloned speech instead of broken output.
-    //
-    // CRISPASR_CHATTERBOX_FORCE_GPU=1 disables the auto-fallback for
-    // users who want to experiment with the broken GPU path
-    // (e.g. for kernel-level debugging).
+    // Backend split. The chatterbox graph has two halves: the T3 AR
+    // transformer (30-layer Llama, multinomial speech-token sampler) and
+    // S3Gen (Conformer encoder + CFM denoiser + HiFT vocoder). Verified
+    // 2026-05-18 (handover-prompts/chatterbox-gpu-bug-is-s3gen.md): with
+    // F16 T3 weights, T3 on GPU produces an AR speech-token sequence
+    // BIT-IDENTICAL to T3 on CPU, and the round-4 Q4_K×Q8_K kernel +
+    // PREC_F32 tagging in T3 keep Q4_K T3 within tolerance too. The
+    // user-audible "GPU produces garbled audio" regression is owned
+    // entirely by the three S3Gen sub-graphs — likely some Conv1d /
+    // norm precision plumbing that hasn't been audited yet. Default is
+    // therefore T3 GPU + S3Gen CPU: correct output, ~most of the GPU
+    // speedup (T3 AR loop is the slow stage).
     c->backend_cpu = ggml_backend_cpu_init();
     if (!c->backend_cpu) {
         fprintf(stderr, "chatterbox: failed to init CPU backend\n");
         delete c;
         return nullptr;
     }
-    // PLAN #83: BOTH T3 and s3gen drift on Metal/GPU vs CPU on M1-M4.
-    // Verified: T3 K-projection drifts ~1e-3 per element (LEARNINGS
-    // §"Methodical bisect, round 2"); enabling s3gen on GPU while keeping
-    // T3 on CPU also produces broken audio (low-RMS noise instead of
-    // intelligible speech), so s3gen has the same kind of mul_mat
-    // algorithmic divergence. Until a bespoke kernel_mul_mv_q4_K_q8_K
-    // Metal kernel lands that mirrors CPU's Q8_K-quantised-input dot
-    // product, both halves of chatterbox auto-fall-back to CPU.
-    //
-    // CRISPASR_CHATTERBOX_FORCE_GPU=1 keeps the legacy override (T3+s3gen
-    // both on GPU, expected to be broken). CRISPASR_CHATTERBOX_T3_CPU_S3GEN_GPU=1
-    // tries the selective split (kept for future regression once the kernel
-    // lands).
+    // Env knobs (all override the default):
+    //   CRISPASR_CHATTERBOX_FORCE_GPU=1       — both T3 and S3Gen on GPU
+    //                                           (legacy; S3Gen output is
+    //                                           garbled, kept for diag).
+    //   CRISPASR_CHATTERBOX_T3_CPU_S3GEN_GPU=1 — flip the split (S3Gen on
+    //                                           GPU only, T3 on CPU).
+    //   CRISPASR_CHATTERBOX_S3GEN_CPU=1       — force S3Gen to CPU even
+    //                                           under FORCE_GPU=1.
+    //   CRISPASR_CHATTERBOX_FULL_CPU=1        — old default; both halves
+    //                                           on CPU.
     // cppcheck-suppress duplicateAssignExpression
     bool t3_use_gpu = params.use_gpu;
     bool s3gen_use_gpu = params.use_gpu; // NOLINT — intentionally same init, diverges below
     if (params.use_gpu) {
-        const char* force_gpu_env = std::getenv("CRISPASR_CHATTERBOX_FORCE_GPU");
-        const bool force_gpu = force_gpu_env && *force_gpu_env && std::strcmp(force_gpu_env, "0") != 0;
-        const char* split_env = std::getenv("CRISPASR_CHATTERBOX_T3_CPU_S3GEN_GPU");
-        const bool split = split_env && *split_env && std::strcmp(split_env, "0") != 0;
+        auto env_set = [](const char* name) {
+            const char* v = std::getenv(name);
+            return v && *v && std::strcmp(v, "0") != 0;
+        };
+        const bool force_gpu = env_set("CRISPASR_CHATTERBOX_FORCE_GPU");
+        const bool split_t3_cpu = env_set("CRISPASR_CHATTERBOX_T3_CPU_S3GEN_GPU");
+        const bool s3gen_cpu_override = env_set("CRISPASR_CHATTERBOX_S3GEN_CPU");
+        const bool full_cpu = env_set("CRISPASR_CHATTERBOX_FULL_CPU");
 
-        if (force_gpu) {
-            fprintf(stderr, "chatterbox: T3+s3gen forced to GPU (CRISPASR_CHATTERBOX_FORCE_GPU=1) — output may be "
-                            "garbled past ~16 decode steps due to Metal F16 drift.\n");
-        } else if (split) {
+        if (full_cpu) {
+            fprintf(stderr, "chatterbox: full CPU (CRISPASR_CHATTERBOX_FULL_CPU=1).\n");
+            t3_use_gpu = false;
+            s3gen_use_gpu = false;
+        } else if (force_gpu) {
+            fprintf(stderr, "chatterbox: T3+s3gen forced to GPU (CRISPASR_CHATTERBOX_FORCE_GPU=1) — S3Gen GPU "
+                            "path is currently broken; expect garbled audio.\n");
+            if (s3gen_cpu_override) {
+                fprintf(stderr,
+                        "chatterbox: s3gen forced to CPU (CRISPASR_CHATTERBOX_S3GEN_CPU=1) — T3 stays on GPU.\n");
+                s3gen_use_gpu = false;
+            }
+        } else if (split_t3_cpu) {
             fprintf(stderr, "chatterbox: T3 → CPU, s3gen → GPU (CRISPASR_CHATTERBOX_T3_CPU_S3GEN_GPU=1). "
-                            "WARNING: s3gen also drifts on GPU; expect broken audio.\n");
+                            "WARNING: s3gen GPU path is broken; expect garbled audio.\n");
             t3_use_gpu = false;
         } else {
-            fprintf(stderr, "chatterbox: T3+s3gen auto-falling back to CPU — Metal/GPU has cumulative F16 "
-                            "drift that breaks chatterbox sampling past ~16 decode steps. Override with "
-                            "CRISPASR_CHATTERBOX_FORCE_GPU=1 (output may be garbled).\n");
-            t3_use_gpu = false;
+            // Default: T3 on GPU, S3Gen on CPU (clean output, most of
+            // the GPU speedup). See chatterbox-gpu-bug-is-s3gen.md.
+            fprintf(stderr, "chatterbox: T3 → GPU, s3gen → CPU (default). Override with "
+                            "CRISPASR_CHATTERBOX_FORCE_GPU=1 (both GPU, broken) or "
+                            "CRISPASR_CHATTERBOX_FULL_CPU=1.\n");
             s3gen_use_gpu = false;
         }
     }
+    // Issue #94: flush so consumers see progress on slow-disk loads — the
+    // 658 MB chatterbox-turbo T3 file can take 30-60 s on slow/external
+    // disks, and a silent gap between this message and "precomputed conds
+    // loaded" reads as a hang.
+    std::fflush(stderr);
     // c->params.use_gpu controls the s3gen sub-context backend (set later
     // via chatterbox_set_s3gen_path). c->backend is the T3 backend.
     c->params.use_gpu = s3gen_use_gpu;
@@ -2168,6 +2400,10 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
     }
 
     // Pass 2: weights
+    if (params.verbosity >= 1) {
+        fprintf(stderr, "chatterbox: loading T3 weights from %s\n", path_model);
+        std::fflush(stderr);
+    }
     {
         core_gguf::WeightLoad wl;
         if (!core_gguf::load_weights(path_model, c->backend, "chatterbox", wl)) {
@@ -2177,6 +2413,10 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
         c->ctx_w = wl.ctx;
         c->buf_w = wl.buf;
         c->tensors = std::move(wl.tensors);
+    }
+    if (params.verbosity >= 1) {
+        fprintf(stderr, "chatterbox: T3 loaded %zu tensors\n", c->tensors.size());
+        std::fflush(stderr);
     }
 
     // Bind tensors
@@ -2198,6 +2438,7 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
     if (params.verbosity >= 1) {
         fprintf(stderr, "chatterbox: precomputed conds %s\n",
                 c->conds.loaded ? "loaded" : "NOT loaded (voice cloning required)");
+        std::fflush(stderr);
     }
 
     // Compute scheduler
@@ -2260,12 +2501,21 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
                 ctx->tokenizer.has_bpe ? "BPE" : "char");
     }
 
-    // 2. Add start/stop text tokens
-    text_tokens.insert(text_tokens.begin(), (int32_t)ctx->hp.start_text_token);
-    text_tokens.push_back((int32_t)ctx->hp.stop_text_token);
+    // 2. Add start/stop text tokens. Base chatterbox wraps text with
+    // [SOT, ..., EOT] via _ensure_BOT_EOT in its inference path
+    // (chatterbox/models/t3/t3.py:255). The turbo path (`is_gpt2 == true`
+    // → ChatterboxTurboTTS.inference_turbo, t3.py:415) does NOT call
+    // _ensure_BOT_EOT — it feeds the bare tokenizer output to the
+    // GPT-2 backbone. Adding SOT/EOT for turbo shifts every WPE
+    // position by 2 and was the dominant audio-quality defect in #94.
+    if (!is_gpt2) {
+        text_tokens.insert(text_tokens.begin(), (int32_t)ctx->hp.start_text_token);
+        text_tokens.push_back((int32_t)ctx->hp.stop_text_token);
+    }
 
     if (ctx->params.verbosity >= 2 || std::getenv("CHATTERBOX_DEBUG")) {
-        fprintf(stderr, "chatterbox: text_tokens(%zu) [SOT,...,EOT] = [", text_tokens.size());
+        fprintf(stderr, "chatterbox: text_tokens(%zu) %s = [", text_tokens.size(),
+                is_gpt2 ? "(no SOT/EOT for turbo)" : "[SOT,...,EOT]");
         for (size_t i = 0; i < text_tokens.size(); ++i) {
             fprintf(stderr, "%d%s", (int)text_tokens[i], i + 1 == text_tokens.size() ? "" : ", ");
         }
@@ -2358,11 +2608,19 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
         } else {
             std::memcpy(blended.data(), logits, V * sizeof(float));
         }
-
+        // Python's HF inference_turbo passes input_ids = generated_speech_tokens
+        // (NO BOS) to RepetitionPenaltyLogitsProcessor from step 1 onward; only
+        // at step 0 is input_ids = speech_start_token = [BOS] (t3.py:450 vs
+        // t3.py:471). Match that exactly here: at step 0 token_hist = [BOS]
+        // (penalizing the BOS logit, which is normally far below speech
+        // tokens anyway); from step 1 onward token_hist = generated tokens.
         std::vector<int32_t> token_hist;
-        token_hist.reserve(speech_tokens.size() + 1);
-        token_hist.push_back((int32_t)ctx->hp.start_speech_token);
-        token_hist.insert(token_hist.end(), speech_tokens.begin(), speech_tokens.end());
+        if (speech_tokens.empty()) {
+            token_hist.push_back((int32_t)ctx->hp.start_speech_token);
+        } else {
+            token_hist.reserve(speech_tokens.size());
+            token_hist.insert(token_hist.end(), speech_tokens.begin(), speech_tokens.end());
+        }
         // Sample next token. CRISPASR_CHATTERBOX_TEMP overrides the
         // configured temperature for divergence-debugging experiments
         // (temperature=0 forces greedy argmax — eliminates multinomial
@@ -2372,7 +2630,7 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
         if (const char* e = std::getenv("CRISPASR_CHATTERBOX_TEMP"); e && *e) {
             temp_eff = std::strtof(e, nullptr);
         }
-        int32_t tok = sample_token(blended.data(), V, temp_eff, ctx->params.min_p, ctx->params.top_p,
+        int32_t tok = sample_token(blended.data(), V, temp_eff, ctx->params.top_k, ctx->params.min_p, ctx->params.top_p,
                                    ctx->params.repetition_penalty, token_hist, ctx->rng_state);
         free(logits);
         logits = nullptr;
@@ -2443,6 +2701,31 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
 
     if (valid.empty()) {
         return nullptr;
+    }
+
+    // Issue #94 follow-up: chatterbox-turbo's Python implementation appends
+    // 3 S3GEN_SIL silence tokens after the AR output before handing tokens
+    // to s3gen (chatterbox/tts_turbo.py:286-287). Without this padding the
+    // generated mel cuts off abruptly — the last-frame silence is what
+    // chatterbox-turbo's meanflow s3gen was trained on. S3GEN_SIL=4299
+    // comes from chatterbox/models/s3gen/const.py. Base chatterbox doesn't
+    // do this (chatterbox/tts.py path).
+    if (is_gpt2) {
+        constexpr int32_t S3GEN_SIL = 4299;
+        valid.push_back(S3GEN_SIL);
+        valid.push_back(S3GEN_SIL);
+        valid.push_back(S3GEN_SIL);
+    }
+
+    if (ctx->params.verbosity >= 2 || std::getenv("CHATTERBOX_DEBUG")) {
+        fprintf(stderr, "chatterbox: speech_tokens(%zu) first=[", valid.size());
+        for (size_t i = 0; i < valid.size() && i < 12; ++i)
+            fprintf(stderr, "%d%s", (int)valid[i], i + 1 == valid.size() || i == 11 ? "" : ",");
+        fprintf(stderr, "] last=[");
+        size_t tail_start = valid.size() > 6 ? valid.size() - 6 : 0;
+        for (size_t i = tail_start; i < valid.size(); ++i)
+            fprintf(stderr, "%d%s", (int)valid[i], i + 1 == valid.size() ? "" : ",");
+        fprintf(stderr, "]\n");
     }
 
     int32_t* out = (int32_t*)malloc(valid.size() * sizeof(int32_t));
@@ -3296,6 +3579,16 @@ extern "C" void chatterbox_set_min_p(struct chatterbox_context* ctx, float min_p
     ctx->params.min_p = min_p;
 }
 
+extern "C" void chatterbox_set_top_k(struct chatterbox_context* ctx, int top_k) {
+    if (!ctx) {
+        return;
+    }
+    if (top_k < 0) {
+        top_k = 0;
+    }
+    ctx->params.top_k = top_k;
+}
+
 extern "C" void chatterbox_set_repetition_penalty(struct chatterbox_context* ctx, float r) {
     if (!ctx) {
         return;
@@ -3323,6 +3616,12 @@ extern "C" void chatterbox_set_max_speech_tokens(struct chatterbox_context* ctx,
         n = 4000;
     }
     ctx->params.max_speech_tokens = n;
+}
+
+extern "C" void chatterbox_set_seed(struct chatterbox_context* ctx, uint32_t seed) {
+    if (!ctx)
+        return;
+    ctx->rng_seed = seed;
 }
 
 extern "C" void chatterbox_tokens_free(int32_t* tokens) {
@@ -3454,6 +3753,25 @@ extern "C" float* chatterbox_dump_prompt_feat_24k(struct chatterbox_context* ctx
     if (!ctx || !ctx->s3gen_ctx)
         return nullptr;
     return chatterbox_s3gen_dump_prompt_feat_24k(ctx->s3gen_ctx, pcm_24k, n_samples, max_samples, out_T_mel);
+}
+
+extern "C" float* chatterbox_dump_s3gen_encoder_out(struct chatterbox_context* ctx, const int32_t* speech_tokens,
+                                                    int n_speech_tokens, int* out_T_mel) {
+    if (out_T_mel)
+        *out_T_mel = 0;
+    if (!ctx || !ctx->s3gen_ctx || !speech_tokens || n_speech_tokens <= 0)
+        return nullptr;
+    std::vector<int32_t> pt_buf;
+    const int32_t* prompt_tokens = nullptr;
+    int n_prompt = 0;
+    if (ctx->conds.gen_prompt_token) {
+        n_prompt = (int)ctx->conds.gen_prompt_token->ne[0];
+        pt_buf.resize(n_prompt);
+        ggml_backend_tensor_get(ctx->conds.gen_prompt_token, pt_buf.data(), 0, n_prompt * sizeof(int32_t));
+        prompt_tokens = pt_buf.data();
+    }
+    return chatterbox_s3gen_dump_encoder_out(ctx->s3gen_ctx, speech_tokens, n_speech_tokens, prompt_tokens, n_prompt,
+                                             out_T_mel);
 }
 
 extern "C" float* chatterbox_dump_t3_prefill_emb(struct chatterbox_context* ctx, const char* text, int* out_T,

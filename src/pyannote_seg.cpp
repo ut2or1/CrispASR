@@ -75,9 +75,9 @@ struct pyannote_seg_context {
 // ===========================================================================
 
 static bool pyannote_load(pyannote_model& m, const char* path) {
-    ggml_backend_t backend = ggml_backend_init_best();
-    if (!backend)
-        backend = ggml_backend_cpu_init();
+    // pyannote_seg_run() is a manual CPU F32 implementation that directly
+    // dereferences tensor->data, so weights must live in host memory.
+    ggml_backend_t backend = ggml_backend_cpu_init();
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path, backend, "pyannote_seg", wl)) {
         ggml_backend_free(backend);
@@ -85,7 +85,7 @@ static bool pyannote_load(pyannote_model& m, const char* path) {
     }
     m.ctx = wl.ctx;
     m.buf = wl.buf;
-    m.backend = backend; // keep alive until pyannote_seg_free — Metal buffer needs its device
+    m.backend = backend; // keep alive until pyannote_seg_free
     m.tensors = std::move(wl.tensors);
 
     auto get = [&](const char* name) -> ggml_tensor* {
@@ -172,13 +172,14 @@ static void bilstm_forward(const float* input, int T, int C_in, const pyannote_l
                 gates[g] = sum;
             }
 
-            // i=sigmoid, f=sigmoid, g=tanh, o=sigmoid
+            // ONNX LSTM gate order is i, o, f, c (cell candidate), not
+            // PyTorch's common i, f, g, o ordering.  See ONNX spec §LSTM.
             for (int j = 0; j < H; j++) {
                 float i_g = sigmoid(gates[0 * H + j]);
-                float f_g = sigmoid(gates[1 * H + j]);
-                float g_g = tanhf(gates[2 * H + j]);
-                float o_g = sigmoid(gates[3 * H + j]);
-                c[j] = f_g * c[j] + i_g * g_g;
+                float o_g = sigmoid(gates[1 * H + j]);
+                float f_g = sigmoid(gates[2 * H + j]);
+                float c_g = tanhf(gates[3 * H + j]);
+                c[j] = f_g * c[j] + i_g * c_g;
                 h[j] = o_g * tanhf(c[j]);
             }
 

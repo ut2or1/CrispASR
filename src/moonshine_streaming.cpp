@@ -1064,6 +1064,30 @@ extern "C" void moonshine_streaming_set_n_threads(struct moonshine_streaming_con
     }
 }
 
+extern "C" int moonshine_streaming_encode(struct moonshine_streaming_context* ctx, const float* pcm, int n_samples,
+                                          float** out, int* seq_len, int* hidden_dim) {
+    if (!ctx || !pcm || n_samples <= 0 || !out || !seq_len || !hidden_dim)
+        return -1;
+    auto& m = ctx->model;
+    std::vector<float> frontend_out;
+    int T_enc = 0;
+    audio_frontend_cpu(pcm, n_samples, m, frontend_out, T_enc);
+    if (T_enc <= 0)
+        return -1;
+    std::vector<float> enc_output;
+    if (run_encoder(ctx, frontend_out.data(), T_enc, enc_output) != 0)
+        return -1;
+    int d = (int)m.hp.enc_hidden;
+    float* buf = (float*)malloc((size_t)T_enc * d * sizeof(float));
+    if (!buf)
+        return -1;
+    memcpy(buf, enc_output.data(), (size_t)T_enc * d * sizeof(float));
+    *out = buf;
+    *seq_len = T_enc;
+    *hidden_dim = d;
+    return 0;
+}
+
 extern "C" char* moonshine_streaming_transcribe(struct moonshine_streaming_context* ctx, const float* pcm,
                                                 int n_samples) {
     return moonshine_streaming_transcribe_impl(ctx, pcm, n_samples, nullptr, nullptr);

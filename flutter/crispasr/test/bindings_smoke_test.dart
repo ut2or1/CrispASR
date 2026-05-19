@@ -8,6 +8,7 @@
 import 'dart:ffi';
 import 'dart:io';
 
+import 'package:crispasr/crispasr.dart' show LidMethod;
 import 'package:ffi/ffi.dart';
 import 'package:test/test.dart';
 
@@ -123,7 +124,13 @@ void main() {
     }
   });
 
-  test('c_api_version reports 0.4.0 (canonical + alias agree)', () {
+  test('c_api_version: canonical + alias agree on the same string', () {
+    // Don't pin a specific version — the C side bumps independently
+    // of the Dart binding. The test's real intent is to verify that
+    // the deprecated alias `crispasr_dart_helpers_version` keeps
+    // returning the same string as the canonical
+    // `crispasr_c_api_version` until the alias is removed.
+    final versions = <String>[];
     for (final sym in const [
       'crispasr_c_api_version',
       'crispasr_dart_helpers_version', // deprecated alias
@@ -132,8 +139,13 @@ void main() {
           Pointer<Utf8> Function()>(sym);
       final ptr = fn();
       expect(ptr.cast<Uint8>().address, isNot(0), reason: sym);
-      expect(ptr.toDartString(), '0.4.0', reason: sym);
+      final s = ptr.toDartString();
+      expect(s, matches(RegExp(r'^\d+\.\d+\.\d+')),
+          reason: '$sym should return a semver-shaped string');
+      versions.add(s);
     }
+    expect(versions[0], versions[1],
+        reason: 'canonical + alias must report the same version string');
   });
 
   test('0.3.0 streaming helpers resolve', () {
@@ -178,5 +190,101 @@ void main() {
     ]) {
       expect(() => lib.lookup(s), returnsNormally, reason: s);
     }
+  });
+
+  test('0.5.9 grammar-constrained sampling helpers resolve', () {
+    // crispasr_session_set_grammar_text was added in 0.5.9 — it
+    // threads a parsed GBNF graph through wparams.grammar_rules
+    // on the whisper transcribe dispatch. Symbol-presence test;
+    // the real parse-and-bind path is exercised by the
+    // CrispasrSession.setGrammar() Dart smoke below.
+    expect(() => lib.lookup('crispasr_session_set_grammar_text'),
+        returnsNormally,
+        reason: 'rebuild libcrispasr — 0.5.9 grammar setter is missing');
+  });
+
+  test('0.5.13 whisper alt-token capture symbols resolve', () {
+    // 0.5.13 adds top-N alternative-candidate capture for whisper
+    // greedy decode. The C side exposes them at three layers:
+    //   * params-level (`crispasr_params_set_alt_n`) for the
+    //     low-level transcribePcm path
+    //   * session-level sticky setter
+    //     (`crispasr_session_set_alt_n`)
+    //   * per-token + per-word accessors so consumers can surface
+    //     runner-up candidates in tap-to-pick UIs.
+    // Pre-0.5.13 dylibs don't have any of these; the Dart wrapper
+    // raises UnsupportedError so apps can graceful-degrade.
+    for (final s in [
+      'crispasr_params_set_alt_n',
+      'crispasr_session_set_alt_n',
+      'crispasr_token_n_alts',
+      'crispasr_token_alt_id',
+      'crispasr_token_alt_p',
+      'crispasr_token_alt_text',
+      'crispasr_session_result_word_n_alts',
+      'crispasr_session_result_word_alt_text',
+      'crispasr_session_result_word_alt_p',
+    ]) {
+      expect(() => lib.lookup(s), returnsNormally,
+          reason: 'rebuild libcrispasr — 0.5.13 alt-token symbol '
+              '$s is missing');
+    }
+  });
+
+  test('0.5.12 audio enhancement helper resolves', () {
+    // crispasr_enhance_audio_rnnoise runs RNNoise on a 16 kHz mono
+    // float32 buffer (upsample → denoise frames → downsample) as a
+    // transcribe pre-step. Pre-0.5.12 dylibs don't have the symbol;
+    // the Dart wrapper raises UnsupportedError so apps can
+    // graceful-degrade to the un-enhanced PCM.
+    expect(() => lib.lookup('crispasr_enhance_audio_rnnoise'),
+        returnsNormally,
+        reason: 'rebuild libcrispasr — 0.5.12 audio enhancement '
+            'helper is missing');
+  });
+
+  test('0.5.11 whisper decode-extras setter resolves', () {
+    // crispasr_session_set_whisper_decode_extras writes
+    // wparams.suppress_nst + suppress_regex + carry_initial_prompt
+    // on every whisper transcribe. Pre-0.5.11 dylibs don't have
+    // the symbol; the Dart wrapper raises UnsupportedError so
+    // apps can graceful-degrade.
+    expect(
+        () => lib
+            .lookup('crispasr_session_set_whisper_decode_extras'),
+        returnsNormally,
+        reason: 'rebuild libcrispasr — 0.5.11 whisper decode-extras '
+            'setter is missing');
+  });
+
+  test('0.5.10 whisper decoder-fallback thresholds setter resolves', () {
+    // crispasr_session_set_fallback_thresholds writes the four
+    // wparams.*_thold fields + wparams.temperature_inc on every
+    // whisper transcribe. Pre-0.5.10 dylibs don't have the
+    // symbol; the Dart wrapper raises UnsupportedError so apps
+    // can graceful-degrade.
+    expect(
+        () => lib.lookup('crispasr_session_set_fallback_thresholds'),
+        returnsNormally,
+        reason: 'rebuild libcrispasr — 0.5.10 fallback-threshold '
+            'setter is missing');
+  });
+
+  test('LidMethod enum indexes match the C-side CrispasrLidMethod', () {
+    // crispasr_detect_language_pcm dispatches on the int value of
+    // `method.index`; the C side's `enum class CrispasrLidMethod`
+    // hard-codes Whisper=0, Silero=1, Firered=2, Ecapa=3 (see
+    // src/crispasr_lid.h). If somebody reorders the Dart enum or
+    // inserts a new variant in the middle, every Firered/Ecapa
+    // call silently routes to the wrong backend with no compile
+    // error. Pin the indexes here so a reorder shows up as a red
+    // test, not a runtime regression.
+    expect(LidMethod.whisper.index, 0);
+    expect(LidMethod.silero.index, 1);
+    expect(LidMethod.firered.index, 2);
+    expect(LidMethod.ecapa.index, 3);
+    expect(LidMethod.values.length, 4,
+        reason: 'extending LidMethod without bumping the C-side enum '
+            'will silently drop the new variant');
   });
 }

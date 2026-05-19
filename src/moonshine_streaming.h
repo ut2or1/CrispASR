@@ -47,6 +47,15 @@ void moonshine_streaming_free(struct moonshine_streaming_context* ctx);
 // Set thread count after init.
 void moonshine_streaming_set_n_threads(struct moonshine_streaming_context* ctx, int n_threads);
 
+// Encode-only path for diff testing (crispasr-diff).
+// Runs audio_frontend + transformer encoder on `n_samples` of 16kHz mono PCM.
+// On success writes a malloc'd float32 array to *out (caller frees with free()),
+// and sets *seq_len (T_enc) and *hidden_dim (enc_hidden_size).
+// Layout: (*out)[t * hidden_dim + d] = encoder_output[t][d]  (row-major, T x D).
+// Returns 0 on success, -1 on error.
+int moonshine_streaming_encode(struct moonshine_streaming_context* ctx, const float* pcm, int n_samples, float** out,
+                               int* seq_len, int* hidden_dim);
+
 // ---- Streaming API (PLAN #62c follow-on) ----
 //
 // Despite the backend name, `moonshine_streaming_transcribe` is single-shot

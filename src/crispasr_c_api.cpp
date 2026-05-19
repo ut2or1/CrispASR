@@ -16,18 +16,24 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
+#include <algorithm>
 #include <string>
 #include <vector>
 
 #include "crispasr.h"
-#include "crispasr_vad.h"            // VAD slicing + stitching (shared with CLI)
-#include "crispasr_diarize.h"        // Speaker diarization (shared with CLI)
-#include "crispasr_lid.h"            // Language identification (shared with CLI)
+#include "crispasr_vad.h"     // VAD slicing + stitching (shared with CLI)
+#include "crispasr_diarize.h" // Speaker diarization (shared with CLI)
+#include "crispasr_lid.h"     // Language identification (shared with CLI)
+#if defined(CRISPASR_RNNOISE)
+#include "crispasr_enhance.h" // RNNoise audio enhancement (shared with CLI)
+#endif
 #include "text_lid_dispatch.h"       // Text-LID backend-agnostic façade (CLD3 + fastText)
 #include "crispasr_aligner.h"        // CTC / forced-aligner word timings (shared with CLI)
 #include "crispasr_cache.h"          // HF download + filesystem cache (shared with CLI)
 #include "crispasr_model_registry.h" // Known-model lookup (shared with CLI)
 #include "core/greedy_decode.h"      // Shared autoregressive greedy decode helper
+#include "grammar-parser.h"          // GBNF parser for grammar-constrained sampling
 // Non-Whisper backend headers. Each of these lives in `src/` and is built as
 // its own shared library — we link them into libwhisper privately so Dart
 // only has to open one library to reach every backend. Any missing header
@@ -133,6 +139,10 @@
 #include "speaker_db.h"
 #define CA_HAVE_TITANET 1
 #endif
+#include "crispasr_speaker_cluster.h"
+#include "crispasr_speaker_embedder.h"
+#include "crispasr_diarize_internal.h"
+#include "pyannote_seg.h"
 
 #ifdef _WIN32
 #define CA_EXPORT extern "C" __declspec(dllexport)
@@ -281,6 +291,67 @@ CA_EXPORT float crispasr_token_p(whisper_context* ctx, int i_seg, int i_tok) {
 }
 
 // =========================================================================
+// Alternative-candidate tokens (`alt_n` knob, greedy decode only)
+// =========================================================================
+//
+// Whisper's per-step softmax produces a full distribution over the vocab;
+// `whisper_full_get_token_data` returns just the chosen token. When
+// `wparams.alt_n > 0` (set via crispasr_params_set_alt_n), the decoder
+// also stashes the top-N runner-up candidates so consumers can build
+// tap-to-pick UIs for ambiguous proper nouns / technical jargon. Beam
+// search is excluded (siblings are beam-conditional, not greedy alts).
+CA_EXPORT void crispasr_params_set_alt_n(whisper_full_params* p, int n) {
+    if (p)
+        p->alt_n = n < 0 ? 0 : (n > 32 ? 32 : n); // sanity clamp; UI caps at 5
+}
+
+CA_EXPORT int crispasr_token_n_alts(whisper_context* ctx, int i_seg, int i_tok) {
+    if (!ctx)
+        return 0;
+    return whisper_full_get_token_n_alts(ctx, i_seg, i_tok);
+}
+
+CA_EXPORT int32_t crispasr_token_alt_id(whisper_context* ctx, int i_seg, int i_tok, int i_alt) {
+    if (!ctx)
+        return 0;
+    return (int32_t)whisper_full_get_token_alt_id(ctx, i_seg, i_tok, i_alt);
+}
+
+CA_EXPORT float crispasr_token_alt_p(whisper_context* ctx, int i_seg, int i_tok, int i_alt) {
+    if (!ctx)
+        return 0.0f;
+    return whisper_full_get_token_alt_p(ctx, i_seg, i_tok, i_alt);
+}
+
+// Resolve alt token id to its display string via whisper's vocab. Writes
+// into the caller's buffer; returns bytes written (excluding NUL), 0
+// on empty / out-of-range, or -1 when the buffer is too small. Mirrors
+// the registry-lookup ABI's "fill caller buffer" convention.
+CA_EXPORT int crispasr_token_alt_text(whisper_context* ctx, int i_seg, int i_tok, int i_alt, char* out, int out_cap) {
+    if (!ctx || !out || out_cap <= 0)
+        return -1;
+    const int n = whisper_full_get_token_n_alts(ctx, i_seg, i_tok);
+    if (i_alt < 0 || i_alt >= n) {
+        if (out_cap > 0)
+            out[0] = '\0';
+        return 0;
+    }
+    const whisper_token id = whisper_full_get_token_alt_id(ctx, i_seg, i_tok, i_alt);
+    const char* t = whisper_token_to_str(ctx, id);
+    if (!t) {
+        out[0] = '\0';
+        return 0;
+    }
+    const int len = (int)std::strlen(t);
+    if (len + 1 > out_cap) {
+        return -1;
+    }
+    std::memcpy(out, t, (size_t)len);
+    out[len] = '\0';
+    return len;
+}
+
+// =========================================================================
 // Language detection
 // =========================================================================
 //
@@ -317,12 +388,12 @@ CA_EXPORT float crispasr_detect_language(whisper_context* ctx, const float* pcm,
 }
 
 // =========================================================================
-// VAD — run Silero on PCM, return [start_s, end_s] pairs
+// VAD — run Silero on PCM, return [start_cs, end_cs] pairs
 // =========================================================================
 //
-// `out_spans` is a malloc'd array of floats (2 per span). The caller must
-// pass the pointer back to `crispasr_vad_free` when done. Returns the number
-// of speech segments detected (>= 0), or a negative error.
+// `out_spans` is a malloc'd array of centisecond floats (2 per span). The
+// caller must pass the pointer back to `crispasr_vad_free` when done. Returns
+// the number of speech segments detected (>= 0), or a negative error.
 //
 //   -1  bad arguments
 //   -2  model init failed
@@ -379,6 +450,69 @@ CA_EXPORT int crispasr_vad_segments(const char* vad_model_path, const float* pcm
     // Silero VAD internally assumes 16 kHz — if we later add automatic
     // resampling here, callers don't have to change.
     (void)sample_rate;
+    return n;
+}
+
+// Dispatcher-backed VAD slicing. Unlike crispasr_vad_segments above, this
+// routes through crispasr_compute_vad_slices so GGUF VAD backends such as
+// Whisper-VAD-EncDec, FireRedVAD, and MarbleNet use the same path as the CLI.
+//
+// `out_spans` is a malloc'd array of [start_s, end_s] float pairs. The caller
+// must pass it to crispasr_vad_free. Returns the number of slices (>= 0), or a
+// negative error.
+//
+//   -1  bad arguments
+//   -2  allocation failed
+CA_EXPORT int crispasr_vad_slices(const char* vad_model_path, const float* pcm, int n_samples, int sample_rate,
+                                  float threshold, int min_speech_ms, int min_silence_ms, int speech_pad_ms,
+                                  float max_chunk_duration_s, int n_threads, float** out_spans) {
+    if (!vad_model_path || !*vad_model_path || !pcm || n_samples <= 0 || sample_rate <= 0 || !out_spans)
+        return -1;
+    *out_spans = nullptr;
+
+    crispasr_vad_options opts;
+    if (threshold > 0.0f) {
+        opts.threshold = threshold;
+        opts.threshold_explicit = true;
+    }
+    if (min_speech_ms > 0)
+        opts.min_speech_duration_ms = min_speech_ms;
+    if (min_silence_ms > 0)
+        opts.min_silence_duration_ms = min_silence_ms;
+    const int pad_ms = speech_pad_ms > 0 ? speech_pad_ms : 0;
+    // Apply padding below for all dispatcher backends. Some implementations
+    // (for example Whisper-VAD-EncDec) ignore opts.speech_pad_ms internally.
+    opts.speech_pad_ms = 0;
+    if (max_chunk_duration_s > 0.0f)
+        opts.chunk_seconds = (int)std::ceil(max_chunk_duration_s);
+    else
+        opts.chunk_seconds = 0;
+    if (n_threads > 0)
+        opts.n_threads = n_threads;
+
+    std::vector<crispasr_audio_slice> slices =
+        crispasr_compute_vad_slices(pcm, n_samples, sample_rate, vad_model_path, opts);
+    const int n = (int)slices.size();
+    if (n == 0)
+        return 0;
+
+    float* buf = (float*)std::malloc(sizeof(float) * 2 * n);
+    if (!buf)
+        return -2;
+
+    const float duration_s = (float)n_samples / (float)sample_rate;
+    const float pad_s = (float)pad_ms / 1000.0f;
+    for (int i = 0; i < n; ++i) {
+        float start_s = (float)slices[i].t0_cs / 100.0f;
+        float end_s = (float)slices[i].t1_cs / 100.0f;
+        if (pad_s > 0.0f) {
+            start_s = std::max(0.0f, start_s - pad_s);
+            end_s = std::min(duration_s, end_s + pad_s);
+        }
+        buf[2 * i + 0] = start_s;
+        buf[2 * i + 1] = end_s;
+    }
+    *out_spans = buf;
     return n;
 }
 
@@ -922,6 +1056,60 @@ struct crispasr_session {
     // follow-up: "expose per-call beam_size on session-API backends."
     int beam_size = 1;
 
+    // Whisper text-suppression + prompt-carry extras (whisper-only).
+    // Map 1-to-1 onto wparams.suppress_nst / suppress_regex /
+    // carry_initial_prompt on every transcribe dispatch.
+    //
+    // Defaults match whisper_full_default_params: nst off,
+    // regex empty (no suppression), carry off. Set via the
+    // matching C-ABI `crispasr_session_set_whisper_decode_extras`.
+    bool whisper_suppress_nst = false;
+    std::string whisper_suppress_regex;
+    bool whisper_carry_initial_prompt = false;
+
+    // Whisper decoder-fallback thresholds (whisper-only — none of
+    // these fields exist on the other backends' wparams equivalent).
+    //
+    // Defaults are the same as `whisper_full_default_params` so an
+    // unmodified session matches whisper.cpp's stock behaviour. The
+    // values get written into wparams.{entropy,logprob,no_speech}
+    // _thold + wparams.temperature_inc on every whisper transcribe
+    // dispatch — same shape as the other sticky setters.
+    //
+    // Set `temperature_inc = 0.0f` to disable the temperature-
+    // fallback loop entirely (= the CLI's `--no-fallback`).
+    float entropy_thold = 2.4f;
+    float logprob_thold = -1.0f;
+    float no_speech_thold = 0.6f;
+    float temperature_inc = 0.2f;
+
+    // Per-token top-N alternative-candidate capture (whisper greedy
+    // decode only). 0 = off (default). Written into wparams.alt_n on
+    // every whisper dispatch. UI caps at 5 to keep memory tame at
+    // ~50 KB/min of audio.
+    int alt_n = 0;
+
+    // GBNF grammar-constrained sampling state (whisper backend only —
+    // wparams.grammar_rules lives in whisper_full_params, no analog
+    // on other backends today).
+    //
+    // Lifecycle:
+    //   * `crispasr_session_set_grammar_text(s, "<gbnf>", "root", 100.0f)`
+    //     re-parses the source, populates `grammar_parsed` + the cached
+    //     `grammar_rules_ptrs` vector, and stores the root rule name.
+    //   * An empty `grammar_text` means "no grammar"; the transcribe
+    //     path skips the rules-wiring branch and runs unconstrained.
+    //   * `grammar_rules_ptrs` is a vector of POINTERS into
+    //     `grammar_parsed.rules`. Both must outlive the transcribe call,
+    //     so they're members of the session, not stack locals.
+    std::string grammar_text;
+    std::string grammar_root_rule;
+    float grammar_penalty = 100.0f; // whisper.cpp default
+    grammar_parser::parse_state grammar_parsed;
+    std::vector<const whisper_grammar_element*> grammar_rules_ptrs;
+    uint32_t grammar_root_rule_id = 0;
+    bool grammar_active = false;
+
     // Exactly one of these pointers is non-null based on `backend`.
     whisper_context* whisper_ctx = nullptr;
 #ifdef CA_HAVE_PARAKEET
@@ -1006,11 +1194,20 @@ struct crispasr_session_seg {
     std::string text;
     int64_t t0 = 0; // centiseconds absolute
     int64_t t1 = 0;
+    struct word_alt {
+        std::string text;
+        float p = 0.0f;
+    };
     struct word {
         std::string text;
         int64_t t0 = 0; // centiseconds absolute
         int64_t t1 = 0;
         float p = 1.0f;
+        // Top-N alternative candidates for the first content token of
+        // this word (whisper greedy decode only, when alt_n > 0).
+        // Empty when alts weren't captured or the backend doesn't
+        // produce them. Ordered descending by p.
+        std::vector<word_alt> alts;
     };
     std::vector<word> words;
 };
@@ -1028,6 +1225,12 @@ struct ca_token_record {
     int64_t t0;
     int64_t t1;
     float p;
+    // Optional per-token top-N alternative candidates. Only the
+    // whisper-greedy path populates these (when alt_n > 0); other
+    // backends leave it empty. emit_words_from_tokens attaches the
+    // alts of each word's first content-bearing token to the emitted
+    // word — see the inline note there for why first-token only.
+    std::vector<crispasr_session_seg::word_alt> alts;
 };
 
 // GPT-2 byte-level BPE decoder. Mirrors HF's bytes_to_unicode reverse map.
@@ -1161,6 +1364,15 @@ static std::vector<crispasr_session_seg::word> emit_words_from_tokens(const std:
 
         if (!have_cur) {
             cur.t0 = tk.t0;
+            // Attribute the first content token's top-N alts to the
+            // emitted word. Whisper tokens are sub-word (BPE-ish), so
+            // for a multi-token word like "kubectl" → ["kub","ect","l"]
+            // we surface alternatives of "kub" only. That's the
+            // discriminating token in practice — if the user sees
+            // "cubicle" as an alt for "kub", they know the model
+            // wavered there. Full word-level enumeration would require
+            // expanding a token-tree per word; out of scope for v1.
+            cur.alts = tk.alts;
             have_cur = true;
         }
         cur.t1 = tk.t1;
@@ -2018,7 +2230,11 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         // breadth (best_of and beam_size are alternative knobs in
         // upstream whisper.cpp — beam search uses `beam_search.beam_size`,
         // greedy uses `greedy.best_of`).
-        const bool use_beam = s->beam_size > 1;
+        // GBNF grammar-constrained sampling requires beam search per
+        // whisper.cpp — fall back to beam=5 when the user enabled
+        // grammar but left beam_size at its default 1. Otherwise use
+        // beam search only when the user explicitly asked for it.
+        const bool use_beam = s->beam_size > 1 || s->grammar_active;
         whisper_full_params wparams =
             whisper_full_default_params(use_beam ? CRISPASR_SAMPLING_BEAM_SEARCH : CRISPASR_SAMPLING_GREEDY);
         wparams.print_progress = false;
@@ -2027,7 +2243,10 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         wparams.print_special = false;
         wparams.n_threads = s->n_threads;
         if (use_beam) {
-            wparams.beam_search.beam_size = s->beam_size;
+            // Honour the user's explicit beam_size when set; otherwise
+            // pick a sensible default (5) so grammar-constrained
+            // sampling has enough beam width to be useful.
+            wparams.beam_search.beam_size = s->beam_size > 1 ? s->beam_size : 5;
         } else if (s->best_of > 1) {
             // Best-of-N for whisper greedy sampling.
             wparams.greedy.best_of = s->best_of;
@@ -2042,6 +2261,46 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         // wparams.translate also activates the EN target language.
         if (s->translate)
             wparams.translate = true;
+        // Decoder-fallback thresholds — write the sticky session
+        // values into wparams on every dispatch so a slider tweak
+        // takes effect on the next transcribe. Defaults match
+        // whisper_full_default_params, so a user who never touches
+        // the AdvancedOptions UI sees identical behaviour to the
+        // stock library.
+        wparams.entropy_thold = s->entropy_thold;
+        wparams.logprob_thold = s->logprob_thold;
+        wparams.no_speech_thold = s->no_speech_thold;
+        wparams.temperature_inc = s->temperature_inc;
+        // Alt-token capture (greedy decode only). 0 = off. The whisper
+        // backend writes top-N runners-up onto each chosen token so
+        // session_result_word_alt_* can surface them for ambiguous
+        // word tap-to-pick UIs.
+        wparams.alt_n = s->alt_n;
+        // We need token-level data to build the per-word records below
+        // (whisper otherwise reports only segment text). Token
+        // timestamps are cheap once whisper_full has the tokens
+        // resident; turn them on unconditionally on the session path
+        // so word-level UIs work the same way they do for parakeet /
+        // canary.
+        wparams.token_timestamps = true;
+        // Whisper text-suppression + prompt-carry extras. All three
+        // map directly onto wparams; an empty regex passes nullptr
+        // (whisper's "no suppression" sentinel) instead of an empty
+        // string so wparams.suppress_regex doesn't end up pointing
+        // at a heap blob with zero length.
+        wparams.suppress_nst = s->whisper_suppress_nst;
+        wparams.carry_initial_prompt = s->whisper_carry_initial_prompt;
+        wparams.suppress_regex = s->whisper_suppress_regex.empty() ? nullptr : s->whisper_suppress_regex.c_str();
+        // GBNF grammar-constrained sampling (whisper-only). The
+        // `grammar_rules_ptrs` vector and the parsed rules it points
+        // into both live on the session struct so they outlive the
+        // whisper_full call.
+        if (s->grammar_active) {
+            wparams.grammar_rules = s->grammar_rules_ptrs.data();
+            wparams.n_grammar_rules = s->grammar_rules_ptrs.size();
+            wparams.i_start_rule = s->grammar_root_rule_id;
+            wparams.grammar_penalty = s->grammar_penalty;
+        }
 
         if (whisper_full(s->whisper_ctx, wparams, pcm, n_samples) != 0) {
             delete r;
@@ -2055,6 +2314,48 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
                 seg.text = t;
             seg.t0 = whisper_full_get_segment_t0(s->whisper_ctx, i);
             seg.t1 = whisper_full_get_segment_t1(s->whisper_ctx, i);
+
+            // Convert whisper's per-token output into the unified
+            // ca_token_record shape and run it through
+            // emit_words_from_tokens — same grouping logic the
+            // parakeet/canary paths use. Special / EOT / timestamp
+            // tokens are filtered so they don't appear as garbage
+            // words. When alt_n > 0, each content token also carries
+            // its top-N runner-up candidates which flow through to
+            // word.alts (attached to the word's first content token).
+            const int n_tok = whisper_full_n_tokens(s->whisper_ctx, i);
+            std::vector<ca_token_record> toks;
+            toks.reserve((size_t)std::max(0, n_tok));
+            for (int j = 0; j < n_tok; ++j) {
+                const whisper_token_data td = whisper_full_get_token_data(s->whisper_ctx, i, j);
+                if (td.id >= whisper_token_eot(s->whisper_ctx)) {
+                    continue; // skip EOT / timestamp / lang / special tokens
+                }
+                const char* ttext = whisper_full_get_token_text(s->whisper_ctx, i, j);
+                if (!ttext || ttext[0] == '\0') {
+                    continue;
+                }
+                ca_token_record rec;
+                rec.text = ttext;
+                rec.t0 = td.t0;
+                rec.t1 = td.t1;
+                rec.p = td.p;
+                const int n_alts = whisper_full_get_token_n_alts(s->whisper_ctx, i, j);
+                if (n_alts > 0) {
+                    rec.alts.reserve((size_t)n_alts);
+                    for (int k = 0; k < n_alts; ++k) {
+                        const whisper_token alt_id = whisper_full_get_token_alt_id(s->whisper_ctx, i, j, k);
+                        const float alt_p = whisper_full_get_token_alt_p(s->whisper_ctx, i, j, k);
+                        const char* alt_text = whisper_token_to_str(s->whisper_ctx, alt_id);
+                        crispasr_session_seg::word_alt wa;
+                        wa.text = alt_text ? alt_text : "";
+                        wa.p = alt_p;
+                        rec.alts.push_back(std::move(wa));
+                    }
+                }
+                toks.push_back(std::move(rec));
+            }
+            seg.words = emit_words_from_tokens(toks);
             r->segments.push_back(std::move(seg));
         }
         return r;
@@ -3282,6 +3583,41 @@ CA_EXPORT int crispasr_detect_language_pcm(const float* samples, int32_t n_sampl
 }
 
 // ---------------------------------------------------------------------------
+// RNNoise audio enhancement (transcribe pre-step).
+//
+// Takes a 16 kHz mono float32 PCM buffer in [-1, 1] and writes the
+// denoised result into a caller-allocated output buffer of the same
+// length. Internally upsamples to 48 kHz, runs RNNoise's 480-sample
+// frame loop, and downsamples back. State is allocated and freed per
+// call so concurrent worker isolates can invoke this safely.
+//
+// Returns:
+//   *  0 — success; out_pcm populated with denoised samples.
+//   * -1 — invalid args (null pointer, n_samples <= 0, out_cap < n_samples).
+//   * -2 — RNNoise init / processing failure (resampler init, etc).
+// ---------------------------------------------------------------------------
+CA_EXPORT int crispasr_enhance_audio_rnnoise(const float* in_pcm, int32_t n_samples, float* out_pcm, int32_t out_cap) {
+#if defined(CRISPASR_RNNOISE)
+    if (!in_pcm || !out_pcm || n_samples <= 0 || out_cap < n_samples)
+        return -1;
+
+    CrispasrEnhanceOptions opts;
+    opts.method = CrispasrEnhanceMethod::Rnnoise;
+    opts.verbose = false;
+
+    if (!crispasr_enhance_audio(in_pcm, n_samples, out_pcm, opts))
+        return -2;
+    return 0;
+#else
+    (void)in_pcm;
+    (void)n_samples;
+    (void)out_pcm;
+    (void)out_cap;
+    return -2; // RNNoise not compiled on this platform
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // Text-LID (P13.5 Phase 7 — downstream consumers' text-LID needs).
 //
 // Wraps the existing internal `text_lid_dispatch.h` façade (CLD3 +
@@ -3551,6 +3887,44 @@ CA_EXPORT float crispasr_session_result_word_p(crispasr_session_result* r, int i
     return (i_word >= 0 && i_word < (int)ws.size()) ? ws[i_word].p : -1.0f;
 }
 
+// Top-N alternative candidates for the word's first content token.
+// Returns 0 / "" / 0.0f when alts weren't captured (alt_n was 0, the
+// backend doesn't produce alts, or indices are out of range). Ordered
+// descending by p.
+CA_EXPORT int crispasr_session_result_word_n_alts(crispasr_session_result* r, int i_seg, int i_word) {
+    if (!r || i_seg < 0 || i_seg >= (int)r->segments.size())
+        return 0;
+    auto& ws = r->segments[i_seg].words;
+    if (i_word < 0 || i_word >= (int)ws.size())
+        return 0;
+    return (int)ws[i_word].alts.size();
+}
+
+CA_EXPORT const char* crispasr_session_result_word_alt_text(crispasr_session_result* r, int i_seg, int i_word,
+                                                            int i_alt) {
+    if (!r || i_seg < 0 || i_seg >= (int)r->segments.size())
+        return "";
+    auto& ws = r->segments[i_seg].words;
+    if (i_word < 0 || i_word >= (int)ws.size())
+        return "";
+    auto& alts = ws[i_word].alts;
+    if (i_alt < 0 || i_alt >= (int)alts.size())
+        return "";
+    return alts[i_alt].text.c_str();
+}
+
+CA_EXPORT float crispasr_session_result_word_alt_p(crispasr_session_result* r, int i_seg, int i_word, int i_alt) {
+    if (!r || i_seg < 0 || i_seg >= (int)r->segments.size())
+        return 0.0f;
+    auto& ws = r->segments[i_seg].words;
+    if (i_word < 0 || i_word >= (int)ws.size())
+        return 0.0f;
+    auto& alts = ws[i_word].alts;
+    if (i_alt < 0 || i_alt >= (int)alts.size())
+        return 0.0f;
+    return alts[i_alt].p;
+}
+
 CA_EXPORT void crispasr_session_result_free(crispasr_session_result* r) {
     if (r)
         delete r;
@@ -3616,6 +3990,15 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
     };
 #ifdef CA_HAVE_VIBEVOICE
     if (s->vibevoice_ctx) {
+        if (ends_with_wav(path)) {
+            // 1.5B/7B base model: WAV reference → env var for vibevoice_synthesize
+#if defined(_WIN32)
+            _putenv_s("VIBEVOICE_VOICE_AUDIO", path);
+#else
+            setenv("VIBEVOICE_VOICE_AUDIO", path, 1);
+#endif
+            return 0;
+        }
         return vibevoice_load_voice(s->vibevoice_ctx, path);
     }
 #endif
@@ -4400,6 +4783,145 @@ CA_EXPORT int crispasr_session_set_beam_size(crispasr_session* s, int n) {
     return 0;
 }
 
+// GBNF grammar-constrained sampling (whisper-only — wparams.grammar_rules
+// has no analog on other backends today).
+//
+// Pass `gbnf_text == nullptr` (or empty) to disable grammar constraints
+// and resume unconstrained decoding. Otherwise the GBNF source is parsed
+// once at setter-time and the resulting whisper_grammar_element graph is
+// stored on the session for reuse across every subsequent transcribe call.
+//
+// `root_rule` is the symbol name to start parsing from (typically "root");
+// `penalty` is whisper's grammar_penalty scalar (the CLI default is 100.0).
+//
+// When grammar is active, the whisper transcribe path automatically
+// switches to beam search (grammar-constrained sampling requires beam ≥ 2);
+// a beam_size left at the default 1 gets bumped to 5.
+//
+// Return codes:
+//    0 = grammar parsed and stored (or cleared, when text was empty)
+//   -1 = null session
+//   -2 = parse failed (invalid GBNF) or root_rule not found in parsed grammar
+CA_EXPORT int crispasr_session_set_grammar_text(crispasr_session* s, const char* gbnf_text, const char* root_rule,
+                                                float penalty) {
+    if (!s)
+        return -1;
+    // Clear-grammar path: empty text disables grammar-constrained
+    // sampling for subsequent transcribe calls.
+    if (!gbnf_text || gbnf_text[0] == '\0') {
+        s->grammar_text.clear();
+        s->grammar_root_rule.clear();
+        s->grammar_parsed = grammar_parser::parse_state{};
+        s->grammar_rules_ptrs.clear();
+        s->grammar_root_rule_id = 0;
+        s->grammar_active = false;
+        return 0;
+    }
+    // Parse the GBNF. The parser writes to stderr on syntax errors but
+    // doesn't throw; we detect failure by checking the resulting
+    // rules vector + symbol table.
+    grammar_parser::parse_state parsed = grammar_parser::parse(gbnf_text);
+    if (parsed.rules.empty()) {
+        return -2;
+    }
+    const std::string root = (root_rule && root_rule[0]) ? root_rule : "root";
+    auto it = parsed.symbol_ids.find(root);
+    if (it == parsed.symbol_ids.end()) {
+        return -2;
+    }
+    // Commit to the session. `c_rules()` materialises a fresh vector
+    // of pointers into `parsed.rules`; both the vector and the
+    // underlying rules must outlive the next transcribe call, which
+    // is why both fields live on the session.
+    s->grammar_text = gbnf_text;
+    s->grammar_root_rule = root;
+    s->grammar_parsed = std::move(parsed);
+    s->grammar_rules_ptrs = s->grammar_parsed.c_rules();
+    s->grammar_root_rule_id = it->second;
+    s->grammar_penalty = penalty > 0.0f ? penalty : 100.0f;
+    s->grammar_active = true;
+    return 0;
+}
+
+// Whisper decoder-fallback thresholds. All four are written into
+// the session struct here and applied to wparams on every whisper
+// transcribe dispatch. Non-whisper backends silently ignore — the
+// fields have no analog in their wparams equivalent.
+//
+// Defaults from whisper_full_default_params (the values the
+// session struct ships with):
+//   entropy_thold     = 2.4f   (per-token entropy fallback trigger)
+//   logprob_thold     = -1.0f  (avg-logprob fallback trigger)
+//   no_speech_thold   = 0.6f   (silence detector cutoff)
+//   temperature_inc   = 0.2f   (temperature step per fallback pass;
+//                                0.0 disables fallback entirely =
+//                                the CLI's `--no-fallback`)
+//
+// Caller passes whatever values they want — there's no "leave
+// default" sentinel because every value in this set is a real
+// float with meaningful semantics, not a presence flag.
+CA_EXPORT int crispasr_session_set_fallback_thresholds(crispasr_session* s, float entropy_thold, float logprob_thold,
+                                                       float no_speech_thold, float temperature_inc) {
+    if (!s)
+        return -1;
+    s->entropy_thold = entropy_thold;
+    s->logprob_thold = logprob_thold;
+    s->no_speech_thold = no_speech_thold;
+    // Clamp temperature_inc to [0, 1] — values outside that range
+    // either disable fallback (= 0, fine) or cause the fallback
+    // loop to never terminate in some versions of whisper.cpp.
+    if (temperature_inc < 0.0f)
+        temperature_inc = 0.0f;
+    if (temperature_inc > 1.0f)
+        temperature_inc = 1.0f;
+    s->temperature_inc = temperature_inc;
+    return 0;
+}
+
+// Per-token top-N alternative-candidate capture (whisper greedy
+// decode only). Writes the sticky value onto the session; the
+// transcribe path forwards it into wparams.alt_n on every dispatch.
+// 0 = off (the upstream default). Bumped beyond 5 is allowed but
+// the UI caps at 5; greater values just cost more memory.
+//
+// Non-whisper backends silently ignore — none of the other engines'
+// wparams equivalents have a runner-ups concept today (parakeet's
+// hypothesis lattice is closest in shape but exposed via a
+// different API).
+CA_EXPORT int crispasr_session_set_alt_n(crispasr_session* s, int n) {
+    if (!s)
+        return -1;
+    s->alt_n = n < 0 ? 0 : (n > 32 ? 32 : n);
+    return 0;
+}
+
+// Whisper text-suppression + prompt-carry extras. All three map
+// onto whisper_full_params fields with no analog on other
+// backends, so this setter is whisper-only at apply time. The
+// session struct holds the values and the transcribe path
+// writes them into wparams on every dispatch.
+//
+// Defaults from whisper_full_default_params:
+//   suppress_nst         = false  ("emit non-speech tokens like
+//                                    [LAUGHTER], [MUSIC] when
+//                                    whisper produces them")
+//   suppress_regex       = ""     (no suppression)
+//   carry_initial_prompt = false  ("only prepend initial_prompt
+//                                    to the FIRST decode window")
+//
+// `suppress_regex` is copied into a std::string on the session;
+// the caller can free their copy after this returns. Empty
+// string clears any prior regex.
+CA_EXPORT int crispasr_session_set_whisper_decode_extras(crispasr_session* s, int suppress_nst,
+                                                         const char* suppress_regex, int carry_initial_prompt) {
+    if (!s)
+        return -1;
+    s->whisper_suppress_nst = suppress_nst != 0;
+    s->whisper_carry_initial_prompt = carry_initial_prompt != 0;
+    s->whisper_suppress_regex = suppress_regex ? suppress_regex : "";
+    return 0;
+}
+
 // Auto-detect spoken language on raw 16 kHz mono PCM. Wraps the
 // standalone crispasr_detect_language() from src/crispasr_lid.h so
 // wrappers can invoke LID via their session handle.
@@ -4493,3 +5015,129 @@ CA_EXPORT int32_t crispasr_speaker_db_enroll(const char* dir_path, const char* n
 }
 
 #endif // CA_HAVE_TITANET
+
+// =========================================================================
+// Pluggable speaker embedder, agglomerative clustering, and pyannote-seg
+// cache (issue #107 P6 — pipeline primitives so every language binding
+// can compose the same diarize flow the CLI does).
+// =========================================================================
+
+// ---- pluggable embedder ----
+// `model_spec` accepts "auto", "titanet", "indextts", "indextts-bigvgan",
+// "ecapa", or a path to a `.gguf`. Returns an opaque handle, or null on
+// failure. See crispasr_speaker_embedder.h for the dispatch rules.
+CA_EXPORT void* crispasr_speaker_embedder_make_abi(const char* model_spec, int32_t n_threads, const char* cache_dir) {
+    if (!model_spec)
+        return nullptr;
+    auto p =
+        crispasr_make_speaker_embedder(std::string(model_spec), n_threads, cache_dir ? std::string(cache_dir) : "");
+    return p.release(); // ownership transfers to the caller via free_abi
+}
+
+CA_EXPORT void crispasr_speaker_embedder_free_abi(void* embedder) {
+    if (embedder)
+        delete static_cast<CrispasrSpeakerEmbedder*>(embedder);
+}
+
+CA_EXPORT int32_t crispasr_speaker_embedder_dim_abi(const void* embedder) {
+    if (!embedder)
+        return 0;
+    return static_cast<const CrispasrSpeakerEmbedder*>(embedder)->dim();
+}
+
+// Embed one mono 16 kHz PCM range. `out` must hold at least dim() floats.
+// Returns 1 on success, 0 on failure (e.g. clip too short for the model).
+CA_EXPORT int32_t crispasr_speaker_embedder_embed_abi(void* embedder, const float* pcm_16k, int32_t n_samples,
+                                                      float* out) {
+    if (!embedder || !pcm_16k || n_samples <= 0 || !out)
+        return 0;
+    return static_cast<CrispasrSpeakerEmbedder*>(embedder)->embed(pcm_16k, n_samples, out) ? 1 : 0;
+}
+
+CA_EXPORT const char* crispasr_speaker_embedder_name_abi(const void* embedder) {
+    if (!embedder)
+        return "";
+    return static_cast<const CrispasrSpeakerEmbedder*>(embedder)->name();
+}
+
+// ---- agglomerative cosine clustering ----
+// Pure arithmetic. `embeddings` is a row-major n×dim buffer of (ideally
+// L2-normalized) speaker embeddings; `labels_out` is filled with one
+// cluster ID per input in [0, k). Returns the number of clusters k, or
+// -1 on invalid args.
+CA_EXPORT int32_t crispasr_speaker_cluster_abi(const float* embeddings, int32_t n, int32_t dim, float merge_threshold,
+                                               int32_t max_speakers, int32_t* labels_out) {
+    if (!embeddings || n <= 0 || dim <= 0 || !labels_out)
+        return -1;
+    std::vector<float> e(embeddings, embeddings + (size_t)n * (size_t)dim);
+    auto labels = crispasr_agglomerative_cluster(e, n, dim, merge_threshold, max_speakers);
+    int max_label = -1;
+    for (int i = 0; i < n; i++) {
+        labels_out[i] = (int32_t)labels[i];
+        if (labels[i] > max_label)
+            max_label = labels[i];
+    }
+    return max_label + 1; // total cluster count (0 means none assigned)
+}
+
+// ---- pyannote-seg cache ----
+// Pre-compute pyannote-seg posteriors over the FULL audio buffer once,
+// then apply them to per-segment scoring with stable local track IDs.
+// The cache is opaque; callers free it with the matching _free_abi.
+//
+// Returns null on model-load failure or empty audio.
+struct crispasr_pyannote_cache_abi {
+    std::vector<float> log_probs;
+    int T = 0;
+    double frame_dur_s = 0.0;
+};
+
+CA_EXPORT void* crispasr_pyannote_cache_compute_abi(const float* full_audio, int32_t n_samples, const char* model_path,
+                                                    int32_t n_threads) {
+    if (!full_audio || n_samples <= 0 || !model_path || !*model_path)
+        return nullptr;
+    pyannote_seg_context* pctx = pyannote_seg_init(model_path, n_threads > 0 ? n_threads : 4);
+    if (!pctx)
+        return nullptr;
+    int T = 0;
+    float* probs = pyannote_seg_run(pctx, full_audio, n_samples, &T);
+    pyannote_seg_free(pctx);
+    if (!probs || T <= 0) {
+        if (probs)
+            std::free(probs);
+        return nullptr;
+    }
+    auto* cache = new crispasr_pyannote_cache_abi();
+    cache->log_probs.assign(probs, probs + (size_t)T * 7);
+    cache->T = T;
+    cache->frame_dur_s = 270.0 / 16000.0;
+    std::free(probs);
+    return cache;
+}
+
+CA_EXPORT void crispasr_pyannote_cache_free_abi(void* cache) {
+    if (cache)
+        delete static_cast<crispasr_pyannote_cache_abi*>(cache);
+}
+
+// Score segs against a precomputed pyannote cache. Each seg's `speaker`
+// is set to 0/1/2 (local pyannote-seg track index) or -1 for silence.
+// `slice_t0_cs` is the absolute centisecond at which the cache buffer
+// starts (usually 0 — the cache covers the whole input audio).
+//
+// Returns 0 on success, -1 on invalid args.
+CA_EXPORT int32_t crispasr_pyannote_cache_apply_abi(const void* cache, int64_t slice_t0_cs,
+                                                    crispasr_diarize_seg_abi* segs, int32_t n_segs) {
+    if (!cache || !segs || n_segs <= 0)
+        return -1;
+    const auto* c = static_cast<const crispasr_pyannote_cache_abi*>(cache);
+    std::vector<CrispasrDiarizeSegment> lib_segs;
+    lib_segs.reserve(n_segs);
+    for (int i = 0; i < n_segs; i++)
+        lib_segs.push_back({segs[i].t0_cs, segs[i].t1_cs, segs[i].speaker});
+    crispasr_diarize_internal::assign_speakers_from_log_posteriors(c->log_probs.data(), c->T, c->frame_dur_s,
+                                                                   slice_t0_cs, lib_segs);
+    for (int i = 0; i < n_segs; i++)
+        segs[i].speaker = lib_segs[i].speaker;
+    return 0;
+}

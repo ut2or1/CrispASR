@@ -173,6 +173,28 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # TitaNet-Large speaker verification. model_dir = HF id or local .nemo.
     # Audio arg is a single speaker utterance (16 kHz mono).
     "titanet":         "reference_backends.titanet",
+    # Moonshine (UsefulSensors tiny/base). model_dir = usefulsensors/moonshine-tiny
+    # or usefulsensors/moonshine-base (or a local snapshot). Audio arg is a 16 kHz
+    # mono WAV. Captures encoder_output (T_enc, hidden_dim) matching moonshine_encode().
+    "moonshine":       "reference_backends.moonshine",
+    "moonshine-base":  "reference_backends.moonshine",
+    # Moonshine-Streaming (ONNX variant from usefulsensors/moonshine).
+    # model_dir = root of the cloned repo (onnx/tiny/{preprocess,encode}.onnx).
+    # Captures encoder_output (T, 288) matching moonshine_encode() streaming path.
+    "moonshine-streaming": "reference_backends.moonshine_streaming",
+    # GLM-ASR (GGUF-direct, no PyTorch). model_dir = path to an F32 GLM-ASR GGUF
+    # (e.g. cstr/glm-asr-nano-GGUF / glm-asr-nano.gguf) or a directory containing
+    # it. Captures mel_spectrogram (128, T_mel) and encoder_output (T_proj, 2048).
+    "glm-asr": "reference_backends.glm_asr",
+    # FireRedASR-AED. model_dir = "FireRedTeam/FireRedASR2-AED" (HF id) or a local
+    # directory containing model.pth.tar + cmvn.ark. Requires `fireredasr` and
+    # `kaldi_native_fbank`. Captures mel_spectrogram (T, 80) Kaldi fbank+CMVN
+    # and encoder_output (T_enc, 1280) Conformer encoder.
+    "firered-asr": "reference_backends.firered_asr",
+    # VoxCPM2 TTS: diffusion AR TTS with 4 transformer sub-networks.
+    # model_dir = openbmb/VoxCPM2 HF snapshot. Audio arg = reference WAV
+    # for voice cloning (optional). Synth text from VOXCPM2_SYN_TEXT env.
+    "voxcpm2-tts": "reference_backends.voxcpm2_tts",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import
@@ -384,6 +406,7 @@ def main() -> None:
     # harnesses on the C++ side can replay the exact synthesis context.
     for env_key in ("QWEN3_TTS_SYN_TEXT", "QWEN3_TTS_REF_TEXT", "QWEN3_TTS_LANG", "QWEN3_TTS_VOICE",
                     "KOKORO_PHONEMES", "KOKORO_VOICE", "KOKORO_SEED", "CHATTERBOX_SYN_TEXT",
+                    "VOXCPM2_SYN_TEXT",
                     "LID_TEXT", "CLD3_TEXT"):
         val = os.environ.get(env_key)
         if val is not None:

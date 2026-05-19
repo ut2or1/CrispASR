@@ -367,6 +367,7 @@ public:
                 }
                 transcript += txt;
                 crispasr_token tk;
+                tk.id = id;
                 tk.text = txt;
                 tk.confidence = (i < probs.size()) ? probs[i] : 1.0f;
                 out_tokens.push_back(std::move(tk));
@@ -396,6 +397,7 @@ public:
         dec_cfg.max_new_tokens = max_new;
         dec_cfg.eos_id = eos_id;
         dec_cfg.temperature = params.temperature;
+        dec_cfg.seed = params.seed;
 
         const int n_runs = (params.temperature > 0.0f && params.best_of > 1) ? params.best_of : 1;
         core_greedy_decode::Result best_dec;

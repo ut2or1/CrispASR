@@ -144,13 +144,57 @@ add_library(crispasr
             # CLI keeps the TTY prompting shim; the library does the
             # non-interactive resolve.
             crispasr_model_registry.cpp
+            # Pluggable speaker-embedding interface + concrete adapters
+            # (TitaNet, IndexTTS-ECAPA) and agglomerative cosine
+            # clustering, shared between the CLI's --diarize-embedder
+            # path and the C ABI's crispasr_speaker_embedder_* surface
+            # (#107 P6). The adapters depend on the lib-local titanet
+            # + indextts_voc runtimes also compiled in here.
+            crispasr_speaker_embedder.cpp
+            crispasr_speaker_cluster.cpp
             # Text-LLM chat C ABI (docs/prompts/chat-abi.md). Calls into
             # the private crispasr-llama-core static lib; the public
             # surface lives in include/crispasr_chat.h and exposes only
             # POD structs + opaque handles — no llama.h types leak out.
             chat.cpp
             ../include/crispasr_chat.h
+            # GBNF grammar parser — moved out of examples/ so the library
+            # can expose grammar-constrained sampling via
+            # `crispasr_session_set_grammar_text`. The CLI examples now
+            # depend on libcrispasr for grammar parsing too instead of
+            # building their own copy.
+            grammar-parser.h
+            grammar-parser.cpp
             )
+
+# RNNoise uses C99 VLAs and M_PI — both unsupported by MSVC out of the box.
+# Exclude the whole feature on Windows rather than patching vendored sources.
+if (NOT MSVC)
+    target_sources(crispasr PRIVATE
+        crispasr_enhance.h
+        crispasr_enhance.cpp
+        rnnoise/rnnoise.h
+        rnnoise/denoise.c
+        rnnoise/rnn.c
+        rnnoise/rnn_data.c
+        rnnoise/pitch.c
+        rnnoise/celt_lpc.c
+        rnnoise/kiss_fft.c
+    )
+    target_compile_definitions(crispasr PRIVATE CRISPASR_RNNOISE=1)
+endif()
+
+# RNNoise's C sources predate the strict implicit-decl errors that
+# clang 16+ defaults to. Silence those warnings on a per-file basis
+# rather than relaxing global -Werror policy.
+if (NOT MSVC)
+    set_source_files_properties(
+        rnnoise/denoise.c rnnoise/rnn.c rnnoise/rnn_data.c
+        rnnoise/pitch.c rnnoise/celt_lpc.c rnnoise/kiss_fft.c
+        PROPERTIES
+            COMPILE_FLAGS "-Wno-implicit-function-declaration -Wno-unused-but-set-variable -Wno-unused-function -Wno-unused-variable"
+    )
+endif()
 add_library(whisper ALIAS crispasr)
 
 # miniaudio.h on Apple includes <AVFoundation/AVFoundation.h> which
@@ -786,6 +830,18 @@ target_compile_features   (vibevoice PUBLIC cxx_std_17)
 target_link_libraries     (vibevoice PUBLIC crispasr-core ggml ggml-base ggml-cpu)
 
 # ---------------------------------------------------------------------------
+# voxcpm2_tts — openbmb/VoxCPM2 (diffusion AR TTS, 30 languages, 48kHz)
+# ---------------------------------------------------------------------------
+add_library(voxcpm2_tts STATIC voxcpm2_tts.h voxcpm2_tts.cpp)
+set_target_properties(voxcpm2_tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(voxcpm2_tts PUBLIC .)
+target_compile_features   (voxcpm2_tts PUBLIC cxx_std_17)
+target_link_libraries     (voxcpm2_tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(voxcpm2_tts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # kokoro — hexgrad/Kokoro-82M + yl4579/StyleTTS2-LJSpeech (iSTFTNet TTS)
 # ---------------------------------------------------------------------------
 add_library(kokoro STATIC kokoro.h kokoro.cpp)
@@ -1187,6 +1243,9 @@ if (TARGET m2m100)
 endif()
 if (TARGET t5_translate)
     target_link_libraries(crispasr PUBLIC t5_translate)
+endif()
+if (TARGET voxcpm2_tts)
+    target_link_libraries(crispasr PUBLIC voxcpm2_tts)
 endif()
 if (TARGET kokoro)
     target_link_libraries(crispasr PUBLIC kokoro)

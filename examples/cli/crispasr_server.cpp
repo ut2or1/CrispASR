@@ -24,6 +24,7 @@
 #include "crispasr_output.h"
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_vad_cli.h"
+#include "crispasr_aligner_cli.h"
 #include "whisper_params.h"
 
 #include "common-crispasr.h" // read_audio_data
@@ -60,7 +61,23 @@
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Create a temporary file securely via mkstemp (POSIX) or _mktemp_s (Win).
+static std::string scratch_dir() {
+    const char* env = std::getenv("CRISPASR_SCRATCH_DIR");
+    if (env && *env)
+        return std::string(env);
+    const char* cache = std::getenv("XDG_CACHE_HOME");
+    if (cache && *cache) {
+        std::string d = std::string(cache) + "/crispasr/scratch";
+        std::filesystem::create_directories(d);
+        return d;
+    }
+    const char* home = std::getenv("HOME");
+    std::string d = std::string(home && *home ? home : ".") + "/.cache/crispasr/scratch";
+    std::filesystem::create_directories(d);
+    return d;
+}
+
+// Create a scratch file securely via mkstemp (POSIX) or _mktemp_s (Win).
 // Writes `data` to it and returns the path. On failure returns "".
 // The caller is responsible for calling std::remove() on the returned path.
 static std::string write_temp_audio(const char* data, size_t size) {
@@ -78,8 +95,10 @@ static std::string write_temp_audio(const char* data, size_t size) {
     f.close();
     return std::string(tmp_path);
 #else
-    char tmpl[] = "/tmp/crispasr-XXXXXX";
-    int fd = mkstemp(tmpl);
+    std::string tmpl_s = scratch_dir() + "/crispasr-XXXXXX";
+    std::vector<char> tmpl(tmpl_s.begin(), tmpl_s.end());
+    tmpl.push_back('\0');
+    int fd = mkstemp(tmpl.data());
     if (fd < 0)
         return "";
     // Write all data; retry on partial write.
@@ -91,14 +110,14 @@ static std::string write_temp_audio(const char* data, size_t size) {
             if (errno == EINTR)
                 continue;
             ::close(fd);
-            ::unlink(tmpl);
+            ::unlink(tmpl.data());
             return "";
         }
         p += n;
         remaining -= (size_t)n;
     }
     ::close(fd);
-    return std::string(tmpl);
+    return std::string(tmpl.data());
 #endif
 }
 
@@ -229,7 +248,7 @@ struct transcription_result {
 // Load audio from a multipart file upload, transcribe it, return result.
 // Acquires model_mutex internally.
 static transcription_result do_transcribe(const httplib::MultipartFormData& audio_file, CrispasrBackend* backend,
-                                          std::mutex& model_mutex, whisper_params rp) {
+                                          std::mutex& model_mutex, whisper_params rp, bool need_timestamps) {
     transcription_result result;
     result.language = rp.language;
 
@@ -266,11 +285,15 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
     const bool lid_disabled = rp.lid_backend == "off" || rp.lid_backend == "none";
 
     // Auto-chunk long audio to prevent OOM (#27).
-    // Most backends have O(T²) attention in the encoder — 30s chunks keep
-    // memory bounded. The CLI does this via --vad / --chunk-seconds.
+    // Most backends have O(T²) attention in the encoder - VAD or 30s fixed chunks keep
+    // memory bounded. The slice t0 values become the absolute timestamp base
     const int SR = 16000;
-    const int max_chunk_samples = rp.chunk_seconds * SR; // default 30s = 480000
     const int n_samples = (int)pcmf32.size();
+    const auto slices = crispasr_compute_audio_slices(pcmf32.data(), n_samples, SR, rp.chunk_seconds, rp);
+    if (slices.empty()) {
+        result.ok = true;
+        return result;
+    }
 
     {
         std::lock_guard<std::mutex> lock(model_mutex);
@@ -303,26 +326,46 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
         }
         result.language = rp.language;
 
-        if (n_samples <= max_chunk_samples) {
-            // Short audio — single pass
-            result.segs = backend->transcribe(pcmf32.data(), n_samples, 0, rp);
-        } else {
-            // Chunk long audio into fixed segments
-            int n_chunks = (n_samples + max_chunk_samples - 1) / max_chunk_samples;
-            fprintf(stderr, "crispasr-server: chunking %.1fs audio into %d × %ds segments\n", result.duration_s,
-                    n_chunks, rp.chunk_seconds);
-            int chunk_idx = 0;
-            for (int offset = 0; offset < n_samples; offset += max_chunk_samples) {
-                int chunk_len = std::min(max_chunk_samples, n_samples - offset);
-                int64_t t_offset_cs = (int64_t)((double)offset / SR * 100.0);
-                auto tc0 = std::chrono::steady_clock::now();
-                auto chunk_segs = backend->transcribe(pcmf32.data() + offset, chunk_len, t_offset_cs, rp);
+        if (!rp.no_prints && slices.size() > 1) {
+            fprintf(stderr, "crispasr-server: processing %zu slice(s)\n", slices.size());
+        }
+
+        const bool want_align = need_timestamps && !rp.aligner_model.empty() &&
+                                ((backend->capabilities() & CAP_TIMESTAMPS_CTC) || rp.force_aligner);
+        if (rp.verbose) {
+            fprintf(stderr,
+                    "crispasr-server[verbose]: align: need_ts=%d aligner='%s' caps_ctc=%d force=%d -> want=%d\n",
+                    need_timestamps ? 1 : 0, rp.aligner_model.c_str(), !!(backend->capabilities() & CAP_TIMESTAMPS_CTC),
+                    rp.force_aligner ? 1 : 0, want_align ? 1 : 0);
+        }
+
+        for (size_t i = 0; i < slices.size(); ++i) {
+            const auto& sl = slices[i];
+            auto tc0 = std::chrono::steady_clock::now();
+            auto segs = backend->transcribe(pcmf32.data() + sl.start, sl.end - sl.start, sl.t0_cs, rp);
+
+            if (want_align) {
+                for (auto& seg : segs) {
+                    if (!seg.words.empty() && !rp.force_aligner)
+                        continue;
+                    auto words = crispasr_ctc_align(rp.aligner_model, seg.text, pcmf32.data() + sl.start,
+                                                    sl.end - sl.start, sl.t0_cs, rp.n_threads);
+                    if (!words.empty()) {
+                        seg.t0 = words.front().t0;
+                        seg.t1 = words.back().t1;
+                        seg.words = std::move(words);
+                    }
+                }
+            }
+
+            for (auto& seg : segs)
+                result.segs.push_back(std::move(seg));
+
+            if (!rp.no_prints && slices.size() > 1) {
                 auto tc1 = std::chrono::steady_clock::now();
-                double chunk_s = std::chrono::duration<double>(tc1 - tc0).count();
-                result.segs.insert(result.segs.end(), chunk_segs.begin(), chunk_segs.end());
-                chunk_idx++;
-                fprintf(stderr, "crispasr-server: chunk %d/%d done (%.1fs audio in %.1fs)\n", chunk_idx, n_chunks,
-                        chunk_len / (double)SR, chunk_s);
+                double slice_s = std::chrono::duration<double>(tc1 - tc0).count();
+                fprintf(stderr, "crispasr-server: slice %zu/%zu done (%.1fs audio in %.1fs)\n", i + 1, slices.size(),
+                        (sl.end - sl.start) / (double)SR, slice_s);
             }
         }
 
@@ -448,7 +491,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         whisper_params rp = params;
         rp.language = form_string(req, "language", rp.language);
 
-        auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp);
+        auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp, /*need_timestamps=*/true);
         if (!result.ok) {
             json_error(res, 400, result.error);
             return;
@@ -511,7 +554,9 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         if (!prompt.empty())
             rp.prompt = prompt;
 
-        auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp);
+        const bool need_timestamps =
+            response_format == "verbose_json" || response_format == "srt" || response_format == "vtt";
+        auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp, need_timestamps);
         if (!result.ok) {
             json_error(res, 400, result.error);
             return;
@@ -766,6 +811,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             rp.tts_voice = voice_name;
         if (!instructions.empty())
             rp.tts_instruct = instructions;
+        if (body.contains("seed") && body["seed"].is_number_integer())
+            rp.seed = body["seed"].get<uint64_t>();
 
         // Long-form chunking (PLAN §75d / issue #66): split input on
         // sentence boundaries before dispatching to the backend so each

@@ -14,6 +14,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
 
 #if defined(_WIN32)
 #include <io.h>
@@ -315,119 +317,63 @@ static const ggml_backend_buffer_i mmap_buffer_iface = {
     /* .reset          = */ nullptr,
 };
 
-// PLAN #51a (Metal variant): wrap a non-CPU backend buffer (built via the
-// device's `buffer_from_host_ptr` capability) so its `free_buffer` callback
-// also munmaps the host memory the inner buffer was constructed from.
+// PLAN #51a (Metal variant): non-CPU backends use `buffer_from_host_ptr`
+// to wrap our mmap region directly into a backend buffer (e.g. an
+// MTLResourceStorageModeShared MTLBuffer on Apple-Silicon Metal). We
+// CANNOT wrap that inner buffer with our own iface to attach a munmap
+// callback: ggml-metal pierces the iface abstraction and casts
+// `buffer->context` straight to its private `ggml_metal_buffer_t` (see
+// `ggml_metal_get_buffer_id` in ggml-metal-context.m), so any wrapper
+// makes Metal read garbage and emit "tensor 'X' buffer is nil" for
+// every weight — the kokoro Metal gibberish-audio regression.
 //
-// Why a wrapper instead of modifying the inner iface: `ggml_backend_buffer_i`
-// is a `static const` table inside each backend (ggml-metal.cpp etc.); we
-// can't override per-instance. And we can't rely on the inner buffer to
-// munmap (Metal's `newBufferWithBytesNoCopy:length:options:deallocator:nil`
-// explicitly takes no ownership — `ggml_metal_buffer_free` only frees the
-// MTLBuffer ref, leaving the host pages mapped).
+// Instead we hand the inner buffer back as-is and track the mmap region
+// in this static side-map. When the buffer is freed elsewhere (model
+// shutdown) the inner backend's free callback releases its device-side
+// reference, but the host mmap stays mapped — Metal's
+// `newBufferWithBytesNoCopy:options:deallocator:nil` doesn't own the
+// host pages, so there's no MTLBuffer-side teardown that could munmap.
+// We deliberately leak the mmap; on macOS the kernel can still evict
+// file-backed pages under pressure (they're not anonymous), and process
+// exit reclaims everything. Address-space-wise this costs nothing past
+// the model's working set, which we'd be holding anyway.
+struct gpu_mmap_handle {
+    void* base = nullptr;
+    size_t size = 0;
+};
+static std::mutex g_gpu_mmap_mu;
+static std::map<ggml_backend_buffer_t, gpu_mmap_handle> g_gpu_mmap;
+
+static void register_gpu_mmap(ggml_backend_buffer_t buf, void* base, size_t size) {
+    std::lock_guard<std::mutex> lk(g_gpu_mmap_mu);
+    g_gpu_mmap[buf] = {base, size};
+}
+static gpu_mmap_handle lookup_gpu_mmap(ggml_backend_buffer_t buf) {
+    std::lock_guard<std::mutex> lk(g_gpu_mmap_mu);
+    auto it = g_gpu_mmap.find(buf);
+    return it != g_gpu_mmap.end() ? it->second : gpu_mmap_handle{};
+}
+
+// Issue #94 (chatterbox-turbo segfault during init on macOS / Apple
+// Silicon): the legacy alloc+copy load path takes 30-60 s for the
+// chatterbox-turbo T3 (658 MB Q8_0) on slow disks and reproducibly
+// fails for some users. The zero-copy mmap path completes the same
+// load in ~5-10 s and uses half the peak RSS. The CPU mmap path has
+// been validated for every backend that goes through this loader
+// (mimo-asr, voxtral, voxtral4b, chatterbox base + turbo, kokoro,
+// qwen3-tts, vibevoice, parakeet, granite, …) since the PLAN #51a
+// rollout in late April; flipping the default after a month of opt-in
+// testing matches llama.cpp's behaviour and resolves the slow-load
+// reports.
 //
-// All non-`free_buffer` ops delegate straight to the inner iface so Metal's
-// shared-buffer semantics (storage-mode-shared, Apple-Silicon unified memory
-// sharing) are preserved.
-struct mmap_wrap_ctx {
-    ggml_backend_buffer_t inner = nullptr;
-    void* mmap_base = nullptr;
-    size_t mmap_size = 0;
-};
-
-static void* mmap_wrap_get_base(ggml_backend_buffer_t buffer) {
-    return ggml_backend_buffer_get_base(((mmap_wrap_ctx*)buffer->context)->inner);
-}
-static enum ggml_status mmap_wrap_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor* tensor) {
-    auto* w = (mmap_wrap_ctx*)buffer->context;
-    if (w->inner->iface.init_tensor)
-        return w->inner->iface.init_tensor(w->inner, tensor);
-    return GGML_STATUS_SUCCESS;
-}
-static void mmap_wrap_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor* tensor, uint8_t value, size_t offset,
-                                    size_t size) {
-    auto* w = (mmap_wrap_ctx*)buffer->context;
-    w->inner->iface.memset_tensor(w->inner, tensor, value, offset, size);
-}
-static void mmap_wrap_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor* tensor, const void* data, size_t offset,
-                                 size_t size) {
-    auto* w = (mmap_wrap_ctx*)buffer->context;
-    w->inner->iface.set_tensor(w->inner, tensor, data, offset, size);
-}
-static void mmap_wrap_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor* tensor, void* data, size_t offset,
-                                 size_t size) {
-    auto* w = (mmap_wrap_ctx*)buffer->context;
-    w->inner->iface.get_tensor(w->inner, tensor, data, offset, size);
-}
-static bool mmap_wrap_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor* src, ggml_tensor* dst) {
-    auto* w = (mmap_wrap_ctx*)buffer->context;
-    if (w->inner->iface.cpy_tensor)
-        return w->inner->iface.cpy_tensor(w->inner, src, dst);
-    return false;
-}
-static void mmap_wrap_clear(ggml_backend_buffer_t buffer, uint8_t value) {
-    auto* w = (mmap_wrap_ctx*)buffer->context;
-    w->inner->iface.clear(w->inner, value);
-}
-static void mmap_wrap_free(ggml_backend_buffer_t buffer) {
-    auto* w = (mmap_wrap_ctx*)buffer->context;
-    // Free the inner backend buffer first — for Metal this releases the
-    // MTLBuffer reference that newBufferWithBytesNoCopy held over our
-    // mmap region. Once that ref is gone, the OS is free to release any
-    // page-table entries the GPU was holding.
-    ggml_backend_buffer_free(w->inner);
-    if (w->mmap_base) {
-#if defined(_WIN32)
-        UnmapViewOfFile(w->mmap_base);
-#else
-        ::munmap(w->mmap_base, w->mmap_size);
-#endif
-    }
-    delete w;
-}
-
-// PLAN #60b: forward-compat delegations for set_tensor_2d / get_tensor_2d
-// / reset. If a future ggml dispatch hits these on a wrapped buffer,
-// route through to the inner Metal buffer's optimized path instead of
-// silently falling back to N×set_tensor calls. Inner iface methods are
-// optional — guard each delegation with a null check; on null we leave
-// the wrapper's slot null too so the scheduler picks its own fallback
-// (matches what would happen pre-wrap).
-static void mmap_wrap_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor* tensor, const void* data, size_t offset,
-                                    size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
-    auto* w = (mmap_wrap_ctx*)buffer->context;
-    if (w->inner->iface.set_tensor_2d)
-        w->inner->iface.set_tensor_2d(w->inner, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
-}
-static void mmap_wrap_get_tensor_2d(ggml_backend_buffer_t buffer, const ggml_tensor* tensor, void* data, size_t offset,
-                                    size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
-    auto* w = (mmap_wrap_ctx*)buffer->context;
-    if (w->inner->iface.get_tensor_2d)
-        w->inner->iface.get_tensor_2d(w->inner, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
-}
-static void mmap_wrap_reset(ggml_backend_buffer_t buffer) {
-    auto* w = (mmap_wrap_ctx*)buffer->context;
-    if (w->inner->iface.reset)
-        w->inner->iface.reset(w->inner);
-}
-
-static const ggml_backend_buffer_i mmap_wrap_iface = {
-    /* .free_buffer    = */ mmap_wrap_free,
-    /* .get_base       = */ mmap_wrap_get_base,
-    /* .init_tensor    = */ mmap_wrap_init_tensor,
-    /* .memset_tensor  = */ mmap_wrap_memset_tensor,
-    /* .set_tensor     = */ mmap_wrap_set_tensor,
-    /* .get_tensor     = */ mmap_wrap_get_tensor,
-    /* .set_tensor_2d  = */ mmap_wrap_set_tensor_2d,
-    /* .get_tensor_2d  = */ mmap_wrap_get_tensor_2d,
-    /* .cpy_tensor     = */ mmap_wrap_cpy_tensor,
-    /* .clear          = */ mmap_wrap_clear,
-    /* .reset          = */ mmap_wrap_reset,
-};
-
+// Opt out with `CRISPASR_GGUF_MMAP=0` for users whose model files live
+// on volumes that may disappear mid-run (network mounts, removable
+// disks); mmap-backed weights SIGBUS if the underlying file vanishes.
 static bool mmap_loader_enabled() {
     const char* v = std::getenv("CRISPASR_GGUF_MMAP");
-    return v && *v && *v != '0';
+    if (!v || !*v)
+        return true;
+    return *v != '0';
 }
 
 // PLAN #60c: opt-in preload — page-walk the entire mmap region so every
@@ -502,8 +448,9 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
     // (which would allocate a fresh backend-side buffer) and instead bind
     // each tensor directly into the mmap'd file. Saves one full copy of
     // the weights — the difference between a 14.9 GB F16 GGUF loading on
-    // a 16 GB Mac and thrashing swap. Gated on CRISPASR_GGUF_MMAP=1 +
-    // CPU backend until we've validated all 24 backends.
+    // a 16 GB Mac and thrashing swap. Default-on as of issue #94 (slow /
+    // failing chatterbox-turbo load on macOS); opt out with
+    // `CRISPASR_GGUF_MMAP=0`.
     if (mmap_loader_enabled() && ggml_backend_is_cpu(backend)) {
         MappedFile mf(path, /*writable=*/true);
         if (mf.ok) {
@@ -546,21 +493,46 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
                 return false;
             }
 
+            // Pre-validate tensor bounds before calling ggml_backend_tensor_alloc,
+            // which fires a hard GGML_ASSERT when any tensor's range exceeds
+            // buf_size.  Seen on macOS 26.x Tahoe (issue #94) — likely a
+            // mismatched or truncated GGUF file.  Detect it here and fall back
+            // gracefully to the legacy alloc+copy path instead of crashing.
+            bool bounds_ok = true;
             for (ggml_tensor* t = ggml_get_first_tensor(out.ctx); t; t = ggml_get_next_tensor(out.ctx, t)) {
-                out.tensors[ggml_get_name(t)] = t;
                 const int64_t tid = gguf_find_tensor(gctx, ggml_get_name(t));
                 if (tid < 0)
                     continue;
                 const size_t off = gguf_get_tensor_offset(gctx, tid);
-                ggml_backend_tensor_alloc(out.buf, t, tensor_base + off);
+                if (off + ggml_nbytes(t) > buf_size) {
+                    fprintf(stderr,
+                            "%s: mmap bounds check failed for tensor '%s' "
+                            "(off=%zu + nbytes=%zu > buf_size=%zu) — "
+                            "falling back to legacy loader\n",
+                            tag, ggml_get_name(t), off, ggml_nbytes(t), buf_size);
+                    bounds_ok = false;
+                    break;
+                }
             }
-
-            gguf_free(gctx);
-            return true;
+            if (bounds_ok) {
+                for (ggml_tensor* t = ggml_get_first_tensor(out.ctx); t; t = ggml_get_next_tensor(out.ctx, t)) {
+                    out.tensors[ggml_get_name(t)] = t;
+                    const int64_t tid = gguf_find_tensor(gctx, ggml_get_name(t));
+                    if (tid < 0)
+                        continue;
+                    const size_t off = gguf_get_tensor_offset(gctx, tid);
+                    ggml_backend_tensor_alloc(out.buf, t, tensor_base + off);
+                }
+                gguf_free(gctx);
+                return true;
+            }
+            // Bounds check failed — release the mmap buffer and fall through to
+            // the legacy alloc+copy path below.
+            ggml_backend_buffer_free(out.buf);
+            out.buf = nullptr;
         }
-        // mmap failed — fall through to the legacy alloc + copy path. We
-        // do NOT print a warning here; mmap is best-effort and the legacy
-        // path is functionally equivalent (just with more RSS).
+        // mmap failed or bounds check failed — fall through to the legacy
+        // alloc + copy path. Functionally equivalent, just with more RSS.
     }
 
     // PLAN #51a (Metal variant): zero-copy GPU path via the device's
@@ -573,6 +545,16 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
     // device-cap probe means we silently fall through on backends that
     // don't advertise host-pointer support (CUDA without managed memory,
     // Vulkan, etc.).
+    //
+    // The inner buffer is returned as `out.buf` UNWRAPPED. We used to
+    // wrap it to attach a munmap callback to free_buffer, but ggml-metal
+    // pierces the iface abstraction and casts `buffer->context` straight
+    // to its `ggml_metal_buffer_t` — wrapping made Metal read garbage
+    // and emit "tensor 'X' buffer is nil" for every weight (kokoro
+    // gibberish-audio regression). The mmap region is registered in
+    // g_gpu_mmap and deliberately leaked when the buffer is freed: Metal
+    // doesn't own the pages (deallocator=nil), and on macOS file-backed
+    // pages can still be evicted under pressure. Process exit cleans up.
     if (mmap_loader_enabled() && !ggml_backend_is_cpu(backend)) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         ggml_backend_dev_props props{};
@@ -590,10 +572,8 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
                 ggml_backend_buffer_t inner = ggml_backend_dev_buffer_from_host_ptr(dev, mf.base, mf.size,
                                                                                     /*max_tensor_size=*/0);
                 if (inner) {
-                    auto* w = new mmap_wrap_ctx{};
-                    w->inner = inner;
-                    w->mmap_base = mf.base;
-                    w->mmap_size = mf.size;
+                    void* leaked_base = mf.base;
+                    size_t leaked_size = mf.size;
                     mf.release();
                     // Hint kernel async readahead — same rationale as the
                     // CPU branch above. On Apple Silicon the unified-memory
@@ -601,51 +581,55 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
                     // pages, so this readahead benefits both CPU and GPU
                     // accesses with one call.
 #if !defined(_WIN32)
-                    ::posix_madvise(w->mmap_base, w->mmap_size, POSIX_MADV_WILLNEED);
+                    ::posix_madvise(leaked_base, leaked_size, POSIX_MADV_WILLNEED);
 #endif
                     // PLAN #60c / #60f: optional preload + mlock, opt-in
                     // via env. mlock is particularly meaningful here —
                     // pinning prevents Metal's shared-storage reads from
                     // racing CPU page faults under memory pressure.
                     if (preload_enabled())
-                        preload_pages(w->mmap_base, w->mmap_size);
+                        preload_pages(leaked_base, leaked_size);
                     if (mlock_enabled())
-                        try_mlock(tag, w->mmap_base, w->mmap_size);
+                        try_mlock(tag, leaked_base, leaked_size);
 
-                    // Reuse the inner buffer's buft so usage/alignment/etc.
-                    // stay consistent with the device's expectations. The
-                    // wrapping iface intercepts `free_buffer` only.
-                    out.buf =
-                        ggml_backend_buffer_init(inner->buft, mmap_wrap_iface, w, ggml_backend_buffer_get_size(inner));
-                    if (!out.buf) {
-                        // Wrapper init failed: roll back the inner buffer
-                        // and the mmap to keep the file descriptor + page
-                        // tables clean.
-                        fprintf(stderr, "%s: failed to wrap inner buffer (Metal mmap path)\n", tag);
-                        ggml_backend_buffer_free(inner);
-#if defined(_WIN32)
-                        UnmapViewOfFile(w->mmap_base);
-#else
-                        ::munmap(w->mmap_base, w->mmap_size);
-#endif
-                        delete w;
-                        gguf_free(gctx);
-                        ggml_free(out.ctx);
-                        out.ctx = nullptr;
-                        return false;
-                    }
+                    register_gpu_mmap(inner, leaked_base, leaked_size);
+                    out.buf = inner;
 
+                    // Pre-validate bounds (same rationale as CPU mmap path).
+                    bool bounds_ok = true;
                     for (ggml_tensor* t = ggml_get_first_tensor(out.ctx); t; t = ggml_get_next_tensor(out.ctx, t)) {
-                        out.tensors[ggml_get_name(t)] = t;
                         const int64_t tid = gguf_find_tensor(gctx, ggml_get_name(t));
                         if (tid < 0)
                             continue;
                         const size_t off = gguf_get_tensor_offset(gctx, tid);
-                        ggml_backend_tensor_alloc(out.buf, t, tensor_base + off);
+                        if (data_off + off + ggml_nbytes(t) > leaked_size) {
+                            fprintf(stderr,
+                                    "%s: GPU mmap bounds check failed for tensor '%s' "
+                                    "(data_off=%zu + off=%zu + nbytes=%zu > file_size=%zu) — "
+                                    "falling back to legacy loader\n",
+                                    tag, ggml_get_name(t), data_off, off, ggml_nbytes(t), leaked_size);
+                            bounds_ok = false;
+                            break;
+                        }
                     }
+                    if (!bounds_ok) {
+                        out.buf = nullptr;
+                        // inner is registered in g_gpu_mmap and deliberately
+                        // leaked (same as the normal teardown path).
+                        // Fall through to legacy path.
+                    } else {
+                        for (ggml_tensor* t = ggml_get_first_tensor(out.ctx); t; t = ggml_get_next_tensor(out.ctx, t)) {
+                            out.tensors[ggml_get_name(t)] = t;
+                            const int64_t tid = gguf_find_tensor(gctx, ggml_get_name(t));
+                            if (tid < 0)
+                                continue;
+                            const size_t off = gguf_get_tensor_offset(gctx, tid);
+                            ggml_backend_tensor_alloc(out.buf, t, tensor_base + off);
+                        }
 
-                    gguf_free(gctx);
-                    return true;
+                        gguf_free(gctx);
+                        return true;
+                    }
                 }
                 // buffer_from_host_ptr returned null — release mmap and fall
                 // through to the legacy path. No warning; same rationale as
@@ -664,6 +648,20 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
     }
 
     MappedFile mf(path);
+    if (mf.ok) {
+        // Issue #94: the legacy alloc+copy path took 30-60 s for the
+        // 658 MB chatterbox-turbo T3 GGUF on slow disks, because each
+        // ggml_backend_tensor_set hit a synchronous page fault on
+        // its first access to the mmap source region. The zero-copy
+        // mmap path already hints WILLNEED (line 526) for the same
+        // reason; doing it here brings the legacy path's load time
+        // back in line for users who opt out of the zero-copy path
+        // with CRISPASR_GGUF_MMAP=0 (e.g. model files on network
+        // mounts where mmap would SIGBUS on disconnect).
+#if !defined(_WIN32)
+        ::posix_madvise(mf.base, mf.size, POSIX_MADV_WILLNEED);
+#endif
+    }
     if (!mf.ok) {
         // Fallback: read via FILE* pread/fseek. This is the rare path —
         // most systems have working mmap. We implement it inline here so
@@ -919,17 +917,17 @@ void mmap_advise_random(ggml_backend_buffer_t buf) {
     void* base = nullptr;
     size_t size = 0;
     if (buf->iface.free_buffer == mmap_buffer_free) {
-        // CPU mmap path — context is mmap_buffer_ctx.
+        // CPU mmap path — context is mmap_buffer_ctx (our own iface).
         auto* mctx = (mmap_buffer_ctx*)buf->context;
         base = mctx->mmap_base;
         size = mctx->mmap_size;
-    } else if (buf->iface.free_buffer == mmap_wrap_free) {
-        // Metal mmap path — context is mmap_wrap_ctx.
-        auto* w = (mmap_wrap_ctx*)buf->context;
-        base = w->mmap_base;
-        size = w->mmap_size;
     } else {
-        return; // not one of our mmap buffers; nothing to advise
+        // Non-CPU (Metal) mmap path — buffer is the inner backend buffer,
+        // its context belongs to that backend; look the mmap region up
+        // in our side-map instead.
+        gpu_mmap_handle h = lookup_gpu_mmap(buf);
+        base = h.base;
+        size = h.size;
     }
     if (base && size > 0)
         ::posix_madvise(base, size, POSIX_MADV_RANDOM);

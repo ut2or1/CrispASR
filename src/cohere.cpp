@@ -523,6 +523,7 @@ struct cohere_context {
 
 static void cohere_log_tensor(const char* name, const struct ggml_tensor* t);
 static struct ggml_cgraph* cohere_build_graph_encoder(struct cohere_context* ctx, int T_mel);
+static struct ggml_cgraph* cohere_build_graph_encoder_staged(struct cohere_context* ctx, int T_mel);
 static struct ggml_cgraph* cohere_build_graph_decoder(struct cohere_context* ctx, const int* /*tokens*/, int n_tokens,
                                                       int offset);
 static void cohere_fold_batchnorm(cohere_model& model, int verbosity = 1);
@@ -744,6 +745,242 @@ static struct ggml_cgraph* cohere_build_graph_encoder(struct cohere_context* ctx
         ggml_build_forward_expand(gf, cv_ready);
     }
 
+    ggml_build_forward_expand(gf, cur);
+
+    return gf;
+}
+
+// Staged encoder: same as above but snapshots per-layer output via ggml_dup.
+// Names: "enc_L00".."enc_L47", "enc_out". Skips cross-KV computation.
+static struct ggml_cgraph* cohere_build_graph_encoder_staged(struct cohere_context* ctx, int T_mel) {
+    const auto& model = ctx->model;
+    const auto& hp = model.hparams;
+    const int d = hp.enc_d_model;
+    const int n_heads = hp.enc_n_heads;
+    const int head_dim = hp.enc_head_dim;
+    const int n_mels = hp.n_mels;
+
+    struct ggml_init_params params = {
+        .mem_size = ctx->compute_meta.size(),
+        .mem_buffer = ctx->compute_meta.data(),
+        .no_alloc = true,
+    };
+
+    struct ggml_context* ctx0 = ggml_init(params);
+    // Larger graph for snapshots
+    struct ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
+
+    struct ggml_tensor* mel = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_mels, T_mel);
+    ggml_set_name(mel, "mel");
+    ggml_set_input(mel);
+
+    // --- Subsampling (identical to non-staged) ---
+    struct ggml_tensor* cur = ggml_conv_2d(ctx0, model.pre_conv0_w, mel, 2, 2, 1, 1, 1, 1);
+    cur = ggml_add(
+        ctx0, cur,
+        ggml_cast(ctx0, ggml_reshape_4d(ctx0, model.pre_conv0_b, 1, 1, model.pre_conv0_b->ne[0], 1), GGML_TYPE_F32));
+    cur = ggml_relu(ctx0, cur);
+
+    // Snapshot after conv0+relu
+    {
+        struct ggml_tensor* s = ggml_dup(ctx0, cur);
+        ggml_set_name(s, "pre_conv0");
+        ggml_build_forward_expand(gf, s);
+    }
+
+    cur = ggml_conv_2d_dw(ctx0, model.pre_conv2_w, cur, 2, 2, 1, 1, 1, 1);
+    cur = ggml_add(
+        ctx0, cur,
+        ggml_cast(ctx0, ggml_reshape_4d(ctx0, model.pre_conv2_b, 1, 1, model.pre_conv2_b->ne[0], 1), GGML_TYPE_F32));
+    cur = ggml_conv_2d(ctx0, model.pre_conv3_w, cur, 1, 1, 0, 0, 1, 1);
+    cur = ggml_add(
+        ctx0, cur,
+        ggml_cast(ctx0, ggml_reshape_4d(ctx0, model.pre_conv3_b, 1, 1, model.pre_conv3_b->ne[0], 1), GGML_TYPE_F32));
+    cur = ggml_relu(ctx0, cur);
+
+    // Snapshot after conv2+3+relu
+    {
+        struct ggml_tensor* s = ggml_dup(ctx0, cur);
+        ggml_set_name(s, "pre_conv3");
+        ggml_build_forward_expand(gf, s);
+    }
+
+    cur = ggml_conv_2d_dw(ctx0, model.pre_conv5_w, cur, 2, 2, 1, 1, 1, 1);
+    cur = ggml_add(
+        ctx0, cur,
+        ggml_cast(ctx0, ggml_reshape_4d(ctx0, model.pre_conv5_b, 1, 1, model.pre_conv5_b->ne[0], 1), GGML_TYPE_F32));
+    cur = ggml_conv_2d(ctx0, model.pre_conv6_w, cur, 1, 1, 0, 0, 1, 1);
+    cur = ggml_add(
+        ctx0, cur,
+        ggml_cast(ctx0, ggml_reshape_4d(ctx0, model.pre_conv6_b, 1, 1, model.pre_conv6_b->ne[0], 1), GGML_TYPE_F32));
+    cur = ggml_relu(ctx0, cur);
+
+    // Snapshot after conv5+6+relu (final conv output before flatten+linear)
+    {
+        struct ggml_tensor* s = ggml_dup(ctx0, cur);
+        ggml_set_name(s, "pre_conv6");
+        ggml_build_forward_expand(gf, s);
+    }
+
+    int H3 = cur->ne[1];
+    int W3 = cur->ne[0];
+    cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 0, 2, 1, 3));
+    cur = ggml_reshape_2d(ctx0, cur, W3 * 256, H3);
+    cur = ggml_add(ctx0, ggml_mul_mat(ctx0, model.pre_out_w, cur), model.pre_out_b);
+
+    const int T = H3;
+
+    // Snapshot pre_encode output
+    {
+        struct ggml_tensor* snap = ggml_dup(ctx0, cur);
+        ggml_set_name(snap, "pre_enc_out");
+        ggml_build_forward_expand(gf, snap);
+    }
+
+    struct ggml_tensor* pos_enc = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, 2 * T - 1);
+    ggml_set_name(pos_enc, "pos_enc");
+    ggml_set_input(pos_enc);
+
+    // --- Conformer blocks with per-layer snapshots ---
+    char lbuf[32];
+    for (int il = 0; il < hp.enc_n_layers; il++) {
+        const auto& layer = model.enc_layers[il];
+        struct ggml_tensor* inpL = cur;
+
+        // FF1
+        struct ggml_tensor* ff1 = ggml_norm(ctx0, cur, 1e-5f);
+        ff1 = ggml_mul_inplace(ctx0, ff1, layer.ff1_norm_w);
+        ff1 = ggml_add_inplace(ctx0, ff1, layer.ff1_norm_b);
+
+        if (il == 0) {
+            struct ggml_tensor* s = ggml_dup(ctx0, ff1);
+            ggml_set_name(s, "L0_ff1_ln");
+            ggml_build_forward_expand(gf, s);
+        }
+
+        ff1 = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.ff1_up_w, ff1), layer.ff1_up_b);
+
+        if (il == 0) {
+            struct ggml_tensor* s = ggml_dup(ctx0, ff1);
+            ggml_set_name(s, "L0_ff1_up");
+            ggml_build_forward_expand(gf, s);
+        }
+
+        ff1 = ggml_silu_inplace(ctx0, ff1);
+        ff1 = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.ff1_dn_w, ff1), layer.ff1_dn_b);
+        cur = ggml_add(ctx0, inpL, ggml_scale(ctx0, ff1, 0.5f));
+
+        if (il == 0) {
+            struct ggml_tensor* s = ggml_dup(ctx0, cur);
+            ggml_set_name(s, "L0_ff1");
+            ggml_build_forward_expand(gf, s);
+        }
+
+        struct ggml_tensor* inpAtn = cur;
+
+        // Self-Attention
+        cur = ggml_norm(ctx0, cur, 1e-5f);
+        cur = ggml_mul_inplace(ctx0, cur, layer.attn_norm_w);
+        cur = ggml_add_inplace(ctx0, cur, layer.attn_norm_b);
+
+        struct ggml_tensor* Q = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.attn_q_w, cur), layer.attn_q_b);
+        struct ggml_tensor* K = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.attn_k_w, cur), layer.attn_k_b);
+        struct ggml_tensor* V = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.attn_v_w, cur), layer.attn_v_b);
+        struct ggml_tensor* R = ggml_mul_mat(ctx0, layer.attn_pos_w, pos_enc);
+
+        struct ggml_tensor* Q_u = ggml_add(ctx0, Q, ggml_reshape_1d(ctx0, layer.attn_pos_bias_u, d));
+        struct ggml_tensor* Q_v = ggml_add(ctx0, Q, ggml_reshape_1d(ctx0, layer.attn_pos_bias_v, d));
+
+        Q_u = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Q_u, head_dim, n_heads, T), 0, 2, 1, 3);
+        Q_v = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Q_v, head_dim, n_heads, T), 0, 2, 1, 3);
+        K = ggml_permute(ctx0, ggml_reshape_3d(ctx0, K, head_dim, n_heads, T), 0, 2, 1, 3);
+        R = ggml_permute(ctx0, ggml_reshape_3d(ctx0, R, head_dim, n_heads, 2 * T - 1), 0, 2, 1, 3);
+
+        struct ggml_tensor* AC = ggml_mul_mat(ctx0, ggml_cont(ctx0, K), Q_u);
+        struct ggml_tensor* BD_raw = ggml_mul_mat(ctx0, ggml_cont(ctx0, R), Q_v);
+        struct ggml_tensor* BD = cohere_rel_shift(ctx0, BD_raw);
+
+        struct ggml_tensor* scores = ggml_add_inplace(ctx0, AC, BD);
+        scores = ggml_scale_inplace(ctx0, scores, 1.0f / sqrtf((float)head_dim));
+        scores = ggml_soft_max_inplace(ctx0, scores);
+
+        struct ggml_tensor* V_reshaped = ggml_reshape_3d(ctx0, V, head_dim, n_heads, T);
+        struct ggml_tensor* V_trans = ggml_permute(ctx0, V_reshaped, 1, 2, 0, 3);
+        struct ggml_tensor* attn_out = ggml_mul_mat(ctx0, ggml_cont(ctx0, V_trans), scores);
+
+        attn_out = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, attn_out, 0, 2, 1, 3)), d, T);
+        attn_out = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.attn_out_w, attn_out), layer.attn_out_b);
+        cur = ggml_add(ctx0, inpAtn, attn_out);
+
+        if (il == 0) {
+            struct ggml_tensor* s = ggml_dup(ctx0, cur);
+            ggml_set_name(s, "L0_attn");
+            ggml_build_forward_expand(gf, s);
+        }
+
+        struct ggml_tensor* inpCnv = cur;
+
+        // Conv module
+        cur = ggml_norm(ctx0, cur, 1e-5f);
+        cur = ggml_mul_inplace(ctx0, cur, layer.conv_norm_w);
+        cur = ggml_add_inplace(ctx0, cur, layer.conv_norm_b);
+
+        struct ggml_tensor* pw1_w = ggml_reshape_2d(ctx0, layer.conv_pw1_w, d, 2 * d);
+        struct ggml_tensor* cnv = ggml_add(ctx0, ggml_mul_mat(ctx0, pw1_w, cur), layer.conv_pw1_b);
+        struct ggml_tensor* cnv_gate = ggml_view_2d(ctx0, cnv, d, T, cnv->nb[1], d * sizeof(float));
+        cnv = ggml_mul(ctx0, ggml_view_2d(ctx0, cnv, d, T, cnv->nb[1], 0), ggml_sigmoid(ctx0, cnv_gate));
+
+        struct ggml_tensor* dw_w_f32 = ggml_cast(ctx0, layer.conv_dw_w, GGML_TYPE_F32);
+        struct ggml_tensor* dw_w_4d = ggml_reshape_4d(ctx0, dw_w_f32, hp.enc_conv_k, 1, 1, d);
+        cnv = ggml_cont(ctx0, ggml_transpose(ctx0, cnv));
+        cnv = ggml_reshape_4d(ctx0, cnv, T, 1, d, 1);
+        cnv = ggml_conv_2d_dw_direct(ctx0, dw_w_4d, cnv, 1, 1, (hp.enc_conv_k - 1) / 2, 0, 1, 1);
+        cnv = ggml_cont(ctx0, ggml_permute(ctx0, cnv, 1, 2, 0, 3));
+        cnv = ggml_add(ctx0, cnv, ggml_reshape_4d(ctx0, layer.conv_dw_b, d, 1, 1, 1));
+        cnv = ggml_silu_inplace(ctx0, cnv);
+
+        struct ggml_tensor* pw2_w = ggml_reshape_2d(ctx0, layer.conv_pw2_w, d, d);
+        cnv = ggml_add(ctx0, ggml_mul_mat(ctx0, pw2_w, cnv), layer.conv_pw2_b);
+        cur = ggml_add(ctx0, inpCnv, cnv);
+
+        if (il == 0) {
+            struct ggml_tensor* s = ggml_dup(ctx0, cur);
+            ggml_set_name(s, "L0_conv");
+            ggml_build_forward_expand(gf, s);
+        }
+
+        struct ggml_tensor* inpFF2 = cur;
+
+        // FF2
+        struct ggml_tensor* ff2 = ggml_norm(ctx0, cur, 1e-5f);
+        ff2 = ggml_mul_inplace(ctx0, ff2, layer.ff2_norm_w);
+        ff2 = ggml_add_inplace(ctx0, ff2, layer.ff2_norm_b);
+        ff2 = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.ff2_up_w, ff2), layer.ff2_up_b);
+        ff2 = ggml_silu_inplace(ctx0, ff2);
+        ff2 = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.ff2_dn_w, ff2), layer.ff2_dn_b);
+        cur = ggml_add(ctx0, inpFF2, ggml_scale(ctx0, ff2, 0.5f));
+
+        if (il == 0) {
+            struct ggml_tensor* s = ggml_dup(ctx0, cur);
+            ggml_set_name(s, "L0_ff2");
+            ggml_build_forward_expand(gf, s);
+        }
+
+        // Final output norm
+        cur = ggml_norm(ctx0, cur, 1e-5f);
+        cur = ggml_mul_inplace(ctx0, cur, layer.out_norm_w);
+        cur = ggml_add_inplace(ctx0, cur, layer.out_norm_b);
+
+        // Snapshot this layer's output
+        snprintf(lbuf, sizeof(lbuf), "enc_L%02d", il);
+        struct ggml_tensor* snap = ggml_dup(ctx0, cur);
+        ggml_set_name(snap, lbuf);
+        ggml_build_forward_expand(gf, snap);
+    }
+
+    // Encoder-decoder projection (skip cross-KV for staged path)
+    cur = ggml_add(ctx0, ggml_mul_mat(ctx0, model.enc_proj_w, cur), model.enc_proj_b);
+    ggml_set_name(cur, "enc_out");
     ggml_build_forward_expand(gf, cur);
 
     return gf;
@@ -1184,6 +1421,7 @@ static std::vector<float> cohere_compute_features(const cohere_hparams& hp, cons
     p.layout = core_mel::Layout::TimeMels;
     p.log_eps = (float)(1.0 / (1 << 24));
     p.center_pad = true;
+    p.drop_last_frame = true; // NeMo returns feat_len = floor(n_samples/hop) frames
 
     auto mel =
         core_mel::compute(pe.data(), n_samples, fe_window_data, win, fe_mel_fb_data, n_freqs, cohere_fft_r2c, p, T_out);
@@ -1782,17 +2020,21 @@ static void cohere_fold_batchnorm(cohere_model& model, int verbosity) {
         for (int c = 0; c < d; c++)
             s[c] = bn_scale[c] / sqrtf(bn_var[c] + eps);
 
-        // Fold s into conv_dw_w (F16 tensor, ggml shape ne[0]=k, ne[1]=1, ne[2]=d)
+        // Fold s into conv_dw_w (ggml shape ne[0]=k, ne[1]=1, ne[2]=d)
         // Linear index for kernel pos ki, channel c: ki + c*k
         {
             std::vector<float> w_f32 = ct_get_f32(layer.conv_dw_w); // k*d elements
             for (int c = 0; c < d; c++)
                 for (int ki = 0; ki < k; ki++)
                     w_f32[ki + c * k] *= s[c];
-            // Write back as F16
-            std::vector<ggml_fp16_t> w_f16(k * d);
-            ggml_fp32_to_fp16_row(w_f32.data(), w_f16.data(), k * d);
-            ggml_backend_tensor_set(layer.conv_dw_w, w_f16.data(), 0, k * d * sizeof(ggml_fp16_t));
+            // Write back in the tensor's native type
+            if (layer.conv_dw_w->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(layer.conv_dw_w, w_f32.data(), 0, k * d * sizeof(float));
+            } else {
+                std::vector<ggml_fp16_t> w_f16(k * d);
+                ggml_fp32_to_fp16_row(w_f32.data(), w_f16.data(), k * d);
+                ggml_backend_tensor_set(layer.conv_dw_w, w_f16.data(), 0, k * d * sizeof(ggml_fp16_t));
+            }
         }
 
         // Fold into conv_dw_b (F32 tensor, shape [d]):
@@ -2709,4 +2951,116 @@ float* cohere_run_encoder(struct cohere_context* ctx, const float* mel, int n_me
         return nullptr;
     ggml_backend_tensor_get(enc_out, r, 0, (size_t)d * T_enc * sizeof(float));
     return r;
+}
+
+int cohere_run_encoder_staged(struct cohere_context* ctx, const float* mel, int n_mels, int T_mel, cohere_stage_cb cb,
+                              void* userdata) {
+    if (!ctx || !mel || T_mel <= 0 || !cb)
+        return -1;
+    const auto& hp = ctx->model.hparams;
+    if (n_mels != hp.n_mels) {
+        fprintf(stderr, "cohere: mel feature mismatch (%d vs %d)\n", n_mels, hp.n_mels);
+        return -1;
+    }
+
+    // Ensure compute_meta is large enough for the staged graph
+    const size_t staged_meta = ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false);
+    if (ctx->compute_meta.size() < staged_meta)
+        ctx->compute_meta.resize(staged_meta);
+
+    struct ggml_cgraph* gf = cohere_build_graph_encoder_staged(ctx, T_mel);
+    if (!gf)
+        return -1;
+
+    ggml_backend_sched_reset(ctx->ggml_alloc);
+    if (!ggml_backend_sched_alloc_graph(ctx->ggml_alloc, gf)) {
+        fprintf(stderr, "cohere: failed to allocate staged encoder graph\n");
+        return -1;
+    }
+
+    struct ggml_tensor* mel_t = ggml_graph_get_tensor(gf, "mel");
+    if (!mel_t)
+        return -1;
+    ggml_backend_tensor_set(mel_t, mel, 0, (size_t)n_mels * T_mel * sizeof(float));
+
+    const int H1 = (T_mel + 2 - 3) / 2 + 1;
+    const int H2 = (H1 + 2 - 3) / 2 + 1;
+    const int H3 = (H2 + 2 - 3) / 2 + 1;
+    auto pos_enc = ct_rel_pos_enc(H3, hp.enc_d_model);
+    struct ggml_tensor* pos_enc_t = ggml_graph_get_tensor(gf, "pos_enc");
+    if (!pos_enc_t)
+        return -1;
+    ggml_backend_tensor_set(pos_enc_t, pos_enc.data(), 0, pos_enc.size() * sizeof(float));
+
+    if (!cohere_sched_graph_compute(ctx->ggml_alloc, gf, ctx->params.n_threads)) {
+        fprintf(stderr, "cohere: staged encoder compute failed\n");
+        return -1;
+    }
+
+    const int d = hp.enc_d_model;
+
+    // Deliver pre-conv snapshots (4D tensors: [W, H, C, N])
+    {
+        const char* conv_snaps[] = {"pre_conv0", "pre_conv3", "pre_conv6"};
+        for (const char* sn : conv_snaps) {
+            struct ggml_tensor* t = ggml_graph_get_tensor(gf, sn);
+            if (t) {
+                const size_t total = ggml_nelements(t);
+                std::vector<float> buf(total);
+                ggml_backend_tensor_get(t, buf.data(), 0, total * sizeof(float));
+                // Report as (total_elements, 1) — just for debug printing
+                cb(sn, buf.data(), (int)total, 1, userdata);
+            }
+        }
+    }
+
+    // Deliver pre_encode output
+    {
+        struct ggml_tensor* t = ggml_graph_get_tensor(gf, "pre_enc_out");
+        if (t) {
+            const int t_steps = (int)t->ne[1];
+            std::vector<float> buf((size_t)d * t_steps);
+            ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(float));
+            cb("pre_enc_out", buf.data(), t_steps, d, userdata);
+        }
+    }
+
+    // Deliver layer-0 sub-stage snapshots
+    {
+        const char* sub_names[] = {"L0_ff1_ln", "L0_ff1_up", "L0_ff1", "L0_attn", "L0_conv", "L0_ff2"};
+        for (const char* sn : sub_names) {
+            struct ggml_tensor* t = ggml_graph_get_tensor(gf, sn);
+            if (t) {
+                const int t_steps = (int)t->ne[1];
+                std::vector<float> buf((size_t)d * t_steps);
+                ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(float));
+                cb(sn, buf.data(), t_steps, d, userdata);
+            }
+        }
+    }
+
+    // Deliver per-layer snapshots
+    char lbuf[32];
+    for (int il = 0; il < hp.enc_n_layers; il++) {
+        snprintf(lbuf, sizeof(lbuf), "enc_L%02d", il);
+        struct ggml_tensor* t = ggml_graph_get_tensor(gf, lbuf);
+        if (!t)
+            continue;
+        const int t_steps = (int)t->ne[1];
+        std::vector<float> buf((size_t)d * t_steps);
+        ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(float));
+        cb(lbuf, buf.data(), t_steps, d, userdata);
+    }
+
+    // Deliver enc_out
+    struct ggml_tensor* enc_out = ggml_graph_get_tensor(gf, "enc_out");
+    if (enc_out) {
+        const int t_steps = (int)enc_out->ne[1];
+        const int d_out = (int)enc_out->ne[0];
+        std::vector<float> buf((size_t)d_out * t_steps);
+        ggml_backend_tensor_get(enc_out, buf.data(), 0, buf.size() * sizeof(float));
+        cb("enc_out", buf.data(), t_steps, d_out, userdata);
+    }
+
+    return 0;
 }

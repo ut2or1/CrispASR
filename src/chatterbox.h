@@ -38,6 +38,10 @@ struct chatterbox_context_params {
     float repetition_penalty; // repetition penalty (default 1.2)
     float min_p;              // min_p sampling (default 0.05)
     float top_p;              // top_p sampling (default 1.0)
+    int top_k;                // top_k sampling, 0 = disabled (default 0).
+                              // chatterbox-turbo enables top_k=1000 + top_p=0.95
+                              // + min_p=0 to match HF inference_turbo defaults
+                              // (tts_turbo.py:248-260, t3.py:415).
     int max_speech_tokens;    // upper bound on T3 AR decode (default 1000)
     int cfm_steps;            // number of CFM Euler steps (default 10)
     bool flash_attn;          // PLAN #89 plumbing — T3 Llama-style AR
@@ -124,8 +128,10 @@ void chatterbox_set_cfm_steps(struct chatterbox_context* ctx, int steps);
 void chatterbox_set_temperature(struct chatterbox_context* ctx, float temperature);
 void chatterbox_set_top_p(struct chatterbox_context* ctx, float top_p);
 void chatterbox_set_min_p(struct chatterbox_context* ctx, float min_p);
+void chatterbox_set_top_k(struct chatterbox_context* ctx, int top_k);
 void chatterbox_set_repetition_penalty(struct chatterbox_context* ctx, float r);
 void chatterbox_set_max_speech_tokens(struct chatterbox_context* ctx, int n);
+void chatterbox_set_seed(struct chatterbox_context* ctx, uint32_t seed);
 
 void chatterbox_tokens_free(int32_t* tokens);
 void chatterbox_pcm_free(float* pcm);
@@ -170,6 +176,16 @@ float* chatterbox_dump_campplus_xvector(struct chatterbox_context* ctx, const fl
 // malloc'd (T_mel * 80) f32 row-major buffer; caller frees with `free()`.
 float* chatterbox_dump_prompt_feat_24k(struct chatterbox_context* ctx, const float* pcm_24k, int n_samples,
                                        int max_samples, int* out_T_mel);
+
+// Diff/debug: Conformer encoder output (Module 5 phase 1). Forwarder
+// to the s3gen sub-context's `chatterbox_s3gen_dump_encoder_out`,
+// supplying the voice's `gen.prompt_token` from the loaded conds.
+// Returns a malloc'd (80 * T_mel) f32 channel-first buffer; T_mel
+// written into *out_T_mel. Caller frees with `free()`. Used by
+// crispasr-diff to split "Conformer encoder breaks on GPU" from
+// "CFM denoiser breaks on GPU" when downstream `s3gen_mel` cos drops.
+float* chatterbox_dump_s3gen_encoder_out(struct chatterbox_context* ctx, const int32_t* speech_tokens,
+                                         int n_speech_tokens, int* out_T_mel);
 
 // Diff/debug: return the T3 prefill embeddings for the given text (output of
 // build_prefill_embeds, excluding the extra BOS). Shape: (*out_T, *out_D).

@@ -2916,6 +2916,27 @@ kernel void kernel_argmax_f32(
     dst_i32[tgpig] = arg_val;
 }
 
+// CrispASR patch — explicit per-T reduction helpers for kernel_norm_fuse_impl
+// and kernel_rms_norm_fuse_impl. The original code uses
+// `dot(sumft, T(1.0f))` and `dot(y[i00], y[i00])` with T = float in
+// the kernel_norm_f32 (scalar) instantiation. The Metal Shading
+// Language Specification only defines `dot()` for vector types
+// (float2, float3, float4, half2, …) — scalar dot is unspecified.
+// On Apple Silicon for short rows (e.g. InstanceNorm 1D over T=65)
+// this silently produces wrong per-row mean and variance: rows that
+// should have mean≈0 / std≈1 end up with means scattered ±0.26 and
+// stds up to 2.7. Cascades through kokoro AdaIN1d into garbage
+// audio (cf. issue #94 series + the F0Ntrain bisect).
+//
+// Replace the two `dot` call sites with explicit per-T overloads so
+// the scalar instantiation no longer relies on undefined dot()
+// behavior. The float4 instantiation is unchanged in semantics
+// (x+y+z+w via dot(v, 1)). MUST RE-APPLY after every ggml bump.
+static inline float crispasr_vec_sum(float v)  { return v; }
+static inline float crispasr_vec_sum(float4 v) { return v.x + v.y + v.z + v.w; }
+static inline float crispasr_vec_sqsum(float v)  { return v * v; }
+static inline float crispasr_vec_sqsum(float4 v) { return v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w; }
+
 // F == 1 : norm (no fuse)
 // F == 2 : norm + mul
 // F == 3 : norm + mul + add
@@ -2952,7 +2973,7 @@ kernel void kernel_norm_fuse_impl(
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
         sumft += x[i00];
     }
-    sumf = dot(sumft, T(1.0f));
+    sumf = crispasr_vec_sum(sumft); // CrispASR patch — see header
     sumf = simd_sum(sumf);
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2963,8 +2984,24 @@ kernel void kernel_norm_fuse_impl(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    sumf = shmem_f32[tiisg];
-    sumf = simd_sum(sumf);
+    // CrispASR patch — serial reduction by thread 0 of sg0 instead of
+    // the cross-simdgroup `sumf = shmem[tiisg]; simd_sum(sumf)` pattern.
+    // The original pattern produces wrong totals on Apple Silicon when
+    // the LAST simdgroup had ≤2 active threads during the prior parallel
+    // sum (bisected via tests/test_metal_norm_repro.cpp on T ∈ {33,
+    // 65, 66, 97, 129..132, 257}). shmem[31] is unused by the original
+    // code (init zeroed it, no sg writes to it), so reuse it as the
+    // broadcast slot.
+    if (sgitg == 0 && tiisg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = 0.0f;
+        for (uint sg = 0; sg < n_sg; sg++) {
+            total += shmem_f32[sg];
+        }
+        shmem_f32[31] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = shmem_f32[31];
 
     const float mean = sumf/args.ne00;
 
@@ -2973,7 +3010,7 @@ kernel void kernel_norm_fuse_impl(
     sumf = 0.0f;
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
         y[i00] = x[i00] - mean;
-        sumf += dot(y[i00], y[i00]);
+        sumf += crispasr_vec_sqsum(y[i00]); // CrispASR patch — see header
     }
     sumf = simd_sum(sumf);
 
@@ -2985,8 +3022,17 @@ kernel void kernel_norm_fuse_impl(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    sumf = shmem_f32[tiisg];
-    sumf = simd_sum(sumf);
+    // CrispASR patch — serial reduction (see kernel_norm mean step).
+    if (sgitg == 0 && tiisg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = 0.0f;
+        for (uint sg = 0; sg < n_sg; sg++) {
+            total += shmem_f32[sg];
+        }
+        shmem_f32[31] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = shmem_f32[31];
 
     const float variance = sumf/args.ne00;
 
@@ -3047,7 +3093,7 @@ kernel void kernel_rms_norm_fuse_impl(
 
     // parallel sum
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
-        sumf += dot(x[i00], x[i00]);
+        sumf += crispasr_vec_sqsum(x[i00]); // CrispASR patch — see kernel_norm header
     }
     sumf = simd_sum(sumf);
 
@@ -3059,8 +3105,17 @@ kernel void kernel_rms_norm_fuse_impl(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    sumf = shmem_f32[tiisg];
-    sumf = simd_sum(sumf);
+    // CrispASR patch — serial reduction by thread 0 (see kernel_norm header).
+    if (sgitg == 0 && tiisg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = 0.0f;
+        for (uint sg = 0; sg < n_sg; sg++) {
+            total += shmem_f32[sg];
+        }
+        shmem_f32[31] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = shmem_f32[31];
 
     const float mean  = sumf/args.ne00;
     const float scale = 1.0f/sqrt(mean + args.eps);
@@ -3115,7 +3170,7 @@ kernel void kernel_l2_norm_impl(
 
     // parallel sum
     for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
-        sumf += dot(x[i00], x[i00]);
+        sumf += crispasr_vec_sqsum(x[i00]); // CrispASR patch — see kernel_norm header
     }
     sumf = simd_sum(sumf);
 
@@ -3127,8 +3182,17 @@ kernel void kernel_l2_norm_impl(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    sumf = shmem_f32[tiisg];
-    sumf = simd_sum(sumf);
+    // CrispASR patch — serial reduction by thread 0 (see kernel_norm header).
+    if (sgitg == 0 && tiisg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = 0.0f;
+        for (uint sg = 0; sg < n_sg; sg++) {
+            total += shmem_f32[sg];
+        }
+        shmem_f32[31] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = shmem_f32[31];
 
     const float scale = 1.0f/max(sqrt(sumf), args.eps);
 

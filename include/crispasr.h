@@ -150,6 +150,18 @@ extern "C" {
         float vlen;        // voice length of the token
     } whisper_token_data;
 
+    // Top-N alternative candidate for a sampled token. Populated when
+    // wparams.alt_n > 0 (greedy decode only). The `p` is the softmax
+    // probability at the same decode step the chosen token came from.
+    // Surfaced via whisper_full_get_token_alt_* and the session-result
+    // crispasr_session_result_word_alt_* accessors so consumers can build
+    // tap-to-pick UIs for ambiguous words (Whisper's first-choice token
+    // is often plausible but wrong for proper nouns / technical jargon).
+    typedef struct whisper_alt_token {
+        whisper_token id; // alternate candidate token id
+        float         p;  // probability at the same decode step in [0, 1]
+    } whisper_alt_token;
+
     typedef struct whisper_model_loader {
         void * context;
 
@@ -588,6 +600,11 @@ extern "C" {
         const char * vad_model_path;              // Path to VAD model
 
         whisper_vad_params vad_params;
+
+        // Capture top-N alternative-candidate tokens at each greedy-sampled
+        // step. 0 (default) = off. Beam-search siblings are not captured —
+        // they're conditional on the beam, not greedy alternatives.
+        int alt_n;
     };
 
     // NOTE: this function allocates memory, and it is the responsibility of the caller to free the pointer - see whisper_free_context_params & whisper_free_params()
@@ -671,6 +688,16 @@ extern "C" {
     CRISPASR_API float whisper_full_get_token_p           (struct whisper_context * ctx, int i_segment, int i_token);
     CRISPASR_API float whisper_full_get_token_p_from_state(struct whisper_state * state, int i_segment, int i_token);
 
+    // Top-N alternative candidates for a sampled token. Returns 0 / 0 / 0.0f
+    // when alts are not captured (wparams.alt_n == 0, beam search, or i_alt
+    // out of range). The chosen token is not present in the alts list.
+    CRISPASR_API int           whisper_full_get_token_n_alts           (struct whisper_context * ctx, int i_segment, int i_token);
+    CRISPASR_API int           whisper_full_get_token_n_alts_from_state(struct whisper_state * state, int i_segment, int i_token);
+    CRISPASR_API whisper_token whisper_full_get_token_alt_id           (struct whisper_context * ctx, int i_segment, int i_token, int i_alt);
+    CRISPASR_API whisper_token whisper_full_get_token_alt_id_from_state(struct whisper_state * state, int i_segment, int i_token, int i_alt);
+    CRISPASR_API float         whisper_full_get_token_alt_p            (struct whisper_context * ctx, int i_segment, int i_token, int i_alt);
+    CRISPASR_API float         whisper_full_get_token_alt_p_from_state (struct whisper_state * state, int i_segment, int i_token, int i_alt);
+
     //
     // Voice Activity Detection (VAD)
     //
@@ -717,6 +744,42 @@ extern "C" {
 
     CRISPASR_API void whisper_vad_free_segments(struct whisper_vad_segments * segments);
     CRISPASR_API void whisper_vad_free         (struct whisper_vad_context  * ctx);
+
+    // CrispASR C-ABI VAD helpers.
+    //
+    // crispasr_vad_segments is the legacy Silero/whisper_vad path and returns
+    // malloc-owned [start_cs, end_cs] float pairs in centiseconds.
+    CRISPASR_API int crispasr_vad_segments(
+            const char * vad_model_path,
+            const float * pcm,
+                    int   n_samples,
+                    int   sample_rate,
+                  float   threshold,
+                    int   min_speech_ms,
+                    int   min_silence_ms,
+                    int   n_threads,
+                   bool   use_gpu,
+                  float ** out_spans);
+
+    // crispasr_vad_slices routes through CrispASR's shared VAD dispatcher and
+    // can use Silero, FireRedVAD, MarbleNet, or Whisper-VAD-EncDec depending
+    // on the concrete model path. It returns malloc-owned [start_s, end_s]
+    // float pairs in seconds. Passing threshold <= 0 leaves per-model default
+    // threshold behavior intact, including Whisper-VAD-EncDec auto-tuning.
+    CRISPASR_API int crispasr_vad_slices(
+            const char * vad_model_path,
+            const float * pcm,
+                    int   n_samples,
+                    int   sample_rate,
+                  float   threshold,
+                    int   min_speech_ms,
+                    int   min_silence_ms,
+                    int   speech_pad_ms,
+                  float   max_chunk_duration_s,
+                    int   n_threads,
+                  float ** out_spans);
+
+    CRISPASR_API void crispasr_vad_free(float * spans);
 
     ////////////////////////////////////////////////////////////////////////////
 

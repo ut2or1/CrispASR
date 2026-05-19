@@ -85,15 +85,14 @@ class ManifestSchemaTests(unittest.TestCase):
         self.assertGreater(len(self.manifest["backends"]), 0)
 
     def test_backend_entries_have_required_keys(self):
-        required = {
-            "name", "backend_id", "gguf",
-            "expected_transcript",
-            "fixture_ref_path", "diff_thresholds",
-        }
+        # Keys required by every entry regardless of skip_diff.
+        always_required = {"name", "backend_id", "gguf", "expected_transcript"}
+        # Keys required only for full diff entries (skip_diff absent or false).
+        diff_required = {"fixture_ref_path", "diff_thresholds"}
         gguf_required = {"repo", "revision", "file"}
         names_seen: set[str] = set()
         for entry in self.manifest["backends"]:
-            missing = required - set(entry)
+            missing = always_required - set(entry)
             self.assertEqual(missing, set(),
                 f"backend missing keys: {missing} in {entry.get('name', '?')}")
             self.assertNotIn(entry["name"], names_seen,
@@ -109,16 +108,54 @@ class ManifestSchemaTests(unittest.TestCase):
                 rev, r"^[0-9a-f]{7,40}$",
                 f"{entry['name']}.gguf.revision must be a SHA, got {rev!r}",
             )
-            self.assertIsInstance(entry["diff_thresholds"], dict)
-            self.assertGreater(len(entry["diff_thresholds"]), 0,
-                f"{entry['name']} has empty diff_thresholds — at least one stage must be tracked")
-            for stage, threshold in entry["diff_thresholds"].items():
-                self.assertIsInstance(threshold, (int, float),
-                    f"{entry['name']}.{stage} threshold must be numeric")
-                self.assertTrue(
-                    0.0 <= threshold <= 1.0,
-                    f"{entry['name']}.{stage} threshold {threshold} out of [0,1]",
-                )
+            skip_diff = entry.get("skip_diff", False)
+            if not skip_diff:
+                # Full diff entry: fixture_ref_path + diff_thresholds required.
+                missing_diff = diff_required - set(entry)
+                self.assertEqual(missing_diff, set(),
+                    f"{entry['name']}: diff entry missing keys {missing_diff} "
+                    f"(set skip_diff=true if no ref dump exists yet)")
+                self.assertIsInstance(entry["diff_thresholds"], dict)
+                self.assertGreater(len(entry["diff_thresholds"]), 0,
+                    f"{entry['name']} has empty diff_thresholds — at least one stage must be tracked")
+                for stage, threshold in entry["diff_thresholds"].items():
+                    self.assertIsInstance(threshold, (int, float),
+                        f"{entry['name']}.{stage} threshold must be numeric")
+                    self.assertTrue(
+                        0.0 <= threshold <= 1.0,
+                        f"{entry['name']}.{stage} threshold {threshold} out of [0,1]",
+                    )
+            else:
+                # Transcript-only entry: diff_thresholds and fixture_ref_path
+                # must NOT be present (forces the maintainer to graduate it
+                # to a full diff entry once the ref dump is baked).
+                self.assertNotIn("diff_thresholds", entry,
+                    f"{entry['name']}: skip_diff=true but diff_thresholds is also set — "
+                    f"remove skip_diff once the ref dump is in cstr/crispasr-regression-fixtures")
+                self.assertNotIn("fixture_ref_path", entry,
+                    f"{entry['name']}: skip_diff=true but fixture_ref_path is also set — "
+                    f"remove skip_diff once the ref dump is in cstr/crispasr-regression-fixtures")
+
+            # Optional transcript_tolerance block — opt-in WER/CER bar
+            # for backends whose decoder ties on punctuation/case
+            # boundaries (e.g. glm-asr-nano). Schema:
+            #   { "cer_max": 0..1, "wer_max": 0..1 } both required when present.
+            if "transcript_tolerance" in entry:
+                tol = entry["transcript_tolerance"]
+                self.assertIsInstance(tol, dict,
+                    f"{entry['name']}: transcript_tolerance must be an object")
+                required_tol = {"cer_max", "wer_max"}
+                missing_tol = required_tol - set(tol)
+                self.assertEqual(missing_tol, set(),
+                    f"{entry['name']}.transcript_tolerance missing keys: {missing_tol}")
+                for k in required_tol:
+                    v = tol[k]
+                    self.assertIsInstance(v, (int, float),
+                        f"{entry['name']}.transcript_tolerance.{k} must be numeric")
+                    self.assertTrue(
+                        0.0 <= v <= 1.0,
+                        f"{entry['name']}.transcript_tolerance.{k} = {v} out of [0,1]",
+                    )
 
     def test_sample_source_declared(self):
         """Every backend must declare its sample source: either a
@@ -264,6 +301,419 @@ class ThresholdEvaluationTests(unittest.TestCase):
         )
         self.assertEqual(f, [])
         self.assertEqual(m, [])
+
+
+class StreamJsonVadRoutingTests(unittest.TestCase):
+    """Pure-Python model of the stream JSON+VAD routing invariants
+    introduced in PR #92 (perf: skip aggregate segs in JSON VAD path).
+
+    The C++ logic is modelled here so regressions to the routing
+    semantics are caught without needing a built binary or audio data.
+
+    Three invariants locked in by PR #92
+    -------------------------------------
+    1. `json_vad_path` flag
+         True  ⟺  stream_json=True AND vad_model is set
+         False otherwise (stream_json=False, or no VAD, or both)
+
+    2. `decoded_segments_this_step` flag
+         Each decode branch sets it when the backend returns non-empty
+         segments, regardless of which path runs:
+           a) JSON+VAD   → sl_for_text non-empty
+           b) Non-JSON VAD → slice_segs non-empty
+           c) No-VAD       → segs non-empty
+
+    3. `segs` invariant in JSON+VAD mode
+         `segs` is intentionally left empty; aggregate post-processing
+         (punc / truecase / pcs / strip-punc) is skipped via the
+         `if !json_vad_path` guard. In non-JSON or no-VAD paths `segs`
+         accumulates normally.
+
+    `stream_monitor` silence-dot (`·`) now fires on
+    `!decoded_segments_this_step` instead of `segs.empty()`, which
+    was always True in JSON+VAD mode even when audio was transcribed.
+    """
+
+    # ------------------------------------------------------------------
+    # Helper: Python model of the three-branch decode routing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _simulate_step(
+        stream_json: bool,
+        vad_model: str,
+        backend_returns: list[str],   # per-slice mock text; empty list = no VAD
+    ) -> dict:
+        """Return the state dict that C++ would have after one step.
+
+        backend_returns:
+          - If vad_model is set (VAD path): one entry per VAD slice.
+            Each is the text that backend->transcribe() returns for
+            that slice (empty string = backend returned nothing).
+          - If vad_model is empty (no-VAD path): a single entry for
+            the whole-window transcribe call.
+        """
+        json_vad_path   = stream_json and bool(vad_model)
+        segs: list[str] = []
+        decoded_segments_this_step = False
+
+        if vad_model:
+            # VAD branches
+            for text in backend_returns:
+                if stream_json:
+                    # JSON+VAD: sl_for_text, segs stays empty
+                    sl_for_text = [text] if text else []
+                    if sl_for_text:
+                        decoded_segments_this_step = True
+                    # segs intentionally NOT updated here
+                else:
+                    # Non-JSON VAD: aggregate into segs
+                    slice_segs = [text] if text else []
+                    if slice_segs:
+                        decoded_segments_this_step = True
+                    segs.extend(slice_segs)
+        else:
+            # No-VAD path
+            text = backend_returns[0] if backend_returns else ""
+            segs = [text] if text else []
+            if segs:
+                decoded_segments_this_step = True
+
+        # Post-loop guard: skip aggregate post-processing in JSON+VAD mode
+        post_processed = not json_vad_path
+
+        silence_dot = not decoded_segments_this_step
+
+        return {
+            "json_vad_path": json_vad_path,
+            "segs": segs,
+            "decoded_segments_this_step": decoded_segments_this_step,
+            "post_processed": post_processed,
+            "silence_dot": silence_dot,
+        }
+
+    # ------------------------------------------------------------------
+    # 1. json_vad_path flag
+    # ------------------------------------------------------------------
+
+    def test_json_vad_path_true_when_both_set(self):
+        r = self._simulate_step(stream_json=True, vad_model="firered_vad.gguf",
+                                backend_returns=["hello"])
+        self.assertTrue(r["json_vad_path"])
+
+    def test_json_vad_path_false_stream_json_only(self):
+        r = self._simulate_step(stream_json=True, vad_model="",
+                                backend_returns=["hello"])
+        self.assertFalse(r["json_vad_path"])
+
+    def test_json_vad_path_false_vad_only(self):
+        r = self._simulate_step(stream_json=False, vad_model="firered_vad.gguf",
+                                backend_returns=["hello"])
+        self.assertFalse(r["json_vad_path"])
+
+    def test_json_vad_path_false_neither(self):
+        r = self._simulate_step(stream_json=False, vad_model="",
+                                backend_returns=["hello"])
+        self.assertFalse(r["json_vad_path"])
+
+    # ------------------------------------------------------------------
+    # 2a. decoded_segments_this_step — JSON+VAD path
+    # ------------------------------------------------------------------
+
+    def test_decoded_flag_json_vad_set_when_backend_returns_text(self):
+        r = self._simulate_step(stream_json=True, vad_model="vad.gguf",
+                                backend_returns=["hello world"])
+        self.assertTrue(r["decoded_segments_this_step"])
+
+    def test_decoded_flag_json_vad_clear_when_all_slices_empty(self):
+        r = self._simulate_step(stream_json=True, vad_model="vad.gguf",
+                                backend_returns=["", ""])
+        self.assertFalse(r["decoded_segments_this_step"])
+
+    def test_decoded_flag_json_vad_set_when_any_slice_non_empty(self):
+        """Even one non-empty slice among many empty ones is enough."""
+        r = self._simulate_step(stream_json=True, vad_model="vad.gguf",
+                                backend_returns=["", "speech here", ""])
+        self.assertTrue(r["decoded_segments_this_step"])
+
+    # ------------------------------------------------------------------
+    # 2b. decoded_segments_this_step — non-JSON VAD path
+    # ------------------------------------------------------------------
+
+    def test_decoded_flag_non_json_vad_set(self):
+        r = self._simulate_step(stream_json=False, vad_model="vad.gguf",
+                                backend_returns=["hello"])
+        self.assertTrue(r["decoded_segments_this_step"])
+
+    def test_decoded_flag_non_json_vad_clear_when_empty(self):
+        r = self._simulate_step(stream_json=False, vad_model="vad.gguf",
+                                backend_returns=[""])
+        self.assertFalse(r["decoded_segments_this_step"])
+
+    # ------------------------------------------------------------------
+    # 2c. decoded_segments_this_step — no-VAD path
+    # ------------------------------------------------------------------
+
+    def test_decoded_flag_no_vad_set_when_backend_returns_text(self):
+        r = self._simulate_step(stream_json=False, vad_model="",
+                                backend_returns=["text"])
+        self.assertTrue(r["decoded_segments_this_step"])
+
+    def test_decoded_flag_no_vad_clear_when_silent(self):
+        r = self._simulate_step(stream_json=False, vad_model="",
+                                backend_returns=[""])
+        self.assertFalse(r["decoded_segments_this_step"])
+
+    # ------------------------------------------------------------------
+    # 3. segs invariant
+    # ------------------------------------------------------------------
+
+    def test_segs_empty_in_json_vad_mode(self):
+        """PR #92 core invariant: aggregate segs must stay empty in
+        JSON+VAD mode regardless of what the backend returns.
+        """
+        r = self._simulate_step(stream_json=True, vad_model="vad.gguf",
+                                backend_returns=["word1", "word2", "word3"])
+        self.assertEqual(r["segs"], [],
+            "JSON+VAD mode must not populate aggregate segs")
+
+    def test_segs_populated_in_non_json_vad_mode(self):
+        r = self._simulate_step(stream_json=False, vad_model="vad.gguf",
+                                backend_returns=["hello", "world"])
+        self.assertEqual(r["segs"], ["hello", "world"])
+
+    def test_segs_populated_in_no_vad_mode(self):
+        r = self._simulate_step(stream_json=False, vad_model="",
+                                backend_returns=["full text"])
+        self.assertEqual(r["segs"], ["full text"])
+
+    def test_post_processing_skipped_in_json_vad_mode(self):
+        """punc/truecase/pcs must not run on the empty segs in JSON+VAD
+        mode (the `if !json_vad_path` guard).
+        """
+        r = self._simulate_step(stream_json=True, vad_model="vad.gguf",
+                                backend_returns=["text"])
+        self.assertFalse(r["post_processed"])
+
+    def test_post_processing_runs_in_non_json_vad_mode(self):
+        r = self._simulate_step(stream_json=False, vad_model="vad.gguf",
+                                backend_returns=["text"])
+        self.assertTrue(r["post_processed"])
+
+    def test_post_processing_runs_in_no_vad_mode(self):
+        r = self._simulate_step(stream_json=False, vad_model="",
+                                backend_returns=["text"])
+        self.assertTrue(r["post_processed"])
+
+    # ------------------------------------------------------------------
+    # 4. stream_monitor silence dot
+    # ------------------------------------------------------------------
+
+    def test_silence_dot_fires_when_no_decode_output_json_vad(self):
+        """With old code segs.empty() was always True in JSON+VAD mode,
+        so the silence dot always fired even when audio was transcribed.
+        PR #92 fixes this; model the corrected behaviour.
+        """
+        r = self._simulate_step(stream_json=True, vad_model="vad.gguf",
+                                backend_returns=[""])
+        self.assertTrue(r["silence_dot"],
+            "silence dot should fire when no segments decoded")
+
+    def test_silence_dot_suppressed_when_json_vad_has_output(self):
+        r = self._simulate_step(stream_json=True, vad_model="vad.gguf",
+                                backend_returns=["hello"])
+        self.assertFalse(r["silence_dot"],
+            "silence dot must NOT fire when backend returned segments")
+
+    def test_silence_dot_fires_in_no_vad_silence(self):
+        r = self._simulate_step(stream_json=False, vad_model="",
+                                backend_returns=[""])
+        self.assertTrue(r["silence_dot"])
+
+    def test_silence_dot_suppressed_in_no_vad_speech(self):
+        r = self._simulate_step(stream_json=False, vad_model="",
+                                backend_returns=["speech"])
+        self.assertFalse(r["silence_dot"])
+
+
+class TtsBackendsSchemaTests(unittest.TestCase):
+    """Schema checks for the optional `tts_backends` section of
+    `manifest.json` introduced by PLAN #12 (TTS->ASR roundtrip nightly).
+
+    The section is opt-in (omitted entirely on older manifests), so
+    these checks short-circuit when absent. When present, every entry
+    must declare a pinned TTS gguf, a pinned voice gguf, a phrase, a
+    `roundtrip_asr_backend` referencing a real ASR entry, and a
+    numeric `wer_max` in [0, 1].
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with (HERE / "manifest.json").open() as f:
+            cls.manifest = json.load(f)
+
+    def test_tts_backends_field_is_optional(self):
+        # tts_backends should be either absent or a list. Tolerate
+        # older manifests that haven't enabled the roundtrip path.
+        section = self.manifest.get("tts_backends", [])
+        self.assertIsInstance(section, list)
+
+    def test_tts_entries_have_required_keys(self):
+        # `voice` (block) and `voice_preset` (name string) are
+        # mutually-exclusive — exactly one must be set. Verified after
+        # the per-entry required-keys check below.
+        required = {"name", "backend_id", "gguf",
+                    "tts_phrase", "roundtrip_asr_backend", "wer_max"}
+        pinned_required = {"repo", "revision", "file"}
+        names_seen: set[str] = set()
+        asr_names = {b["name"] for b in self.manifest["backends"]}
+
+        for entry in self.manifest.get("tts_backends", []):
+            missing = required - set(entry)
+            self.assertEqual(missing, set(),
+                f"tts backend missing keys: {missing} in {entry.get('name', '?')}")
+            name = entry["name"]
+            self.assertNotIn(name, names_seen,
+                f"duplicate tts backend name: {name}")
+            names_seen.add(name)
+
+            # Exactly one of `voice` (block) or `voice_preset` (string).
+            has_voice = "voice" in entry
+            has_preset = "voice_preset" in entry
+            self.assertTrue(
+                has_voice ^ has_preset,
+                f"{name}: must set exactly one of `voice` block or "
+                f"`voice_preset` string (got voice={has_voice} preset={has_preset})")
+            if has_preset:
+                self.assertIsInstance(entry["voice_preset"], str,
+                    f"{name}.voice_preset must be a string")
+                self.assertGreater(len(entry["voice_preset"].strip()), 0,
+                    f"{name}.voice_preset must be non-empty")
+
+            # Pinned revisions: SHA only, never a branch.
+            pinned_blocks: list[tuple[str, dict]] = [("gguf", entry["gguf"])]
+            if has_voice:
+                pinned_blocks.append(("voice", entry["voice"]))
+            if "codec" in entry:
+                pinned_blocks.append(("codec", entry["codec"]))
+            for label, block in pinned_blocks:
+                self.assertEqual(pinned_required - set(block), set(),
+                    f"{name}.{label} missing keys")
+                self.assertRegex(
+                    block["revision"], r"^[0-9a-f]{7,40}$",
+                    f"{name}.{label}.revision must be a SHA, got {block['revision']!r}")
+
+            # roundtrip_asr_backend must reference a real ASR entry.
+            asr_ref = entry["roundtrip_asr_backend"]
+            self.assertIn(asr_ref, asr_names,
+                f"{name}.roundtrip_asr_backend={asr_ref!r} not in manifest.backends")
+
+            # wer_max must be a numeric in [0, 1].
+            wer_max = entry["wer_max"]
+            self.assertIsInstance(wer_max, (int, float),
+                f"{name}.wer_max must be numeric")
+            self.assertTrue(0.0 <= wer_max <= 1.0,
+                f"{name}.wer_max = {wer_max} out of [0,1]")
+
+            # tts_phrase must be a non-empty string.
+            self.assertIsInstance(entry["tts_phrase"], str,
+                f"{name}.tts_phrase must be a string")
+            self.assertGreater(len(entry["tts_phrase"].strip()), 0,
+                f"{name}.tts_phrase must be non-empty")
+
+    def test_tts_entries_name_is_unique_against_asr_entries(self):
+        # `run_one.py main()` dispatches on name across both lists.
+        # A duplicate name would collide ambiguously.
+        asr_names = {b["name"] for b in self.manifest["backends"]}
+        tts_names = {b["name"] for b in self.manifest.get("tts_backends", [])}
+        overlap = asr_names & tts_names
+        self.assertEqual(overlap, set(),
+            f"tts_backends names collide with asr backend names: {overlap}")
+
+
+class TranscriptToleranceTests(unittest.TestCase):
+    """CER/WER metric for the optional transcript_tolerance field.
+
+    The metric only kicks in when byte-equal fails AND the manifest
+    entry opts in via ``transcript_tolerance``. Per-backend opt-in so
+    backends with truly deterministic output keep the strict bar.
+    """
+
+    def test_levenshtein_empty(self):
+        self.assertEqual(run_one._levenshtein([], []), 0)
+        self.assertEqual(run_one._levenshtein(["a"], []), 1)
+        self.assertEqual(run_one._levenshtein([], ["a", "b"]), 2)
+
+    def test_levenshtein_identical(self):
+        self.assertEqual(run_one._levenshtein(list("hello"), list("hello")), 0)
+
+    def test_levenshtein_substitution(self):
+        self.assertEqual(run_one._levenshtein(list("cat"), list("bat")), 1)
+
+    def test_levenshtein_mixed_ops(self):
+        # kitten -> sitting: substitute k->s, e->i, insert g => 3 ops
+        self.assertEqual(run_one._levenshtein(list("kitten"), list("sitting")), 3)
+
+    def test_metrics_identical_strings(self):
+        cer, wer = run_one.compute_transcript_metrics("hello world", "hello world")
+        self.assertEqual(cer, 0.0)
+        self.assertEqual(wer, 0.0)
+
+    def test_metrics_punctuation_only_diff(self):
+        # The exact glm-asr-nano failure mode: 'you. Ask' vs 'you, ask'.
+        # Two character substitutions ('.'→',' AND 'A'→'a'); zero word
+        # edits after WER normalization (lowercase + strip punc).
+        expected = "And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country."
+        actual = "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
+        cer, wer = run_one.compute_transcript_metrics(expected, actual)
+        # 2 character diffs over 108 chars = ~0.0185 CER.
+        self.assertAlmostEqual(cer, 2.0 / len(expected), places=4)
+        # 'Ask' vs 'ask' is a case-only difference and the leading
+        # punctuation diffs are stripped, so WER = 0.
+        self.assertEqual(wer, 0.0)
+        # The configured 2% CER / 5% WER tolerance covers it:
+        self.assertLessEqual(cer, 0.02)
+        self.assertLessEqual(wer, 0.05)
+
+    def test_metrics_one_word_substitution(self):
+        cer, wer = run_one.compute_transcript_metrics("hello world", "hello earth")
+        # 'world' -> 'earth' is one word substitution after lowercase+split.
+        self.assertEqual(wer, 0.5)  # 1 substitution / 2 expected words
+        self.assertGreater(cer, 0.0)
+
+    def test_metrics_inserted_word(self):
+        cer, wer = run_one.compute_transcript_metrics("hello world", "hello there world")
+        # 1 inserted word out of 2 expected words.
+        self.assertEqual(wer, 0.5)
+
+    def test_metrics_deleted_word(self):
+        cer, wer = run_one.compute_transcript_metrics("hello there world", "hello world")
+        # 1 deleted word out of 3 expected words.
+        self.assertAlmostEqual(wer, 1.0 / 3, places=4)
+
+    def test_metrics_empty_expected(self):
+        cer, wer = run_one.compute_transcript_metrics("", "")
+        self.assertEqual(cer, 0.0)
+        self.assertEqual(wer, 0.0)
+        # Non-empty actual against empty expected -> infinite (cannot divide).
+        cer, wer = run_one.compute_transcript_metrics("", "something")
+        self.assertEqual(cer, float("inf"))
+        self.assertEqual(wer, float("inf"))
+
+    def test_metrics_case_normalization(self):
+        cer, wer = run_one.compute_transcript_metrics("Hello World", "hello world")
+        # CER counts the case differences as substitutions; WER does not
+        # (normalization lowercases first).
+        self.assertGreater(cer, 0.0)
+        self.assertEqual(wer, 0.0)
+
+    def test_metrics_punctuation_normalization(self):
+        cer, wer = run_one.compute_transcript_metrics(
+            "hello, world!", "hello world"
+        )
+        # CER counts the dropped comma + exclamation; WER ignores them.
+        self.assertGreater(cer, 0.0)
+        self.assertEqual(wer, 0.0)
 
 
 if __name__ == "__main__":

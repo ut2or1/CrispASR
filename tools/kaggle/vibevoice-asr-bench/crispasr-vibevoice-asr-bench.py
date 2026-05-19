@@ -5,18 +5,15 @@
 # https://huggingface.co/cstr/vibevoice-asr-GGUF/discussions/1
 # report Q4_K is bad. Sunknown specifically said "clear high quality
 # speech without background noise transcribes to just '[Music]'" on
-# CUDA. The F16 was just uploaded today; this kernel:
+# CUDA. The F16 was just uploaded; this kernel:
 #
-#   1. Builds CrispASR-CLI with CUDA.
-#   2. Downloads both F16 (15.5 GB) and Q4_K (4.5 GB).
-#   3. Transcribes samples/jfk.wav with each.
-#   4. Prints both transcripts side-by-side.
+#   1. Builds CrispASR-CLI CPU-only (fast; CUDA build takes 10+ h).
+#   2. Downloads Q4_K (4.5 GB) first and transcribes samples/jfk.wav.
+#   3. Downloads F16 (15.5 GB) if ≥60 min of wall-time remain.
+#   4. Prints both transcripts side-by-side vs gold.
 #
-# Expectation: F16 produces a real transcript; Q4_K confirms the
-# regression (either gibberish or "[Music]"). If both work, the
-# regression reports are environment-specific to one of the
-# reporters' setups. If only F16 works, that's an actionable
-# datapoint we can post back to the discussion.
+# CPU result isolates whether Q4_K is fundamentally broken (bad quant)
+# vs a CUDA-specific regression.
 
 # %% [code]
 import json
@@ -27,8 +24,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ── unbuffered I/O + step checkpoint (HF live-progress on by default) ──
 os.environ["PYTHONUNBUFFERED"] = "1"
+os.environ["PYDEVD_DISABLE_FILE_VALIDATION"] = "1"  # suppress pydevd frozen-module noise
 try:
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
@@ -42,6 +39,8 @@ _HF_LAST_PUSH = 0.0
 _HF_REPO = "cstr/crispasr-kaggle-progress"
 _HF_PATH = (f"runs/{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
             f"-vibevoice-asr-bench.jsonl")
+
+MAX_WALL_S = 8 * 3600  # Kaggle GPU limit is 9 h; leave 1 h margin
 
 
 def _push_hf():
@@ -74,8 +73,15 @@ def step(name, **extra):
 
 step("script.start")
 
+# Open build-log early so ALL noisy subprocesses (pip, apt, cmake, ninja)
+# are redirected there. Unicode box-drawing from pip progress bars and ANSI
+# codes from mold corrupt the notebook's cell-output JSON when papermill
+# tries to serialize them → the "Invalid \uXXXX" crash on disk-save.
+_BUILD_LOG = WORK / "build.log"
+_BUILD_LOG.parent.mkdir(parents=True, exist_ok=True)
+_blog = open(_BUILD_LOG, "a")
+
 # %% [code]
-# Read HF_TOKEN from Kaggle secret if present (for HF progress push).
 try:
     from kaggle_secrets import UserSecretsClient
     tok = UserSecretsClient().get_secret("HF_TOKEN")
@@ -90,92 +96,46 @@ step("install-deps.begin")
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", "--quiet",
     "huggingface_hub", "hf_transfer",
-])
+], stdout=_blog, stderr=_blog)
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 step("install-deps.done")
 
 # %% [code]
-step("apt-install.begin")
-subprocess.check_call(
-    "apt-get update -qq && apt-get install -y --no-install-recommends "
-    "cmake ninja-build g++ libopenblas-dev ccache mold || true",
-    shell=True)
-step("apt-install.done")
+# Download pre-built release binary — skips the 4-minute cmake/ninja build.
+RELEASE = "v0.6.6"
+TARBALL = f"crispasr-linux-x86_64.tar.gz"
+RELEASE_URL = f"https://github.com/CrispStrobe/CrispASR/releases/download/{RELEASE}/{TARBALL}"
+BIN_DIR = WORK / "bin"
+BIN_DIR.mkdir(exist_ok=True)
+CRISPASR = BIN_DIR / "crispasr"
 
-# %% [code]
-step("git-clone.begin")
+step("binary-download.begin", release=RELEASE)
+subprocess.check_call(
+    f"wget -q {RELEASE_URL} -O /tmp/crispasr.tar.gz && "
+    f"tar -xzf /tmp/crispasr.tar.gz -C {BIN_DIR} --strip-components=1",
+    shell=True, stdout=_blog, stderr=_blog)
+CRISPASR.chmod(0o755)
+assert CRISPASR.is_file(), f"binary missing after download"
+step("binary-download.done", binary=str(CRISPASR))
+
+# Clone repo only for the jfk.wav sample (no build needed)
 REPO = WORK / "CrispASR"
 if not REPO.exists():
     subprocess.check_call(
-        f"git clone --depth 1 https://github.com/CrispStrobe/CrispASR.git {REPO}",
-        shell=True)
-step("git-clone.done")
+        "git clone --depth 1 --filter=blob:none --no-checkout "
+        f"https://github.com/CrispStrobe/CrispASR.git {REPO} && "
+        f"git -C {REPO} checkout HEAD -- samples/",
+        shell=True, stdout=_blog, stderr=_blog)
+step("samples.ready")
 
 # %% [code]
-step("cmake-configure.begin")
-BUILD = WORK / "build"
-import shutil as _shutil
-HAS_GPU = _shutil.which("nvcc") is not None
-CMAKE_FLAGS = [
-    "-DCMAKE_BUILD_TYPE=Release",
-    "-DCRISPASR_BUILD_TESTS=OFF",
-    "-DCRISPASR_BUILD_EXAMPLES=ON",
-    "-DCRISPASR_BUILD_SERVER=OFF",
-]
-if _shutil.which("ccache"):
-    CCACHE_DIR = WORK / ".ccache"
-    CCACHE_DIR.mkdir(exist_ok=True)
-    os.environ["CCACHE_DIR"] = str(CCACHE_DIR)
-    CMAKE_FLAGS += [
-        "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
-        "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
-        "-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache",
-    ]
-if _shutil.which("mold"):
-    for kind in ("EXE", "SHARED", "MODULE"):
-        CMAKE_FLAGS.append(f"-DCMAKE_{kind}_LINKER_FLAGS=-fuse-ld=mold")
-if HAS_GPU:
-    CMAKE_FLAGS += ["-DGGML_CUDA=ON", "-DGGML_CUDA_NO_VMM=ON",
-                    "-DCMAKE_CUDA_ARCHITECTURES=60",
-                    "-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc"]
-subprocess.check_call(
-    ["cmake", "-S", str(REPO), "-B", str(BUILD), "-G", "Ninja", *CMAKE_FLAGS])
-step("cmake-configure.done")
-
-# %% [code]
-step("cmake-build.begin")
-subprocess.check_call(
-    ["cmake", "--build", str(BUILD), "--target", "crispasr-cli", "-j",
-     str(os.cpu_count() or 4)])
-CRISPASR = BUILD / "bin" / "crispasr"
-assert CRISPASR.is_file(), f"binary missing: {CRISPASR}"
-step("cmake-build.done", binary=str(CRISPASR))
-
-# %% [code]
-# Pre-download both quants from HF
-step("download-f16.begin")
-from huggingface_hub import hf_hub_download
-MODELS_DIR = WORK / "models"
-MODELS_DIR.mkdir(exist_ok=True)
-f16_path = hf_hub_download(
-    repo_id="cstr/vibevoice-asr-GGUF",
-    filename="vibevoice-asr-f16.gguf",
-    local_dir=str(MODELS_DIR),
-)
-step("download-f16.done", size_gb=round(Path(f16_path).stat().st_size / 1e9, 2))
-
-step("download-q4_k.begin")
-q4k_path = hf_hub_download(
-    repo_id="cstr/vibevoice-asr-GGUF",
-    filename="vibevoice-asr-q4_k.gguf",
-    local_dir=str(MODELS_DIR),
-)
-step("download-q4_k.done", size_gb=round(Path(q4k_path).stat().st_size / 1e9, 2))
-
-# %% [code]
-# Transcribe with each. samples/jfk.wav already in the repo.
 WAV = REPO / "samples" / "jfk.wav"
 assert WAV.is_file(), f"sample WAV missing: {WAV}"
+MODELS_DIR = WORK / "models"
+MODELS_DIR.mkdir(exist_ok=True)
+GOLD = ("And so, my fellow Americans, ask not what your country can do for you, "
+        "ask what you can do for your country.")
+
 
 def transcribe(gguf: Path, label: str) -> dict:
     step(f"transcribe-{label}.begin", gguf=gguf.name)
@@ -190,7 +150,6 @@ def transcribe(gguf: Path, label: str) -> dict:
         return {"label": label, "transcript": None, "wallclock_s": 600,
                 "stderr_tail": "TIMEOUT"}
     elapsed = time.time() - t0
-    # Take the last non-empty stdout line (the CLI's transcript output)
     text_lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
     transcript = text_lines[-1] if text_lines else "(no stdout)"
     step(f"transcribe-{label}.done", wallclock_s=round(elapsed, 1),
@@ -204,12 +163,59 @@ def transcribe(gguf: Path, label: str) -> dict:
     }
 
 
-results = []
-for label, path in (("F16", Path(f16_path)), ("Q4_K", Path(q4k_path))):
-    results.append(transcribe(path, label))
+# %% [code]
+# ── Q4_K first (4.5 GB) ──────────────────────────────────────────────────────
+from huggingface_hub import hf_hub_download
+
+step("download-q4_k.begin")
+q4k_path = hf_hub_download(
+    repo_id="cstr/vibevoice-asr-GGUF",
+    filename="vibevoice-asr-q4_k.gguf",
+    local_dir=str(MODELS_DIR),
+)
+step("download-q4_k.done", size_gb=round(Path(q4k_path).stat().st_size / 1e9, 2))
+
+r_q4k = transcribe(Path(q4k_path), "Q4_K")
+results = [r_q4k]
+# Print immediately so we have the transcript even if F16 download crashes
+print(f"\nQ4_K ({r_q4k['wallclock_s']}s exit={r_q4k.get('exit','?')}): {r_q4k['transcript']!r}", flush=True)
+print(f"GOLD: {GOLD!r}\n", flush=True)
 
 # %% [code]
-# Headline comparison
+# ── F16 only if time AND disk space allow ────────────────────────────────────
+import shutil as _shutil2
+import warnings as _warnings
+
+# Delete build object files to recover ~1 GB before F16 download check.
+_cmake_files = BUILD / "CMakeFiles"
+if _cmake_files.exists():
+    _shutil2.rmtree(str(_cmake_files), ignore_errors=True)
+    step("cleanup-build-objects")
+
+elapsed_now = time.time() - _T0
+remaining = MAX_WALL_S - elapsed_now
+free_gb = _shutil2.disk_usage(str(WORK)).free / 1e9
+F16_SIZE_GB = 16.7  # vibevoice-asr-f16.gguf is ~16.6 GB
+step("time-check", elapsed_s=round(elapsed_now), remaining_s=round(remaining),
+     free_gb=round(free_gb, 1))
+
+if remaining >= 60 * 60 and free_gb >= F16_SIZE_GB + 0.5:
+    step("download-f16.begin")
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore")
+        f16_path = hf_hub_download(
+            repo_id="cstr/vibevoice-asr-GGUF",
+            filename="vibevoice-asr-f16.gguf",
+            local_dir=str(MODELS_DIR),
+        )
+    step("download-f16.done", size_gb=round(Path(f16_path).stat().st_size / 1e9, 2))
+    results.append(transcribe(Path(f16_path), "F16"))
+elif free_gb < F16_SIZE_GB + 0.5:
+    step("skip-f16", reason=f"disk full ({free_gb:.1f} GB free < {F16_SIZE_GB+0.5:.1f} GB needed)")
+else:
+    step("skip-f16", reason="insufficient time remaining")
+
+# %% [code]
 step("results.begin")
 print("\n=== TRANSCRIPTS ===\n", flush=True)
 for r in results:
@@ -219,11 +225,8 @@ for r in results:
         print(f"        stderr tail: {r['stderr_tail']}")
     print()
 
-GOLD = ("And so, my fellow Americans, ask not what your country can do for you, "
-        "ask what you can do for your country.")
 print(f"\nGOLD: {GOLD!r}\n")
 
-# Save JSON sidecar
 RESULTS_PATH = WORK / "vibevoice-asr-bench.json"
 RESULTS_PATH.write_text(json.dumps({
     "ts": datetime.now(timezone.utc).isoformat(),

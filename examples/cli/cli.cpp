@@ -3,9 +3,12 @@
 
 #include "crispasr.h"
 #include "grammar-parser.h"
-#include "whisper_params.h"       // struct whisper_params (shared with crispasr_*)
-#include "crispasr_backend.h"     // crispasr_run_backend() dispatch entry point
-#include "crispasr_diagnostics.h" // --version / --diagnostics + verbose banner (#31)
+#include "whisper_params.h"            // struct whisper_params (shared with crispasr_*)
+#include "crispasr_backend.h"          // crispasr_run_backend() dispatch entry point
+#include "crispasr_diagnostics.h"      // --version / --diagnostics + verbose banner (#31)
+#include "crispasr_diarize_cli.h"      // crispasr_apply_diarize / pyannote cache (#107)
+#include "crispasr_speaker_embedder.h" // pluggable speaker embedder (#107 P3)
+#include "crispasr_stream_punc.h"      // streaming punctuation mode helpers (#112)
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
 #include "crispasr_output.h"   // crispasr_make_disp_segments — split-on-punct (#29)
@@ -223,6 +226,8 @@ static bool whisper_params_parse_arg_general(int argc, char** argv, int& i, whis
         params.no_speech_thold = std::stof(ARGV_NEXT);
     } else if (arg == "-tp" || arg == "--temperature") {
         params.temperature = std::stof(ARGV_NEXT);
+    } else if (arg == "--seed") {
+        params.seed = (uint64_t)std::stoull(ARGV_NEXT);
     } else if (arg == "-tpi" || arg == "--temperature-inc") {
         params.temperature_inc = std::stof(ARGV_NEXT);
     } else if (arg == "-debug" || arg == "--debug-mode") {
@@ -385,6 +390,7 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.max_new_tokens = std::stoi(ARGV_NEXT);
     } else if (arg == "-ck" || arg == "--chunk-seconds") {
         params.chunk_seconds = std::stoi(ARGV_NEXT);
+        params.chunk_seconds_explicit = true;
     } else if (arg == "--lid-backend") {
         params.lid_backend = ARGV_NEXT;
     } else if (arg == "--lid-model") {
@@ -409,6 +415,12 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.titanet_model = ARGV_NEXT;
     } else if (arg == "--speaker-threshold" || arg == "-st") {
         params.speaker_threshold = std::stof(ARGV_NEXT);
+    } else if (arg == "--diarize-embedder") {
+        params.diarize_embedder = ARGV_NEXT;
+    } else if (arg == "--diarize-cluster-threshold") {
+        params.diarize_cluster_threshold = std::stof(ARGV_NEXT);
+    } else if (arg == "--diarize-max-speakers") {
+        params.diarize_max_speakers = std::stoi(ARGV_NEXT);
     } else if (arg == "--cache-dir") {
         params.cache_dir = ARGV_NEXT;
     } else if (arg == "--alt") {
@@ -520,6 +532,25 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.stream_json = true;
     } else if (arg == "--stream-final-on-silence-ms") {
         params.stream_final_silence_ms = std::stoi(ARGV_NEXT);
+    } else if (arg == "--stream-vad-merge-gap-ms") {
+        params.stream_vad_merge_gap_ms = std::stoi(ARGV_NEXT);
+        if (params.stream_vad_merge_gap_ms < 0) {
+            fprintf(stderr, "crispasr: --stream-vad-merge-gap-ms must be >= 0\n");
+            exit(2);
+        }
+    } else if (arg == "--stream-partial-decode-ms") {
+        params.stream_partial_decode_ms = std::stoi(ARGV_NEXT);
+        if (params.stream_partial_decode_ms < 0) {
+            fprintf(stderr, "crispasr: --stream-partial-decode-ms must be >= 0\n");
+            exit(2);
+        }
+    } else if (arg == "--stream-punc") {
+        std::string mode = ARGV_NEXT;
+        if (!crispasr_stream_punc_mode_valid(mode)) {
+            fprintf(stderr, "crispasr: --stream-punc must be 'off', 'final', or 'partial' (got '%s')\n", mode.c_str());
+            exit(2);
+        }
+        params.stream_punc = mode;
     } else if (arg == "--stream-final-mode") {
         std::string mode = ARGV_NEXT;
         if (mode != "redecode" && mode != "prefix") {
@@ -664,6 +695,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr, "  -nth N,    --no-speech-thold N    [%-7.2f] no speech threshold\n", params.no_speech_thold);
     fprintf(stderr, "  -tp,       --temperature N        [%-7.2f] The sampling temperature, between 0 and 1\n",
             params.temperature);
+    fprintf(stderr, "             --seed N               [%-7d] RNG seed for sampling (0 = non-deterministic)\n",
+            (int)params.seed);
     fprintf(stderr, "  -tpi,      --temperature-inc N    [%-7.2f] The increment of temperature, between 0 and 1\n",
             params.temperature_inc);
     fprintf(stderr, "  -debug,    --debug-mode           [%-7s] enable debug mode (eg. dump log_mel)\n",
@@ -793,9 +826,28 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr,
             "  --diarize-method NAME             [%-7s] diarize method: energy|xcorr|vad-turns|sherpa|pyannote|ecapa\n",
             params.diarize_method.c_str());
-    fprintf(
-        stderr,
-        "                                             (sherpa/pyannote/ecapa all use the sherpa-onnx subprocess)\n");
+    fprintf(stderr,
+            "                                             energy/xcorr: stereo channel split; vad-turns: gap-based "
+            "turn proxy (mono)\n");
+    fprintf(stderr,
+            "                                             pyannote: native GGUF segmentation only (experimental — "
+            "no speaker embeddings or clustering, IDs are not stable across long files; for reliable diarization "
+            "use sherpa/ecapa)\n");
+    fprintf(stderr, "                                             sherpa/ecapa: external sherpa-onnx subprocess with "
+                    "segmentation + speaker embedding + clustering\n");
+    fprintf(stderr,
+            "  --diarize-embedder MODEL          [%-7s] speaker-embedding model used to cluster pyannote local "
+            "tracks into globally stable speaker IDs. Pluggable; known aliases: 'auto' / 'titanet' (192-d "
+            "TitaNet-Large) and 'indextts' / 'indextts-bigvgan' / 'ecapa' (512-d IndexTTS-BigVGAN ECAPA-TDNN). "
+            "Pass a .gguf path to load directly. When unset, --diarize-method pyannote labels are local to each "
+            "forward pass (#107).\n",
+            params.diarize_embedder.empty() ? "off" : params.diarize_embedder.c_str());
+    fprintf(stderr,
+            "  --diarize-cluster-threshold X     [%-7.2f] cosine merge threshold for --diarize-embedder clustering "
+            "(higher = more distinct clusters, lower = more merged)\n",
+            params.diarize_cluster_threshold);
+    fprintf(stderr, "  --diarize-max-speakers N          [%-7d] hard cap on cluster count for --diarize-embedder\n",
+            params.diarize_max_speakers);
     fprintf(stderr,
             "  --sherpa-bin PATH                 [%-7s] sherpa-onnx-offline-speaker-diarization binary (default: in "
             "PATH)\n",
@@ -849,6 +901,15 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "  --stream-final-on-silence-ms N    [%-7d] trailing silence (ms) that promotes a partial to final\n",
             params.stream_final_silence_ms);
     fprintf(stderr,
+            "  --stream-vad-merge-gap-ms N       [%-7d] JSON+VAD close-gap merge in ms; clamped below final silence\n",
+            params.stream_vad_merge_gap_ms);
+    fprintf(stderr,
+            "  --stream-partial-decode-ms N      [%-7d] JSON+VAD minimum interval between partial ASR decodes; 0 = "
+            "every step\n",
+            params.stream_partial_decode_ms);
+    fprintf(stderr, "  --stream-punc MODE                [%-7s] JSON+VAD FireRedPunc mode: off, final, or partial\n",
+            params.stream_punc.c_str());
+    fprintf(stderr,
             "  --stream-final-mode MODE          [%-7s] final.text source: 'redecode' (re-runs on the utterance "
             "PCM, best quality) or 'prefix' (LCP-accumulated, no extra encoder pass)\n",
             params.stream_final_mode.c_str());
@@ -873,8 +934,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.tts_voice.c_str());
     fprintf(stderr, "             --ref-text \"TEXT\"        reference transcription (qwen3-tts; required when --voice "
                     "is a WAV)\n");
-    fprintf(stderr, "             --instruct \"TEXT\"        natural-language voice description "
-                    "(qwen3-tts VoiceDesign only; replaces --voice)\n");
+    fprintf(stderr, "             --instruct \"TEXT\"        natural-language voice/style description "
+                    "(qwen3-tts: VoiceDesign = voice description; CustomVoice = style control)\n");
     fprintf(stderr,
             "             --codec-model FNAME      codec / companion GGUF (defaults to sibling/cache/registry)\n");
     fprintf(stderr, "             --codec-quant Q          [%-7s] preferred quant for registry companion resolution\n",
@@ -1122,9 +1183,12 @@ static void output_txt(const std::vector<crispasr_segment>& segs, std::ofstream&
     const int n_segments = (int)segs.size();
     for (int i = 0; i < n_segments; ++i) {
         const char* text = segs[i].text.c_str();
-        std::string speaker = "";
-
-        if (params.diarize && pcmf32s.size() == 2) {
+        // Prefer the unified segs[i].speaker string when set (e.g. by
+        // the pyannote diarize post-step from #107). Fall back to the
+        // legacy whisper.cpp stereo-energy estimator only when no
+        // upstream speaker label is available and we have stereo input.
+        std::string speaker = segs[i].speaker;
+        if (speaker.empty() && params.diarize && pcmf32s.size() == 2) {
             const int64_t t0 = segs[i].t0;
             const int64_t t1 = segs[i].t1;
             speaker = estimate_diarization_speaker(pcmf32s, t0, t1);
@@ -1143,9 +1207,24 @@ static void output_vtt(const std::vector<crispasr_segment>& segs, std::ofstream&
         const char* text = segs[i].text.c_str();
         const int64_t t0 = segs[i].t0;
         const int64_t t1 = segs[i].t1;
+        // Prefer the unified segs[i].speaker label (e.g. from pyannote
+        // post-step #107). Strip the "(speaker N) " wrapper and use a
+        // VTT-style <v Speaker N> instead.
         std::string speaker = "";
-
-        if (params.diarize && pcmf32s.size() == 2) {
+        if (!segs[i].speaker.empty()) {
+            const std::string& s = segs[i].speaker;
+            // Convert "(speaker 1) " -> "<v Speaker 1>".
+            size_t open = s.find('(');
+            size_t close = s.find(')');
+            if (open != std::string::npos && close != std::string::npos && close > open) {
+                std::string inner = s.substr(open + 1, close - open - 1); // "speaker 1"
+                if (!inner.empty()) {
+                    inner[0] = (char)std::toupper((unsigned char)inner[0]);
+                    speaker = "<v " + inner + ">";
+                }
+            }
+        }
+        if (speaker.empty() && params.diarize && pcmf32s.size() == 2) {
             speaker = estimate_diarization_speaker(pcmf32s, t0, t1, true);
             speaker.insert(0, "<v Speaker");
             speaker.append(">");
@@ -1163,9 +1242,8 @@ static void output_srt(const std::vector<crispasr_segment>& segs, std::ofstream&
         const char* text = segs[i].text.c_str();
         const int64_t t0 = segs[i].t0;
         const int64_t t1 = segs[i].t1;
-        std::string speaker = "";
-
-        if (params.diarize && pcmf32s.size() == 2) {
+        std::string speaker = segs[i].speaker;
+        if (speaker.empty() && params.diarize && pcmf32s.size() == 2) {
             speaker = estimate_diarization_speaker(pcmf32s, t0, t1);
         }
 
@@ -1420,8 +1498,35 @@ static void output_json(const std::vector<crispasr_segment>& segs, std::ofstream
             end_arr(!params.diarize && !params.tinydiarize);
         }
 
-        if (params.diarize && pcmf32s.size() == 2) {
-            value_s("speaker", estimate_diarization_speaker(pcmf32s, t0, t1, true).c_str(), true);
+        if (params.diarize) {
+            // Prefer the unified segs[i].speaker (pyannote / energy / etc.
+            // post-step #107). Strip the historical "(speaker N) "
+            // wrapper down to just "N" for clean JSON; if the wrapper
+            // isn't present, pass the string through. Fall back to the
+            // legacy stereo-energy estimator only when no upstream
+            // label is available AND we have stereo input.
+            std::string label;
+            const std::string& s = segs[i].speaker;
+            if (!s.empty()) {
+                size_t open = s.find('(');
+                size_t close = s.find(')');
+                if (open != std::string::npos && close != std::string::npos && close > open) {
+                    // "(speaker 1) " -> "1"
+                    std::string inner = s.substr(open + 1, close - open - 1);
+                    const std::string prefix = "speaker ";
+                    if (inner.size() > prefix.size() && inner.compare(0, prefix.size(), prefix) == 0) {
+                        label = inner.substr(prefix.size());
+                    } else {
+                        label = inner;
+                    }
+                } else {
+                    label = s;
+                }
+            } else if (pcmf32s.size() == 2) {
+                label = estimate_diarization_speaker(pcmf32s, t0, t1, true);
+            }
+            if (!label.empty())
+                value_s("speaker", label.c_str(), true);
         }
 
         if (params.tinydiarize) {
@@ -2117,6 +2222,45 @@ int main(int argc, char** argv) {
                     resplit.push_back(std::move(s));
                 }
                 segs = std::move(resplit);
+            }
+
+            // Diarization post-step (issue #107). The whisper backend
+            // came through cli.cpp's legacy main path rather than the
+            // backend dispatcher in crispasr_run.cpp, so until now
+            // --diarize-method only delegated to whisper.cpp's built-in
+            // stereo-only energy diarize. Wire it up to the shared
+            // crispasr_apply_diarize() shim so pyannote (and the other
+            // methods) work here too. Only fires when the user passed
+            // an explicit method — otherwise the existing whisper.cpp
+            // (speaker N) string is left in place unchanged.
+            if (params.diarize && !params.diarize_method.empty() && !segs.empty()) {
+                CrispasrPyannoteCache pyannote_cache;
+                if (params.diarize_method == "pyannote" && !pcmf32.empty()) {
+                    if (!crispasr_compute_pyannote_cache(pcmf32.data(), (int)pcmf32.size(), params, pyannote_cache)) {
+                        pyannote_cache = {};
+                    }
+                }
+                const bool is_stereo =
+                    pcmf32s.size() == 2 && !pcmf32s[0].empty() && pcmf32s[0].size() == pcmf32s[1].size();
+                const std::vector<float>& left = is_stereo ? pcmf32s[0] : pcmf32;
+                const std::vector<float>& right = is_stereo ? pcmf32s[1] : pcmf32;
+                crispasr_apply_diarize(left, right, is_stereo, /*slice_t0_cs=*/0, segs, params,
+                                       pyannote_cache.valid() ? &pyannote_cache : nullptr);
+
+                // Optional embedding-based clustering (#107 P3). When
+                // --diarize-embedder is set, build the pluggable
+                // embedder (TitaNet today, others later) and rewrite
+                // each segment's speaker label with its global cluster
+                // ID. Failure to build the embedder is a warning, not
+                // an error — the pyannote-local labels above survive.
+                if (!params.diarize_embedder.empty() && !pcmf32.empty()) {
+                    auto embedder =
+                        crispasr_make_speaker_embedder(params.diarize_embedder, params.n_threads, params.cache_dir);
+                    if (embedder) {
+                        crispasr_remap_speakers_via_embeddings(segs, pcmf32.data(), (int)pcmf32.size(), embedder.get(),
+                                                               params);
+                    }
+                }
             }
 
             // macros to stringify function name

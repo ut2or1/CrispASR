@@ -178,6 +178,7 @@ target_include_directories(test-params PRIVATE
     ${PROJECT_SOURCE_DIR}/ggml/include
     ${PROJECT_SOURCE_DIR}/examples
     ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
 )
 target_link_libraries(test-params PRIVATE
     Catch2::Catch2WithMain
@@ -207,6 +208,122 @@ catch_discover_tests(test-stream-finalize
     PROPERTIES LABELS "unit;regression-84"
 )
 
+# Pre-decode finalized-slice skip added in PR #90 (stream JSON mode).
+# Pure arithmetic, no model load.
+add_executable(test-stream-vad-skip
+    test-stream-vad-skip.cpp
+)
+target_link_libraries(test-stream-vad-skip PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-stream-vad-skip
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;stream-json"
+)
+
+# JSON streaming VAD post-merge policy. Pure arithmetic, no model load.
+add_executable(test-stream-vad-merge-policy
+    test-stream-vad-merge-policy.cpp
+)
+target_include_directories(test-stream-vad-merge-policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-stream-vad-merge-policy PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-stream-vad-merge-policy
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;stream-json"
+)
+
+# JSON streaming punctuation policy (PR #112). Pure string-to-bool
+# predicate covered exhaustively; no model load, no audio.
+add_executable(test-stream-punc
+    test-stream-punc.cpp
+)
+target_include_directories(test-stream-punc PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-stream-punc PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-stream-punc
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;stream-json"
+)
+
+# JSON streaming partial-decode cadence (PR #113). Pure arithmetic on
+# the throttle predicate + interval conversion; no model, no audio.
+add_executable(test-stream-partial-decode
+    test-stream-partial-decode.cpp
+)
+target_include_directories(test-stream-partial-decode PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-stream-partial-decode PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-stream-partial-decode
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;stream-json"
+)
+
+# Pyannote-seg → ASR-segment speaker scoring (issue #107). Drives the
+# internal helper with synthetic log-softmax posteriors; no model, no
+# audio. Links against libcrispasr so it tests the actually-shipped
+# logic rather than a fork of it.
+add_executable(test-diarize-pyannote
+    test-diarize-pyannote.cpp
+)
+target_include_directories(test-diarize-pyannote PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-diarize-pyannote PRIVATE
+    Catch2::Catch2WithMain
+    crispasr
+)
+catch_discover_tests(test-diarize-pyannote
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;diarize"
+)
+
+# Live end-to-end checks that --diarize-method pyannote (and optional
+# --diarize-embedder) produce sensible labels on a real multi-speaker
+# WAV. Opt-in via env vars; skips cleanly otherwise. Compiles the
+# CLI-side cluster helper directly so the embedder variant doesn't
+# need to link the whole crispasr-cli executable.
+add_executable(test-diarize-pyannote-live
+    test-diarize-pyannote-live.cpp
+)
+target_include_directories(test-diarize-pyannote-live PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-diarize-pyannote-live PRIVATE
+    Catch2::Catch2WithMain
+    crispasr
+)
+catch_discover_tests(test-diarize-pyannote-live
+    TEST_SPEC "[live]"
+    PROPERTIES LABELS "live;diarize"
+)
+
+# Agglomerative cosine clustering used by --diarize-embedder (#107 P3b).
+# Pure arithmetic on synthetic embeddings; no model, no audio.
+add_executable(test-speaker-cluster
+    test-speaker-cluster.cpp
+)
+target_include_directories(test-speaker-cluster PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-speaker-cluster PRIVATE
+    Catch2::Catch2WithMain
+    crispasr
+)
+catch_discover_tests(test-speaker-cluster
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;diarize"
+)
+
 # ─── test - punctuation - policy — Catch2 unit tests for punctuation auto - enable
 #policy.Pure logic, no model load.
 add_executable(test-punctuation-policy
@@ -217,6 +334,7 @@ target_include_directories(test-punctuation-policy PRIVATE
     ${PROJECT_SOURCE_DIR}/ggml/include
     ${PROJECT_SOURCE_DIR}/examples
     ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
 )
 target_link_libraries(test-punctuation-policy PRIVATE
     Catch2::Catch2WithMain
@@ -258,6 +376,24 @@ target_link_libraries(test-chatterbox-params PRIVATE
 catch_discover_tests(test-chatterbox-params
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;chatterbox"
+)
+
+# ─── test-qwen3-tts-cv-style — Catch2 unit tests for qwen3_tts_set_cv_style_instruct
+# (issue #91: --instruct silently ignored for CustomVoice models).
+# Exercises null-ctx guards and default-params sanity — no GGUF needed. ─────
+add_executable(test-qwen3-tts-cv-style
+    test-qwen3-tts-cv-style.cpp
+)
+target_include_directories(test-qwen3-tts-cv-style PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-qwen3-tts-cv-style PRIVATE
+    Catch2::Catch2WithMain
+    qwen3_tts
+)
+catch_discover_tests(test-qwen3-tts-cv-style
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;qwen3-tts"
 )
 
 # ─── test - flash - attn - defaults — Catch2 unit tests for the PLAN #89
@@ -318,6 +454,27 @@ if (APPLE AND GGML_METAL)
         PROPERTIES LABELS "unit;metal;pipeline-cache"
     )
 endif()
+
+# ─── test_chunk_context — Catch2 unit tests for the energy-minima chunker (issue #89)
+#
+# Covers: audio_chunking::split_at_energy_minima slice coverage / contiguity
+# / single-slice cases. The ctx_l/ctx_r expansion and word-trim that the
+# original 617cd02 round added were reverted (see issue #89 round 2); the
+# tests that pinned them are gone with the code. Pure CPU, no model load.
+add_executable(test_chunk_context
+    test_chunk_context.cpp
+)
+target_include_directories(test_chunk_context PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test_chunk_context PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test_chunk_context
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;chunk-context"
+)
 
 # ─── test - math - consistency — Catch2 unit tests for math constants ────────
 add_executable(test-math-consistency
@@ -438,7 +595,7 @@ catch_discover_tests(test_vibevoice_wav_ref
 #Tests the shared decode helpers in isolation with a mock LLM.No models
 #loaded, no GPU — pure CPU, sub - millisecond.Covers : argmax, softmax_of,
 #greedy run_with_probs, beam run_with_probs(beam_size = 1, 4), max_new_tokens
-#cap, multi - EOS termination.
+#cap, multi-EOS termination, token-id invariant (PR #97).
 add_executable(test-core-decode test-core-decode.cpp)
 target_include_directories(test-core-decode PRIVATE
     ${PROJECT_SOURCE_DIR}/src
@@ -449,6 +606,26 @@ target_link_libraries(test-core-decode PRIVATE
 catch_discover_tests(test-core-decode
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit"
+)
+
+# ─── test_slice_timestamps — Catch2 unit tests for crispasr_fixed_chunk_slices
+# t0_cs / t1_cs timestamp math.  Pins the invariant that PR #96 depends on:
+# each slice's t0_cs = start_sample / SR * 100, with no gaps between adjacent
+# slices.  Links libcrispasr for crispasr_fixed_chunk_slices.  Pure CPU, no
+# model load.
+add_executable(test_slice_timestamps
+    test_slice_timestamps.cpp
+)
+target_include_directories(test_slice_timestamps PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test_slice_timestamps PRIVATE
+    Catch2::Catch2WithMain
+    crispasr
+)
+catch_discover_tests(test_slice_timestamps
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;slice-ts"
 )
 
 # ─── test_qwen3_audio_tower — pre - refactor numeric baseline for the audio
@@ -485,6 +662,30 @@ catch_discover_tests(test-chat-ggml
     TEST_SPEC "[chat]"
     PROPERTIES LABELS "chat;integration"
 )
+
+# ─── test_metal_norm_repro — ggml_norm Metal vs CPU bit-exactness ────────────
+# Standalone repro for the kernel_norm cross-simdgroup reduction bug
+# (see tools/upstream-prs/08-metal-norm-cross-simdgroup). Sweeps a
+# range of T values around the failure boundary and asserts CPU and
+# Metal outputs match bit-exactly. Guards against ggml bumps reverting
+# the patch.
+if(APPLE)
+    add_executable(test_metal_norm_repro test_metal_norm_repro.cpp)
+    target_link_libraries(test_metal_norm_repro PRIVATE
+        ggml
+        ggml-base
+        ggml-cpu
+        ggml-metal
+    )
+    # T values that triggered the original bug; each must return rc=0.
+    foreach(T 33 65 66 67 97 129 130 131 132 257)
+        add_test(NAME metal_norm_T${T}
+            COMMAND test_metal_norm_repro ${T} 512)
+        set_tests_properties(metal_norm_T${T} PROPERTIES
+            LABELS "unit;metal"
+            TIMEOUT 30)
+    endforeach()
+endif()
 
 # ─── test - backends — integration tests for all CrispASR backends ────────────
 #Requires network(downloads models).Not run in CI by default.

@@ -6,6 +6,494 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-19 Issue #89 — disable default 30s chunking for non-whisper backends
+
+**Problem:** parakeet-tdt-0.6b-ja (and other non-whisper backends with
+bidirectional FastConformer encoders) lost text at fixed 30-second chunk
+boundaries. The default `--chunk-seconds 30` was a whisper-era default —
+whisper's positional-encoding encoder is trained on exactly 30 s windows,
+but parakeet/canary/moonshine/etc. can handle arbitrary-length input.
+Chunking these backends threw away the bidirectional context at each
+boundary, causing tokens near the cut point to decode as blanks.
+
+**Fix (`68b4b3e`):**
+- Added `chunk_seconds_explicit` flag to `whisper_params`. When the user
+  doesn't pass `--chunk-seconds`, non-whisper backends (detected via
+  `!(CAP_VAD_INTERNAL)`) now process the full audio in one encoder pass.
+  Users can still force chunking with `--chunk-seconds N` for very long
+  audio where memory is a concern.
+- Also fixed streaming-mode VAD timestamp offsets: `sl.t0_cs` (relative
+  to rolling window) was passed as absolute `t_offset_cs` to
+  `backend->transcribe()` in 4 call sites. Corrected to
+  `window_start_cs + sl.t0_cs`.
+
+**Files:** `whisper_params.h`, `cli.cpp`, `crispasr_run.cpp`,
+`docs/cli.md`.
+
+---
+
+## 2026-05-17 Graduate canary-1b-v2 mel + encoder to full diff
+
+The canary encoder had cos_min=0.917 for `pre_encode_output` vs
+NeMo reference — well below the 0.999 graduation threshold. Two
+sessions of diff-testing chased the bug through the pre_encode conv
+pipeline, testing F16 quantization (ruled out — Python F16 also gave
+0.990), ggml conv2d/im2col math (verified correct), and intermediate
+conv stages (added `snap_conv4d` + per-stage hooks in Python backend).
+
+Root cause: **one extra boundary mel frame**. The C++ STFT produced
+`floor((n+pad-n_fft)/hop)+1` frames (1101 for jfk.wav), while NeMo's
+`AudioToMelSpectrogramPreprocessor` returns `feat_len = floor(n/hop)`
+valid frames (1100). The 1101st frame was boundary garbage — after
+per-feature z-normalization, its values diverged by ±4 in z-score
+units, propagating through the 8× conv downsampling (max_abs=356 at
+pre_encode) and then through 32 conformer layers.
+
+Fix: `p.drop_last_frame = true` in `core_mel::Params` for all three
+NeMo backends (canary, parakeet, cohere). Also disabled NeMo dither
+(`featurizer.dither = 0.0`) and clipped the Python reference mel to
+`feat_len` for deterministic reference dumps.
+
+Result: mel cos_min=1.000, pre_encode cos_min=0.999999,
+encoder_output cos_min=0.999280. All 32 layers pass except layers
+18–19 (F16 precision, cos_min=0.9977/0.9988, recovers by layer 20).
+Deleted the silence-only `canary_dummy.wav` test file (degenerate
+input that masked the real mel issue).
+
+Takeaway: see LEARNINGS.md "STFT frame count" entry.
+
+---
+
+## 2026-05-17 Issue #89 round 2 — revert chunked-slice context expansion
+
+`lenhone` reported that parakeet-tdt-0.6b-ja still dropped words across
+`--chunk-seconds` boundaries after the 617cd02 fix. Reproduced on a
+33 s JA concat (`reazon_baseball + reazon_meal + reazon_raft`) at
+`--chunk-seconds 10`:
+
+    Pre-fix (617cd02 word-trim):
+      "ピ ッ チャ ー の 岡 本 は 1 回 戦 の 鳥 取 城 北 戦 は 8 回、 6 対 対 3 3 点 …
+       腹 す いた い つ もの 手 料 理 ちゃん と お い しく して く れる ジ ュ ー う ん そこ の …"
+      Note: every kana spaced; "6対対33" duplicated "対"; missing "お" before "腹"
+
+    Post-revert (no context, no trim):
+      "ピッチャーの岡本は1回戦の鳥取城北戦は8回6失点。 6対3、3点リードの場面で3人目で
+       マウンドに上がりました。 お腹すいたいつもの手料理ちゃんとおいしくしてくれるジューうん。
+       そこの上流から丸太を組んでいかだにしてる。 どんどん流したんです、これを。"
+
+Two failure modes in 617cd02:
+
+1. **TDT emission-frame drift**: the FastConformer encoder is bidirectional,
+   so feeding ±2 s of neighbour audio shifts the TDT decoder's emission
+   frame for boundary words by 1–2 frames between adjacent slices' passes.
+   The "assign each word to the slice it STARTS in" rule
+   (`w.t0 < sl.t0_cs || w.t0 >= sl.t1_cs`) is *deterministic* only if the
+   same audio content produces the same `t_start` regardless of which
+   context window it appears in — which is not what the encoder
+   guarantees. A word can land outside *both* adjacent slices' ranges
+   and disappear entirely (the user's symptom).
+
+2. **Text rebuild assumed space-prefix tokens**: the trim rebuilt
+   `seg.text` from surviving words with `if (!rebuilt.empty() && w.text[0] != ' ') rebuilt += ' '`.
+   parakeet-ja emits no-space tokens (every kana is its own word with no
+   leading space), so the rebuild inserted a literal space between every
+   character.
+
+Fix is a revert. Each slice transcribes its own audio only;
+`audio_chunking::split_at_energy_minima` already places chunk seams at
+the quietest 100 ms within the search window (PLAN #80b), so boundaries
+fall in pauses and the encoder gets coherent input on either side
+without needing the ±2 s borrow. The 617cd02-era unit tests in
+`tests/test_chunk_context.cpp` that pinned the broken ctx/filter math
+are removed; the file now only covers `split_at_energy_minima` (4 tests,
+22 assertions, all passing).
+
+Verified on JFK 11 s @ 5 s chunks (English parakeet) — full quote
+intact; the very-short 3 s case still has boundary trouble but no
+worse than the 617cd02 round, and the user's reported chunk sizes
+(10, 30, 180) all land safely above that threshold.
+
+---
+
+## 2026-05-17 PRs #92 + #95 — streaming JSON+VAD merge policy
+
+Two @CKwasd PRs accepted as a pair:
+
+- **PR #92** — `perf(stream): skip aggregate segs in JSON VAD path`.
+  Drops the unused aggregate `segs` build-and-postprocess work from
+  the live `--stream-json --vad` path, since it's not consumed by the
+  JSON state machine. Adds an explicit `decoded_segments_this_step`
+  flag for stream-monitor silence detection (the aggregate `segs`
+  is intentionally empty in JSON+VAD mode now). Equivalent commit
+  had landed in main as 6318884c earlier; the PR merge records the
+  formal accept and credit. Our `StreamJsonVadRoutingTests` follow-up
+  (42494f23) sits on top.
+
+- **PR #95** — `Rewrite streaming JSON VAD merge policy`. Adds a
+  `crispasr_vad_post_merge_policy` enum (`offline` vs
+  `streaming_json`) and a new `--stream-vad-merge-gap-ms` CLI flag.
+  Offline / file VAD path keeps the historical short/close merge.
+  JSON streaming gets a narrower close-gap-only policy that never
+  exceeds `--stream-final-on-silence-ms - 1` (so the merger can't
+  hide a silence gap that should finalize an utterance). Includes
+  a Catch2 unit test for the policy helper
+  (`tests/test-stream-vad-merge-policy.cpp`) and a `docs/streaming.md`
+  entry.
+
+Verified pre-merge: `test-stream-vad-merge-policy` (18/7),
+`test-stream-vad-skip` (20/7), `test-stream-finalize` (11/8, our PR
+#92 invariants test) all pass; live smoke with `--stream-json --vad
+--stream-vad-merge-gap-ms 250` + parakeet on `samples/jfk.wav` emits
+clean utterance-level JSON.
+
+The pair landed via the open-PR audit on 2026-05-17 after we
+realised PR #92's diff had been integrated into main without the
+GitHub merge button being pressed — bad style on our end. Both PRs
+now show as merged with proper credit on @CKwasd's profile.
+
+---
+
+## 2026-05-17 Kokoro short-input Metal regression — ggml-metal kernel_norm fix
+
+CrisperWeaver reported kokoro on Apple Silicon Metal producing
+garbage audio for short utterances ("hello world" → ~6× lower
+amplitude, transcribed as "Mm-hmm." by parakeet). Long utterances
+worked. CPU worked. Five-step bisect via the ground-truth diff
+harness localised the divergence to the first AdainResBlk1d in
+F0Ntrain, then to `ggml_norm` Metal itself.
+
+Root cause: `kernel_norm_fuse_impl`, `kernel_rms_norm_fuse_impl`,
+and `kernel_l2_norm_impl` end their parallel reduction with a
+cross-simdgroup `simd_sum(shmem[tiisg])` pattern that produces wrong
+totals on Apple Silicon when the LAST active simdgroup had only a
+few lanes participate in the prior loop body. Sweep of `ne00_t` ∈
+{32..320} confirms the bug strikes at {33, 65, 66, 97, 129-132, 257}
+— exactly the cases where `nth` doubles past `ne00_t` and the
+trailing simdgroup is sparsely populated. Most LLM workloads escape
+because their hidden-size aligns on multiples of 4 (float4 kernel
+variant, `ne00_t = ne00/4` lands on "good" boundaries); audio
+backends with per-frame normalisation (kokoro AdaIN1d at
+T_frames=65) sit exactly in the bug's strike zone.
+
+Fix in `ggml/src/ggml-metal/ggml-metal.metal`: replace the
+cross-simdgroup `simd_sum` with a serial reduction by thread 0 of
+sg0 that sums `shmem[0..n_sg-1]` and broadcasts via `shmem[31]`
+(unused by the original — initialized to 0 by sg0 and never written
+by any sg). Applied at four sites. Also adds explicit per-T
+overloads (`crispasr_vec_sum` / `crispasr_vec_sqsum`) to replace
+`dot(scalar, scalar)` calls — `dot()` is only spec-defined for
+vector types and the kernel_norm_f32 (scalar T) instantiation
+should not rely on it.
+
+`tests/test_metal_norm_repro.cpp` wired into ctest as a regression
+guard (one test per bug-pattern T value). Draft upstream PR at
+`tools/upstream-prs/08-metal-norm-cross-simdgroup.{md,patch}`.
+
+The kokoro-side primitive-op workaround landed earlier the same
+day (`d1fdd476`) was reverted — kokoro now uses `ggml_norm` again
+since the underlying bug is fixed at the source.
+
+Earlier in the chain:
+- `ef2f79c0`, `4e9c6ba8` — mmap loader Metal-side fixes (cleared
+  the "buffer is nil" spam from issue #94's default-on flip).
+- `98488dcb` — bisect infrastructure: extends
+  `tools/dump_reference.py` + `kokoro_extract_stage` +
+  `crispasr-diff` to capture per-op intermediates inside F0Ntrain.
+- `d2266229` — gated the bisect intermediates behind
+  `KOKORO_DEBUG_INTERMEDIATES=1` so production builds pay no cost
+  but the bisect path stays available for the next per-op Metal
+  kernel issue.
+
+---
+
+## 2026-05-16 Issue #94 — chatterbox-turbo slow / failing init on macOS
+
+External report from `niksedk` (SubtitleEdit ships `crispasr` for
+Chatterbox TTS): selecting the Turbo model in SubtitleEdit on
+Apple Silicon segfaulted during s3gen init (exit 139); the Base
+model worked. Reproduced as a 60 s+ slow load on the legacy
+alloc+copy path that, depending on memory pressure, can manifest
+either as a perceived hang or a hard crash. mmap path (formerly
+`CRISPASR_GGUF_MMAP=1`) loaded the same model in ~26 s and
+produced valid 24 kHz audio.
+
+Fix:
+
+- `src/core/gguf_loader.cpp` — flip `mmap_loader_enabled()` to
+  default **on** (opt out with `CRISPASR_GGUF_MMAP=0`). The CPU
+  mmap path has been the validated default-eligible loader since
+  PLAN #51a in late April; this matches llama.cpp's default.
+- `src/chatterbox.cpp` + `src/chatterbox_s3gen.cpp` — add explicit
+  "loading T3 weights from …" / "T3 loaded N tensors" / "s3gen:
+  loading from …" progress prints with `fflush(stderr)` so the
+  silent gap between "auto-falling back to CPU" and "precomputed
+  conds loaded" reads as progress instead of a hang.
+- `docs/cli.md` — update the mmap section + the llama.cpp
+  comparison table to reflect the new default.
+
+Verified on M1 / macOS Tahoe 26.2:
+
+- chatterbox-turbo: 29 s init (was 60 s+) + working `/v1/audio/speech`.
+- chatterbox (base): 28 s init + working `/v1/audio/speech`.
+- `CRISPASR_GGUF_MMAP=0` opt-out: 37 s init, still works.
+
+### 2026-05-17 follow-up — T3 sampler reorder
+
+`src/chatterbox.cpp` `sample_token` had base-chatterbox's ordering
+(rep_penalty → temperature → min_p → top_p) hard-wired, but the
+Python turbo path runs a different `LogitsProcessorList`
+(`chatterbox/models/t3/t3.py:415-490`): temperature → top_k → top_p
+→ repetition_penalty. The two are not interchangeable — applying
+rep_penalty before top_k/top_p reshapes the survival set in a way
+base never needed because base sets `top_k=0`.
+
+- Added `top_k` to `chatterbox_context_params` + `chatterbox_set_top_k`
+  setter (default 0 = off, preserves base behaviour bit-equivalent).
+- `sample_token` now bifurcates on `top_k > 0`: turbo path follows the
+  HF order on raw logits, base path keeps the pre-fix ordering on
+  softmaxed probs. Both paths share the existing torch.multinomial CPU
+  port.
+- `chatterbox_init_from_file` extends the existing `is_gpt2` block
+  (was just `cfg_weight=0`) to also set `min_p=0`, `top_p=0.95`,
+  `top_k=1000` — the exact `tts_turbo.py:248-260` defaults.
+- Aligned `token_hist` passed to rep_penalty with Python: BOS is in
+  the history at step 0 only, then drops out (matches `t3.py:450` vs
+  `t3.py:471`).
+
+Diagnostic finding from the Python reference (captured 2026-05-17,
+audio under `/Volumes/backups/ai/crispasr/issue94-audio/topk-fix/`):
+
+1. Python's turbo sampler also emits S3GEN_SIL (4299) as the second
+   generated speech token on both `"hello world test"` and `"hello
+   chatterbox turbo"` — so 4299-at-step-1 is not the audible defect.
+2. Feeding Python's captured tokens through C++ `chatterbox_synthesize_
+   from_tokens` produces clean audio ("HEllo world test..", "HEllo
+   chatterbox turbo..") — so S3Gen + HiFT on the C++ side are correct
+   end-to-end for inputs sourced from Python's T3.
+3. With C++'s natural sampler the same prompt only round-trips cleanly
+   on ~3/19 random seeds; the Python turbo path is clean on 6/6 seeds
+   tested with the same prompts. The Python path is robust to seed
+   variation; the C++ path is fragile.
+4. The compression is in raw T3 logits, not the sampler. Forcing
+   Python to sample the same step-0 token as our C++ (`tok0=4024`)
+   gives Python a step-1 max logit of 13.75 vs C++'s 12.39 — and the
+   C++ top-token spread is ~1.4 logits wider than Python's at the
+   top of the distribution. After temperature + top_k + top_p that
+   shows up as the sampled token landing on phonemically-bad tokens
+   more often, which then propagates through the AR loop.
+5. F16 weights reproduce the same compression as Q8_0 weights
+   (step-1 max 12.37 with F16 vs 12.39 with Q8_0), so this is not a
+   weight-quantisation effect.
+
+Per-layer bisect (added 2026-05-17):
+
+`CRISPASR_CHATTERBOX_DUMP_GPT2_LAYERS=1` makes the GPT-2 graph dump
+each block's `post_attn` and `post_ffn` hidden states to
+`/tmp/cb_gpt2_step_<n_past>_LNN_*.bin`. The companion Python tool
+`tools/cb_turbo_perlayer_dump_pyref.py` produces the matching Python
+files; `tools/cb_turbo_perlayer_diff.py` walks both sets and reports
+per-layer cosine similarity at the first AR step.
+
+For `"hello world test"` (seed 0, forced `tok0=4024`) the bisect shows:
+
+    L00_post_attn cos=0.99893    L00_post_ffn cos=0.99774
+    L01_post_attn cos=0.99832    L01_post_ffn cos=0.99868
+    L02_post_attn cos=0.99795    L02_post_ffn cos=0.99847
+    L03_post_attn cos=0.99741    L03_post_ffn cos=0.99792
+    L04_post_attn cos=0.99418    L04_post_ffn cos=0.99434
+    L05_post_attn cos=0.94450    ← jump
+    L05_post_ffn  cos=0.93701
+    L06–L23       cos 0.91–0.97 (does not recover)
+
+L00–L04 stay above 0.994; the divergence locus is **L05 attention**.
+Magnitudes (rms) match closely on both sides at the jump (1.83 vs
+1.84), so the issue is direction, not scale — consistent with a sharp
+softmax attention pattern at L05 where small K/V precision noise flips
+which prefill position is attended to.
+
+Ruled out so far: speech_head bias missing, WPE double-add, attention
+scale, GPT-2 LayerNorm scale/bias loading, GELU variant, `scale_attn_
+by_inverse_layer_idx` (False on this config — verified by loading the
+GPT2Config from Python), `scale_attn_weights` (True on both sides),
+prefill length mismatch, Q8_0 vs F16 weight precision (F16 model
+reproduces the same step-1 max logit 12.37 vs 12.39 for Q8_0), F32
+KV cache (cache stored as F32 or read as F32 — neither helps).
+Verified independently: the C++ input embed fed to the GPT-2 forward
+at step 1 (`speech_emb(4024) + wpe(383)`) matches the Python ref to 5
+decimal places, so the divergence is in the transformer forward, not
+the input.
+
+Outlier analysis on the L00 post-attn diff: the maximum-absolute-diff
+element is at dim 265, which is head 4 / hd-position 9. This same
+dim 265 is the largest outlier through L01-L04 with the diff growing
+slowly (−0.21 → −0.91), then at L05 the outlier jumps to dim 659
+(head 10) with diff -2.36. Suggests a specific head-4 attention
+pattern at L00 produces a head-4-localized numerical difference that
+propagates into the residual stream and is then amplified by a sharp
+attention pattern at head 10 of L05.
+
+**Flash_attn ruled out** (added 2026-05-17): added a naive
+softmax(QK^T)V code path behind `CRISPASR_CHATTERBOX_NAIVE_ATTN=1`
+following the qwen3_asr.cpp layout (with the post-mul_mat
+`permute(0, 2, 1, 3)` so the head dim packs correctly for the WO
+projection). Naive attention produces essentially identical bisect
+results: L05_post_attn cos 0.94421 with naive vs 0.94450 with
+flash_attn. The divergence is therefore **not** in the attention
+compute — it's accumulated drift from `ggml_mul_mat` (QKV / WO /
+FFN projections), `ggml_norm` (LayerNorm), or some other per-layer
+op whose F32 accumulator order differs from PyTorch's CPU path.
+Q8_0 weight quant noise (~0.4%/dot) is consistent with the L00 cos
+0.999 baseline but is *not* the dominant source — F16 weights
+reproduce the same L05 divergence.
+
+Suspect remaining: per-op CPU numerics differences between ggml's
+F32 mul_mat / norm and PyTorch's. Hard to fix without bit-exact
+op replacements. The diagnostic infrastructure
+(`CRISPASR_CHATTERBOX_DUMP_GPT2_LAYERS=1`,
+`CRISPASR_CHATTERBOX_NAIVE_ATTN=1`,
+`tools/cb_turbo_perlayer_dump_pyref.py`,
+`tools/cb_turbo_perlayer_diff.py`) is in place so future attempts
+(e.g., dumping per-position K/V at the prefill end and diffing
+against Python's cache, or trying a bit-exact F32 mul_mat) can
+keep narrowing the locus.
+
+**Deep-debug round (2026-05-17 cont'd):**
+
+Two more candidate fixes tested against the L05 cos 0.944 baseline:
+
+1. **F16 weights** (full `chatterbox-turbo-t3-f16.gguf` + `s3gen-f16`):
+   per-layer bisect is *identical* to Q8_0 within 5e-5 (L00 0.99893
+   vs 0.99893; L05 0.94470 vs 0.94450; matching outlier at dim 265 /
+   head-4 / hd-9). Confirms **weight quantisation is not the bug** —
+   neither input-side Q8 quant (which F16 avoids via the PR-01
+   `vec_dot_type = GGML_TYPE_F32` patch) nor weight-side precision
+   loss accounts for the L00 0.1% drift.
+
+2. **`ggml_norm` Accelerate bypass**: forced
+   `ggml_compute_forward_norm_f32` onto the `ggml_vec_cvar_f32` path
+   (double accumulator) instead of the macOS Accelerate
+   `vDSP_measqv` F32-acc path. No measurable change — L05 cos 0.94427
+   vs the prior 0.94450. **`ggml_norm` precision vs PyTorch CPU
+   LayerNorm (Welford's algorithm) is not dominant either.**
+
+Inventory of CrispASR ggml patches in `tools/upstream-prs/` that
+*could* have been relevant: PR-01 (F16 mul_mat saturation, already
+active and confirmed not load-bearing here), PR-08 (Metal norm
+cross-simdgroup, Metal-only — chatterbox runs on CPU). None of the
+shipped patches address CPU mul_mat or softmax precision.
+
+**Conclusion**: the L00 0.1% drift is an *accumulation* of multiple
+tiny per-op numerics differences — likely a combination of
+mul_mat F32 SIMD accumulator order vs PyTorch's CPU BLAS, `tanhf`
+in `ggml_gelu` vs PyTorch's libm, exp/softmax in `ggml_soft_max_ext`
+vs PyTorch's, and similar single-ULP differences. Each contributes
+< 0.05% per layer, sums to ~0.6% by L04, then gets amplified ~9× by
+L05's sharp attention. No single-knob fix surfaced; a real fix needs
+**bit-exact F32 op replacements** matching PyTorch's CPU accumulation
+across mul_mat, LayerNorm, GELU, and softmax — outside the scope of
+issue #94 as originally filed.
+
+**Practical user-facing baseline**: across 19 random RNG seeds for
+"hello chatterbox turbo" with default sampling
+(`temp=0.8 top_k=1000 top_p=0.95`, matching Python), ~3/19 ≈ 16%
+produce Whisper-clean "HEllo, Chatterbox Turbo" output. The rest
+start with a brief onset artifact ("SO,", "UH,", "ANy?", "IN no,",
+etc.) before the intelligible "Chatterbox Turbo" payload. The
+sampler matches Python exactly so this is the residual T3 drift
+compounding through the AR loop. Workaround for users who care
+about the onset artifact: sweep `CRISPASR_CHATTERBOX_T3_SEED` until
+a clean output appears; or fall back to base chatterbox (the
+Llama-style backbone doesn't have L05's amplification).
+
+### 2026-05-17 root cause: SOT/EOT prepended for turbo
+
+The "0.1% per-layer accumulated drift" model from the previous bisect
+turned out to mis-diagnose the issue. The real defect was structural:
+`chatterbox_synthesize_tokens` unconditionally wrapped tokenized text
+with `[start_text_token, …, stop_text_token]` (chatterbox.cpp:2496-
+2498). That matches base chatterbox's path
+(`chatterbox/models/t3/t3.py:255` calls `_ensure_BOT_EOT`), but the
+turbo path (`ChatterboxTurboTTS.inference_turbo`, `t3.py:415`) does
+**not** call `_ensure_BOT_EOT` and feeds the raw tokenizer output to
+the GPT-2 backbone.
+
+For "Hello world test." that means C++'s prefill carried 6 text
+tokens `[SOT=255, 15496, 995, 1332, 13, EOT=0]` while Python's
+carried 4 `[15496, 995, 1332, 13]`, making C++'s `prefill_len=383` vs
+Python's `prefill_len=381`. Every WPE position was shifted by 2 and
+the model attended to two phantom positions (SOT/EOT). The per-layer
+cos numbers from the earlier bisect look much closer to "small drift"
+than "structural offset" only because the diff tool aligned on
+matching `n_past` filenames — at `n_past=383` it was comparing C++'s
+first AR step against Python's *third* AR step (Python at
+prefill_len=381 dumps its first AR step at n_past=381). With the
+mis-alignment, L01–L04 cos accidentally landed in the 0.99-band,
+making it look like CPU numerics drift.
+
+Fix (chatterbox.cpp:2496-2509): gate the SOT/EOT insertion on
+`!is_gpt2`. Base chatterbox keeps the existing behaviour; turbo now
+sends the bare tokenizer output to the GPT-2 backbone, matching
+Python's `inference_turbo` exactly.
+
+User-facing audio quality after the fix (q8_0 weights, seed 0,
+default sampling, 5 iterations each, Whisper-base transcripts):
+
+    Pre-fix:  hello world test  → 1/5 clean (other 4 had onset noise)
+              hello chatterbox  → 1/6 clean (5 had "SO,", "UH,", …)
+    Post-fix: hello world test  → 5/5 clean ("Hello world test.")
+              hello chatterbox  → 5/5 clean ("Hello chatterbox/…box turbo.")
+
+The "84% bad" baseline is gone — clean rate on default seeds is now
+indistinguishable from Python's. No remaining "L05 cumulative
+softmax drift" to chase; the diagnostic infrastructure
+(`CRISPASR_CHATTERBOX_DUMP_GPT2_LAYERS=1` env knob, the
+naive-softmax(QK^T)V path, per-layer dumpers under `tools/`) stays
+in the tree as a stage-gate fixture against future regressions.
+
+### 2026-05-17 follow-up: dumper positional-args fix
+
+`tools/cb_turbo_perlayer_dump_pyref.py`'s `patched_block_forward`
+also had a latent bug: its signature `(self, hidden_states, *_,
+**kwargs)` silently swallowed all positional args. HF
+`GPT2Model.forward` calls each block positionally with at least
+`(hidden_states, past_key_values, cache_position, attention_mask,
+head_mask, encoder_hidden_states, …)`, so the patched block lost
+the KV cache and the causal mask on every AR step; the inner
+`self.attn(h, **kwargs)` ran as if the prefill had never happened.
+That is why L05 cos appeared to crash to 0.944 in the previous
+bisect even after C++ and Python were aligned on prefill content —
+the Python side was computing degenerate single-token attention.
+The dumper now promotes the positional args back to kwargs so
+attention sees the full prefix on every step; this only affects
+diagnostics, not production.
+
+---
+
+## 2026-05-16 Cross-Stack Audit Hardening
+
+Cross-repo audit work covered `CrispASR`, `CrispLens`, and `cloud-backup`.
+Completed items:
+
+- Added `AUDIT.md` and cross-stack tests for repository wiring, VPS services,
+  scratch roots, transcript search, and SSH-only deployment shape.
+- Removed hardcoded `/tmp` usage from audited production/test paths; local
+  scratch now uses configured durable roots such as `/Volumes/backups`.
+- CrispLens video transcript search works for imported videos, including the
+  real 70 second PURplus MP4 crop test searched by `Detektivarbeit`.
+- iOS Capacitor smoke passed: CocoaPods sync under Ruby 3.1.3 detected the
+  CrispASR plugin, Xcode built the simulator app with derived data on
+  `/Volumes/backups`, and the app installed/launched on the iPhone 17 simulator.
+- Android Capacitor packaging passed: the v4 app now has a real native
+  CrispASR JNI bridge, the generated Android project builds a debug APK with
+  JDK 21, and the verified APK was saved under `/Volumes/backups` before
+  generated build outputs were cleaned from the repo volume.
+- Installed `ripgrep 14.1.0` on the VPS for future SSH service/env audits.
+
+TB-scale confidence testing was not run. It remains blocked until a real-world
+dataset is specified so the resulting cloud/index state is worth keeping.
+
+---
+
 ## Timeline
 
 ### 1. Cohere Transcribe — the original port
@@ -3711,3 +4199,73 @@ absence is documented in the binding's source comment; closing it
 properly needs an ABI tweak so `on_token` pointers stay valid past
 the C callback's return (e.g. malloc-per-chunk + Dart-side
 `crispasr_chat_string_free`).
+
+
+### §91 — VibeVoice 1.5B voice clone fidelity fix (issue #74) (2026-05-17)
+
+Root cause of VibeVoice 1.5B TTS voice clone not carrying speaker
+identity (reported by vkrmch in #74): the TTS voice-ref path only
+used the **acoustic** σ-VAE encoder, but Microsoft's Python reference
+combines **both** acoustic and semantic encoder outputs via element-wise
+sum before embedding them as voice conditioning tokens.
+
+**The fix** (`src/vibevoice.cpp`, ~30 LOC net):
+
+1. Run both `at_enc` (acoustic) and `st_enc` (semantic) on the
+   reference WAV.
+2. Scale acoustic output: `(x + bias_factor) * scaling_factor` —
+   semantic gets NO scaling (matches Python).
+3. Run both through their respective connectors (`at_conn`, `se_conn`).
+4. Element-wise sum → `voice_embeds[i] = at_feat[i] + st_feat[i]`.
+5. Graceful fallback to acoustic-only if semantic path fails (old
+   GGUFs without `st_enc` tensors).
+
+All encoder/connector tensors were already in the 1.5B GGUF
+(converter always included them) and the C++ runtime already had
+`run_encoder_stage` + `run_connector_stage` for both prefixes (used
+by the ASR path). The TTS clone path simply wasn't calling them.
+
+**24 kHz resample fix** (`src/vibevoice_wav_ref.h`):
+
+The WAV parser was ignoring the sample rate field from the fmt chunk.
+A 16 kHz reference WAV would produce 55 frames instead of the correct
+83, because the σ-VAE expects 24 kHz input (3200× downsample). Fix:
+parse `sample_rate` from fmt chunk offset +4, add
+`vibevoice_resample_linear()` (simple linear interpolation), apply
+automatically when the WAV rate ≠ 24 kHz. Log line confirms:
+`resampled voice ref 16000 Hz → 24000 Hz (176000 → 264000 samples)`.
+
+**C ABI `.wav` voice path** (`src/crispasr_c_api.cpp`):
+
+`crispasr_session_set_voice()` unconditionally called
+`vibevoice_load_voice()` for all paths including `.wav` references,
+which only works for pre-baked GGUF voice packs. Fix: detect `.wav`
+suffix and set `VIBEVOICE_VOICE_AUDIO` env var instead, matching the
+CLI adapter's existing logic. Python and Dart bindings (which wrap the
+C ABI) now support `.wav` voice cloning for vibevoice-1.5b sessions.
+
+**Verification:**
+
+| Metric | Value |
+|---|---|
+| cos(C++ F16, Python F32) | 0.999884 |
+| cos(C++ Q8_0, Python F32) | 0.999229 |
+| ASR roundtrip (parakeet-ctc q4_k) | "Hello, this is the voice scone test of j. F. K." |
+| Peak | 7940 (no clipping) |
+| Nonzero samples | 99.9% |
+
+Python reference script: `tools/vibevoice_tts_ref_voice_clone.py` —
+loads encoder + connector weights from safetensors, dumps per-stage
+intermediates (`voice_at_enc_mean`, `voice_at_conn`, `voice_st_conn`,
+`voice_combined`) for comparison via `crispasr-diff` or manual cosine.
+C++ dump via `VIBEVOICE_TTS_DUMP=<dir>` writes `tts_voice_embeds.bin`.
+
+**Wiring audit** (status after this session):
+
+| Layer | `.gguf` voice | `.wav` clone | Notes |
+|---|---|---|---|
+| CLI (`--voice`) | ✓ | ✓ + resample | env var path |
+| C ABI | ✓ | ✓ (NEW) | detects `.wav` suffix |
+| Python | ✓ | ✓ (inherited) | via C ABI |
+| Dart/Flutter | ✓ | ✓ (inherited) | via C ABI |
+| Server `/v1/audio/speech` | ✓ | ✓ | via CLI adapter |

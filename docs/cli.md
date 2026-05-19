@@ -13,6 +13,7 @@ when you don't pass `--backend`, whisper is the default.
 - [Word-level timestamps via CTC alignment](#word-level-timestamps-via-ctc-alignment)
 - [Sampling / decoding](#sampling--decoding-whisper--llm-backends) — temperature, beam, grammar
 - [Language detection (LID)](#language-detection-lid)
+- [Diarization](#diarization) — `--diarize`, pyannote, embedder-based clustering
 - [LLM-backend specific](#llm-backend-specific) — aligner, max-new-tokens
 - [Multi-language / translation](#multi-language--translation)
 - [Threading & processors](#threading--processors)
@@ -125,7 +126,7 @@ per-token `tokens[]` arrays when the backend populates them.
 | `-vt F` | VAD threshold (default 0.5) |
 | `-vspd N` | VAD min speech duration (ms, default 250) |
 | `-vsd N` | VAD min silence duration (ms, default 100) |
-| `-ck N`, `--chunk-seconds N` | Fallback chunk size when VAD is off (default 30 s) |
+| `-ck N`, `--chunk-seconds N` | Fallback chunk size when VAD is off (default: 30 s for whisper, disabled for other backends) |
 
 ### How VAD works
 
@@ -149,9 +150,12 @@ segments (< 3 s) are auto-merged, and oversized segments are split at
 ```
 
 The cached model lives at `~/.cache/crispasr/ggml-silero-v5.1.2.bin`
-(~885 KB). If you don't pass `--vad`, CrispASR falls back to fixed
-30-second chunking (`-ck`). Encoder cost is O(T²) in the frame count,
-so for multi-minute audio you really want VAD.
+(~885 KB). If you don't pass `--vad`, whisper falls back to fixed
+30-second chunking (`-ck 30`). Non-whisper backends (parakeet, canary,
+moonshine, etc.) process the full audio in one encoder pass by default
+because their bidirectional encoders lose context at fixed chunk
+boundaries (#89). Pass `--chunk-seconds N` explicitly to force chunking
+on these backends (useful for very long audio where memory is a concern).
 
 ### Recommended for subtitles
 
@@ -171,9 +175,8 @@ crispasr --backend parakeet -m parakeet.gguf -f long_audio.wav \
   `voxtral`, `voxtral4b`, `qwen3`): use a CTC aligner together with
   `--vad`. Without VAD, leading silence can throw off sentence
   starts, especially for the qwen3 forced aligner.
-- **If parakeet is too heavy for very long audio:** keep parakeet for
-  timing quality, but cap memory with fixed chunking
-  (`--chunk-seconds 180`).
+- **If parakeet OOMs on very long audio:** cap memory with explicit
+  chunking (`--chunk-seconds 180`).
 
 ## Word-level timestamps via CTC alignment
 
@@ -346,6 +349,83 @@ faithfully reproduces upstream's `pycld3` behaviour). GlotLID-V3 covers
 the most languages (2102 ISO 639-3 + script). LID-176 is **CC-BY-SA-3.0
 (viral)** — pick CLD3 or GlotLID for non-SA distribution.
 
+## Diarization
+
+Diarization assigns a speaker label to every transcribed segment. Two
+high-level paths, both work with every ASR backend:
+
+```bash
+# Native GGUF pyannote (no Python, no sherpa-onnx)
+crispasr -m auto --backend cohere -f podcast.wav \
+    --diarize --diarize-method pyannote --sherpa-segment-model auto -ojf
+
+# Same + embedder-based global speaker IDs (recommended for >2 speakers
+# or long-form audio where pyannote local-track IDs drift)
+crispasr -m auto --backend cohere -f podcast.wav \
+    --diarize --diarize-method pyannote --sherpa-segment-model auto \
+    --diarize-embedder auto -ojf
+```
+
+### `--diarize-method NAME`
+
+| Method | Stereo / mono | What it does |
+|---|---|---|
+| `energy` | stereo | `|L|` vs `|R|` per segment; the louder channel wins (1.1× margin) |
+| `xcorr` | stereo | TDOA via cross-correlation, ±5 ms search window |
+| `vad-turns` | mono | Alternates 0/1 every >600 ms gap (mono-friendly proxy) |
+| `pyannote` | mono | Native GGUF pyannote-seg-3.0; runs once globally over the full audio, splits ASR segments at speaker-turn boundaries when per-word timestamps exist. Auto-downloads the GGUF via `--sherpa-segment-model auto` |
+| `sherpa` / `ecapa` | mono | External `sherpa-onnx` subprocess with segmentation + speaker-embedding model. Requires `--sherpa-bin`, `--sherpa-segment-model`, `--sherpa-embedding-model` |
+
+Bare `--diarize` (no `--diarize-method`) defaults to `energy` for stereo
+input and `vad-turns` for mono — the historical behaviour.
+
+### `--diarize-embedder MODEL` — globally stable speaker IDs
+
+The pyannote method's per-pass local tracks (spk0 / spk1 / spk2) are
+not anchored to physical speakers across an entire file. Pass
+`--diarize-embedder` to extract a speaker embedding per segment and
+cluster on cosine similarity, producing IDs that are consistent across
+the whole audio.
+
+| Alias | Backend | Dim |
+|---|---|---|
+| `auto`, `titanet` | TitaNet-Large | 192 |
+| `indextts`, `indextts-bigvgan`, `ecapa` | IndexTTS-BigVGAN ECAPA-TDNN | 512 |
+| `<path>.gguf` | Dispatched by filename (`indextts` substring -> IndexTTS, otherwise TitaNet) | — |
+
+The interface is pluggable: add a new adapter by subclassing
+`CrispasrSpeakerEmbedder` in `src/crispasr_speaker_embedder.cpp` and
+extending the factory's dispatch. Tune clustering with
+`--diarize-cluster-threshold X` (default 0.5; higher = more clusters)
+and `--diarize-max-speakers N` (default 8 — hard cap).
+
+### Output shape
+
+Each segment carries the label as the string `"(speaker N) "` in
+`crispasr_segment.speaker`. Output writers surface it as:
+
+* **txt / wts**: prefixed inline: `(speaker 0) hello world`
+* **srt**: prefixed inline
+* **vtt**: `<v Speaker 0>` markup
+* **json**: per-segment `"speaker": "0"` (stripped of the `(speaker )` wrapper)
+
+When the embedder is enabled the labels are global cluster IDs;
+otherwise they are pyannote-local track IDs.
+
+### What changed in 0.6.6+ (issue [#107](https://github.com/CrispStrobe/CrispASR/issues/107))
+
+* `--diarize-method pyannote` is now actually correct end-to-end:
+  pyannote-seg runs ONCE over the full audio (cross-slice consistent
+  IDs), overlap classes contribute to both involved speakers, ASR
+  segments split at speaker-turn boundaries when word timestamps
+  exist.
+* `--diarize-method X` now also works with the whisper backend
+  (previously silently ignored — only the upstream stereo-energy
+  diarize ran).
+* Output writers prefer the unified `segs[i].speaker` over the legacy
+  stereo-only energy estimator. Mono input now gets a `speaker` field
+  in JSON when an explicit method is set.
+
 ## LLM-backend specific
 
 | Flag | Meaning |
@@ -426,14 +506,13 @@ language prefix from `-tl` automatically. m2m100 / WMT21 use both
 
 These work both with the historical default whisper code path AND
 with `--backend whisper`. The historical path retains a few extras
-unique to it (`-owts` karaoke, full-mode JSON DTW tokens, `-di`
-stereo diarize) — pass a `ggml-*.bin` model without `--backend` to
-get them.
+unique to it (`-owts` karaoke, full-mode JSON DTW tokens) — pass a
+`ggml-*.bin` model without `--backend` to get them.
 
 | Flag | Meaning |
 |---|---|
-| `--diarize` | Whisper-internal stereo diarization (upstream feature) |
-| `-tdrz`, `--tinydiarize` | TinyDiarize speaker turn detection |
+| `--diarize` | Generic diarization post-step. Stereo defaults to `energy`, mono to `vad-turns`. Pair with `--diarize-method` for pyannote / sherpa / etc. — see [Diarization](#diarization). |
+| `-tdrz`, `--tinydiarize` | TinyDiarize speaker turn detection (upstream whisper feature, separate from `--diarize`) |
 | `--carry-initial-prompt` | Forward `--prompt` across audio chunks |
 | `-dtw` | Output DTW token-level timing in `-ojf` JSON |
 | `-fa`, `-nfa` | Force flash-attn on / off |
@@ -644,15 +723,26 @@ the most aggressive memory footprint reduction. `KV_QUANT` is
 cheaper than layer offload; reach for `N_GPU_LAYERS` only when the
 *model* doesn't fit, not the cache.
 
-### `CRISPASR_GGUF_MMAP=1` — zero-copy weight load
+### `CRISPASR_GGUF_MMAP` — zero-copy weight load (default **on**)
 
 Map the GGUF file directly into the model's backend buffer instead
 of read-and-copy. Saves one full copy of the GGUF on load: a 14.9 GB
 F16 model goes from "load + 14.9 GB peak RSS" to "mmap +
 ~working-set RSS." No quality impact; pure load-time + RAM win.
 
+Default-on since 0.6.7 (issue #94 — chatterbox-turbo slow / failing
+init on macOS, where the legacy alloc+copy path took 30-60 s for
+the 658 MB T3 GGUF). Opt out with `CRISPASR_GGUF_MMAP=0` if your
+model files live on volumes that may disappear mid-run — mmap-backed
+weights SIGBUS if the underlying file vanishes (network mounts,
+removable disks).
+
 ```bash
-CRISPASR_GGUF_MMAP=1 ./build/bin/crispasr --backend voxtral4b -m auto -f audio.wav
+# Default — mmap is on, no env var needed
+./build/bin/crispasr --backend voxtral4b -m auto -f audio.wav
+
+# Opt out for removable media
+CRISPASR_GGUF_MMAP=0 ./build/bin/crispasr --backend voxtral4b -m auto -f audio.wav
 ```
 
 Honored by every backend that uses `core_gguf::load_weights()` —
@@ -714,7 +804,7 @@ map:
 | Concern | llama.cpp | CrispASR |
 |---|---|---|
 | KV cache dtype | `--type-k q8_0 --type-v q8_0` (CLI flag, separate K/V) | `CRISPASR_KV_QUANT=q8_0` for symmetric, or `CRISPASR_KV_QUANT_K` / `_V` per half |
-| mmap weights | `--no-mmap` (mmap is default **on**) | `CRISPASR_GGUF_MMAP=1` (mmap is default **off**) |
+| mmap weights | `--no-mmap` (mmap is default **on**) | `CRISPASR_GGUF_MMAP=0` (mmap is default **on** since 0.6.7) |
 | Lock pages in RAM | `--mlock` | (not supported — `mmap+preload` is the closest analogue) |
 | GPU layer count | `--n-gpu-layers N` / `-ngl N` (CLI flag) | not supported yet — see [PLAN #69a](https://github.com/CrispStrobe/CrispASR/blob/main/PLAN.md) |
 | KV-on-CPU-only | `--no-kv-offload` | not supported yet — see [PLAN #69b](https://github.com/CrispStrobe/CrispASR/blob/main/PLAN.md) |
@@ -724,11 +814,12 @@ map:
 
 Differences worth flagging:
 
-1. **mmap default.** llama.cpp defaults mmap **on**, CrispASR defaults
-   it **off** (PLAN #51a flipped this opt-in pending wider RSS
-   measurements). On hosts with plenty of RAM, the default-off
-   behavior pays a copy that mmap would skip — set
-   `CRISPASR_GGUF_MMAP=1` to match llama.cpp's behavior.
+1. **mmap default.** Both projects now default mmap **on**. CrispASR
+   flipped from opt-in to default-on in 0.6.7 after issue #94 (slow /
+   failing chatterbox-turbo init on macOS — the legacy alloc+copy
+   path took 30-60 s for the 658 MB T3 GGUF). Set
+   `CRISPASR_GGUF_MMAP=0` to opt out (matches llama.cpp's
+   `--no-mmap`).
 2. **K/V dtype unified.** llama.cpp lets you set `--type-k` and
    `--type-v` independently (rare scenario: quantize K but keep V
    at f16). CrispASR uses a single `CRISPASR_KV_QUANT` for both.

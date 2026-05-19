@@ -37,6 +37,7 @@ struct whisper_params {
     float grammar_penalty = 100.0f;
     float temperature = 0.0f;
     float temperature_inc = 0.2f;
+    uint64_t seed = 0; // RNG seed for sampling (0 = non-deterministic)
 
     bool debug_mode = false;
     bool translate = false;
@@ -132,6 +133,7 @@ struct whisper_params {
     bool no_auto_aligner = false;
     int32_t max_new_tokens = 512;
     int32_t chunk_seconds = 30;
+    bool    chunk_seconds_explicit = false; // true when user passed --chunk-seconds
     std::string lid_backend;
     std::string lid_model;
     // Post-ASR text LID: when set, after transcription completes, run
@@ -150,6 +152,16 @@ struct whisper_params {
     std::string enroll_speaker;     // enrollment mode: save embedding as this name
     std::string titanet_model;      // TitaNet GGUF path or "auto"
     float speaker_threshold = 0.7f; // cosine similarity threshold for matching
+
+    // Embedding-based diarization clustering (issue #107 P3). When set,
+    // after --diarize-method pyannote runs, each speech segment is
+    // embedded by this model and clustered on cosine similarity to
+    // produce globally stable speaker IDs (independent of pyannote's
+    // local track indices). Path, "auto", or empty for no clustering.
+    // Currently dispatches to the TitaNet adapter; pluggable.
+    std::string diarize_embedder;           // model path or "auto"
+    float diarize_cluster_threshold = 0.5f; // cosine merge threshold
+    int diarize_max_speakers = 8;           // upper bound for cluster count
     bool stream = false;
     bool mic = false;
     bool stream_continuous = false;
@@ -174,6 +186,18 @@ struct whisper_params {
     // pause length for live captions / translation handoff and matches
     // the example in the issue. Only relevant with --stream-json.
     int32_t stream_final_silence_ms = 800;
+    // JSON streaming + VAD only: merge adjacent VAD slices across tiny
+    // detector jitter gaps, but never across --stream-final-on-silence-ms.
+    // 0 disables streaming-specific post-merge.
+    int32_t stream_vad_merge_gap_ms = 250;
+    // JSON streaming + VAD only: minimum interval between live partial ASR
+    // decodes. 0 = decode partials every --stream-step, preserving the
+    // previous behavior. VAD timing/finalization still runs every step.
+    int32_t stream_partial_decode_ms = 0;
+    // JSON streaming + VAD only: control FireRedPunc placement when
+    // --punc-model is loaded. "final" avoids the high-frequency partial
+    // punc path; "partial" preserves the older partial+final behavior.
+    std::string stream_punc = "final"; // off|final|partial
     // Issue #84 round 2 (CKwasd retest): how to compute `final.text`
     // when an utterance closes. The round-1 design just echoed the
     // last rolling-window partial — wrong because the rolling window

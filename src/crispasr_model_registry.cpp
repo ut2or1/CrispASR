@@ -364,6 +364,32 @@ constexpr Entry k_registry[] = {
     {"lid-fasttext176", "fasttext-lid176-f16.gguf",
      "https://huggingface.co/cstr/fasttext-lid176-GGUF/resolve/main/fasttext-lid176-f16.gguf",
      "~63 MB", nullptr, nullptr},
+
+    // Audio-LID family — speech-signal language identification.
+    // Silero + Ecapa run through the module-level `detect_language_pcm`;
+    // FireRed requires the session-level `Session::detect_language` (Phase 6).
+    // `lid-silero` is the recommended default: 95 languages, ~16 MB, Apache-2.0.
+    // Converted from deepghs/silero-lang95-onnx via models/convert-silero-lid-to-gguf.py.
+    {"lid-silero", "silero-lid-95-f16.gguf",
+     "https://huggingface.co/cstr/silero-lid-95-GGUF/resolve/main/silero-lid-95-f16.gguf",
+     "~16 MB", nullptr, nullptr},
+    // ECAPA-TDNN LID: speechbrain/lang-id-voxlingua107-ecapa (Apache-2.0),
+    // 107 languages, attentive statistical pooling. ~42 MB F16.
+    // Converted via models/convert-ecapa-tdnn-lid-to-gguf.py.
+    {"lid-ecapa", "ecapa-lid-107-f16.gguf",
+     "https://huggingface.co/cstr/ecapa-lid-107-GGUF/resolve/main/ecapa-lid-107-f16.gguf",
+     "~42 MB", nullptr, nullptr},
+    // FireRed LID: FireRedTeam/FireRedLID encoder + 6-layer LID Transformer,
+    // 120 languages. Converted via models/convert-firered-lid-to-gguf.py.
+    {"lid-firered", "firered-lid-f16.gguf",
+     "https://huggingface.co/cstr/firered-lid-GGUF/resolve/main/firered-lid-f16.gguf",
+     "~300 MB", nullptr, nullptr},
+    // VoxCPM2: openbmb/VoxCPM2 diffusion AR TTS, 30 languages, 48kHz,
+    // Apache 2.0. Tokenizer-free, voice cloning via reference audio.
+    // Default: Q4_K (1.6 GB, practical for CPU). F16 at same repo.
+    {"voxcpm2-tts", "voxcpm2-q4_k.gguf",
+     "https://huggingface.co/cstr/voxcpm2-GGUF/resolve/main/voxcpm2-q4_k.gguf",
+     "~1.6 GB", nullptr, nullptr},
 };
 
 // Multi-companion extras. When a backend needs >1 auxiliary file the

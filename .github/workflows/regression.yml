@@ -13,6 +13,23 @@
 #     is discarded anyway.
 #   - HF cache lives under $RUNNER_TEMP so it's automatically gone at
 #     the end of the job; no GitHub cache eviction concerns.
+#
+# Three tiers of tests (all run on GH free tier):
+#
+#   Tier 0 — smoke (no network, no model, <2 s):
+#     manifest schema validation + driver unit tests
+#     also: fast Python unit tests (backend_config, driver_smoke)
+#
+#   Tier 0.5 — unit-tests (no network, no model, <10 s):
+#     all no-model Python tests in tests/ (test_backend_config.py, etc.)
+#
+#   Tier 1 — preflight dry-run (HF API, no download, ~5 s):
+#     HEAD-check every pinned HF artifact referenced by manifest.json
+#
+#   Tier 2 — per-backend regression (nightly only):
+#     full build + download + crispasr + crispasr-diff against pinned refs
+#     entries with skip_diff=true run transcript check only (no ref dump
+#     needed); useful while the Kaggle rebake for a new backend is pending
 
 name: Regression (nightly)
 
@@ -48,13 +65,27 @@ jobs:
       - name: Run driver smoke test
         run: python tests/regression/test_driver_smoke.py
 
+  # Tier 0.5: no-model Python unit tests. Validates backend config
+  # invariants and other source-level assertions that don't require a
+  # built binary or a model download. Runs in <10 s.
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run no-model Python unit tests
+        run: |
+          python -m pytest tests/test_backend_config.py -v || \
+          python -m unittest tests/test_backend_config.py -v
+
   # Dry-run preflight: confirm every pinned HF artifact in the
   # manifest actually exists (GGUF + fixture ref.gguf + fixture
-  # audio.wav). Catches the "added a backend, forgot to upload"
-  # case in PR CI without the 1+ GB pull. ~1 s for the seed
-  # manifest; O(N+1) HF API calls for N backends.
+  # audio.wav). Entries with skip_diff=true skip the ref.gguf check.
+  # Catches the "added a backend, forgot to upload" case in PR CI
+  # without the 1+ GB pull. ~1 s for the seed manifest; O(N+1) HF
+  # API calls for N backends.
   preflight:
-    needs: smoke
+    needs: [smoke, unit-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -62,15 +93,21 @@ jobs:
       - run: pip install huggingface_hub
       - run: python tests/regression/run_one.py --dry-run
 
-  # Tier 1: per-backend regression. Each entry of the matrix downloads
+  # Tier 2: per-backend regression. Each entry of the matrix downloads
   # its pinned-revision GGUF + pinned-revision reference dump from HF,
   # runs crispasr + crispasr-diff against the manifest's expected
   # transcript and per-stage cos_min thresholds. `fail-fast: false`
   # so one bad backend doesn't mask the rest.
   #
-  # Skipped on `pull_request` — PRs only get smoke + preflight,
-  # which run in <2 minutes total. Full matrix runs nightly +
-  # on manual workflow_dispatch.
+  # Backends with skip_diff=true in manifest.json run only the
+  # transcript check (no ref.gguf download, no crispasr-diff). Add
+  # new backends with skip_diff=true to get transcript regression
+  # on GH immediately; graduate them to full diff entries once the
+  # Kaggle rebake lands in cstr/crispasr-regression-fixtures.
+  #
+  # Skipped on `pull_request` — PRs only get smoke + unit-tests +
+  # preflight, which run in <5 minutes total. Full matrix runs
+  # nightly + on manual workflow_dispatch.
   #
   # The matrix is intentionally small; expand as backends get their
   # fixtures uploaded to HF (see `tests/regression/README.md`
@@ -87,7 +124,35 @@ jobs:
       fail-fast: false
       matrix:
         backend:
+          # Full diff entry (GGUF + ref dump + crispasr-diff cosine checks)
           - parakeet-tdt-0.6b-ja
+          # Transcript-only entries (skip_diff=true; ref dumps pending Kaggle rebake)
+          - moonshine-tiny
+          - moonshine-base
+          - moonshine-streaming-tiny
+          - parakeet-tdt-0.6b-en
+          - canary-1b-v2
+          - firered-asr2-aed
+          - glm-asr-nano
+          # cohere-transcribe: removed from matrix — cstr/cohere-transcribe-GGUF
+          # is hitting HF private-repo storage limit (403). Re-add once the
+          # repo is made public or space is freed on the HF account.
+          - granite-speech-4.1-2b
+          # TTS->ASR roundtrip entries (manifest.tts_backends). Each
+          # synthesises a fixed phrase via the TTS backend, transcribes
+          # it back with parakeet, and asserts WER under the manifest's
+          # wer_max. Catches silent decode regressions the diff harness
+          # can miss (e.g. the voxcpm2 BF16 noise bug).
+          #
+          # Cheap tier (~600 MB - 1.8 GB download per slot, fits GitHub
+          # free-tier 14 GB runner scratch comfortably):
+          - kokoro-82m-en
+          - qwen3-tts-0.6b-customvoice-eric
+          # Heavier TTS backends (orpheus 3B at 3.5 GB; vibevoice 7 GB;
+          # qwen3-tts-1.7b 2.4 GB; voxcpm2 ~3 GB) stay manual via
+          # `tools/test-all-backends.py --tts-roundtrip=full`. They
+          # need 4+ GB per slot once you add parakeet on top, and
+          # nightly traffic at that size adds up on free tier.
     steps:
       - uses: actions/checkout@v4
 
@@ -101,7 +166,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install huggingface_hub
 
-      - name: Configure + build crispasr-cli + crispasr-diff
+      - name: Configure + build crispasr-cli (+ crispasr-diff for full-diff backends)
         run: |
           cmake -S . -B build-regression -G Ninja \
               -DCMAKE_BUILD_TYPE=Release \
@@ -112,6 +177,10 @@ jobs:
           # binary (target name vs output name diverge — see
           # examples/cli/CMakeLists.txt). Asking for target `crispasr`
           # would build just the library, leaving bin/crispasr absent.
+          #
+          # Also build crispasr-diff unconditionally — the binary is
+          # tiny and building it costs <10 s, much less than adding
+          # conditional logic per matrix backend.
           cmake --build build-regression --target crispasr-cli crispasr-diff -j$(nproc)
 
       - name: Run regression for ${{ matrix.backend }}

@@ -34,10 +34,12 @@ DEFAULT_STAGES = [
     "raw_audio",
     "mel_spectrogram",
     "enc_pre_subsample_out",
-    "enc_blk00_out",
-    "enc_blk_mid_out",
-    "enc_blk_last_out",
-    "encoder_out",         # final encoder hidden state (post enc→dec proj)
+    "L0_ff1",              # layer 0: after FF1 + residual
+    "L0_attn",             # layer 0: after self-attention + residual
+    "L0_conv",             # layer 0: after conv + residual
+    "L0_ff2",              # layer 0: after FF2 + residual (before out_norm)
+] + [f"encoder_layer_{i}" for i in range(48)] + [
+    "encoder_output",      # final encoder hidden state (post enc→dec proj)
     "llm_argmax",          # greedy decoded token IDs from model.generate()
     "generated_text",      # decoded transcript (special tokens stripped)
 ]
@@ -96,6 +98,22 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         low_cpu_mem_usage=True,
     ).eval()
 
+    # Workaround: from_pretrained with trust_remote_code + the Cohere
+    # CohereAsrPreTrainedModel._init_weights re-initializes all Linear/Conv
+    # weights to normal(0, 0.02), overwriting the pretrained values.  Detect
+    # and patch by reloading ALL weight tensors from the safetensors file.
+    _conv0 = model.encoder.pre_encode.conv[0].weight
+    _conv0_rms = float(_conv0.norm() / _conv0.numel() ** 0.5)
+    if _conv0_rms < 0.1:
+        print(f"  WARNING: weights appear random-init (rms={_conv0_rms:.4f}), patching ALL from safetensors")
+        from safetensors import safe_open
+        sf_path = Path(model_dir) / "model.safetensors"
+        model_sd = dict(model.named_parameters())
+        with safe_open(str(sf_path), framework="pt") as sf:
+            for key in sf.keys():
+                if key in model_sd:
+                    model_sd[key].data.copy_(sf.get_tensor(key).float())
+
     # ---- Feature extraction (processor handles pre-emphasis + mel + norm) ----
     # CohereProcessor mirrors WhisperFeatureExtractor's API.
     inputs = processor(
@@ -107,8 +125,9 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
 
     out: Dict[str, np.ndarray] = {}
     if "mel_spectrogram" in stages and "input_features" in inputs:
-        mel = inputs["input_features"][0]           # drop batch
-        out["mel_spectrogram"] = mel.detach().cpu().float().numpy()
+        mel = inputs["input_features"][0]           # drop batch → (n_mels, T)
+        # Transpose to (T, n_mels) matching C++ Layout::TimeMels convention.
+        out["mel_spectrogram"] = mel.transpose(0, 1).contiguous().detach().cpu().float().numpy()
 
     # ---- Resolve the encoder and register hooks ----
     encoder, enc_path = _resolve_encoder(model)
@@ -125,12 +144,19 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
 
     handles = []
     # Per-layer hooks (only the three we expose in DEFAULT_STAGES).
-    layer_hooks = {
+    # Per-layer hooks for full diagnosis
+    for i in range(n_layers):
+        stage_name = f"encoder_layer_{i}"
+        if stage_name in stages:
+            handles.append(
+                encoder.layers[i].register_forward_hook(cap(stage_name)))
+    # Legacy stage names (keep for backwards compat with old refs)
+    legacy_hooks = {
         "enc_blk00_out":    0,
         "enc_blk_mid_out":  max(1, n_layers // 2),
         "enc_blk_last_out": n_layers - 1,
     }
-    for stage_name, idx in layer_hooks.items():
+    for stage_name, idx in legacy_hooks.items():
         if stage_name in stages:
             handles.append(
                 encoder.layers[idx].register_forward_hook(cap(stage_name)))
@@ -146,6 +172,42 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         handles.append(
             pre_encode.register_forward_hook(cap("enc_pre_subsample_out")))
 
+    # ---- Layer-0 sub-stage monkey-patch ----
+    want_substages = stages & {"L0_ff1", "L0_attn", "L0_conv", "L0_ff2"}
+    if want_substages:
+        layer0 = encoder.layers[0]
+        _orig_forward = layer0.forward
+
+        def _patched_forward(x, pos_emb, mask=None, pad_mask=None):
+            # Replicate ConformerLayer.forward with intermediate captures.
+            residual = x
+            x = layer0.norm_feed_forward1(x)
+            x = residual + 0.5 * layer0.feed_forward1(x)
+            if "L0_ff1" in stages:
+                captures["L0_ff1"] = x.detach().clone()
+
+            residual = x
+            x = layer0.norm_self_att(x)
+            x = residual + layer0.self_attn(x, pos_emb, mask)
+            if "L0_attn" in stages:
+                captures["L0_attn"] = x.detach().clone()
+
+            residual = x
+            x = layer0.norm_conv(x)
+            x = residual + layer0.conv(x, pad_mask=pad_mask)
+            if "L0_conv" in stages:
+                captures["L0_conv"] = x.detach().clone()
+
+            residual = x
+            x = layer0.norm_feed_forward2(x)
+            x = residual + 0.5 * layer0.feed_forward2(x)
+            if "L0_ff2" in stages:
+                captures["L0_ff2"] = x.detach().clone()
+
+            return layer0.norm_out(x)
+
+        layer0.forward = _patched_forward
+
     # ---- Encoder forward ----
     enc_hidden = None
     with torch.no_grad():
@@ -159,11 +221,13 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
 
     for h in handles:
         h.remove()
+    if want_substages:
+        layer0.forward = _orig_forward
 
     for k, v in captures.items():
         out[k] = v[0].detach().cpu().float().numpy()
-    if "encoder_out" in stages and enc_hidden is not None:
-        out["encoder_out"] = enc_hidden[0].detach().cpu().float().numpy()
+    if "encoder_output" in stages and enc_hidden is not None:
+        out["encoder_output"] = enc_hidden[0].detach().cpu().float().numpy()
 
     # ---- Generation (greedy) ----
     want_argmax = "llm_argmax" in stages

@@ -11,7 +11,7 @@ Pipeline stages captured:
   s3gen_enc0_matrix_bd — rel-pos attention scores (post rel_shift) in enc.0
   s3gen_enc0_attn_out — attention output of enc.0 (after output proj)
   s3gen_pos_emb_pre   — positional encoding for pre-upsample blocks
-  s3gen_gen_mel       — CFM denoiser output mel (generation portion only)
+  s3gen_mel       — CFM denoiser output mel (generation portion only)
   hift_pcm            — final 24 kHz waveform
 
 Usage:
@@ -30,6 +30,7 @@ from typing import Dict, Set
 import numpy as np
 
 DEFAULT_STAGES = [
+    "t3_speech_tokens",
     "s3gen_encoder_out",
     "s3gen_enc0_pre_attn",
     "s3gen_enc0_q",
@@ -37,7 +38,21 @@ DEFAULT_STAGES = [
     "s3gen_enc0_attn_out",
     "s3gen_pos_emb_pre",
     "s3gen_init_noise",
-    "s3gen_gen_mel",
+    "s3gen_mel",
+    # HiFT per-stage capture so crispasr-diff can localise vocoder
+    # divergence (issue #94 follow-up — hift_pcm(ref_mel) reported
+    # cos=0.21 against Python's mel2wav output).
+    "hift_f0",
+    "hift_source",
+    "hift_source_stft",
+    "voc_conv_pre",
+    "voc_ups_0",
+    "voc_rb_0",
+    "voc_ups_1",
+    "voc_rb_1",
+    "voc_ups_2",
+    "voc_rb_2",
+    "voc_conv_post",
     "hift_pcm",
 ]
 
@@ -162,6 +177,11 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
                                    5830, 4372, 3644, 1919, 1676, 1649, 596, 2816, 5088, 5067,
                                    1275, 5400, 732, 2031, 4218, 4218, 4218, 4218]])
 
+    # Issue #94 follow-up: save these tokens so crispasr-diff can chain the
+    # s3gen-only checks (it expects a t3_speech_tokens tensor in the archive).
+    if "t3_speech_tokens" in stages:
+        out["t3_speech_tokens"] = speech_tokens.squeeze(0).cpu().numpy().astype(np.float32)
+
     ref_dict = model.conds.gen
 
     print(f"  running S3Gen with {speech_tokens.size(1)} speech tokens (meanflow, 2 steps)")
@@ -203,21 +223,74 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
             out[k_name] = v_val
 
     # Gen mel
-    if "s3gen_gen_mel" in stages and mel is not None:
+    if "s3gen_mel" in stages and mel is not None:
         # mel shape: (B, 80, T_gen)
-        out["s3gen_gen_mel"] = mel.detach().squeeze(0).permute(1, 0).contiguous().cpu().float().numpy()
+        out["s3gen_mel"] = mel.detach().squeeze(0).permute(1, 0).contiguous().cpu().float().numpy()
     if "s3gen_init_noise" in stages and init_noise is not None:
         out["s3gen_init_noise"] = init_noise.detach().squeeze(0).permute(1, 0).contiguous().cpu().float().numpy()
 
-    # Vocoder
-    if "hift_pcm" in stages:
+    # ── HiFT per-stage capture (issue #94 follow-up) ──
+    # Identical to chatterbox.py's HiFT capture; chatterbox-turbo shares the
+    # same HiFTGenerator under model.s3gen.mel2wav. Feed the gen-only mel
+    # (matches what crispasr-diff supplies as ref_mel) and dump every
+    # intermediate so the diff harness can pinpoint the diverging op.
+    hift = model.s3gen.mel2wav
+    any_hift_stage = any(s.startswith("hift_") or s.startswith("voc_") for s in stages)
+    if mel is not None and any_hift_stage:
         with torch.inference_mode():
-            wav, _ = model.s3gen.inference(
-                speech_tokens=speech_tokens,
-                ref_dict=ref_dict,
-                n_cfm_timesteps=2,
-            )
-        out["hift_pcm"] = wav.detach().squeeze(0).cpu().float().numpy()
+            f0 = hift.f0_predictor(mel)
+            if "hift_f0" in stages:
+                # f0 shape: (B, T_mel) — capture the per-frame F0 in Hz so the
+                # C++ side can do a direct cosine compare on the F0 predictor
+                # output (next divergence candidate after the source-STFT
+                # itself per crispasr-diff localisation).
+                out["hift_f0"] = f0.detach().squeeze(0).cpu().float().numpy()
+            s = hift.f0_upsamp(f0[:, None]).transpose(1, 2)
+            s, _, _ = hift.m_source(s)
+            s = s.transpose(1, 2)
+            if "hift_source" in stages:
+                out["hift_source"] = s.detach().squeeze(0).transpose(0, 1).contiguous().cpu().float().numpy()
+
+            s_stft_real, s_stft_imag = hift._stft(s.squeeze(1))
+            s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
+            if "hift_source_stft" in stages:
+                out["hift_source_stft"] = s_stft.detach().squeeze(0).permute(1, 0).contiguous().cpu().float().numpy()
+
+            x = hift.conv_pre(mel)
+            if "voc_conv_pre" in stages:
+                out["voc_conv_pre"] = x.detach().squeeze(0).permute(1, 0).contiguous().cpu().float().numpy()
+
+            for i in range(hift.num_upsamples):
+                x = torch.nn.functional.leaky_relu(x, hift.lrelu_slope)
+                x = hift.ups[i](x)
+                if i == hift.num_upsamples - 1:
+                    x = hift.reflection_pad(x)
+                if f"voc_ups_{i}" in stages:
+                    out[f"voc_ups_{i}"] = x.detach().squeeze(0).permute(1, 0).contiguous().cpu().float().numpy()
+
+                si = hift.source_downs[i](s_stft)
+                si = hift.source_resblocks[i](si)
+                x = x + si
+
+                xs = None
+                for j in range(hift.num_kernels):
+                    rb = hift.resblocks[i * hift.num_kernels + j](x)
+                    xs = rb if xs is None else xs + rb
+                x = xs / hift.num_kernels
+                if f"voc_rb_{i}" in stages:
+                    out[f"voc_rb_{i}"] = x.detach().squeeze(0).permute(1, 0).contiguous().cpu().float().numpy()
+
+            x = torch.nn.functional.leaky_relu(x)
+            x = hift.conv_post(x)
+            if "voc_conv_post" in stages:
+                out["voc_conv_post"] = x.detach().squeeze(0).permute(1, 0).contiguous().cpu().float().numpy()
+
+            magnitude = torch.exp(x[:, :hift.istft_params["n_fft"] // 2 + 1, :])
+            phase = torch.sin(x[:, hift.istft_params["n_fft"] // 2 + 1:, :])
+            wav = hift._istft(magnitude, phase)
+            wav = torch.clamp(wav, -hift.audio_limit, hift.audio_limit)
+            if "hift_pcm" in stages:
+                out["hift_pcm"] = wav.detach().squeeze(0).cpu().float().numpy()
 
     print(f"  captured {len(out)} stages: {list(out.keys())}")
     return out

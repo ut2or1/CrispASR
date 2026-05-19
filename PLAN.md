@@ -1088,22 +1088,31 @@ of commit `65e0a61` + the Dart follow-up. **The non-Session ABI (~80
 exports) is still C-ABI-only or partially-wrapped on most bindings.**
 This entry tracks closing those gaps.
 
-### Coverage matrix (May 2026)
+### Coverage matrix (May 2026, post-#107)
 
-C-ABI exposes 127+ unique `crispasr_*` exports in
-`src/crispasr_c_api.cpp`. Coverage by binding:
+C-ABI exposes 136+ unique `crispasr_*` exports in
+`src/crispasr_c_api.cpp` (9 new in #107 P6 — pluggable speaker
+embedder, agglomerative clustering, pyannote cache). Coverage by
+binding:
 
-| Binding | Symbols wrapped | Approx % | ASR Transcribe | TTS Session | Variant detect | Align | Diarize | LID | VAD | Streaming | Punc | Registry | Cache |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Rust (`crispasr-sys`) | 56 | ~44% | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Python (`_binding.py`) | 53 | ~42% | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Dart (`flutter/crispasr`) | ~30 | ~24% | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Go (`bindings/go`) | ~45 | ~35% | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Java (JNA) | ~38 | ~30% | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ✅¹ | ✅¹ | ✅¹ |
-| Ruby (C ext) | ~30 | ~24% | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅¹ | ❌ | ❌ |
-| JS (emscripten) | 18 | ~14% | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Binding | Symbols wrapped | Approx % | ASR Transcribe | TTS Session | Variant detect | Align | Diarize | **Diarize embedder²** | LID | VAD | Streaming | Punc | Registry | Cache |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Rust (`crispasr-sys`) | 65 | ~48% | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Python (`_binding.py`) | 62 | ~46% | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Dart (`flutter/crispasr`) | ~39 | ~29% | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Go (`bindings/go`) | ~54 | ~40% | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Java (JNA) | ~38 | ~28% | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅¹ | ✅¹ | ✅¹ |
+| Ruby (C ext) | ~30 | ~22% | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅¹ | ❌ | ❌ |
+| JS (emscripten) | 18 | ~13% | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 ¹ JNA declarations added, idiomatic Java wrapper methods pending.
+² **Diarize embedder** column covers the #107 P6 surface:
+  `crispasr_speaker_embedder_*_abi`, `crispasr_speaker_cluster_abi`,
+  `crispasr_pyannote_cache_*_abi`. Adapters dispatch by spec string
+  (`auto`/`titanet`/`indextts`/`ecapa`/.gguf path). Without this
+  surface, callers can still run pyannote-only diarization via
+  `crispasr_diarize_segments_abi`; the embedder adds globally
+  stable speaker IDs across long files.
 
 Rust + Python are the canonical / "full-coverage" wrappers. The other
 five track the high-traffic surface (transcribe + TTS) and were swept
@@ -1116,15 +1125,24 @@ For each, ~3-12 exports + an idiomatic result type per binding:
 
 - **Forced alignment** — `crispasr_align_words`, `align_words_abi`,
   `align_result_*`. Word-level timestamps from a transcript + audio.
-- **Diarization** — `crispasr_diarize_segments[_abi]`. Speaker segment
-  spans.
+- **Diarization (segment-level)** — `crispasr_diarize_segments[_abi]`.
+  Speaker segment spans via energy / xcorr / vad-turns / pyannote
+  methods. Missing in **Java, Ruby, JS**.
+- **Diarization (embedder + clustering)** — `crispasr_speaker_embedder_*_abi`,
+  `crispasr_speaker_cluster_abi`, `crispasr_pyannote_cache_*_abi` (#107
+  P6). Pluggable speaker-embedding adapters (TitaNet, IndexTTS-BigVGAN
+  ECAPA-TDNN) + agglomerative cosine clustering + pyannote-seg cache
+  for globally stable speaker IDs across long files. Missing in
+  **Java, Ruby, JS** (which also lack the segment-level surface above).
 - **Language ID** — `crispasr_detect_language[_pcm]`,
   `crispasr_lid_free_cache`. Pre-transcribe LID for routing.
 - **VAD** — `crispasr_vad_segments`, `crispasr_compute_vad_slices`,
   `crispasr_stitch_vad_slices`, `crispasr_vad_remap_timestamp`,
   `crispasr_vad_free`. Standalone VAD + slice stitching.
 - **Streaming** — `crispasr_stream_open/feed/get_text/flush/close`,
-  `crispasr_stream_run_decode`. Online ASR with a step buffer.
+  `crispasr_stream_run_decode`. Online ASR with a step buffer. (PR #112
+  `--stream-punc` is a CLI-orchestration flag, not a library surface
+  — wrappers using `crispasr_stream_*` inherit no change.)
 - **Punctuation** — `crispasr_punc_init/process/free/free_text`.
   FireRedPunc post-processor.
 - **Model registry** — `crispasr_registry_lookup[_abi]`,
@@ -1132,6 +1150,34 @@ For each, ~3-12 exports + an idiomatic result type per binding:
   `crispasr_detect_backend_from_gguf`. Backend / file resolution.
 - **Cache** — `crispasr_cache_dir_abi`,
   `crispasr_cache_ensure_file_abi`. Auto-download dir + lookup.
+
+### #107 diarize-pipeline binding follow-up (deferred)
+
+The full diarization surface — both the segment-level
+`diarize_segments` family and the new #107 P6 embedder + clustering
++ cache primitives — landed in Python, Rust, Dart/Flutter, and Go.
+Three bindings still have nothing wired:
+
+- **Java** (`bindings/java/`) — JNI binding currently exposes only
+  `crispasr_session_*` (transcription) and `*speaker_name*` (TTS
+  preset-voice). Adding diarize means JNI wrappers for
+  `crispasr_diarize_segments_abi` + the 9 new `crispasr_speaker_*_abi`
+  / `crispasr_pyannote_cache_*_abi` exports plus an idiomatic Java
+  helper class. ~250 LOC.
+- **Ruby** (`bindings/ruby/`) — only exposes `Session.transcribe`.
+  Treats `Segment#speaker_turn_next?` as the only speaker field
+  (whisper tinydiarize). Wider diarize surface needs Ruby FFI
+  bindings. ~200 LOC.
+- **JavaScript / WASM** (`bindings/javascript/`) — emscripten build,
+  no speaker surface at all today. Closing the gap depends on the
+  WASM build expanding what it links in (pyannote-seg, titanet,
+  indextts_voc all need to be in the WASM target). Bigger effort —
+  start with `crispasr_diarize_segments_abi` (no model deps beyond
+  the existing wasm whisper) and defer the embedder primitives.
+
+Same "when to do this" rule as the rest of #59 applies: open when a
+concrete consumer asks. The Python / Rust / Dart / Go quartet covers
+the active CrispASR usage today.
 
 ### Effort
 
@@ -2525,10 +2571,55 @@ gap is visible:
   Needs an engine-side `audio[t0:t0+d]` slice + timestamp shift
   (similar mechanics to the existing resume-offset routing).
   Estimate: 1 day end-to-end (CrispASR Dart binding + UI).
-* `--alt N` / `--alt-n N` — alternative token candidates with
-  probabilities. Power-user feature for transcript correction.
-  C surface: would need an "alternates" array on the
-  segment/word structs, plus a runtime cap. ~2 days end-to-end.
+* ~~`--alt N` / `--alt-n N`~~ — alternative-candidate tokens —
+  **shipped May 2026 (0.5.13 + CrisperWeaver §5.8)**. Whisper
+  internals carry a parallel `alts` vector on `whisper_segment`
+  (mirrored at every `tokens.{clear,push_back,resize}` site
+  through the fallback-temperature loop, `result_len`
+  truncation, and `max_len` wrap-segment splitter). New
+  `wparams.alt_n` (default 0 = off). Capture happens inside
+  `whisper_sample_token` — beam search is excluded because
+  siblings are beam-conditional rather than greedy
+  alternatives. Six new public getters
+  (`whisper_full_get_token_n_alts` / `_alt_id` / `_alt_p` +
+  `_from_state` variants); new C-ABI for both the low-level
+  (`crispasr_token_n_alts` / `_alt_id` / `_alt_p` /
+  `_alt_text`) and the unified session result
+  (`crispasr_session_result_word_n_alts` / `_alt_text` /
+  `_alt_p`); sticky session setter
+  `crispasr_session_set_alt_n`. The whisper session-transcribe
+  path now also populates `seg.words` via
+  `emit_words_from_tokens` (it previously emitted only
+  segment text — closing a long-standing gap with the parakeet
+  / canary backends as a side benefit). Dart 0.5.13 + smoke
+  test pinned. CrisperWeaver surfaces this as
+  `AdvancedOptions.altN` (0..5 slider in the Whisper-only
+  section) and a tap-to-pick chip row in the segment edit
+  dialog.
+
+  Deferred follow-ups (low priority — v1 covers the common
+  case):
+  - **Beam-search alt capture.** Siblings ≠ greedy
+    alternatives; needs a different capture path and a
+    different chip-walk UX. Defer until a user actually asks.
+  - **Full word-level alt enumeration.** Sub-word BPE means
+    multi-token words ("kubectl" → `["kub","ect","l"]`) only
+    surface alts for the first content token. Whole-word
+    alternates would need a per-word token-tree expansion —
+    not free; v1's first-token alts already catch most real
+    mishears.
+  - **Widget test for the alt-picker popover** (CrisperWeaver
+    side; Riverpod + l10n scaffolding nontrivial).
+  - ~~**Live end-to-end test**~~ — **shipped** as
+    `flutter/crispasr/test/alt_tokens_live_test.dart`. Opens a
+    session against `ggml-tiny.en.bin`, sets `altN=3`,
+    transcribes `samples/jfk.wav`, and asserts ≥1 word has
+    alts, p ∈ [0, 1] and descending, chosen token excluded,
+    `setAltN(0)` actually clears on the next decode. Tagged
+    `live` so model-less CI still passes. On the dev box
+    whisper-tiny gives 22/22 words runner-ups on JFK with
+    real morphological alternatives like "Americans →
+    America / americ / American".
 * Whisper decoder fallback knobs (`--word-thold`,
   `--entropy-thold`, `--logprob-thold`, `--no-speech-thold`,
   `--no-fallback`, `--temperature-inc`) — already in the Dart
