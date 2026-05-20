@@ -1,6 +1,6 @@
 # CrispASR
 
-**One C++ binary, twenty-four ASR backends + eight TTS engines + multilingual text translation, zero Python dependencies.**
+**One C++ binary, twenty-seven ASR backends + eight TTS engines + multilingual text translation, zero Python dependencies.**
 
 CrispASR started as a fork of [whisper.cpp](https://github.com/ggml-org/whisper.cpp) and extends that base into a **unified speech engine** called `crispasr`, backed by full ggml C++ runtimes for major open-weights ASR *and* TTS architectures. One build, one binary, one consistent CLI — pick the backend at the command line or let CrispASR auto-detect it from your GGUF file. See [Text-to-Speech](#text-to-speech-tts) for the TTS side.
 
@@ -61,6 +61,10 @@ to the [TTS table](#text-to-speech-models) for the synthesis side.
 | **whisper** | [`ggml-base.en.bin`](https://huggingface.co/ggerganov/whisper.cpp/) and all OpenAI Whisper variants | Encoder-decoder transformer | 99 | MIT |
 | **whisper** | [`distil-whisper/distil-large-v3`](https://huggingface.co/cstr/distil-large-v3-GGUF) | Distilled Whisper: 32L encoder + 2L decoder (6.3x faster) | English | MIT |
 | **parakeet** | [`nvidia/parakeet-tdt-0.6b-v3`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | FastConformer + TDT | 25 EU (auto-detect) | CC-BY-4.0 |
+| **parakeet** | [`nvidia/parakeet-tdt-0.6b-v2`](https://huggingface.co/cstr/parakeet-tdt-0.6b-v2-GGUF) | FastConformer + TDT, original Open ASR Leaderboard topper | en (mixed-case + punct) | CC-BY-4.0 |
+| **parakeet** | [`nvidia/parakeet-tdt-1.1b`](https://huggingface.co/cstr/parakeet-tdt-1.1b-GGUF) | 42L FastConformer + TDT, larger English variant | en (lowercase) | CC-BY-4.0 |
+| **parakeet** | [`nvidia/parakeet-tdt_ctc-110m`](https://huggingface.co/cstr/parakeet-tdt_ctc-110m-GGUF) | 17L FastConformer + TDT+CTC hybrid; smallest variant, auto-CTC decode | en | CC-BY-4.0 |
+| **parakeet** | [`nvidia/parakeet-tdt_ctc-1.1b`](https://huggingface.co/cstr/parakeet-tdt_ctc-1.1b-GGUF) | 42L FastConformer + TDT+CTC hybrid; largest, mixed-case + punct | en | CC-BY-4.0 |
 | **parakeet** | [`nvidia/parakeet-tdt_ctc-0.6b-ja`](https://huggingface.co/cstr/parakeet-tdt-0.6b-ja-GGUF) | FastConformer-TDT-CTC, xscaling, 80 mels | Japanese | CC-BY-4.0 |
 | **fastconformer-ctc** | [`nvidia/parakeet-ctc-0.6b`](https://huggingface.co/cstr/parakeet-ctc-0.6b-GGUF) | 24L FastConformer + CTC, 80 mels (same arch as fc-ctc-xlarge) | en | CC-BY-4.0 |
 | **fastconformer-ctc** | [`nvidia/parakeet-ctc-1.1b`](https://huggingface.co/cstr/parakeet-ctc-1.1b-GGUF) | 42L FastConformer + CTC, 80 mels | en | CC-BY-4.0 |
@@ -90,6 +94,9 @@ to the [TTS table](#text-to-speech-models) for the synthesis side.
 | **omniasr-llm** | [`omniASR-LLM-Unlimited-300M-v2`](https://huggingface.co/cstr/omniasr-llm-unlimited-300m-v2-GGUF) | Streaming: 15s segment protocol, unlimited audio ([more](docs/architecture.md#omniasr-ctc--llm--unlimited)) | **1600+** | Apache-2.0 |
 | **vibevoice** | [`microsoft/VibeVoice-ASR`](https://huggingface.co/cstr/vibevoice-asr-GGUF) | σ-VAE ConvNeXt + Qwen2.5-7B ([more](docs/architecture.md#vibevoice)) | 50+ | MIT |
 | **mimo-asr** | [`XiaomiMiMo/MiMo-V2.5-ASR`](https://huggingface.co/cstr/mimo-asr-GGUF) | 6L transformer + 36L Qwen2 LM + RVQ codec ([more](docs/architecture.md#mimo-asr)) | Mandarin + dialects + English | MIT |
+| **funasr** | [`FunAudioLLM/Fun-ASR-Nano-2512`](https://huggingface.co/cstr/funasr-nano-GGUF) | 70-block SANM encoder + 2-block Transformer adaptor + Qwen3-0.6B LLM | zh, yue, en, ja, ko | FunASR Model License v1.1 (commercial OK w/ attribution) |
+| **fun-asr-mlt-nano** | [`FunAudioLLM/Fun-ASR-MLT-Nano-2512`](https://huggingface.co/cstr/funasr-mlt-nano-GGUF) | Same architecture, multilingual decoder | 31 langs incl. de, fr, es, pt, ru, ar, hi, vi, th, ko | FunASR Model License v1.1 |
+| **sensevoice** | [`FunAudioLLM/SenseVoiceSmall`](https://huggingface.co/cstr/sensevoice-small-GGUF) | 70-block SANM encoder + CTC head; emits transcript + language ID + emotion + audio-event in one forward pass (non-AR, 15× faster than Whisper-Large); structured C ABI + `-oj` JSON expose the four tags as separate fields | 50+ langs; native LID + emotion + audio-event tags | FunASR Model License v1.1 |
 
 ### Text-to-Speech models
 
@@ -106,15 +113,20 @@ quick-start commands and engine selection guidance.
 | **orpheus** | [`Orpheus-3B-FT`](https://huggingface.co/cstr/orpheus-3b-base-GGUF) + [`SNAC 24 kHz`](https://huggingface.co/cstr/snac-24khz-GGUF) | Llama-3.2-3B + SNAC RVQ codec; 8 speakers ([more](docs/architecture.md#orpheus)) | en, de | Llama / MIT |
 | **chatterbox** | [`cstr/chatterbox-GGUF`](https://huggingface.co/cstr/chatterbox-GGUF) + turbo/kartoffelbox/lahgtna variants | T3 AR + S3Gen flow-matching ([more](docs/architecture.md#chatterbox--chatterbox-turbo--kartoffelbox-turbo--lahgtna-chatterbox)) | en, de, ar | MIT |
 | **indextts** | [`cstr/indextts-1.5-GGUF`](https://huggingface.co/cstr/indextts-1.5-GGUF) | GPT-2 AR (24L/1280d) + Conformer conditioning + BigVGAN vocoder; voice cloning via reference audio | zh, en | Apache-2.0 |
-| **voxcpm2-tts** _(beta)_ | [`cstr/voxcpm2-GGUF`](https://huggingface.co/cstr/voxcpm2-GGUF) | Tokenizer-free CFM diffusion AR (TSLM + RALM + LocDiT) at 48 kHz native; intended for zero-shot voice cloning | 30 languages | Apache-2.0 |
+| **voxcpm2-tts** | [`cstr/voxcpm2-GGUF`](https://huggingface.co/cstr/voxcpm2-GGUF) | Tokenizer-free CFM diffusion AR (TSLM + RALM + LocDiT) at 48 kHz native; zero-shot + voice cloning via `--voice <wav>` | 30 languages | Apache-2.0 |
 
-> _Beta:_ voxcpm2-tts is end-to-end runnable today on Q4_K but the default
-> Q4_K output is currently in the "garbled-but-recognisable" band — the
-> inference path matches the upstream PyTorch reference within precision
-> floor (see `crispasr-diff voxcpm2-tts`), so the remaining gap is on the
-> quantization side. Voice cloning via `--voice <wav>` is declared in the
-> backend's capability bits but the adapter currently falls back to the
-> default voice with a warning.
+> _Status:_ end-to-end runnable on both Q4_K and F16; zero-shot synth and
+> voice cloning (`--voice <wav>`) both work and ASR-roundtrip correctly.
+> The inference path matches the upstream PyTorch reference within
+> precision floor (14 pass / 0 fail / 3 skip in `crispasr-diff
+> voxcpm2-tts`, `cfm_step0_result cos_mean ≥ 0.98`). Set
+> `VOXCPM2_USE_GRAPH=1` for the fast path: weights load onto the best
+> available backend (Metal on Apple Silicon), AR-step LocDiT + TSLM
+> run as cached per-step cgraphs (qwen3-style multi-bucket Lk), and
+> the VAE decode hot loops are OMP-parallelised with a SIMD-friendly
+> contiguous-`ic` inner layout. On M1 (OMP=8), `"Hello world"` zero-
+> shot Q4_K takes ~7 s total wall (down from ~49 s before the perf
+> work).
 
 ### Translation
 
@@ -187,28 +199,28 @@ The static table below is a curated subset focusing on the ASR backends and the 
 
 <!-- Generated from `crispasr --list-backends` + cross-cutting features. -->
 
-| Feature | whisper | parakeet | canary | cohere | granite | granite&#8209;4.1 | voxtral | voxtral4b | qwen3 | fc&#8209;ctc | wav2vec2 | glm&#8209;asr | kyutai&#8209;stt | firered | moonshine | moon&#8209;stream | omniasr | omniasr&#8209;llm | vibevoice | gemma4&#8209;e2b | mimo&#8209;asr |
-|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-| Native timestamps | ✔ | ✔ | ✔ | ✔ | | | | | | | | | ✔ | | | | | | | | |
-| CTC timestamps | | | ✔ | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
-| Word-level timing | ✔ | ✔ | ✔ | ✔ | `-am` | `-am` | `-am` | `-am` | `-am` | `-am` | `-am` | `-am` | ✔ | `-am` | `-am` | `-am` | `-am` | `-am` | | `-am` | `-am` |
-| Per-token confidence | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | ✔ | ✔ | | | ✔ |
-| Language auto-detect | ✔ | ✔ | LID | LID | LID | LID | LID | LID | ✔ | LID | LID | ✔ | LID | LID | LID | LID | LID | LID | LID | ✔ | LID |
-| Speech translation | ✔ | | ✔ | | ✔ | ✔ | ✔ | | ✔ | | | | | | | | | | | | |
-| Speaker diarization | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
-| Grammar (GBNF) | ✔ | | | | | | | | | | | | | | | | | | | | |
-| Temperature sampling | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | | ✔ | ✔ | | ✔ | | ✔ | ✔ | ✔ | ✔ | ✔ |
-| Beam search | ✔ | | | | ✔ | ✔ | ✔ | | ✔ | | | ✔ | ✔ | ✔ | ✔ | | ✔ | ✔ | | | |
-| Flash attention | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
-| Punctuation toggle | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | | ✔ | ✔ | | ✔ | | ✔ | ✔ | | | |
-| Punc restoration | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp |
-| Source / target language | | | ✔ | | ✔ | ✔ | ✔ | | ✔ | | | | | | | | | | | | |
-| Audio Q&A (`--ask`) | | | | | * | * | ✔ | | * | | | | | | | | | | | | |
-| Streaming | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
-| Auto-download (`-m auto`) | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
-| KV quant (`CRISPASR_KV_QUANT`, plus per-half `_K` / `_V`) | | | | | ✔ | ✔ | ✔ | ✔ | ✔ | | | ✔ | | | | | | ✔ | | ✔ | ✔ |
-| mmap weights (`CRISPASR_GGUF_MMAP`) | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
-| TTS | | | | | | | | | | | | | | | | | | | ✔ | | |
+| Feature | whisper | parakeet | canary | cohere | granite | granite&#8209;4.1 | voxtral | voxtral4b | qwen3 | fc&#8209;ctc | wav2vec2 | glm&#8209;asr | kyutai&#8209;stt | firered | moonshine | moon&#8209;stream | omniasr | omniasr&#8209;llm | vibevoice | gemma4&#8209;e2b | mimo&#8209;asr | funasr | sensevoice |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| Native timestamps | ✔ | ✔ | ✔ | ✔ | | | | | | | | | ✔ | | | | | | | | | | |
+| CTC timestamps | | | ✔ | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
+| Word-level timing | ✔ | ✔ | ✔ | ✔ | `-am` | `-am` | `-am` | `-am` | `-am` | `-am` | `-am` | `-am` | ✔ | `-am` | `-am` | `-am` | `-am` | `-am` | | `-am` | `-am` | `-am` | `-am` |
+| Per-token confidence | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | ✔ | ✔ | | | ✔ | | |
+| Language auto-detect | ✔ | ✔ | LID | LID | LID | LID | LID | LID | ✔ | LID | LID | ✔ | LID | LID | LID | LID | LID | LID | LID | ✔ | LID | LID | ✔ |
+| Speech translation | ✔ | | ✔ | | ✔ | ✔ | ✔ | | ✔ | | | | | | | | | | | | | | |
+| Speaker diarization | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
+| Grammar (GBNF) | ✔ | | | | | | | | | | | | | | | | | | | | | | |
+| Temperature sampling | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | | ✔ | ✔ | | ✔ | | ✔ | ✔ | ✔ | ✔ | ✔ | | |
+| Beam search | ✔ | | | | ✔ | ✔ | ✔ | | ✔ | | | ✔ | ✔ | ✔ | ✔ | | ✔ | ✔ | | | | | |
+| Flash attention | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
+| Punctuation toggle | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | | ✔ | ✔ | | ✔ | | ✔ | ✔ | | | | ✔ | ✔ |
+| Punc restoration | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp |
+| Source / target language | | | ✔ | | ✔ | ✔ | ✔ | | ✔ | | | | | | | | | | | | | | |
+| Audio Q&A (`--ask`) | | | | | * | * | ✔ | | * | | | | | | | | | | | | | | |
+| Streaming | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
+| Auto-download (`-m auto`) | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
+| KV quant (`CRISPASR_KV_QUANT`, plus per-half `_K` / `_V`) | | | | | ✔ | ✔ | ✔ | ✔ | ✔ | | | ✔ | | | | | | ✔ | | ✔ | ✔ | ✔ | |
+| mmap weights (`CRISPASR_GGUF_MMAP`) | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
+| TTS | | | | | | | | | | | | | | | | | | | ✔ | | | | |
 
 The matrix above covers ASR backends. **TTS-only backends** (`kokoro`, `qwen3-tts` + variants, `vibevoice-tts`, `orpheus` + DE variants, `chatterbox` / `chatterbox-turbo` / `kartoffelbox-turbo` / `lahgtna-chatterbox`) all carry the TTS, AUTO_DOWNLOAD, TEMPERATURE, and FLASH_ATTN caps; per-backend cloning + voice-pack support is documented in the [Text-to-Speech models](#text-to-speech-models) table above and [`docs/tts.md`](docs/tts.md). The vibevoice column marks the dual-mode (ASR + TTS) backend.
 
@@ -243,6 +255,8 @@ Full reference + tuning knobs (cluster threshold, max speakers, pluggable embedd
 | voxtral | ✔ | ✔ | LLM output |
 | voxtral4b | ✔ | ✔ | LLM output |
 | qwen3 | ✔ | ✔ | LLM output |
+| funasr | ✔ | ✔ | LLM output (Qwen3-0.6B decoder). Chinese chars carry full-width period; mlt-nano variant adds Latin-script casing + punctuation. |
+| sensevoice | ✔ | ✔ | CTC output with native ITN — toggle via `--punctuation` / `--no-punctuation`, controls Arabic-digit vs spelled-out numerals + comma/period emission. |
 | glm-asr | ✔ | ✔ | LLM output |
 | kyutai-stt | ✔ | ✔ | LLM output |
 | moonshine | ✔ | ✔ | Encoder-decoder output |
@@ -293,7 +307,9 @@ crispasr --backend parakeet -m parakeet.gguf --vad --flush-after 1 -osrt -f long
 | Highest-quality offline speech-LLM | **voxtral** |
 | Apache-licensed speech-LLM | **granite**, **voxtral**, **qwen3**, **omniasr-llm** |
 | **Lightweight CTC-only** (fast, no decoder) | **wav2vec2**, **fc-ctc**, **data2vec**, **omniasr** |
-| **Mandarin + Chinese dialects** | **firered-asr**, **qwen3**, **glm-asr** |
+| **Mandarin + Chinese dialects** | **firered-asr**, **qwen3**, **glm-asr**, **funasr**, **sensevoice** |
+| **Multilingual (31 langs) speech-LLM** | **fun-asr-mlt-nano**, **qwen3**, **omniasr-llm**, **gemma4-e2b** |
+| **Multilingual (50+ langs) + LID + emotion + audio-event in one pass** | **sensevoice** (encoder-only CTC, non-AR, 15× faster than Whisper-Large) |
 
 ### Language detection for backends that don't do it natively
 
@@ -737,7 +753,7 @@ downloads (in that order).
 
 - **[whisper.cpp](https://github.com/ggml-org/whisper.cpp)** — the original ggml inference engine and Whisper runtime this fork is built on
 - **[ggml](https://github.com/ggml-org/ggml)** — the tensor library everything runs on
-- **NVIDIA NeMo** — parakeet-tdt, parakeet-ctc-{0.6b,1.1b}, canary-1b-v2, canary-ctc aligner, and the FastConformer-CTC family (stt_en_fastconformer_ctc_{large,xlarge,xxlarge})
+- **NVIDIA NeMo** — parakeet-tdt-{0.6b-v2,0.6b-v3,1.1b}, parakeet-tdt_ctc-{110m,1.1b,0.6b-ja}, parakeet-ctc-{0.6b,1.1b}, canary-1b-v2, canary-ctc aligner, and the FastConformer-CTC family (stt_en_fastconformer_ctc_{large,xlarge,xxlarge})
 - **Cohere** — cohere-transcribe-03-2026
 - **Qwen team (Alibaba)** — Qwen3-ASR-0.6B, Qwen3-ASR-1.7B, Qwen3-ForcedAligner-0.6B
 - **Mistral AI** — Voxtral Mini 3B and 4B Realtime

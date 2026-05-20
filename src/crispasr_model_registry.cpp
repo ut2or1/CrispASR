@@ -62,6 +62,36 @@ constexpr Entry k_registry[] = {
      "~3.2 GB", nullptr, nullptr},
     {"qwen3", "qwen3-asr-0.6b-q4_k.gguf",
      "https://huggingface.co/cstr/qwen3-asr-0.6b-GGUF/resolve/main/qwen3-asr-0.6b-q4_k.gguf", "~500 MB", nullptr, nullptr},
+    // FunAudioLLM/Fun-ASR-Nano-2512: 70 SANM encoder blocks + 2-block
+    // Transformer adaptor + Qwen3-0.6B LLM decoder. zh/yue/en/ja/ko.
+    // Only F16 ships today (Q4_K + Q8_0 pending). Upstream code is
+    // Apache-2.0; weights are FunASR Model License v1.1 (Alibaba) —
+    // commercial use OK with attribution, so the license field below
+    // is set so the cache layer prints it to stderr on first download.
+    {"funasr", "funasr-nano-2512-f16.gguf",
+     "https://huggingface.co/cstr/funasr-nano-GGUF/resolve/main/funasr-nano-2512-f16.gguf",
+     "~1.98 GB", nullptr, nullptr,
+     "FunASR Model License v1.1 (commercial use OK with attribution; see "
+     "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512/blob/main/LICENSE)"},
+    // Multilingual sibling — same architecture, 31 languages including
+    // Korean, Vietnamese, Indonesian, Thai, Malay, Filipino, Arabic,
+    // Hindi, Bulgarian, German, French, Spanish, Italian, Portuguese,
+    // Dutch, Polish, Czech, Romanian, Greek, Finnish, Swedish, Turkish,
+    // Persian, Danish, Hungarian, Macedonian, Russian.
+    {"fun-asr-mlt-nano", "funasr-mlt-nano-2512-f16.gguf",
+     "https://huggingface.co/cstr/funasr-mlt-nano-GGUF/resolve/main/funasr-mlt-nano-2512-f16.gguf",
+     "~1.98 GB", nullptr, nullptr,
+     "FunASR Model License v1.1 (commercial use OK with attribution; see "
+     "https://huggingface.co/FunAudioLLM/Fun-ASR-MLT-Nano-2512/blob/main/LICENSE)"},
+    // FunAudioLLM/SenseVoiceSmall: encoder-only multi-task ASR — same
+    // SANM encoder body as Fun-ASR-Nano but with a CTC head emitting
+    // language + emotion + audio-event tags alongside the transcript.
+    // 15× faster than Whisper-Large per upstream.
+    {"sensevoice", "sensevoice-small-f16.gguf",
+     "https://huggingface.co/cstr/sensevoice-small-GGUF/resolve/main/sensevoice-small-f16.gguf",
+     "~0.47 GB", nullptr, nullptr,
+     "FunASR Model License v1.1 (commercial use OK with attribution; see "
+     "https://huggingface.co/FunAudioLLM/SenseVoiceSmall/blob/main/LICENSE)"},
     {"cohere", "cohere-transcribe-q4_k.gguf",
      "https://huggingface.co/cstr/cohere-transcribe-03-2026-GGUF/resolve/main/cohere-transcribe-q4_k.gguf", "~550 MB", nullptr, nullptr},
     {"wav2vec2", "wav2vec2-xlsr-en-q4_k.gguf",
@@ -144,6 +174,32 @@ constexpr Entry k_registry[] = {
     {"parakeet-ja", "parakeet-tdt-0.6b-ja.gguf",
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-ja-GGUF/resolve/main/parakeet-tdt-0.6b-ja.gguf",
      "~1.24 GB", nullptr, nullptr},
+    // parakeet-v2 — English-only TDT (1024-vocab BPE, pred_layers=2).
+    // The original Open ASR Leaderboard topper before v3 spread capacity
+    // to 25 languages; often stronger on plain English. Same FastConformer
+    // encoder + TDT decoder as v3, just trained on a different corpus.
+    {"parakeet-v2", "parakeet-tdt-0.6b-v2-q4_k.gguf",
+     "https://huggingface.co/cstr/parakeet-tdt-0.6b-v2-GGUF/resolve/main/parakeet-tdt-0.6b-v2-q4_k.gguf",
+     "~468 MB", nullptr, nullptr},
+    // parakeet-tdt-1.1b — larger TDT, English-only, 42-layer encoder
+    // (vs 24 for 0.6b). Lowercase + no punctuation output. Slower but
+    // wins on very long-tail vocabulary.
+    {"parakeet-tdt-1.1b", "parakeet-tdt-1.1b-q4_k.gguf",
+     "https://huggingface.co/cstr/parakeet-tdt-1.1b-GGUF/resolve/main/parakeet-tdt-1.1b-q4_k.gguf",
+     "~808 MB", nullptr, nullptr},
+    // parakeet-tdt_ctc-110m — smallest hybrid TDT+CTC. pred_layers=1
+    // (single LSTM) means the TDT path can't be used; parakeet.cpp
+    // auto-flips to CTC decode on load (see parakeet_init_from_file).
+    // English-only, 17-layer encoder, d_model=512.
+    {"parakeet-tdt_ctc-110m", "parakeet-tdt_ctc-110m-q4_k.gguf",
+     "https://huggingface.co/cstr/parakeet-tdt_ctc-110m-GGUF/resolve/main/parakeet-tdt_ctc-110m-q4_k.gguf",
+     "~91 MB", nullptr, nullptr},
+    // parakeet-tdt_ctc-1.1b — larger hybrid TDT+CTC, 42-layer encoder,
+    // multilingual vocab (proper casing + punctuation). Default decode
+    // is TDT; pass `--parakeet-decoder ctc` for the CTC head.
+    {"parakeet-tdt_ctc-1.1b", "parakeet-tdt_ctc-1.1b-q4_k.gguf",
+     "https://huggingface.co/cstr/parakeet-tdt_ctc-1.1b-GGUF/resolve/main/parakeet-tdt_ctc-1.1b-q4_k.gguf",
+     "~810 MB", nullptr, nullptr},
     // Qwen3-TTS: the talker LM and the codec live in two separate HF
     // repos. Default download is Q8_0 talker (the LEARNINGS-recommended
     // deployment quant — Q4_K drifts noticeably in strict diffs) paired
@@ -560,7 +616,12 @@ void download_extras(const Entry& e, bool quiet, const std::string& cache_dir_ov
 
 void print_license_note(const CrispasrRegistryEntry& e, bool quiet) {
     if (!quiet && !e.license.empty()) {
-        fprintf(stderr, "crispasr: note: %s is licensed %s (non-commercial)\n", e.filename.c_str(), e.license.c_str());
+        // The license string is authoritative — it carries its own
+        // commercial/non-commercial language (e.g. "CC-BY-NC-SA-4.0"
+        // already says NC; FunASR Model License v1.1 says "commercial
+        // OK with attribution"). Don't append a misleading "(non-
+        // commercial)" suffix.
+        fprintf(stderr, "crispasr: note: %s is licensed %s\n", e.filename.c_str(), e.license.c_str());
     }
 }
 
@@ -640,8 +701,17 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
         }
 
         // File not found — try registry-based download when permitted.
+        // Match priority:
+        //   1. exact filename / known-companion match (e.g. -m parakeet-tdt-0.6b-v2-q4_k.gguf)
+        //   2. backend-key match on the literal -m arg (e.g. -m parakeet-v2 → the parakeet-v2 entry)
+        //   3. fallback: backend name passed via --backend (e.g. -m foo.gguf --backend parakeet)
+        // Step 2 must precede step 3, otherwise the CLI's filename-inferred
+        // backend (always "parakeet" for any "parakeet*" arg) would shadow
+        // sub-variant keys like "parakeet-v2" / "parakeet-tdt-1.1b" / etc.
         CrispasrRegistryEntry match;
         bool have_match = crispasr_registry_lookup_by_filename(model_arg, match, preferred_quant);
+        if (!have_match)
+            have_match = crispasr_registry_lookup(model_arg, match, preferred_quant);
         if (!have_match && !backend_name.empty())
             have_match = crispasr_registry_lookup(backend_name, match, preferred_quant);
 

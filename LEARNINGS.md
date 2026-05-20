@@ -10,6 +10,41 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## VAD + chunking
+
+### Overlap-save context is for *chunks*, not for VAD slices (issue #114)
+
+`cad4c28a feat(#89): overlap-save chunking with --chunk-overlap flag`
+added a ± `chunk_overlap_seconds` (default 3.0) neighbour-audio
+extension to every per-slice transcribe call when `slices.size() >
+1`. That gate is correct for explicit `--chunk-seconds N` runs, where
+each cut falls in the middle of continuous speech and the encoder
+genuinely needs context to span the boundary. It is *wrong* for VAD-
+derived multi-slice runs: VAD slices are separated by silence, so
+there is no boundary signal to recover, and pulling 3 s of the next
+utterance into the current encoder context shifts the per-feature
+z-norm statistics + bidirectional self-attention enough to push the
+TDT decoder onto a different (worse) token path. The visible
+regression on parakeet-tdt-0.6b-ja was kanji compounds collapsing to
+bare hiragana plus entire short slices being dropped.
+
+The crispasr-diff harness did NOT catch this — the cos at mel /
+encoder stayed at 1.0 / 0.999994 on the single-utterance baseball
+fixture, because the bug only manifests once multiple VAD slices
+sit in the same long-form audio with realistic inter-slice silence.
+
+Fix: gate overlap-save on `effective_chunk_seconds > 0`. The gate
+lives in `examples/cli/crispasr_chunk_context_gate.h` so a unit test
+can pin the invariant without spinning up a model.
+
+Signature of the bug: per-slice transcripts that look "almost
+right" but consistently pick simpler (more conservative) tokens at
+the same boundaries — kanji → hiragana, multi-word phrases →
+chopped syllables. Single-shot diff against PyTorch reference looks
+fine because the diff harness only feeds one continuous segment.
+
+---
+
 ## mel / preprocessor
 
 ### STFT frame count: NeMo `feat_len` vs raw STFT output
@@ -5187,3 +5222,585 @@ build may report `Built target X` without actually relinking the final
 executable — the `.a` timestamp doesn't trigger the exe's link step. The
 binary stays stale. Workaround: `rm build/bin/crispasr` then rebuild, or
 touch the exe's own `.o` dependency.
+
+---
+
+## voxcpm2 perf — per-step ggml graphs, Metal, SIMD layouts (May 2026)
+
+The PLAN #96 push took voxcpm2-tts "Hello world" zero-shot from **~49 s
+to ~5–7 s** wall on M1 (≈8 commits across one session). Most of the
+lessons below apply to any new TTS / ASR backend that mixes legacy
+CPU helpers with ggml graphs.
+
+### Per-call ggml cgraph beats per-matmul tiny graphs by 2–3× even on CPU
+
+The original voxcpm2 LocDiT did ~30 `matmul_mv_ggml` calls per
+invocation, each of which ran `ggml_init` + `ggml_new_graph` +
+`ggml_backend_graph_compute` + `ggml_free`. With CFM running LocDiT
+19× per AR step (CFG × 10 timesteps − the zero-star skip), that's
+~570 graph builds per AR step *just for CFM*.
+
+Replacing them with one cgraph per `locdit_forward` call — 12 layers
+folded into a single graph with named `ggml_set_input` tensors —
+gave 2.3× on CPU (CFM/step 2398 → 1035 ms on M1 OMP=8) before any
+Metal involvement. The win is amortising graph-build overhead, not
+the matmul work itself.
+
+Pattern (mirror `qwen3_tts.cpp build_graph_talker_kv` or
+`chatterbox.cpp build_graph_t3_kv`):
+
+  - Add `backend`, `backend_cpu`, `compute_meta` (vector<uint8_t>),
+    `galloc` (ggml_gallocr_t) to the context.
+  - Pre-allocate `compute_meta` = `ggml_tensor_overhead() * N +
+    ggml_graph_overhead_custom(N, false)` where `N` is the
+    worst-case node count (4096 was generous for voxcpm2).
+  - `build_<thing>_graph(ctx)` runs `ggml_init` with
+    `no_alloc=true` over `compute_meta`, builds the topology with
+    `ggml_set_input` / `ggml_set_output` named tensors, then
+    `ggml_free(ctx0)`.
+  - Per call: `ggml_gallocr_alloc_graph` + per-input
+    `ggml_backend_tensor_set` + `ggml_backend_graph_compute` +
+    `ggml_backend_tensor_get`.
+
+### Cache the graph itself for another 2× on top of that
+
+The above still rebuilds the cgraph topology on every call.
+`ggml_gallocr_reserve` against a long-lived graph in a dedicated
+per-cache arena (`std::vector<uint8_t>` + `ggml_context*`) lets all
+subsequent calls skip the rebuild + the gallocr planner walk. For
+voxcpm2 this took CFM/step from ~1035 ms (uncached) to ~410 ms
+(cached) — meeting the plan's ~400 ms CPU target.
+
+Works directly for any graph with constant topology (LocDiT,
+LocEnc — bidirectional encoders). For graphs with `n_past`-varying
+shape (TSLM step), use the qwen3 bucketed pattern below.
+
+### Multi-bucket Lk + runtime `kv_indices` makes KV-cache step graphs cacheable
+
+qwen3_tts's `talker_buckets` pattern: pin `Lk = bucket_size` in
+`core_attn::kv_self_attn`'s `fixed_kv_len` parameter and pass
+`positions` as the `kv_indices` tensor so the K/V scatter goes
+through `ggml_set_rows` (runtime-indexed) instead of a baked
+static offset. Topology becomes `n_past`-invariant. Layer count,
+KV-cache shape, and bucket Lk are the only things that affect
+the graph structure — and Lk is fixed per bucket.
+
+For voxcpm2 TSLM we ship 5 buckets {128, 256, 512, 1024, 2048};
+`tslm_pick_bucket(needed_lk)` picks the smallest fitting one,
+each is built lazily on first hit, longer prefills fall through
+to the dynamic per-call build. Short prompts pay the cheapest
+(Lk=128) attention overhead — important because
+`ggml_flash_attn_ext` computes `Q·K^T` over the full bucket Lk
+regardless of the `-inf`-masked tail, so wider buckets are
+genuinely more expensive even with the mask.
+
+### Apple Silicon Metal "shared" buffers keep `tensor->data` CPU-readable
+
+`ggml_backend_init_best()` on M1 returns a Metal backend whose
+weight buffers default to `is_shared = true` (unified memory).
+This means `tensor->data` is a CPU-dereferenceable pointer to the
+same physical pages Metal sees — no copy, no SIGSEGV when legacy
+CPU helpers (`matmul_mv_ggml`, `rms_norm_cpu`, `tensor_data_f32`,
+…) dereference it directly.
+
+Concretely: switching `vox_load_weights` to load onto
+`c->backend` (Metal) on `params.use_gpu=true` *didn't break* any
+of the remaining legacy CPU paths (TSLM/RALM prefill, LocEnc,
+VAE encode/decode, FSQ, stop predictor) on Apple Silicon. The
+graph paths automatically got Metal compute via
+`ggml_backend_graph_compute(c->backend, gf)`.
+
+This trick is M1-specific. On discrete GPUs (CUDA, ROCm) or
+non-shared Metal modes (very rare on M-series), `tensor->data`
+would be device-only and dereferencing from CPU would SIGSEGV —
+you'd need either per-weight CPU mirrors (like qwen3_tts's
+`CpuEmbdCache`) or a full graph-only path.
+
+The follow-on: the same Metal weights also speed up the legacy
+helpers because Q4_K dequant reads land in lower-latency unified
+memory than the previous CPU allocations. voxcpm2's TSLM prefill
+went 5 000 ms → 80 ms (~60×) just from this — the matmul code
+itself was unchanged.
+
+### `GGML_PREC_F32` on `ggml_flash_attn_ext` is refused by Metal's `supports_op`
+
+The chatterbox T3 patch (`ggml-metal-device.m`) explicitly returns
+`false` from `supports_op` for any `GGML_OP_FLASH_ATTN_EXT` tagged
+`GGML_PREC_F32`. The intent is to route those ops to the CPU
+backend via sched for bit-identical CPU/GPU output (chatterbox
+needs that to debug #83).
+
+But: if you call `ggml_backend_graph_compute(metal, gf)` directly
+(no sched), the unsupported op aborts the entire compute. Symptom:
+`ggml_metal_op_encode_impl: error: unsupported op 'FLASH_ATTN_EXT'`
+followed by ggml_abort.
+
+For voxcpm2 the fix was just to *not* set PREC_F32 on LocDiT's
+bidirectional flash-attn — the per-stage cosine bar (`cfm_step0_result
+≥ 0.93`) tolerates Metal's F16 simdgroup drift. Pre-existing
+`core_attn::kv_self_attn` doesn't set PREC_F32 internally, so TSLM
+step worked out of the box.
+
+If you do need bit-identical CPU/GPU (e.g. for debug bisects),
+switch from direct `ggml_backend_graph_compute` to
+`ggml_backend_sched_graph_compute` against a `[Metal, CPU]` sched —
+that's what qwen3_tts and chatterbox do, and it auto-routes
+PREC_F32 ops to CPU.
+
+### `ggml_flash_attn_ext` head_dim allowlist
+
+Metal's flash-attn supports `head_dim ∈ {32, 40, 48, 64, 72, 80,
+96, 112, 128, 192, 256, 320, 512, 576}`. Anything else falls back
+to CPU via sched or aborts under direct compute. Picking head_dim
+during a port: stick to the allowlist or expect to route attn to
+CPU.
+
+### OMP parallelism on conv loops needs gather-form rewrites
+
+The original `causal_transposed_conv1d` did scatter-add into
+shared output — race-prone, so the outer loop couldn't be OMP'd.
+Rewriting in gather form (for each output position, walk valid
+kernel taps via `k0 = (ot + trim) mod stride` step `stride`) made
+the `(out_ch, ot)` outer pair write-disjoint and parallelisable.
+
+Similar story for `snake1d` and per-block SR conditioning —
+outer loop over channels is write-disjoint, OMP-parallel.
+
+But OMP alone isn't enough when the inner loops have strided
+memory access (see next).
+
+### Strided ic loops kill auto-vectorisation; transpose to contiguous wins 4–8×
+
+VAE conv1d inner loops read `x[ic*T_in + it]` (stride `T_in`) and
+`weight[ic*out_ch*ksize + …]` (stride `out_ch * ksize`). Both
+strided in the inner axis — the compiler can't emit NEON vector
+loads. Per-call work was effectively scalar even with OMP.
+
+Fix: transpose both into contiguous-`ic` layout before the inner
+loop:
+
+  - weight: `[in_ch, out_ch, ksize] → [ksize, out_ch, in_ch_inner]`
+  - x: `[in_ch, T_in] → [T_in, in_ch_inner]`
+
+The inner `ic` dot product becomes a contiguous load on both
+operands — clang/gcc auto-vectorises into NEON `fmla` instructions.
+
+The transposes are `O(in_ch × (out_ch × ksize + T_in))` per call,
+small vs the unlocked dot work. For voxcpm2 block 0 transposed
+conv: 2 957 ms → 615 ms (4.8×) on M1 OMP=8. Total VAE decode
+8 772 → 3 875 ms (2.3×).
+
+Gate the transpose path on `in_per_grp > 1 && ksize > 1` —
+depthwise (`in_per_grp == 1`) and 1×1 convs (`ksize == 1`)
+get no SIMD lift and the transpose is pure overhead.
+
+### Build instrumentation BEFORE optimising the wrong thing
+
+Per-block VAE decode timings under `VOXCPM2_BENCH=1` revealed
+that **72 % of VAE time was in `causal_transposed_conv1d` upsamples**,
+not the residual units I'd been about to spend an hour rewriting.
+Before then I'd assumed snake1d was the hotspot — wrong.
+
+The instrumentation cost: ~10 lines of `vox_now_ms()` deltas +
+one `fprintf` per block, gated on the existing
+`VOXCPM2_BENCH` env. Always pays for itself.
+
+### `ggml_concat` along time axis lets you build prefix sequences cleanly
+
+For both the LocDiT graph (mu_toks + time + cond + x = T=11) and
+the LocEnc graph (CLS + patch_frames = T=5), the input sequence
+is built by concatenating disjoint pieces with `ggml_concat(ctx,
+a, b, dim=1)`. This is much cleaner than allocating a
+pre-sized `[d, T]` tensor and writing slices into it — and on
+Metal it's just a single `kernel_concat` dispatch.
+
+### Don't over-engineer the first cut — ship working, then optimise
+
+The session's biggest unit wins came from the simplest changes:
+
+  1. LocDiT graph (1 day): 2.3× CPU CFM.
+  2. Cache the graph (3 hours): 1.7× on top.
+  3. Metal-load weights (1 hour): 60× on TSLM prefill.
+
+Each commit was small, single-purpose, validated by the diff
+harness before the next one started. If we'd tried to land
+"VAE graph + LocDiT graph + Metal + caching + buckets" in one
+go we'd still be debugging.
+
+---
+
+## voxcpm2 VAE — Python wrapper that captures kwargs without forwarding (May 2026)
+
+This bit hard. The voxcpm `CausalTransposeConv1d` class in
+`audio_vae_v2.py` defines:
+
+```python
+class CausalTransposeConv1d(nn.ConvTranspose1d):
+    def __init__(self, *args, padding: int = 0, output_padding: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.__padding = padding
+        self.__output_padding = output_padding
+
+    def forward(self, x):
+        return super().forward(x)[..., : -(self.__padding * 2 - self.__output_padding)]
+```
+
+The trap: `padding` and `output_padding` are **named keyword args**
+in the subclass `__init__` signature, so Python pulls them out of
+the call's kwargs BEFORE the `**kwargs` capture. They're stored
+into `self.__padding` (name-mangled) and **never passed to
+`super().__init__`**. So PyTorch's `nn.ConvTranspose1d`
+internally uses `padding=0`, `output_padding=0` regardless of what
+the caller passed.
+
+That changes the output length of `super().forward(x)` from "PyTorch
+ConvTranspose1d output with padding P" to "no-padding output,
+`L_std = (T_in - 1)*S + K`". The wrapper then slices `[:-(2P - OP)]`
+from the END, yielding `T_in * S` samples (verified for
+`S ∈ {8, 6, 5, 2}` with `K = 2S, P = ceil(S/2), OP = S%2`).
+
+**What this means for a C++ port.** Don't assume the subclass's
+`__init__` signature lines up with the parent's — read what `*args,
+**kwargs` actually passes through, then trust that. The legacy
+voxcpm2 C++ `causal_transposed_conv1d` used `trim = K - 1` (a
+head-shift), which gives the same OUTPUT LENGTH but a completely
+wrong slice of the no-padding output. Cumulated across 6 upsample
+blocks at increasing sample rates, the audio was shifted by **~46 ms
+vs Python** — and `decoded_audio cos vs Python = 0.008` in the
+diff harness for months.
+
+The correct C++ formula: emit `T_in * S` samples, taking positions
+`[0, T_in * S)` of the standard padding=0 transposed conv output.
+For each output position `ot`:
+
+```
+y[ot] = sum_k w[k] * x[(ot - k) / S]   for k with (ot - k) % S == 0 and (ot - k)/S in [0, T_in)
+```
+
+= a tail-trim of `K - S` samples from the no-padding output. The
+ggml graph version is even simpler — just take the first
+`T_in * S` rows of `ggml_conv_transpose_1d(s, p=0, d=1)`.
+
+Fixed in both legacy CPU `vae_decode` and the new `vae_decode_graph`.
+After the fix: `vae_only cos vs Python = 0.989` (essentially correct),
+`decoded_audio cos = 0.683` (remaining drift is now provably upstream
+— CFM/TSLM precision cascade).
+
+### Isolate the VAE before chasing audio drift
+
+The diff harness's `decoded_audio` cosine compares end-to-end audio
+through ALL of TSLM → RALM → LocDiT → CFM (10 Euler steps × N AR
+steps) → VAE. A failing cosine there could come from any of those.
+
+To isolate the VAE: hook `model.audio_vae.decode` in the Python
+dumper, save the input latent as `generated_latent`, then add a C++
+`vae_only` / `vae_only_graph` stage in `voxcpm2_extract_stage` that
+takes the latent via `ref_samples` and runs **only** vae_decode.
+Comparing the C++ output of that against Python's `decoded_audio`
+directly attributes drift to the VAE without confounding it with
+upstream precision drift. (Implementation: ~50 LOC across the
+backend + dump + diff main.)
+
+This is the same pattern used elsewhere (e.g. chatterbox `s3gen`
+with reference T3 tokens) — feed Python's intermediate as the
+boundary input, run only the segment under test. Cheap to add when
+the upstream is non-deterministic or non-trivial; saves hours of
+"is it the AR or the codec?" guessing.
+
+---
+
+## ggml broadcast hides size-mismatch bugs (May 2026)
+
+When the SR-cond fix went in (`vae_decode_graph` first call), the new
+sr_scale/sr_bias tensors were sized from `it->second->ne[1]` — which
+returned **4** instead of **2048** because GGUF's `scale_embed` is
+stored as ne=[2048, 4] in ggml (C innermost, bucket outer — the
+*opposite* of what I'd assumed). So my init allocated 4-element
+tensors and only wrote 4 scales (the first 4 channels at bucket 3),
+leaving the "broadcast" to fend for itself.
+
+**`ggml_mul(cur ne=[T, 2048], sr_scale ne=[1, 4])` does NOT assert**.
+The op compiled and ran. The output was even close to correct — `cos
+vs Python = 0.967` (vs 0.989 for the legacy CPU path). The first few
+channels got the right scale; the rest got whatever ggml's binary-op
+broadcast read from past the tensor end.
+
+**Why this is dangerous.** A small cos drop reads like "Metal
+floating-point drift" — so I spent multiple iterations trying to
+swap CPU/Metal backends instead of looking at the broadcast input
+shapes. The truth was much simpler: the input tensor was the wrong
+size.
+
+**How to detect.** When debugging a graph-vs-legacy drift:
+
+1. Dump intermediates per-stage and find the first stage where they
+   diverge (here: `block_0_sr` was identical until I added the SR
+   cond step; the snake checkpoint came in already-wrong).
+2. **Always print `ne[]` of every input tensor** to the failing op.
+   I had `C=4` printed in the init trace from the very first run; I
+   just didn't look at it carefully because "obviously ne[1] is the
+   channel dim".
+3. If ggml broadcast looks suspicious, replace it with an explicit
+   `ggml_repeat` to a matching shape — that *does* assert on size
+   mismatch.
+
+**How to apply.** For multi-axis GGUF tensors with ambiguous shape
+order, **take `max(ne[0], ne[1])` for "the non-bucket dim"** instead
+of trusting either dim's position. The legacy CPU loop's pointer
+arithmetic doesn't care about ne order (it just walks raw bytes),
+which is why it kept working through the same ambiguity.
+
+---
+
+## Diff-harness "drift" is mostly the GGUF quant, not a code bug (May 2026)
+
+The voxcpm2 VAE-graph session (commit `3be663cc`) left
+`decoded_audio cos vs Python = 0.683` open and tracked as "upstream
+CFM / TSLM drift". Several intermediate stages also looked weak:
+`cfm_step0_result` 0.937, `tslm_layer_27_out` 0.968.
+
+I spent half a day chasing this assuming F32-vs-bf16 op precision was
+the culprit (Python runs voxcpm2 in `dtype=bfloat16`, our C++ in F32).
+Hypothesis: rounding every tensor op output to bf16 (via the
+`bf16_round_vec` helper in `core/torch_rng.h`) would align us with
+Python's bf16-throughout dataflow. Added rounds to `tslm_layer_step`
+(Q/K/V/O matmuls, RoPE, attention, FFN, both residual adds), to
+`bidir_attn_full`, and to `locdit_forward` (time MLP, in/cond projs,
+all 12 layers' attn + FFN).
+
+**The bf16-round changes had near-zero effect** and slightly
+**regressed** `cfm_step0_result` (0.937 → 0.925). They were also
+costly (synth wall +~15 min from extra sequential op overhead).
+Reverted entirely.
+
+**Actual cause: the diff harness loads `voxcpm2-q4_k.gguf`** (4-bit
+quantised weights) **but Python's reference uses the bfloat16
+weights**. The "drift" was the Q4_K quantisation noise, multiplied
+through the network. Re-running the diff with `voxcpm2-f16.gguf`:
+
+| Stage              | Q4_K cos | F16 cos |
+| ------------------ | -------: | ------: |
+| tslm_prefill_out   |    0.986 | **0.998** |
+| dit_single_fwd     |    0.994 | **0.99999** |
+| cfm_step0_result   |    0.937 | **0.99992** |
+| tslm_layer_27_out  |    0.968 | **0.999** |
+| **decoded_audio**  | **0.683**| **0.929** |
+| lm_to_dit_hidden   |    0.998 | **0.99996** |
+
+Every intermediate stage hits cos ≥ 0.998 on F16. The remaining 0.07
+gap in `decoded_audio` on F16 is most likely AR-stop-step jitter
+(C++ and Python stop predictors fire at slightly different patches
+when fed the same `mu`) plus residual F16-vs-bf16 mantissa drift in
+the VAE. Not the deep transformer body.
+
+**How to apply.**
+
+1. **Before chasing "upstream precision drift" in a diff harness,
+   re-run with the F16 (or BF16) GGUF.** If cos jumps to ≥ 0.998,
+   the model is bit-correct — the previous drift was just the
+   shipped quant level. Don't add bf16 rounds to F32 ops; they
+   don't fix quant noise.
+
+2. **The Q4_K → bf16 cos gap IS the quant cost** — it's the same
+   number you'd see for any sufficiently deep transformer that's
+   bf16 in Python and Q4_K in C++. The acceptance bar should be
+   "audio sounds good + ASR roundtrips" (which Q4_K passes for
+   voxcpm2), not "diff-harness cos ≥ 0.999 against bf16
+   reference" (which Q4_K never will).
+
+3. **For per-stage diff diagnostics, recommend dumping the
+   reference against the matching weight precision:** run the
+   Python dumper with `voxcpm2-f16` if you want to compare F16
+   C++ vs F16-equivalent Python, or accept the Q4_K cosine
+   penalty as quant noise.
+
+Cross-ref: [[project_voxcpm2_vae_kwargs_bug]] (real bug fix earlier
+in the same session, contrasts with this non-bug).
+
+---
+
+## SANM-encoder family (FunASR / SenseVoice / CosyVoice)
+
+### The same `SenseVoiceEncoderSmall` ships in at least three FunAudioLLM products
+
+Fun-ASR-Nano-2512, Fun-ASR-MLT-Nano-2512, and SenseVoiceSmall all use
+the identical 70-block `SenseVoiceEncoderSmall` topology (1 entry
+block @ 560→512 with `encoders0`, 49 main blocks via `encoders`,
+20 tp blocks via `tp_encoders`, `after_norm` between, `tp_norm` at
+end; 512-dim, 4 heads, kernel 11). The encoder weights ARE different
+across the three releases (each is fine-tuned for its product) but
+the C++ runtime is shared: factor everything that touches a SANM
+block into `src/core/sanm.h` (`core_sanm::BlockWeights`,
+`BlockParams`, `build_block`) and reuse it from each per-model `*.cpp`.
+
+If we ever port CosyVoice2 / CosyVoice3 the same encoder is in there
+too (it's the text-to-codec semantic-encoder bottleneck). One
+helper, three+ consumers.
+
+### config.yaml advertises CTC; Fun-ASR's `model.pt` ships none of it
+
+Upstream `config.yaml` and `funasr/models/fun_asr_nano/model.py`
+declare a `ctc_decoder` + a `CTC` head; the published checkpoint for
+Fun-ASR-Nano-2512 and Fun-ASR-MLT-Nano-2512 ships **only**
+`audio_encoder.* + audio_adaptor.* + llm.*` (1261 tensors total, zero
+`ctc_decoder.*` / `ctc.ctc_lo.*` keys). If you trust the config you'll
+spend a day chasing a CTC path that isn't there. Verify by enumerating
+the state-dict prefixes before writing converter code.
+
+The CTC weights live in **SenseVoiceSmall** instead — same encoder
+shape, but the published `model.pt` carries `encoder.* + embed.*
++ ctc.*` and skips the LLM. That's the model to use when you want
+fast non-AR multi-task ASR; Fun-ASR-Nano is the one to use when you
+want LLM-quality text output (and can pay the AR cost).
+
+### Adaptor `MultiHeadedAttention` default heads is 8, not 16 (Fun-ASR)
+
+`funasr.models.llm_asr.adaptor.Transformer` builds the per-block
+attention as `MultiHeadedAttention(kwargs.get("attention_heads", 8),
+llm_dim, ...)` and `config.yaml`'s `audio_adaptor_conf` does NOT pass
+`attention_heads`. So the adaptor's two transformer blocks run at
+**8 heads (head_dim = 128)**, not the 16 you'd guess from
+`llm_dim / 64`. The CrispASR converter wrote 16 into the GGUF
+`funasr.ada_n_heads` KV by mistake; the runtime ignores that KV
+and hard-codes 8. Mis-counting drops the adaptor's cosine similarity
+to ~0.6 (vs cos=1.0 on the 70-layer encoder which is bit-near-exact)
+and produces a one-character-off Chinese transcript (`开放` instead of
+`开饭`). The diff harness catches this immediately, but only if you
+run it.
+
+### EncoderLayerSANM drops the attn residual when `in_size != size`
+
+```python
+if self.in_size == self.size:
+    x = residual + dropout(self_attn(x, mask))     # standard
+else:
+    x = dropout(self_attn(x, mask))                # no residual
+```
+
+`encoders0[0]` (the entry block, `in_size=560, size=512`) is the
+only one of the 70 blocks that hits this branch. The C++ encoder
+block builder needs an `apply_attn_residual` flag (or two code
+paths). Forgetting to special-case it produces a 560-dim residual
+being added to a 512-dim output, which won't even compile in ggml —
+but if you silently pad / project the residual to 512, you get a
+model that "works" but has subtly wrong activations from layer 0
+onward.
+
+### SANM FSMN memory branch has its own pre-conv-V residual
+
+```python
+def forward_fsmn(self, inputs, mask, ...):
+    x = inputs.transpose(1, 2)
+    x = self.pad_fn(x)
+    x = self.fsmn_block(x)               # depthwise Conv1d, no bias
+    x = x.transpose(1, 2)
+    x += inputs                          # ← residual to PRE-conv V
+    return x
+```
+
+The full SANM block output is `att_out + fsmn_memory`. Two
+non-obvious things: (1) FSMN convolves over **V only** (not Q or K,
+and not the post-MHA result), (2) the FSMN branch carries its own
+residual to V **before** joining the MHA path. Drawing the dataflow
+with one arrow fewer or one arrow more both produce a network that
+compiles fine but yields ~cos 0.5 vs the reference.
+
+### `use_low_frame_rate=true` shrinks the prompt placeholder count (Fun-ASR)
+
+config.yaml `audio_adaptor_conf.use_low_frame_rate: true` triggers
+a 3× `(x-1)//2+1` reduction in `fake_token_len_i` inside
+`FunASRNano.data_load_speech`, even though the adaptor itself has
+`downsample_rate: 1` (no actual downsample in the forward graph).
+The prompt builder reserves the reduced number of placeholder slots,
+and only `adaptor_out[:fake_token_len_i]` gets spliced — the rest
+of the adaptor frames are discarded. Looks like a vestige of an
+earlier adaptor design; mirror it verbatim and the model still
+produces correct transcripts.
+
+### funasr 1.3.1 packaging bug — `from ctc import CTC` is absolute
+
+`funasr/models/fun_asr_nano/model.py` line 20 imports CTC with an
+unqualified name; on a clean install this fails with
+`ModuleNotFoundError: No module named 'ctc'`. Workaround in
+`tools/reference_backends/funasr.py`
+(`_ensure_fun_asr_nano_importable`): prepend the `fun_asr_nano/`
+directory to `sys.path` before importing. Don't try to upstream-fix
+this on user machines.
+
+### Flash-attn crossover sits at ~T_lfr=100-150 (~6 s audio)
+
+`FUNASR_NO_FA=1` (and the same shape `SENSEVOICE_NO_FA=1`) reverts the
+SANM + adaptor MHA from `ggml_flash_attn_ext` back to the unfused
+`mul_mat + soft_max_ext + mul_mat` path. On Apple M1 Metal:
+
+| Clip | T_lfr | FA ON | FA OFF | Total Δ |
+| --- | ---: | ---: | ---: | --- |
+| zh.mp3 (5.6 s) | 94 | 196 ms | 166 ms | FA OFF wins 6 % |
+| samples/jfk.wav (11 s) | 183 | 258 ms | 370 ms | FA ON wins 7 % |
+
+Below T≈100 the FA kernel-launch overhead eats the win; above T≈150
+the fused-softmax+matmul kernel pulls clearly ahead. Default ON is
+right for typical ASR workloads (most utterances ≥6 s); realtime
+users splitting on tight VAD windows may want the opt-out.
+
+### SenseVoice query-embed pattern — multi-task output via prepended tokens, not separate heads
+
+SenseVoiceSmall's "4 outputs in one CTC pass" trick is **not** four
+classifier heads — it's a 16-row embedding table (`embed.weight`,
+`(16, 560)`) prepended to the LFR fbank features. The first 4
+positions of the encoder output go through the same CTC head as the
+rest of the sequence, but the CTC vocab reserves slot ranges for
+language IDs (24884-24992), emotions (25001-25009), audio events,
+and ITN flags (25016-25017). So the model "writes" the multi-task
+predictions to the first 4 positions via the standard CTC argmax,
+and the transcript follows from position 4 onward.
+
+This means the C++ runtime needs zero per-task classifier code —
+just one CTC head + the query-embed prepend. The runtime decides
+which of the 4 query rows to prepend (language hint, ITN flag) at
+inference time; the model uses them as the implicit "channel
+selector" for the encoder output positions.
+
+If the upstream model adds a new task (e.g. speaker ID) the
+infrastructure on our side stays exactly the same — they extend
+the query-embed table + the CTC vocab; we just read whichever new
+special-token IDs get emitted from position 0..3.
+
+### SenseVoice output-token order ≠ input query order — classify by content, not position
+
+The four query embeds are prepended to the LFR features in input
+order `[language, event_query, emotion_query, textnorm]` (see
+`sensevoice_gather_query_rows` and the upstream Python ref
+`tools/reference_backends/sensevoice.py`). The intuitive assumption
+is that the encoder output's four prefix tokens come back in the
+same order — they don't. On `samples/jfk.wav` the encoder emits
+`<|en|><|ANGRY|><|Speech|><|withitn|>`: position 1 is the **emotion**
+(`ANGRY`), position 2 is the **audio event** (`Speech`). The
+"event_query" and "emo_query" names in upstream refer to the
+embedding-table row IDs (1 and 2), not to which slot they decode
+into; the trained model has those slots swapped relative to the
+input naming.
+
+This bit when wiring `sensevoice_transcribe_structured()`. Positional
+parsing populated `audio_event` with `"ANGRY"` and `emotion` with
+`"Speech"`. The fix is content-based classification: maintain three
+small static sets (languages, emotions, itn flags) and classify each
+`<|…|>` against them; whatever doesn't match those three is the
+audio event (which is open-ended — Speech / Music / BGM / Laughter
+/ Cough / Sneeze / Sigh / ... so a positive enum is brittle).
+
+Bonus robustness: on degenerate audio the model can emit fewer than
+four prefix markers. Positional parsing would mislabel everything
+downstream; content-based classification just leaves the missing
+field empty.
+
+### SentencePiece detokenise without linking libsentencepiece
+
+For CTC-decode-only consumers, we don't need full SentencePiece —
+just a piece-ID → piece-string table. Extract the table once at
+convert time via `sp.id_to_piece(i)` for i in range(vocab_size),
+write it as `tokenizer.ggml.tokens`, and detokenise at runtime by
+looking up each ID and replacing the SentencePiece leading-space
+marker `▁` (U+2581, "\xE2\x96\x81") with an ASCII space. ~20 LOC
+of C++, no link-time dep. Same pattern canary-ctc / firered-asr
+already use.

@@ -226,6 +226,18 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(crispasr PUBLIC ggml Threads::Threads)
 
+# `crispasr_cache.cpp` calls WinHTTP for HF auto-download on Windows. MSVC
+# auto-links winhttp.lib via `#pragma comment(lib, "winhttp.lib")` inside
+# the .cpp, but MinGW / GCC ignore that pragma — so any downstream test or
+# executable that links libcrispasr.a (and therefore pulls in
+# crispasr_cache.cpp.obj) needs winhttp on its link line. Propagate it as
+# PUBLIC here so every consumer transitively picks it up, and individual
+# tests don't have to remember to add it. Mirrors how Threads::Threads
+# already flows through.
+if (WIN32)
+    target_link_libraries(crispasr PUBLIC winhttp)
+endif()
+
 if (CRISPASR_COREML)
     target_link_libraries(crispasr PRIVATE crispasr.coreml)
 endif()
@@ -510,6 +522,55 @@ endif()
 if(GGML_CUDA)
     target_compile_definitions(qwen3_asr PRIVATE GGML_USE_CUDA)
     target_link_libraries(qwen3_asr PUBLIC ggml-cuda)
+endif()
+
+# ---------------------------------------------------------------------------
+# FunASR — FunAudioLLM/Fun-ASR-Nano-2512 (SANM encoder + Transformer adaptor
+#          + Qwen3-0.6B LLM decoder)
+# ---------------------------------------------------------------------------
+add_library(funasr STATIC
+            funasr.h
+            funasr.cpp
+            )
+target_include_directories(funasr PUBLIC . ../include)
+target_compile_features   (funasr PUBLIC cxx_std_17)
+set_target_properties(funasr PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (funasr PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+if(NOT MSVC)
+    target_compile_options(funasr PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(funasr PRIVATE GGML_USE_METAL)
+    target_link_libraries(funasr PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(funasr PRIVATE GGML_USE_CUDA)
+    target_link_libraries(funasr PUBLIC ggml-cuda)
+endif()
+
+# ---------------------------------------------------------------------------
+# SenseVoice — FunAudioLLM/SenseVoiceSmall (encoder-only multi-task ASR:
+#              transcript + LID + emotion + audio-event via a single CTC head,
+#              non-AR, 15× faster than Whisper-Large, 50+ languages)
+# ---------------------------------------------------------------------------
+add_library(sensevoice STATIC
+            sensevoice.h
+            sensevoice.cpp
+            )
+target_include_directories(sensevoice PUBLIC . ../include)
+target_compile_features   (sensevoice PUBLIC cxx_std_17)
+set_target_properties(sensevoice PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (sensevoice PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+if(NOT MSVC)
+    target_compile_options(sensevoice PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(sensevoice PRIVATE GGML_USE_METAL)
+    target_link_libraries(sensevoice PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(sensevoice PRIVATE GGML_USE_CUDA)
+    target_link_libraries(sensevoice PUBLIC ggml-cuda)
 endif()
 
 # ---------------------------------------------------------------------------

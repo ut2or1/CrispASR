@@ -476,6 +476,107 @@ catch_discover_tests(test_chunk_context
     PROPERTIES LABELS "unit;chunk-context"
 )
 
+# ─── test-issue-114-chunk-context-gate — issue #114 regression guard
+#
+# Pins crispasr_chunk_context::should_use_chunk_context so a future
+# refactor cannot silently re-introduce the cad4c28a gate that
+# extended VAD-derived slices with neighbour audio and produced
+# kanji → hiragana on parakeet-tdt-0.6b-ja. Pure CPU, no model load.
+add_executable(test-issue-114-chunk-context-gate
+    test-issue-114-chunk-context-gate.cpp
+)
+target_include_directories(test-issue-114-chunk-context-gate PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-issue-114-chunk-context-gate PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-issue-114-chunk-context-gate
+    TEST_SPEC "[issue-114]"
+    PROPERTIES LABELS "unit;chunk-context;issue-114"
+)
+
+# ─── test-issue-89-long-audio-fallback — issue #89 regression guard
+#
+# Pins crispasr_long_audio::should_auto_chunk_long so a future refactor
+# cannot silently restore the a069018f "always full-encode for
+# CAP_UNBOUNDED_INPUT" behaviour. That produced 35 tokens of output on
+# 300 s of audio when the user provided neither --vad nor --chunk-seconds
+# because the FastConformer + TDT decoder collapse past ~30-60 s in a
+# single pass.
+add_executable(test-issue-89-long-audio-fallback
+    test-issue-89-long-audio-fallback.cpp
+)
+target_include_directories(test-issue-89-long-audio-fallback PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-issue-89-long-audio-fallback PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-issue-89-long-audio-fallback
+    TEST_SPEC "[issue-89]"
+    PROPERTIES LABELS "unit;long-audio;issue-89"
+)
+
+# ─── test-lcs-chunk-merge — Catch2 unit tests for LCS chunk-merge dedup
+#
+# Ports of NeMo's `longest_common_subsequence_merge` test cases
+# (`nemo/collections/asr/parts/utils/streaming_utils.py`). Pin the
+# algorithm so subsequent refactors keep behavioural parity with the
+# upstream BatchedFrameASRTDT hypothesis stitcher.
+add_executable(test-lcs-chunk-merge
+    test-lcs-chunk-merge.cpp
+)
+target_include_directories(test-lcs-chunk-merge PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-lcs-chunk-merge PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-lcs-chunk-merge
+    TEST_SPEC "[lcs]"
+    PROPERTIES LABELS "unit;lcs"
+)
+
+# ─── test-lcs-dedup-driver — Catch2 unit tests for the segment-aware
+# driver that wraps the LCS algorithm with token / word / text book-
+# keeping. Together with test-lcs-chunk-merge this gives end-to-end
+# coverage of the chunk-boundary dedup feature.
+add_executable(test-lcs-dedup-driver
+    test-lcs-dedup-driver.cpp
+)
+target_include_directories(test-lcs-dedup-driver PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-lcs-dedup-driver PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-lcs-dedup-driver
+    TEST_SPEC "[lcs-dedup]"
+    PROPERTIES LABELS "unit;lcs;lcs-dedup"
+)
+
+# ─── test-lcs-c-abi — pin the public C ABI surface for the LCS dedup.
+# Verifies that `crispasr_lcs_dedup_prefix_count` is exported from
+# libcrispasr and agrees with the in-tree algorithm on the same
+# fixtures. Catches regressions where the symbol gets dropped from the
+# dynamic library (CMake link-order slip, missing CA_EXPORT).
+add_executable(test-lcs-c-abi
+    test-lcs-c-abi.cpp
+)
+target_include_directories(test-lcs-c-abi PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-lcs-c-abi PRIVATE
+    crispasr
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-lcs-c-abi
+    TEST_SPEC "[c-abi]"
+    PROPERTIES LABELS "unit;lcs;c-abi"
+)
+
 # ─── test - math - consistency — Catch2 unit tests for math constants ────────
 add_executable(test-math-consistency
     test-math-consistency.cpp

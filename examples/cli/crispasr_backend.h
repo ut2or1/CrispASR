@@ -59,6 +59,12 @@ struct crispasr_segment {
     bool speaker_turn_next = false;     // whisper tinydiarize
     std::vector<crispasr_word> words;   // may be empty
     std::vector<crispasr_token> tokens; // may be empty
+    // Multi-task ASR metadata (SenseVoice and similar). Empty when the
+    // backend doesn't emit them.
+    std::string lang_id;     // e.g. "en", "zh", "ja"
+    std::string emotion;     // e.g. "HAPPY", "NEUTRAL"
+    std::string audio_event; // e.g. "Speech", "Music"
+    std::string itn_flag;    // "withitn" or "woitn"
 };
 
 // ---------------------------------------------------------------------------
@@ -134,12 +140,19 @@ public:
         return transcribe(mono.data(), n_samples_per_channel, t_offset_cs, params);
     }
 
-    // TTS: synthesize speech from text. Returns 24 kHz mono PCM samples.
-    // Default returns empty (not supported). Only backends with CAP_TTS override.
+    // TTS: synthesize speech from text. Returns mono PCM samples at the
+    // backend's native rate (see `tts_sample_rate()`). Default returns empty
+    // (not supported). Only backends with CAP_TTS override.
     virtual std::vector<float> synthesize(const std::string& text, const whisper_params& /*params*/) {
         (void)text;
         return {};
     }
+
+    // Sample rate of `synthesize()` output PCM. Defaults to 24 kHz since most
+    // TTS backends (kokoro, qwen3-tts, vibevoice, chatterbox, orpheus, indextts)
+    // produce 24 kHz. Backends that emit a different rate (e.g. voxcpm2-tts at
+    // 48 kHz) override this.
+    virtual int tts_sample_rate() const { return 24000; }
 
     // Text-to-text translation. m2m100 and any future translate-only
     // backend overrides this. Default returns empty (not supported).

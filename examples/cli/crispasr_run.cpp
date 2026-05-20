@@ -9,6 +9,9 @@
 
 #include "crispasr_backend.h"
 #include "crispasr_cache.h"
+#include "crispasr_chunk_context_gate.h"
+#include "crispasr_lcs_dedup.h"
+#include "crispasr_long_audio_fallback.h"
 #include "crispasr_mic_cli.h"
 #include "crispasr_popen.h"
 #include "crispasr_vad_cli.h"
@@ -387,7 +390,39 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     if (!params.chunk_seconds_explicit && (backend.capabilities() & CAP_UNBOUNDED_INPUT)) {
         effective_chunk_seconds = 0;
     }
-    if (!params.no_prints) {
+
+    // Issue #89: CAP_UNBOUNDED_INPUT backends are mathematically able to take
+    // arbitrarily long audio, but in practice the FastConformer encoder + TDT
+    // decoder break down past ~30-60 s in a single pass — per-feature z-norm
+    // stats are computed across the whole input, so a long input shifts the
+    // distribution away from what the model was trained on and the TDT
+    // decoder stops emitting after a few seconds. On the issue #89 reporter's
+    // 300 s YouTube reproducer this collapsed to 35 tokens covering only the
+    // first 4.8 s, with the rest of the audio silently dropped.
+    //
+    // Fallback to fixed chunking when the user provided no VAD and no
+    // explicit --chunk-seconds and the audio is longer than the model's safe
+    // single-pass window. Chunking alone is sufficient (verified: 300 s
+    // audio with `--chunk-seconds 60` produces 7 segments covering the
+    // whole file); we don't need to silently auto-enable a VAD download.
+    // The overlap-save gate in `use_chunk_context` (issue #114) still
+    // applies here, so the chunk boundaries get the ± chunk_overlap_seconds
+    // context they need to span continuous-speech cuts.
+    constexpr int kLongAudioFallbackChunkSeconds = 60;
+    const bool wants_vad = params.vad || !params.vad_model.empty();
+    const bool long_audio_no_vad =
+        crispasr_long_audio::should_auto_chunk_long(effective_chunk_seconds, wants_vad, backend.capabilities(),
+                                                    (int)samples.size(), SR, kLongAudioFallbackChunkSeconds);
+    if (long_audio_no_vad) {
+        effective_chunk_seconds = kLongAudioFallbackChunkSeconds;
+        if (!params.no_prints) {
+            fprintf(stderr,
+                    "crispasr: %s backend on %.1fs audio without --vad or --chunk-seconds — "
+                    "auto-chunking at %d s to keep encoder in its safe window "
+                    "(pass --vad for finer slicing, or --chunk-seconds N to set explicitly)\n",
+                    backend.name(), (double)samples.size() / SR, kLongAudioFallbackChunkSeconds);
+        }
+    } else if (!params.no_prints) {
         if (effective_chunk_seconds == 0 && (int)samples.size() > params.chunk_seconds * SR &&
             (backend.capabilities() & CAP_UNBOUNDED_INPUT)) {
             fprintf(stderr,
@@ -588,7 +623,11 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     // appropriate).
     const float kChunkContextS = params.chunk_overlap_seconds;
     constexpr int64_t kBoundaryToleranceCs = 20; // 200 ms tolerance for TDT frame shift
-    const bool use_chunk_context = slices.size() > 1 && kChunkContextS > 0.0f;
+    // Issue #114 — gate lives in crispasr_chunk_context_gate.h so the
+    // unit test in tests/test-issue-114-chunk-context-gate.cpp can pin
+    // it without spinning up a model. See the header for the rationale.
+    const bool use_chunk_context =
+        crispasr_chunk_context::should_use_chunk_context(effective_chunk_seconds, slices.size(), kChunkContextS);
 
     auto process_slice = [&](size_t i, CrispasrBackend& be) {
         const auto& sl = slices[i];
@@ -884,6 +923,29 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
         for (size_t i = 0; i < slices.size(); i++)
             process_slice(i, backend);
     }
+
+    // LCS-based dedup across adjacent chunks (issue #89 / #114 follow-up,
+    // matching upstream NeMo's BatchedFrameASRTDT hypothesis stitching).
+    // Only active when the overlap-save context window was added in the
+    // first place — for VAD-derived slices there is no overlap region, so
+    // no duplicates to remove. `delay_tokens` is sized to the chunk
+    // overlap measured in encoder frames; parakeet's frame_dur is 80 ms
+    // and each frame can emit one TDT token, so `chunk_overlap_seconds *
+    // 1000 / 80` is a safe upper bound on how far back in the previous
+    // chunk we need to look.
+    // CLI knob (--lcs-dedup): "auto" (default) follows use_chunk_context,
+    // "on" forces it even on bindings/test paths, "off" disables for A/B.
+    // --lcs-min-length raises the floor on what counts as a match — useful
+    // when audio has long-silence regions where blank tokens dominate the
+    // boundary run.
+    const bool lcs_default = use_chunk_context && per_slice.size() > 1;
+    const bool lcs_active =
+        (params.lcs_dedup == "on") ? (per_slice.size() > 1) : (params.lcs_dedup == "off" ? false : lcs_default);
+    if (lcs_active) {
+        const int delay_tokens = (int)(params.chunk_overlap_seconds * 1000.0f / 80.0f + 0.5f);
+        crispasr_lcs::apply_lcs_chunk_dedup(per_slice, delay_tokens > 0 ? delay_tokens : 1, params.lcs_min_length);
+    }
+
     auto all_segs = merge_segments(std::move(per_slice), slices);
 
     // Optional embedding-based clustering (#107 P3). When the user
@@ -1190,11 +1252,15 @@ int crispasr_run_backend(const whisper_params& params_in) {
             return 15;
         }
 
+        // Sample rate of the synthesized PCM — backend-declared. Most TTS
+        // backends emit 24 kHz; voxcpm2-tts emits 48 kHz. Hard-coding 24 kHz
+        // here is why voxcpm2 output played at half-speed before this fix.
+        const int sr_in = backend->tts_sample_rate();
+
         // Optional leading-silence trim. RMS gate over a 20 ms window;
         // drop frames below -50 dBFS (≈ 0.0032 RMS) until the gate
         // opens, then back off 50 ms so we don't clip the consonant onset.
         if (params.tts_trim_silence) {
-            const int sr_in = 24000;
             const int win = sr_in / 50;       // 20 ms
             const int headroom = sr_in / 20;  // 50 ms
             const float rms_thresh = 0.0032f; // ≈ -50 dBFS
@@ -1216,15 +1282,14 @@ int crispasr_run_backend(const whisper_params& params_in) {
             }
         }
 
-        // Write output WAV (24 kHz mono)
+        // Write output WAV (backend-native sample rate, mono)
         std::string out_path = params.tts_output.empty() ? "tts_output.wav" : params.tts_output;
         FILE* fout = fopen(out_path.c_str(), "wb");
         if (!fout) {
             fprintf(stderr, "crispasr: error: cannot write '%s'\n", out_path.c_str());
             return 16;
         }
-        // WAV header: 24 kHz, mono, 16-bit PCM
-        int32_t sr = 24000;
+        int32_t sr = sr_in;
         int16_t channels = 1;
         int16_t bits = 16;
         int32_t data_size = (int32_t)audio.size() * 2;
@@ -1258,8 +1323,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
         fclose(fout);
 
         if (!params.no_prints)
-            fprintf(stderr, "crispasr: TTS output written to '%s' (%zu samples, %.2f sec)\n", out_path.c_str(),
-                    audio.size(), audio.size() / 24000.0);
+            fprintf(stderr, "crispasr: TTS output written to '%s' (%zu samples @ %d Hz, %.2f sec)\n", out_path.c_str(),
+                    audio.size(), sr_in, (double)audio.size() / (double)sr_in);
         return 0;
     }
 

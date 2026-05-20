@@ -42,6 +42,8 @@ add_executable(${TARGET}
     crispasr_backend_gemma4_e2b.cpp
     crispasr_backend_omniasr.cpp
     crispasr_backend_mimo_asr.cpp
+    crispasr_backend_funasr.cpp
+    crispasr_backend_sensevoice.cpp
     crispasr_aligner_cli.cpp
     crispasr_vad_cli.cpp
     crispasr_lid_cli.cpp
@@ -166,6 +168,8 @@ target_link_libraries(crispasr-diff PRIVATE
     mimo_tokenizer
     mimo_asr
     voxcpm2_tts
+    funasr
+    sensevoice
     crispasr-diff-lib
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
@@ -250,6 +254,8 @@ target_link_libraries(${TARGET} PRIVATE
     vibevoice
     silero-lid
     pyannote-seg
+    funasr
+    sensevoice
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
     $<$<BOOL:${WIN32}>:winhttp>

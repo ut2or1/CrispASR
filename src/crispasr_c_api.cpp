@@ -144,11 +144,16 @@
 #include "crispasr_diarize_internal.h"
 #include "pyannote_seg.h"
 
-#ifdef _WIN32
-#define CA_EXPORT extern "C" __declspec(dllexport)
-#else
-#define CA_EXPORT extern "C" __attribute__((visibility("default")))
-#endif
+// CA_EXPORT decorates every C-ABI definition in this file. It MUST expand
+// to the same linkage attributes that `CRISPASR_API` (from
+// `include/crispasr.h`) puts on the public declaration, otherwise MSVC
+// raises `C2375: redefinition; different linkage` (Windows static build
+// CI failure 2026-05-20, caught at b6ab1655). Static builds set
+// CRISPASR_API to empty; shared builds set __declspec(dllexport) on the
+// library side and __declspec(dllimport) on the consumer side. Reusing
+// the same macro for the impl side keeps decl and definition in lock-step
+// across all three configurations.
+#define CA_EXPORT extern "C" CRISPASR_API
 
 // =========================================================================
 // whisper_full_params setters
@@ -519,6 +524,33 @@ CA_EXPORT int crispasr_vad_slices(const char* vad_model_path, const float* pcm, 
 CA_EXPORT void crispasr_vad_free(float* spans) {
     if (spans)
         std::free(spans);
+}
+
+// =========================================================================
+// LCS chunk-boundary deduplication
+// =========================================================================
+//
+// Public-API entry point for the NeMo-style LCS hypothesis stitcher used
+// internally by the CLI's overlap-save chunking path. Exposed so bindings
+// that drive `libcrispasr` chunk-by-chunk (Go cgo, Rust, Dart FFI, Python
+// ctypes) can run the same dedup on their own per-chunk token streams
+// without re-implementing the algorithm.
+//
+// Pure function over the input arrays — no state, no thread safety
+// concerns. See `src/core/crispasr_lcs.h` for the algorithm itself; this
+// is a 4-line C-ABI wrapper that does input validation + namespace
+// stripping.
+
+#include "core/crispasr_lcs.h"
+
+CA_EXPORT int crispasr_lcs_dedup_prefix_count(const int32_t* prev_tail_tokens, int n_prev, const int32_t* curr_tokens,
+                                              int n_curr, int min_lcs_length) {
+    if (!prev_tail_tokens || !curr_tokens || n_prev <= 0 || n_curr <= 0)
+        return 0;
+    std::vector<int32_t> prev(prev_tail_tokens, prev_tail_tokens + n_prev);
+    std::vector<int32_t> curr(curr_tokens, curr_tokens + n_curr);
+    const int min_l = min_lcs_length > 0 ? min_lcs_length : crispasr_lcs::kMinMergeSubsequenceLen;
+    return crispasr_lcs::lcs_dedup_prefix_count(prev, curr, min_l);
 }
 
 // =========================================================================
