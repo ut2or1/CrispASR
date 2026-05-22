@@ -6,6 +6,199 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-21 fix(#89): parakeet long-audio NeMo-style streamed pipeline
+
+**Outcome.** The issue #89 reporter's 300 s Japanese YouTube clip
+(`o_9dWkRPYC0`, parakeet-tdt-0.6b-ja on Vulkan/AMD) went from 35
+tokens covering 0-5 s → full coverage.  The 60 s case went from 0 chars
+(with the original 60 s auto-chunk) to 294 chars / 99.5 % coverage.
+
+**Root cause.** Three layered problems:
+
+1. Per-feature z-norm drift: the TDT decoder emits blanks when mel
+   statistics computed over >30 s shift from the training distribution.
+2. Decoder cold-start: each independently-chunked slice resets the LSTM
+   predictor to SOS, losing 5-20 s of interior content per chunk.
+3. `crispasr_run.cpp` auto-chunked at 60 s → 30 s before the backend
+   could handle it internally.
+
+**Fix (6 commits).**
+
+| Commit | Change | Impact |
+|--------|--------|--------|
+| `bdc8175` | Reduce auto-chunk 60 → 30 s | Prevents 0-output catastrophe |
+| `1037bcb` | PR #116: VAD slices out of chunk-context path | Fixes VAD + cohere/granite regressions |
+| `9488223` | Chunked-encode + single-decode (PLAN #104 v1) | 93 % coverage without VAD |
+| `300149e` | NeMo-style: global z-norm + chunked encode | Feature-identical to single-pass |
+| `97d2b4f` | Raise threshold to 60 s + env knobs | 99.5 % on 60 s, tuneable |
+
+**Architecture.** Audio ≤60 s: single-pass `parakeet_transcribe_ex` (best
+quality, 99.5 %).  Audio >60 s: `parakeet_transcribe_streamed` — compute
+mel with global z-norm over the full audio, encode in overlapping 8 s
+chunks, concatenate encoder outputs, decode in one TDT pass.  The
+encoder is bidirectional so each 8 s chunk gets independent context; the
+decoder sees a single continuous sequence (no LSTM reset).
+
+**Env knobs:** `CRISPASR_PARAKEET_STREAM_THRESHOLD` (default 60 s),
+`CRISPASR_PARAKEET_STREAM_CHUNK` (default 8 s),
+`CRISPASR_PARAKEET_STREAM_OVERLAP` (default 2 s).
+
+**Benchmark framework.** New `tests/benchmark_asr.py` driver + audio
+corpus in `/mnt/storage/test-audio/` (en/de/ja/zh × 4 durations from
+FLEURS + reporter's audio).  14 pytest unit tests for metric computation
+(`tests/test_benchmark_metrics.py`).
+
+**Files.**
+
+| File | Change |
+|------|--------|
+| `src/parakeet.cpp` | `parakeet_encode_chunked`, `parakeet_transcribe_chunked`, `parakeet_transcribe_streamed`, `parakeet_compute_mel_raw`, `parakeet_apply_znorm` |
+| `src/parakeet.h` | New public API declarations |
+| `examples/cli/crispasr_backend_parakeet.cpp` | Path selection + env knobs, `CAP_INTERNAL_CHUNKING` |
+| `examples/cli/crispasr_backend.h` | `CAP_INTERNAL_CHUNKING` flag |
+| `examples/cli/crispasr_long_audio_fallback.h` | `CAP_INTERNAL_CHUNKING_FLAG` gate |
+| `examples/cli/crispasr_run.cpp` | 30 s auto-chunk default |
+| `tests/benchmark_asr.py` | Multi-backend benchmark driver |
+| `tests/benchmark_metrics.py` | Coverage metric computation |
+| `tests/benchmark_corpus.py` | FLEURS audio corpus builder |
+| `tests/test_benchmark_metrics.py` | 14 pytest unit tests |
+| `tests/run-benchmark.sh` | CTest smoke wrapper |
+
+---
+
+## 2026-05-21 paraformer: FunASR Paraformer-zh NAR-ASR port
+
+**Outcome.** Ported FunASR Paraformer-zh (220M params, non-autoregressive,
+Mandarin Chinese + English) as a new `--backend paraformer`. Character-level
+tokenizer (8404 vocab), single-pass decode via CIF (continuous integrate-and-fire)
+predictor. Published F16 (421 MB), Q4_K (123 MB), Q8_0 (227 MB) at
+`cstr/paraformer-zh-GGUF`; Q4_K is the registry default. All three produce
+byte-identical transcripts vs Python on both Chinese test audio and JFK English.
+
+**Architecture:** 50 SANM encoder blocks (reusing `core_sanm::build_block()`)
+→ CIF predictor (Conv1d + sigmoid → accumulation) → 16 NAR decoder blocks
+(FFN → FSMN → cross-attn, note the unusual order) → decoders3 post block
+→ output_layer → argmax → space insertion between English word tokens.
+
+**Four bugs in initial WIP port:**
+1. Decoder block operation order: had FSMN → cross-attn → FFN but upstream
+   does FFN → FSMN → cross-attn. Norms (norm1/2/3) were applied to wrong
+   sub-layers.
+2. FFN internal LayerNorm: was w1→LN→ReLU→w2, upstream is w1→ReLU→LN→w2.
+   Post block (decoders3) also had a spurious residual connection.
+3. CIF encoder-output transposition: used `enc_out[d*T+t]` instead of
+   `enc_out[t*D+d]`. The ggml tensor already stores row-major (T,D), so
+   no transpose was needed. Same bug in acoustic_embeds → decoder path.
+4. Missing English word spacing: the vocab has whole English words as tokens
+   with `@@` BPE continuation markers. Argmax loop concatenated tokens without
+   spaces, producing `andsomyfellowamericans...`. Fixed by inserting a space
+   between consecutive Latin-script word-final tokens.
+
+**Diff harness.** Reference backend (`tools/reference_backends/paraformer.py`)
+captures 73 stages. `paraformer_extract_stage()` implemented for all stages.
+generated_text matches byte-for-byte on both Chinese and English.
+
+### Files
+
+| File | Change |
+|------|--------|
+| `models/convert-paraformer-to-gguf.py` | New: converter (model.pt → 956-tensor GGUF) |
+| `src/paraformer.{h,cpp}` | New: ~850 LOC runtime |
+| `examples/cli/crispasr_backend_paraformer.cpp` | New: CLI adapter |
+| `tools/reference_backends/paraformer.py` | New: 73-stage reference backend |
+
+---
+
+## 2026-05-21 sensevoice: Q4_K + Q8_0 quants + fix crispasr-quantize `.w` suffix gate
+
+**Outcome.** Published Q4_K (129 MB) + Q8_0 (240 MB) alongside the
+existing F16 (448 MB) at `cstr/sensevoice-small-GGUF`. Registry
+default flipped to Q4_K. All three produce byte-identical English
+(JFK) and Japanese (JSUT) transcripts on M1 Metal; Q4_K is ~3× faster
+end-to-end than F16, Q8_0 ~1.7×.
+
+**Bug found while quantising.** First attempt at `crispasr-quantize
+sensevoice-small-f16.gguf out.gguf q4_k` produced a file the same
+size as the input. Every tensor in the log said `copying...`
+instead of `quantizing to q4_K...`.
+
+`examples/crispasr-quantize/main.cpp:216` gates "is this a weight
+tensor" on either the substring `weight` OR the suffix `_w` (Kyutai
+STT convention). SenseVoice's converter uses the FunASR-style `.w`
+suffix (e.g. `sensevoice.enc.blk.0.attn.qkv.w`), which matches
+neither check. Every tensor fell through to the copy path.
+
+The same bug silently affected the FunASR encoder side too: FunASR's
+LLM half uses llama.cpp `weight` names and quantises fine, but the
+SANM encoder uses `.w`/`.b` and stayed F16. Older FunASR Q4_K files
+on HF are therefore larger than they could be — re-quantising +
+re-uploading them is queued as a follow-up but not blocking.
+
+**Fix.** Extend the gate to also accept `.w` as a weight suffix:
+
+```cpp
+bool is_weight = (sname.find("weight") != std::string::npos) ||
+                 (sname.size() >= 2 && sname.substr(sname.size() - 2) == "_w") ||
+                 // FunASR / SenseVoice converter convention: .w / .b suffixes
+                 (sname.size() >= 2 && sname.substr(sname.size() - 2) == ".w");
+```
+
+**72 tensors legitimately stay F16.** SenseVoice's `attn.fsmn.w` is
+the FSMN depthwise convolution kernel with `ne[0] = 11` (kernel
+size); `attn.qkv.w` has `ne[0] = 560` (encoder hidden 512 + SANM
+context 48). Neither divides any quant block size (256 for K-quants,
+32 for legacy), so the fallback chain rightly leaves them F16. The
+other ~280 weight matrices quantise cleanly.
+
+### Files
+
+- `examples/crispasr-quantize/main.cpp` — extend the weight-suffix gate.
+- `src/crispasr_model_registry.cpp` — Q4_K becomes the default;
+  F16 + Q8_0 lookupable by canonical filename.
+- `hf_readmes/sensevoice-small-GGUF.md` — quant table + default
+  switch + "all three byte-identical on tested clips" note.
+- `cstr/sensevoice-small-GGUF` HF repo — Q4_K + Q8_0 uploaded
+  alongside the existing F16.
+
+### Verification
+
+- `crispasr -m sensevoice-small-{f16,q8_0,q4_k}.gguf -f samples/jfk.wav`
+  → identical "And so my fellow Americans ask not what your
+  country can do for you, ask what you can do for your country."
+- `crispasr -m sensevoice-small-{f16,q8_0,q4_k}.gguf -f
+  samples/ja/jsut_water_3s.wav -l ja` → identical
+  "水をマレーシアから買わなくてはならないのです。"
+- `-l auto` correctly identifies Japanese on all three quants.
+
+---
+
+## 2026-05-21 funasr: fix MLT-Nano hallucination (PLAN #99)
+
+**Bug.** `cstr/funasr-mlt-nano-GGUF` produced hallucinated endings on
+English transcripts (e.g. "ask what your country can do for you"
+repeated instead of "ask what you can do for your country").  The
+`cstr/funasr-nano-GGUF` variant worked correctly on the same audio.
+
+**Root cause.** The C++ runtime hardcoded `use_low_frame_rate = true`.
+Fun-ASR-Nano-2512's `config.yaml` sets it to `true`, but
+Fun-ASR-MLT-Nano-2512 omits the key — the upstream Python default is
+`false`.  With `true` the prompt builder spliced only the first 23 of
+183 adaptor-output frames into the Qwen3-0.6B prompt, truncating 87 %
+of the audio context.  The LLM decoded correctly up to token ~20 and
+then hallucinated.
+
+**Fix (commit `4433216`).**
+
+| File | Change |
+|------|--------|
+| `models/convert-funasr-to-gguf.py` | Read `audio_adaptor_conf.use_low_frame_rate` from `config.yaml`; write as bool KV `funasr.use_low_frame_rate`. Also fixed `ada_n_heads` 16 → 8. |
+| `src/funasr.cpp` | Read KV at load time; fall back `true` for old GGUFs. |
+
+Both `cstr/funasr-nano-GGUF` and `cstr/funasr-mlt-nano-GGUF` GGUFs
+reconverted (F16 + Q4_K + Q8_0) and re-uploaded.
+
+---
+
 ## 2026-05-20 parakeet: 4 new variants — v2 + tdt-1.1b + tdt_ctc-{110m,1.1b}
 
 **Goal.** Bring NVIDIA's remaining Parakeet TDT / TDT+CTC variants

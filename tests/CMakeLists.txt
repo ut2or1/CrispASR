@@ -800,3 +800,14 @@ add_test(NAME ${TEST_TARGET}
 set_tests_properties(${TEST_TARGET} PROPERTIES
     LABELS "integration"
     TIMEOUT 600)
+
+# ─── benchmark-quick — ASR benchmark framework smoke test ───────────────────
+# Runs the Python benchmark driver on JFK + parakeet (11s, fast). Verifies
+# the framework works end-to-end: JSON parse → metric computation → JSONL
+# storage. Full matrix runs are done interactively or in nightly CI.
+add_test(NAME benchmark-quick
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run-benchmark.sh --quick
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(benchmark-quick PROPERTIES
+    LABELS "benchmark"
+    TIMEOUT 600)

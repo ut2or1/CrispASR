@@ -194,6 +194,10 @@ std::vector<crispasr_segment> merge_segments(std::vector<std::vector<crispasr_se
     return out;
 }
 
+bool crispasr_words_have_positive_span(const std::vector<crispasr_word>& words) {
+    return !words.empty() && words.back().t1 > words.front().t0;
+}
+
 // Stdout serialization mutex. Used by the parallel-processors path to
 // keep stdout transcript lines from interleaving across worker threads.
 // The single-threaded path acquires it too — no measurable cost since
@@ -393,22 +397,20 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
 
     // Issue #89: CAP_UNBOUNDED_INPUT backends are mathematically able to take
     // arbitrarily long audio, but in practice the FastConformer encoder + TDT
-    // decoder break down past ~30-60 s in a single pass — per-feature z-norm
-    // stats are computed across the whole input, so a long input shifts the
-    // distribution away from what the model was trained on and the TDT
-    // decoder stops emitting after a few seconds. On the issue #89 reporter's
-    // 300 s YouTube reproducer this collapsed to 35 tokens covering only the
-    // first 4.8 s, with the rest of the audio silently dropped.
+    // decoder break down past ~30 s in a single pass — per-feature z-norm
+    // stats drift from the training distribution (model trained on ~10-15 s
+    // utterances), the position encodings exit the trained range, and the TDT
+    // decoder starts emitting blanks.  On the reporter's 300 s YouTube clip
+    // with the original 60 s fallback, only 4 words survived in the first
+    // 60 s on Vulkan/AMD hardware due to z-norm drift at that length.
     //
-    // Fallback to fixed chunking when the user provided no VAD and no
-    // explicit --chunk-seconds and the audio is longer than the model's safe
-    // single-pass window. Chunking alone is sufficient (verified: 300 s
-    // audio with `--chunk-seconds 60` produces 7 segments covering the
-    // whole file); we don't need to silently auto-enable a VAD download.
-    // The overlap-save gate in `use_chunk_context` (issue #114) still
-    // applies here, so the chunk boundaries get the ± chunk_overlap_seconds
-    // context they need to span continuous-speech cuts.
-    constexpr int kLongAudioFallbackChunkSeconds = 60;
+    // Fallback to 30 s chunking when the user provided no VAD and no explicit
+    // --chunk-seconds and the audio is longer than the safe single-pass
+    // window.  30 s is short enough for stable z-norm but long enough to
+    // avoid excessive chunk boundaries.  The overlap-save gate in
+    // `use_chunk_context` (issue #114) still applies, so chunk boundaries
+    // get the ± chunk_overlap_seconds context they need.
+    constexpr int kLongAudioFallbackChunkSeconds = 30;
     const bool wants_vad = params.vad || !params.vad_model.empty();
     const bool long_audio_no_vad =
         crispasr_long_audio::should_auto_chunk_long(effective_chunk_seconds, wants_vad, backend.capabilities(),
@@ -512,7 +514,7 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
                 if (e > s) {
                     auto words = crispasr_ctc_align(params.aligner_model, seg.text, samples.data() + s, e - s, seg.t0,
                                                     params.n_threads);
-                    if (!words.empty()) {
+                    if (crispasr_words_have_positive_span(words)) {
                         seg.t0 = words.front().t0;
                         seg.t1 = words.back().t1;
                         seg.words = std::move(words);
@@ -626,8 +628,8 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     // Issue #114 — gate lives in crispasr_chunk_context_gate.h so the
     // unit test in tests/test-issue-114-chunk-context-gate.cpp can pin
     // it without spinning up a model. See the header for the rationale.
-    const bool use_chunk_context =
-        crispasr_chunk_context::should_use_chunk_context(effective_chunk_seconds, slices.size(), kChunkContextS);
+    const bool use_chunk_context = crispasr_chunk_context::should_use_chunk_context(
+        effective_chunk_seconds, slices.size(), kChunkContextS, wants_vad);
 
     auto process_slice = [&](size_t i, CrispasrBackend& be) {
         const auto& sl = slices[i];
@@ -751,7 +753,7 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
                     continue;
                 auto words = crispasr_ctc_align(params.aligner_model, seg.text, samples.data() + sl.start,
                                                 sl.end - sl.start, sl.t0_cs, params.n_threads);
-                if (!words.empty()) {
+                if (crispasr_words_have_positive_span(words)) {
                     seg.t0 = words.front().t0;
                     seg.t1 = words.back().t1;
                     seg.words = std::move(words);
@@ -2468,7 +2470,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
                         sl.end - sl.start,
                         sl.t0_cs,
                         params.n_threads);
-                    if (!words.empty()) {
+                    if (crispasr_words_have_positive_span(words)) {
                         seg.t0 = words.front().t0;
                         seg.t1 = words.back().t1;
                         seg.words = std::move(words);
