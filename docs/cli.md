@@ -252,6 +252,42 @@ curl -L -o canary-ctc-aligner.gguf \
 
 Alignment granularity is one encoder frame (~80 ms).
 
+### Language-specific wav2vec2 aligners (WhisperX parity)
+
+For non-English audio, use a language-matched wav2vec2 CTC aligner
+instead of the multilingual canary-ctc model. These are the same models
+WhisperX uses for word alignment, converted to GGUF and available via
+auto-download:
+
+| Alias | Language | Source model |
+|---|---|---|
+| `-am wav2vec2-aligner` | English (default) | wav2vec2-xlsr-en |
+| `-am wav2vec2-aligner-de` | German | jonatasgrosman/xlsr-53-german |
+| `-am wav2vec2-aligner-fr` | French | jonatasgrosman/xlsr-53-french |
+| `-am wav2vec2-aligner-es` | Spanish | jonatasgrosman/xlsr-53-spanish |
+| `-am wav2vec2-aligner-it` | Italian | jonatasgrosman/xlsr-53-italian |
+| `-am wav2vec2-aligner-ja` | Japanese | jonatasgrosman/xlsr-53-japanese |
+| `-am wav2vec2-aligner-zh` | Chinese | jonatasgrosman/xlsr-53-chinese-zh-cn |
+| `-am wav2vec2-aligner-nl` | Dutch | jonatasgrosman/xlsr-53-dutch |
+| `-am wav2vec2-aligner-pt` | Portuguese | jonatasgrosman/xlsr-53-portuguese |
+| `-am wav2vec2-aligner-ar` | Arabic | jonatasgrosman/xlsr-53-arabic |
+| `-am wav2vec2-aligner-uk` | Ukrainian | Yehor/xls-r-300m-uk-with-small-lm |
+| `-am wav2vec2-aligner-cs` | Czech | comodoro/xls-r-300m-cs-250 |
+
+```bash
+# Japanese word timestamps with the JA-specific aligner:
+crispasr --backend cohere -m cohere.gguf -f japanese.wav \
+    -am wav2vec2-aligner-ja --auto-download -osrt -ml 1
+
+# French with Voxtral:
+crispasr --backend voxtral -m auto -f french.wav \
+    -am wav2vec2-aligner-fr --auto-download -osrt -ml 1
+```
+
+All models are Q4_K-quantized (~200 MB each) and auto-download on first
+use. The canary-ctc aligner remains the default (`-am auto`) because
+it covers 25+ languages in one model.
+
 For subtitle output, prefer adding `--vad --split-on-punct`:
 
 ```bash
@@ -332,11 +368,67 @@ upstream tools like SubtitleEdit.
 | Flag | Meaning |
 |---|---|
 | `-tp F`, `--temperature F` | Sampling temperature. `0` = pure argmax (default, bit-identical). `> 0` enables multinomial sampling for whisper, voxtral, voxtral4b, qwen3, granite |
+| `--seed N` | RNG seed for sampling. `0` = non-deterministic. Used by temperature-sampling ASR backends and TTS backends that sample; CLI values override backend-specific env seeds |
+| `-bo N`, `--best-of N` | Number of best candidates to keep when temperature > 0 (whisper + some AR backends) |
 | `-bs N`, `--beam-size N` | Beam search width (whisper only) |
 | `-tpi F`, `--temperature-inc F` | Whisper temperature-fallback increment |
-| `--grammar FNAME` | GBNF grammar file (whisper only, including `--backend whisper`) |
-| `--grammar-rule NAME` | Top-level rule name in the grammar |
+| `-nf`, `--no-fallback` | Disable temperature fallback (equivalent to `--temperature-inc 0`) |
+| `--frequency-penalty F` | Opt-in repeated generated-token penalty for autoregressive ASR backends (`0.0` disabled). Applied to generated output tokens before greedy/sampling selection. |
+| `--grammar FNAME` | GBNF grammar file for constrained whisper decoding |
+| `--grammar-rule NAME` | Top-level rule name in the grammar (default: `root`) |
+| `--grammar-penalty F` | Scales down logits of tokens that violate the grammar (default: `100.0`) |
+| `--alt` | Show alternative token candidates with per-token probabilities (whisper) |
+| `--alt-n N` | Number of alternative token candidates per step (whisper, default: `1`) |
 | `--prompt STR` | Initial prompt for whisper |
+
+## Hotwords / contextual biasing
+
+Supply domain-specific vocabulary that the ASR should prefer when in
+doubt — names, jargon, product terms, place names. Works by boosting
+the log-probability of tokens that continue a matching hotword prefix
+during CTC/TDT decoding (shallow fusion via an Aho-Corasick trie).
+
+| Flag | Meaning |
+|---|---|
+| `--hotwords "A,B,C"` | Comma-separated hotword list |
+| `--hotwords-file FILE` | One hotword per line |
+| `--hotwords-boost F` | Per-token log-prob boost (default: `2.0`) |
+
+Per-word boost suffix: `"Berenz^5.0,NVIDIA^3.0,plain"`.
+
+### Backend coverage
+
+| Mechanism | Backends |
+|---|---|
+| **CTC-WS trie (Phase A)** — token-level logit boost during CTC/TDT decode | parakeet (CTC + TDT) |
+| **LLM prompt injection (Phase B)** — hotwords appended to the system/instruction prompt | qwen3-asr, voxtral |
+| Not applicable | voxtral4b (fixed streaming prompt), granite-nle (NAR, no text prompt), funasr (hardcoded prompt), whisper (use `--prompt` instead) |
+
+### Example
+
+```bash
+# Boost rare names during parakeet CTC decode
+crispasr --backend parakeet -m auto -f meeting.wav \
+    --parakeet-decoder ctc \
+    --hotwords "Berenz,Acme Corp,GPU-PB"
+
+# Same hotwords for qwen3-asr (injected into LLM system prompt)
+crispasr --backend qwen3 -m auto -f meeting.wav \
+    --hotwords "Berenz,Acme Corp,GPU-PB"
+
+# Boost from a file with custom boost values
+crispasr --backend parakeet -m auto -f meeting.wav \
+    --hotwords-file names.txt --hotwords-boost 3.0
+```
+
+### How it works (CTC-WS)
+
+An Aho-Corasick multi-pattern trie is built from the hotword strings
+by tokenizing each word through the backend's SentencePiece vocab.
+Before each frame's argmax, the trie checks which tokens continue an
+active hotword prefix match and adds the boost to their logits. After
+argmax, the trie state advances based on the emitted token. The
+overhead is O(1) per frame — no measurable impact on throughput.
 
 ## Language detection (LID)
 
@@ -423,10 +515,17 @@ crispasr -m auto --backend cohere -f podcast.wav \
 | `xcorr` | stereo | TDOA via cross-correlation, ±5 ms search window |
 | `vad-turns` | mono | Alternates 0/1 every >600 ms gap (mono-friendly proxy) |
 | `pyannote` | mono | Native GGUF pyannote-seg-3.0; runs once globally over the full audio, splits ASR segments at speaker-turn boundaries when per-word timestamps exist. Auto-downloads the GGUF via `--sherpa-segment-model auto` |
-| `sherpa` / `ecapa` | mono | External `sherpa-onnx` subprocess with segmentation + speaker-embedding model. Requires `--sherpa-bin`, `--sherpa-segment-model`, `--sherpa-embedding-model` |
+| `sherpa` / `ecapa` | mono | External `sherpa-onnx` subprocess with segmentation + speaker-embedding model. Since #110, runs once globally over the full audio (not per-slice), producing consistent speaker IDs across the whole file. Splits ASR segments at speaker-turn boundaries when per-word timestamps exist. Requires `--sherpa-bin`, `--sherpa-segment-model`, `--sherpa-embedding-model` |
 
 Bare `--diarize` (no `--diarize-method`) defaults to `energy` for stereo
 input and `vad-turns` for mono — the historical behaviour.
+
+> **Note on global execution (issue #110).** Both `pyannote` and
+> `sherpa`/`ecapa` now run once on the full audio before any VAD/ASR
+> slicing. The global speaker-turn timeline is then used to assign
+> speakers to each per-slice ASR segment, ensuring speaker IDs are
+> consistent across the entire file. Before #110, `sherpa`/`ecapa`
+> ran per-slice, producing local IDs that could reset between slices.
 
 ### `--diarize-embedder MODEL` — globally stable speaker IDs
 
@@ -481,6 +580,7 @@ otherwise they are pyannote-local track IDs.
 |---|---|
 | `-am FNAME`, `--aligner-model FNAME` | CTC aligner GGUF for word-level timestamps |
 | `-n N`, `--max-new-tokens N` | Max tokens the LLM may generate (default 512) |
+| `--frequency-penalty F` | Penalize repeated generated token IDs on supported autoregressive backends. Useful with `-n` as a retry knob after cap-triggered degeneration. |
 
 ## Multi-language / translation
 

@@ -3830,23 +3830,73 @@ CPU**. `CRISPASR_CHATTERBOX_T3_GPU=1` opts back into T3-on-GPU; the
 non-Metal default (CUDA / Vulkan / etc.) is unchanged. Saves ~30 %
 wall time on M1.
 
-### CUDA / Vulkan caveats (untested, inferred)
+### Round 8 (2026-05-23) — CUDA P100 bisect confirms cross-backend compound drift
 
-Round 4–5's claim "affects Metal, Vulkan, and CUDA" was for the
-quantised-mat dot-product divergence (CPU's Q8_K-input path vs GPU's
-F32-input path). That class is genuinely cross-backend. Round 7's
-**compound** drift was only bisected on Metal — the simdgroup-half
-tile path is Metal-specific terminology, but the analogue (CUDA wmma
-F16 fragments, Vulkan cooperative-matrix F16 accumulators) likely
-has similar F16-intermediate roundings that compound the same way
-through the 10-step CFM solver. Until S3Gen-GPU is verified on CUDA
-or Vulkan, the S3Gen-CPU default ships on every GPU backend; T3 GPU
-stays on for non-Metal because Round 4–5's T3 patches handle the
-Q4_K T3 case (mul_mv_q4_K_q8_K kernel) and the AR-loop launch
-overhead is much smaller on discrete GPUs with hardware command
-queues than on M1's unified-memory dispatch path. CUDA + S3Gen-GPU
-re-bisect would tell us whether the same `UNET_PIN_CPU_OP=mul_mat`
-fix path applies there too.
+Ran the same `PIN_CPU_OP` / `KEEP_GPU_OP` sweep on Kaggle P100
+(Tesla P100-PCIE-16GB, compute capability 6.0 / sm_60, CUDA 12.8)
+using a self-contained Kaggle kernel that clones + builds CrispASR,
+generates a ref GGUF on-device, downloads Q8_0 GGUFs, then runs 21
+diff configs with `CRISPASR_DIFF_USE_GPU=1 CRISPASR_CHATTERBOX_FORCE_GPU=1`.
+
+| Config | s3gen_mel cos_min |
+|---|---|
+| Full CPU (control) | 0.999955 |
+| S3Gen on CUDA P100 baseline (no pin) | **0.858455** |
+| `PIN_CPU_OP=mul_mat` | **1.000000** ← FIXES |
+| `PIN_CPU_OP=flash_attn_ext` | **1.000000** ← FIXES |
+| `PIN_CPU_OP=norm` | **1.000000** ← FIXES |
+| `PIN_CPU_OP=add` | **1.000000** ← FIXES |
+| `PIN_CPU_OP=concat` | **1.000000** ← FIXES |
+| `PIN_CPU_OP=unary_gelu` | **1.000000** ← FIXES |
+| `PIN_CPU_OP=unary_tanh` | **1.000000** ← FIXES |
+| `PIN_CPU_OP=unary_softplus` | **1.000000** ← FIXES |
+| `PIN_CPU_OP=unary_mish` | 0.858542 (no effect) |
+| `PIN_CPU_OP=conv_1d` | 0.858348 (no effect) |
+| `KEEP_GPU_OP=<any>` | None (crash — ggml tensor type constraint) |
+
+**Conclusions:**
+
+1. **The compound FP16 drift is not Metal-specific.** CUDA P100
+   shows the same pattern (cos_min 0.858, worse than Metal's 0.923),
+   with the same 8 ops fixing it when individually pinned to CPU.
+
+2. **The fix is cross-backend.** Pinning `mul_mat` (or any of the 7
+   other high-frequency FP16 op types) to CPU forces a dtype
+   round-trip that breaks the drift chain through the 10-step CFM
+   solver. The same `CRISPASR_S3GEN_UNET_PIN_CPU_OP=mul_mat`
+   workaround that restores cos=1.000 on M1 works identically on
+   CUDA P100.
+
+3. **unary_mish and conv_1d are not the drift source.** Consistent
+   with Metal — the mish op was replaced with
+   `softplus+tanh+mul` in Round 6, so there are no `GGML_UNARY_OP_MISH`
+   nodes in the UNet graph; conv_1d's fp32 path on CUDA is already
+   exact.
+
+4. **KEEP_GPU_OP all crash.** Running only one op type on GPU with
+   the rest pinned to CPU triggers a ggml type-constraint violation
+   (GPU output tensors can't feed CPU op inputs without explicit
+   view/copy nodes that the UNet graph doesn't insert). Not a useful
+   fix path.
+
+5. **Next step for a real fix:** Instead of per-op CPU pinning (which
+   adds round-trip overhead), promote the S3Gen UNet1D graph to
+   FP32 on GPU (force `GGML_TYPE_F32` weight loading and remove the
+   FP16 intermediate casts). This matches what PyTorch does on CUDA
+   by default and avoids the compound rounding entirely. Alternatively,
+   enable `GGML_SCHED_MAX_COPIES=1` with an explicit F32-accum
+   prefix on each UNet block's matmul — whichever is cheaper.
+
+6. **Per-op CPU pinning causes NaN in full-pipeline runs.** Attempting
+   to auto-pin `mul_mat` to CPU via `ggml_backend_sched_set_tensor_backend`
+   in a GPU-backed scheduler works correctly in the diff harness (small T=102,
+   no prompt tokens: cos_min=1.0) but produces NaN in the full production
+   pipeline (T≥392, 157 prompt tokens). Any mix of CPU and GPU compute ops
+   in a GPU-backed scheduler causes GPU→CPU tensor copy synchronization
+   failures for large graphs — the NaN appears at denoiser step 0.
+   Per-op CPU pinning is therefore not safe for production. The production
+   fix remains S3Gen on CPU (current default); the mathematically correct
+   fix (UNet FP32 promotion) requires GPU-side kernel changes.
 
 2. **T3 sampling can drift on long technical prompts**. The seed=0
    default is deterministic, but particular prompts produce
@@ -5884,3 +5934,613 @@ doesn't through the same code, compare the config files first.
 **Fix:** Converter reads `audio_adaptor_conf.use_low_frame_rate` from
 `config.yaml` and writes it as a bool GGUF KV. Runtime reads the KV
 at load time, falling back to `true` for pre-fix GGUFs.
+
+### Qwen3-TTS FUSED_QKV bench — cold-cache trap + Q8_0 is neutral on Metal
+
+**Trap:** A naive A/B test of `QWEN3_TTS_FUSED_QKV=1` appeared to show
+a 1.83× speedup (144.7 → 79.0 ms/frame). The "improvement" was a
+**cold-cache artifact**: the baseline run loaded the Q8_0 GGUF from
+`/Volumes/backups/ai/` (external disk) into unified memory and macOS's
+file-page cache. The immediately following FUSED_QKV run benefited
+from those warm pages and appeared faster. Running both cold, or
+properly interleaving the two conditions in sequence, gives:
+~129 ms/frame for baseline, ~129 ms/frame for FUSED_QKV — neutral.
+
+**Rule:** Always interleave conditions (A B A B A B) and discard the
+first cold run of a new binary invocation when benching on macOS.
+The first invocation loads the GGUF from disk; subsequent invocations
+reuse page-cached pages. Alternating order eliminates this confound.
+
+**Why FUSED_QKV is neutral for Q8_0 on Metal:** The optimization
+byte-concatenates Q + K + V weight rows into a single fused tensor so
+one `ggml_mul_mat` replaces three. For F16 weights this reduces Metal
+kernel-launch overhead (three small dispatches → one larger one). For
+Q8_0, Metal's Q8_0 dequant dispatch already launches a GPU threadgroup
+that spans the full head_dim×head_dim tile; fusing to a 4096-output
+tensor doesn't improve parallelism and may slightly hurt cache
+utilization. The net effect on M1 Metal Q8_0 (28L, 1024 d, 8 KV
+heads): no measurable difference.
+
+**F16 case still open:** FUSED_QKV for F16 talkers is untested locally
+(no F16 talker GGUF on this Mac). The expected benefit is real for
+F16 (fewer kernel launches, larger tiles map better to the GPU
+scheduler) — but requires a dedicated bench on a machine with the F16
+GGUF and enough RAM to hold it warm.
+
+**Bench setup used (2026-05-23, M1, build-ninja-compile):**
+```
+QWEN3_TTS_BENCH=1 [QWEN3_TTS_FUSED_QKV=1] \
+  crispasr --backend qwen3-tts-customvoice \
+  -m .../qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf \
+  --codec-model .../qwen3-tts-tokenizer-12hz.gguf \
+  --tts "In the beginning..." --tts-output bench_tmp.wav
+```
+Key output line: `qwen3_tts: ar_loop  N ms (94 frames, X.X ms/frame)`.
+
+---
+
+## WDDM idle-clock-state hysteresis on consumer/laptop NVIDIA SKUs (May 2026)
+
+Issue #81 investigation surfaced a Windows/WDDM behavior that
+dominates **any** chunked-streaming inference perf measurement on
+consumer/laptop NVIDIA GPUs (RTX A1000 Laptop confirmed; almost
+certainly applies to RTX 30/40-series mobile and lower-end GeForce
+desktop too). Knowing this saves days of code-bisecting noise.
+
+### The behavior
+
+A cold dGPU starts at low P-state (P5/P8, ~210-510 MHz core /
+405-810 MHz mem). When compute work arrives, **WDDM does NOT
+immediately boost** to P0/1140 MHz / 5501 MHz mem — it requires
+~5-15 s of *sustained* GPU activity to engage P0, and it
+aggressively defends idle clocks against bursty workloads with
+sub-100 ms kernel groups (which is exactly the shape of chunked
+ASR/TTS inference).
+
+Same DLL, same hardware, same workload, two different states:
+
+| State | mean / chunk | RTx | Notes |
+|---|---:|---:|---|
+| Cold (P5/P8) | 1400 ms | 2.7× | what you get if you bench from idle |
+| Warm (P0)    |  185 ms | 21×  | what the model is actually capable of |
+
+**8× wallclock difference** from nothing but driver-side power
+state. The "real" performance is the warm number.
+
+### Why this matters for ASR specifically
+
+Parakeet / Canary / FastConformer-style ASR runs the encoder
+graph in many short kernel groups (one per 4 s chunk = ~150 ms of
+GPU work + ~50 ms host gap). WDDM sees each gap as "GPU is idle"
+and starts demoting clocks. On a server SKU (Tesla / Quadro with
+TCC mode, or any Linux box) this would never happen — TCC bypasses
+WDDM, and Linux uses a more conservative DVFS. **The problem is
+specific to WDDM on consumer SKUs.**
+
+### What works to mitigate
+
+1. **Pre-warm the dGPU** with ~10 s of sustained CUDA work before
+   measuring. We ship `bench-issue81/gpu_keepalive.py` for this
+   (a tight 256×256 fp32 ORT-CUDA add loop, ~50 MB VRAM,
+   ~1 % util, but enough to keep WDDM in "GPU is busy" mode).
+   For benches, simpler: run the workload-under-test ~200 times
+   as a discard warmup, then measure.
+2. **NVIDIA Control Panel → 3D Settings → Manage 3D Settings**
+   - Global → "Power management mode" → "Prefer maximum
+     performance" (no admin, persists across reboots)
+   - Same setting under Program Settings tab for `python.exe`
+     / `crispasr.exe` (per-app override tends to engage the
+     dGPU more aggressively on Optimus laptops than the global
+     setting alone)
+
+### What does NOT work (counter-intuitive)
+
+1. **`nvidiaProfileInspector.exe -setProfileSetting
+   "_GLOBAL_DRIVER_PROFILE,PreferredPState,1"`** *USED* to help
+   on older drivers (e.g., 581.95) but is **actively harmful on
+   newer drivers** (we confirmed on Studio Driver 596.36): it
+   caps the dGPU at P1 instead of allowing P0, so the GPU
+   underclocks even when work demands max clocks. **Default
+   driver behavior is better than this override on 596.x+.**
+   To remove: `nvidiaProfileInspector.exe -deleteProfileSetting
+   "_GLOBAL_DRIVER_PROFILE,PreferredPState"`. The setting was
+   itself a workaround that newer drivers obsoleted; recheck
+   on every driver bump.
+
+2. **Driver upgrades don't fix it.** We went 581.95 → Studio
+   596.36 mid-investigation; same WDDM behavior, same magnitude
+   of cold-vs-warm gap. The heuristic is OS-side
+   (DXGI/dxgkrnl), not driver-side. Game Ready and Studio
+   variants behave identically.
+
+3. **`nvidia-smi -lgc <freq>`** would force-pin the clock but
+   needs admin per session AND is blocked on consumer SKUs with
+   "user does not have permission" even when elevated.
+
+4. **`gpu_keepalive.py` alone is not enough** if NPI is also
+   set (the keepalive engages WDDM but NPI caps the resulting
+   clock). Use keepalive WITHOUT NPI on 596.x+.
+
+### Practical bench protocol (Windows + laptop NVIDIA)
+
+```powershell
+# 1. Set NV Control Panel "Prefer maximum performance" once (GUI, no admin).
+# 2. Ensure no NPI PreferredPState override is active:
+#    nvidiaProfileInspector.exe -deleteProfileSetting "_GLOBAL_DRIVER_PROFILE,PreferredPState"
+# 3. Set CPU max state to 100% on AC (was 98% by default on some Win11 11):
+#    powercfg -setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX 100
+# 4. Warm WDDM (10+ s of sustained CUDA work):
+python bench-issue81/probe_postsiglu_leak.py <dll> 200
+# 5. Bench immediately:
+python tools/benchmark_asr_engines.py --engine crispasr --crispasr-lib <dll> ...
+```
+
+Single-shot cold benches on this class of hardware are **noise**.
+Report best-of-N back-to-back with warm-up; document the warm-up
+explicitly.
+
+### How this was learned the hard way
+
+Initial measurements on a fresh-rebooted machine showed `dll-postsiglu`
+(current main) at 14.96 s mean vs `dll-post-cg` (May 11 baseline)
+at 5.94 s — a *2.5× regression* that looked like a code bug. We
+wrote a leak-probe (`bench-issue81/probe_postsiglu_leak.py`) that
+called the same DLL 60-150 times in a tight loop, expecting to
+see the per-call time degrade. Both DLLs were rock-stable in the
+probe (157-256 ms per call, GPU memory constant).
+
+The actual difference between the probe and the bench was that
+the probe ran **after** another GPU-intensive bench had just
+finished, so WDDM was already engaged. The bench ran from a
+cold state. After running the probe FIRST, immediately followed
+by the bench, both DLLs returned to ~2.7-2.9 s mean / 175-184 ms
+p50 — matching the original May 11 3.063 s reference closely.
+
+**The "2.5× regression" was a WDDM-state coincidence, not code.**
+The actual `d758fe69` (fused norm_affine + siglu) impact on A1000
+is +5.7 % wallclock improvement when measured cleanly.
+
+### Sources / cross-refs
+
+- PERFORMANCE.md "A1000 Ampere CUDA A/B" + "Phase 1 update
+  (2026-05-23) — fused siglu/norm_affine A1000 verdict"
+- `bench-issue81/probe_postsiglu_leak.py` (the probe itself; also
+  a useful warmup driver)
+- `bench-issue81/gpu_keepalive.py` (the May 11 keepalive — its
+  docstring was already saying *"NPI's 'Prefer maximum
+  performance' only biases up; it doesn't actually pin P0"*, and
+  we now know that even when it does bias up, on modern drivers
+  it biases the wrong direction)
+- Microsoft DXGI WDDM Display Power Management docs (not linked
+  here — search "WDDM idle detection" if you need primary sources)
+
+---
+
+## Chatterbox #83 Round 9 — S3Gen UNet GPU drift on Metal (2026-05-24)
+
+This round is the production-fix landing for the cross-backend GPU
+drift documented in Rounds 7 (Metal bisect) and 8 (CUDA P100 confirm).
+The actual root cause hunt that previous rounds attempted (which
+specific kernel loses precision) finally produced a clear answer:
+**there's no single kernel bug to fix.** The drift is path-dependent
+through `ggml-alloc`'s in-place buffer reuse decisions interacting
+with Metal command-buffer scheduling, and 11 independent fix attempts
+either don't help or trade one failure mode for another.
+
+### Production fix: UNet weight residency split
+
+`src/chatterbox_s3gen.cpp` is the only changed file. On GPU init, the
+910 `s3.fd.*` (UNet1D ConditionalDecoder) weight tensors are loaded
+on the CPU backend buffer via `core_gguf::load_weights_split`; the
+other ~1375 tensors (`s3.fe.*` Conformer encoder, `s3.flow.*` front-end,
+`s3.tok.*` Whisper-style tokenizer, `s3.se.*` CAMPPlus, `s3.v.*` HiFT
+vocoder) stay on the GPU buffer. The ggml scheduler auto-routes ops
+to the backend where weights live, so the entire UNet sub-graph runs
+on the CPU backend in a single backend split — no per-op pinning, no
+GPU↔CPU sync inside the UNet (which is what produced the Round 8 NaN
+at T_mel ≥ 200). M1 Metal `s3gen_mel cos_min`: 0.940 → **0.999980**
+in the diff harness; intelligible audio in smoke at all T.
+
+Wall-time on M1 (3-iter median, "Ask not what your country can do for
+you.", T_mel=200):
+
+| Mode | s/run |
+|---|---|
+| cpu-only | 67.6 |
+| default weight residency (UNet CPU, encoder/vocoder GPU) | 76.8 |
+| gpu residency (broken, produces nonsense) | 48.0 |
+
+The default residency mode is wall-time comparable to pure CPU on M1
+because the encoder/vocoder are a small fraction of total time. The
+gpu-residency mode would be ~30% faster *if* the drift were fixed —
+that's the motivation for upstream PRs 09–11, not a practical win for
+the M1 dev box. On dGPUs (CUDA, larger Metal Pro/Max) the encoder
+fraction is larger and the residency split should buy more.
+
+### Q8_0 × F32 bit-match Metal kernel (committed; upstream PR 09)
+
+`ggml/src/ggml-metal/ggml-metal.metal` gains the Q8_0 counterpart of
+the existing Q4_K × Q8_K `GGML_PREC_F32` bit-match path: pre-quantise
+the F32 input to Q8_0 via `kernel_quantize_q8_0_f32` (mirrors
+`quantize_row_q8_0` ARM NEON), then run a scalar integer-dot
+`kernel_mul_mv_q8_0_q8_0` (mirrors `ggml_vec_dot_q8_0_q8_0_generic`).
+Two precision-critical details:
+
+- `id = 1.0f / d` uses the unrounded F32 `d`, not the F16 round-trip.
+  We initially used `d_back = (float)(half)d` and got cos_min 0.940
+  → 0.947 (basically no change). Switching to the unrounded F32 `d`
+  matters but didn't move the needle on the UNet drift either,
+  because…
+- Quantize rounding uses `rint()` (round-to-nearest-even, IEEE
+  default), which matches ARM NEON's `vcvtnq_s32_f32`. We tried
+  `roundf` semantics (`floor(x + copysign(0.5, x))`) first — also no
+  significant change.
+
+The kernel is bit-identical to CPU on all 350 UNet Q8_0 mul_mats. It
+just doesn't help the UNet drift because the drift isn't in mul_mat
+output. Verified by combining the kernel with weight residency: the
+two are independent.
+
+### The exhaustive bisect — 11 attempts, none surgically fix it
+
+The session pivoted from "find the buggy kernel" to "characterise
+where the drift comes from" after the bit-match mul_mat kernel
+failed to help.
+
+1. **Bit-perfect mul_mat** (the Q8_0 kernel above) → no improvement.
+   Drift isn't in mul_mat output.
+2. **PIN_CPU_OP=mul_mat at T=102 (diff harness)** → cos=1.000.
+   Inserting GPU→CPU→GPU sync at every mul_mat call restores parity.
+3. **Same PIN at T=200 (smoke)** → NaN. Confirmed the Round 8 finding.
+4. **PIN bisect across op types** at T=102: pinning ANY frequent op
+   (norm, mul, add, flash_attn_ext, gelu, reshape, cont, concat,
+   permute, mul_mat) restores cos=1.000. Pinning a sparse op (conv_1d,
+   soft_max, mish, silu, scale) does not. The pattern is op
+   *frequency*, not op identity — sync-barrier density matters.
+5. **Per-segment dump bisect** — wrote a debug knob that dumps UNet
+   intermediates from each sub-block. Discovered along the way that
+   ggml allocator reuses buffers for same-shape outputs (mb_0_out and
+   mb_2_out had identical md5 because the allocator placed them at
+   the same address after compute finished). `ggml_set_output()` on
+   each dumped tensor disables that reuse — required for the dump to
+   yield distinct data.
+6. **`set_output` on all 62 sub-block intermediates** in the diff
+   harness call context → **cos_min = 1.000, max_abs = 0** (bit-perfect).
+   `set_output` on 14 (block-level only) → 0.907 (worse than baseline).
+   `set_output` on 1 (just db_resnet) → 0.879 (worse). Non-monotonic
+   in the number of preservation points.
+7. **Same 62-output set_output in the smoke call context** → NaN at
+   every T tested (T_mel ∈ {38, 58, 66, 68, 244}).
+8. **GGML_NO_INPLACE=1** (global allocator knob to skip the in-place
+   reuse path) → cos = -0.97 (sign-flipped garbage). Some downstream
+   code relies on in-place semantics in ways we couldn't trace.
+9. **GGML_METAL_CONCURRENCY_DISABLE=1** (existing env knob that
+   forces serial Metal command encoding) → no effect on drift.
+10. **`kernel_norm` audit** — `kernel_norm_fuse_impl` uses
+    `float sumf` accumulators end-to-end, F32 `simd_shuffle_xor`
+    reduction, F32 shared memory. Not the source.
+11. **`kernel_flash_attn_ext` audit** — line 6430 downcasts Q from
+    F32 to half: `sq4[j*DK4 + i] = (q4_t) q4[i]` where `q4_t = half4`
+    even in the `FA_TYPES_F32` family. Patched `FA_TYPES_F32`'s Q
+    triple to `float, float4, simdgroup_float8x8` and rebuilt → cos
+    went 0.940 → 0.860 (worse). The F16 Q downcast IS happening but
+    "fixing" it changes the numerical ordering in a way that doesn't
+    bit-match CPU either.
+
+### The remaining unresolved question
+
+Why does `set_output` on all 62 intermediates achieve
+**bit-perfect** parity in the diff harness call context and **NaN**
+in the smoke call context, when the chatterbox model, UNet graph
+topology, CFM solver loop, and seed are all the same? Invariant
+against: random seed, T_mel value, S3-tokenizer presence (.wav vs
+precomputed .gguf voice), Metal concurrency on/off, no-inplace,
+F32-tile Q in flash_attn. The diff-vs-smoke divergence is structural
+in `ggml_gallocr` state across multi-graph sched invocations
+(`chatterbox_synthesize_mel` calls fewer ggml graphs into
+`c->s3gen_ctx->sched` than `chatterbox_synthesize` does before the
+UNet runs), and isolating it would need targeted instrumentation of
+the allocator's per-tensor address decisions. Standalone handover
+prompt prepared in `docs/prompts/`.
+
+### Three upstream PR drafts (`tools/upstream-prs/`)
+
+- **09 metal-q8_0-bit-match** — the kernel above. Concrete patch
+  ready to send to `ggml-org/ggml` (Metal changes can go to either
+  repo per the README).
+- **10 metal-sched-buffer-reuse-drift** — bug report with full
+  bisect evidence. The "set_output on 1 makes it WORSE, on all 62
+  makes it BIT-PERFECT" finding is the smoking gun that points
+  reviewers at `ggml_gallocr_allocate_node`'s reuse-decision-order
+  dependency. No patch — out of scope for an application-side fix.
+- **11 metal-sched-nan-large-t** — bug report for the Round 8 NaN.
+  Same call-context-sensitivity flavour as 10 but at a different
+  symptom level (NaN, not drift).
+
+All three drafts strip CrispASR-internal markers (no `(#83)` refs,
+no internal language) per the standing repo rule
+([[feedback_strip_local_markers]]).
+
+### Lessons for future ggml-drift hunts on Metal
+
+1. **Pin-any-frequent-op-fixes-it is a sync-barrier-density signal,
+   not an op-identity signal.** Don't try to identify "the" buggy op
+   by op-type bisect alone — there isn't one. Each "approximate
+   enough" GPU op contributes; pinning enough of them to CPU resets
+   precision via the sync barrier, regardless of which kernel.
+
+2. **`ggml_set_output` changes allocator reuse decisions in
+   path-dependent ways.** A single `set_output` can make drift
+   *worse* (0.879 < 0.940 baseline). The reuse decision in
+   `ggml_gallocr_allocate_node` depends on traversal order
+   (`p_hn->n_children == 1 && p_hn->n_views == 0` — both vary as
+   markers are added). For an app-side debug knob to work reliably,
+   mark ALL intermediates or NONE, not a subset.
+
+3. **Bit-perfect at small T, NaN at large T** is the canonical Metal
+   shape for "mixed-backend op routing exposes a sync race." Round 7
+   PIN_CPU_OP=mul_mat hit this. Round 9 set_output on 62 hits the
+   same shape from a different angle. Whatever the underlying bug
+   is, it scales with the working-set size of the allocator's reuse
+   pattern.
+
+4. **The diff harness is not a faithful proxy for the production
+   pipeline on Metal.** Same model, same graph, same seed, same T,
+   different result (bit-perfect vs NaN). The diff harness call
+   context goes through `chatterbox_synthesize_mel_from_tokens`
+   which runs fewer ggml graphs into `c->s3gen_ctx->sched` before
+   the UNet; the smoke context goes through `chatterbox_synthesize`
+   which involves more (S3 tokenizer in `--voice .wav` path, plus
+   the vocoder on CPU after). Always test on smoke before claiming a
+   Metal fix.
+
+5. **Weight residency split is the safe production answer.** When
+   you can't fix the GPU compute, push the entire problematic
+   sub-graph to CPU via where the weights live. Avoids per-op
+   pinning races. Cost: forgo the GPU speedup for that sub-graph.
+   On M1 with a small encoder/vocoder shell, that's nearly free.
+
+### Round 9 follow-up (2026-05-24, evening) — correcting items #6, #7, #11
+
+The investigation continued the same day. **Three of the bisect
+items above were wrong**, and the headline "set_output on 62 →
+bit-perfect in diff harness / NaN in smoke" was a measurement
+artifact. The actual bug shape is much tighter.
+
+**The measurement bug.** `compare_with_row_width` in
+`examples/cli/crispasr_diff_main.cpp` aggregated cosine and max_abs
+without checking for non-finite data. When the diff harness output
+is all-NaN, IEEE-754 silently makes every comparison
+short-circuit:
+
+- `if (ad > r.max_abs)` — `NaN > 0.0f` is `false`. `max_abs`
+  stays at its initial `0.0`.
+- `if (denom > 1e-12)` — `sqrt(NaN_sum_sq) > 1e-12` is `false`.
+  The cosine accumulator loop skips every row. `cos_min` stays at
+  initial `1.0f`, `cos_mean` stays at `1.0f`.
+
+Result: `[PASS] cos_min=1.000000 cos_mean=1.000000 max_abs=0.00e+00 rms=nan`.
+The `rms=nan` was visible the whole time but read as
+"cosmetic"; the bogus PASS hid an entirely NaN s3gen_mel. Fixed in
+commit `4c2e54c0` — `Report.n_nonfinite` is tracked, surfaced as
+`non_finite=N/N`, and forces FAIL.
+
+**With the comparison fixed, the actual picture:**
+
+| Config (GPU residency on Metal, T_mel=102) | Result |
+|---|---|
+| baseline (no marks) | PASS cos_min=0.940 (real degradation) |
+| + PRESERVE (~14 block-out marks) | PASS cos_min=0.907 (slightly worse) |
+| + DUMP_UNET (62 marks) | **FAIL non_finite=8160/8160** (all NaN, was bogus PASS 1.000) |
+| + minimal 2-mark trigger (see below) | **FAIL non_finite=8160/8160** |
+| production (CPU residency) | PASS cos_min=0.999980 |
+
+So item #6's "set_output on all 62 → bit-perfect 1.000" was a
+phantom. Item #7's "same 62 → NaN in smoke" was right but
+incomplete; **the diff harness was also producing NaN**, just
+reported as PASS. Item #11's "F32 Q in flash_attn made cos=0.860"
+is also suspect — the comparison was running on whatever data
+the patched flash_attn produced; with NaN content this metric
+isn't meaningful. The bit-match mul_mat (item #1) and the pin
+bisect (items #2–#4) measurements are still valid because their
+output stayed finite.
+
+**The actual minimum trigger.** With commit `1a37f4c8`'s granular
+bisect knobs, the smallest set of marks that flips the Metal UNet
+from "degraded but finite" to "all NaN" is **two specific
+`set_output` calls**:
+
+1. `dump_db_resnet` — output of the first DOWN block's
+   `causal_resnet_block` (shape `(T_mel, 256)`).
+2. Any one of `dump_mb_{0,2,4,6,8,10,11}_out` — output of an
+   *even-indexed* MID block (or `mb_11`, the last one).
+
+Both alone are finite. Together → NaN. The parity is reproducible:
+`mb_{1,3,5,7,9}_out` paired with `dump_db_resnet` produces
+identical finite output (`rms=15.806` deterministic). The same
+2-mark trigger fires in both the diff harness and smoke — the bug
+is **path-independent**. The handover's "diff-vs-smoke
+divergence" was entirely the comparison artifact.
+
+**What that means for the upstream story.** The path-dependence
+narrative from upstream-prs/10 was wrong. The real shape is:
+
+- 2 specific `set_output` marks on a long all-F32 Metal graph
+  cause the Metal kernel chain to write NaN.
+- The parity pattern (even mb_*_out indices trigger; odd don't)
+  strongly suggests buffer aliasing in `ggml_gallocr`: when an
+  even-indexed mb_out and the db_resnet both reserve their own
+  buffers (non-reused), the allocator places them in colliding
+  pool regions. Odd indices land elsewhere.
+- The visible NaN is then "an early kernel reads from a buffer
+  that another kernel is writing to" or "a later kernel reads from
+  the wrong-aligned region of an overlapping buffer."
+
+This is a much more tractable upstream bug than the original
+phrasing. Repro is now self-contained: two env vars + the public
+chatterbox CLI. `tools/upstream-prs/10` rewritten in commit
+[TBD] with the tight repro.
+
+### Updated lessons (replace #2 and #4 above)
+
+2'. **`ggml_set_output` is a no-monotonicity sledgehammer for
+debug.** A single mark CAN make finite output go all-NaN on Metal.
+Don't add `set_output` to "see what's happening at point X" — it
+changes the allocator's reuse map and may invent NaN that wasn't
+in the un-instrumented compute path. The data you dump is data
+the *modified* graph produced, not the *real* graph.
+
+4'. **NaN data must fail the diff harness loudly.** If a tensor
+comparison can silently report `[PASS] cos=1.000 max_abs=0`
+because both data and reference (or just data) contain NaN, all
+your downstream bisect is unreliable. Always count + assert on
+non-finite before consuming cosine/max_abs. Same lesson would
+apply to any other Metric pipeline that aggregates over potentially
+non-finite data.
+
+### Round 9 follow-up #2 (2026-05-24, evening) — gallocr ruled out
+
+The "buffer aliasing in `ggml_gallocr`" hypothesis from the prior
+follow-up is **wrong**. The allocator is correct. The bug is
+elsewhere.
+
+**The instrumentation.** Added a per-node allocator trace
+(`CRISPASR_GGML_ALLOC_TRACE=1`) that emits one line per allocate,
+free, in-place-reuse, view-reuse, and FREE_SKIP_OUTPUT event in a
+diffable single-line format. Captured pass=37 (the first UNet
+allocator pass, n_nodes=2715) for both 1-mark and 2-mark configs.
+
+**The diff.** Of 3044 events in pass=37:
+- 2108 lines diverge (~70%).
+- Exactly +1 FREE_SKIP_OUTPUT and -1 FREE in the 2-mark case
+  (`dump_mb_0_out` now pinned instead of freed).
+- 1312 ALLOC events have shifted offsets.
+- Max chunk-0 offset reached: 8,310,688 (1-mark) vs 8,701,856
+  (2-mark) — exactly +391,168 bytes, the size of `dump_mb_0_out`.
+- Both runs use only chunk 0; no spill to a new chunk.
+
+**The overlap check.** Wrote a script that scans the trace and
+flags any pair of live tensors whose byte ranges overlap inside
+overlapping lifetimes (filtering out the legitimate parent→child
+in-place reuse). Result: **0 overlaps in both configurations.** The
+allocator's plan is correct; no two distinct live tensors share
+bytes. If the bug were aliasing, the script would have flagged it.
+
+**The parity mechanism, finally.** In the 1-mark control trace,
+even-indexed `mb_*_out` tensors are allocated at `chunk=0 offset=0`
+and odd-indexed at `chunk=0 offset=1271296`. The allocator
+naturally alternates them across the two large reusable regions of
+the same shape (391,168 bytes). Pinning a *low-offset* output
+(via `set_output` → `FREE_SKIP_OUTPUT`) blocks reuse of offset=0
+and forces ~1300 downstream allocations to higher offsets. Pinning
+a *mid-offset* output (the odd indices) is local — only a small
+hole, no cascading shift. Hence the even/odd trigger pattern. The
+parity is geometric, not aliasing-driven.
+
+**Where the bug actually is.** It must be at a layer above gallocr:
+- a Metal kernel whose correctness depends on the specific
+  address pattern produced when downstream allocations are shifted;
+- `ggml_metal_op_concurrency_check`'s barrier insertion against the
+  shifted address layout;
+- the Metal output-staging path that handles `set_output`-flagged
+  tensors;
+- or sched-level interaction between OUTPUT tensors and split
+  boundaries.
+
+`GGML_METAL_CONCURRENCY_DISABLE=1` was already negative, so it's
+not the *first-order* barrier check, but it may be the
+output-staging side. Item #6 (`kernel_flash_attn_ext` Q downcast)
+is still a known F32→half precision loss worth a separate PR; it's
+not the 2-mark NaN trigger.
+
+### Updated lesson (replace #2' above)
+
+2''. **`set_output` reshapes the allocator's plan, not its
+correctness.** When a debug `set_output` causes downstream NaN, the
+gallocr plan is still valid (no live-range overlap); what changed
+is the geometric layout of where every subsequent tensor lives.
+The bug surfaced by the mark is in whatever code path is sensitive
+to *which* addresses the kernels run on, not in the allocator
+itself. Before chasing gallocr internals, run the per-node trace
+(`CRISPASR_GGML_ALLOC_TRACE=1`) and confirm with an overlap scan;
+if it's clean, pivot to the backend's kernel/barrier/output paths.
+
+### Toolbox added
+
+| Knob | Effect |
+|---|---|
+| `CRISPASR_GGML_ALLOC_TRACE=1` | One trace line per allocator event |
+| `CRISPASR_GGML_ALLOC_TRACE_MAX_PASSES=N` | Cap to the first N passes (UNet is at pass=37 in the chatterbox CLI smoke path) |
+| `CRISPASR_S3GEN_DUMP_UNET_NO_AUTO_MARK=1` | Lets `DUMP_UNET` dump only tensors kept live by other `MARK_*` knobs — without the implicit "mark every dump point" that triggers the NaN cascade. Required for clean per-stage A/B between CPU and GPU. |
+| `CRISPASR_S3GEN_UNET_PROBE_BLOCK1=<N>` | Inline-probes the N-th `causal_block1d` call within one UNet graph. Names + marks `dump_probe_after_{im2col,mul_mat,conv1d,transpose_in,norm,ln_mul,ln_bias,transpose_out,mish}` so the bug can be bisected within a single resnet block. N=0 is `s3.fd.db.0.0.b1`. |
+
+Trace format:
+```
+ggml-alloc: [TRACE] PASS pass=37 n_nodes=2715 n_leafs=909
+ggml-alloc: [TRACE] ALLOC node=<n> op=<op> buf=<b> chunk=<c> offset=<o> size=<s> inplace_from=- view_src=-
+ggml-alloc: [TRACE] ALLOC_REUSE node=<n> op=<op> ... inplace_from=<parent> view_src=-
+ggml-alloc: [TRACE] FREE node=<n> buf=<b> chunk=<c> offset=<o> size=<s>
+ggml-alloc: [TRACE] FREE_SKIP_OUTPUT node=<n> buf=<b> chunk=<c> offset=<o> size=<s>
+ggml-alloc: [TRACE] PASS_END pass=37
+```
+
+### Round 9 follow-up #3 (2026-05-24, late) — bug localized to the first UNet block; pin workarounds were also a measurement artifact
+
+The new tooling pinned the bug down further. Three things to record:
+
+**1. The bug starts at the very first UNet block.** With
+`CRISPASR_S3GEN_DUMP_UNET_NO_AUTO_MARK=1` and only the marks needed
+to keep `db_resnet` live, the GPU's first `causal_resnet_block`
+output is already wrong: 1280 NaN values across 5 contiguous time
+frames (t=260..264) for every channel (256), in a tensor of shape
+(T=382, C=256). The downstream `set_output`-marked intermediates
+that I previously assumed were the "first" NaN are 100% NaN purely
+by propagation. The PROBE_BLOCK1 path further pins this to inside
+`causal_block1d` (conv1d→norm→mul→add→transpose→mish), and
+because the block2 `causal_conv1d` has `K=3`, its receptive field
+expands the 3-frame NaN slice from block1 conv1d output into a
+5-frame slice at the resnet block boundary.
+
+**2. The bug is not just precision drift; it is structural.** GPU
+vs CPU `db_resnet`: cosine similarity is **-0.09** (essentially
+uncorrelated), magnitude is 10× off (GPU `max_abs=14.6` vs CPU
+`max_abs=1.9`). This is not the kind of error a small FP16
+accumulator drift produces. Setting `GGML_PREC_F32` on conv1d's
+internal `mul_mat` makes no difference (rms 13.938 → 13.942,
+within noise). The wrongness is in the structural arithmetic of
+some Metal kernel chain, not in accumulator precision.
+
+**3. The handover's "pinning any frequent op restores cos = 1.0"
+claim was also a measurement artifact.** Re-tested
+`CRISPASR_S3GEN_UNET_PIN_CPU_OP=norm`, `=mul_mat`, `=add`, `=cont`
+with the fixed `crispasr-diff`. All four now FAIL with
+`non_finite=8160/8160`. The original PASS reports came from the
+pre-`4c2e54c0` harness that silently scored all-NaN as
+`cos=1.000`. So both the "pin to CPU restores baseline" and the
+"set_output on 62 → bit-perfect" claims were the same one
+measurement bug. With it fixed, **no per-op pin currently fixes
+the GPU baseline**. The only working configuration remains the
+production weight-residency split (`s3.fd.*` on CPU).
+
+**4. The bug is layout-dependent and moves with `set_output`.**
+Adding the PROBE_BLOCK1 named outputs cleared the conv1d NaN (its
+intermediates were finite) but pushed the first observable NaN to
+`dump_db_tb_0` (the basic_transformer_block output). The final
+audio was still NaN. This is the classic signal that the bug is a
+GPU kernel correctness issue sensitive to which addresses the
+allocator picks — adding marks shifts addresses and the kernel
+breakage moves.
+
+**Updated lesson (replaces 2'' above):**
+
+2'''. **GPU-residency UNet on Apple Metal is fundamentally broken
+in a way no in-tree workaround addresses.** The production fix
+(weight-residency split) is not just a perf-comparable
+convenience; it is the only configuration that produces correct
+output. Documented per-op pins, single-mark and PRESERVE marks,
+F32 precision hints, and `GGML_METAL_CONCURRENCY_DISABLE` all
+either don't help or actively break it. A real fix needs Metal
+shader-level investigation against the address pattern the
+allocator produces for this graph — out of scope for a normal
+chatterbox session. Until then: `CRISPASR_S3GEN_UNET_GPU_RESIDENCY`
+remains an investigation-only knob, not a user-facing option.

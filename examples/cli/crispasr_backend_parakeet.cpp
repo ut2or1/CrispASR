@@ -8,6 +8,7 @@
 #include "crispasr_backend.h"
 #include "crispasr_backend_utils.h"
 #include "whisper_params.h"
+#include "core/asr_context_bias.h"
 
 #include "parakeet.h"
 
@@ -60,6 +61,17 @@ public:
         return true;
     }
 
+    void warmup() override {
+        if (!ctx_)
+            return;
+        // 0.5 s of silence at 16 kHz — touches mel, encoder, and decoder
+        // graphs once so subsequent calls hit pre-allocated buffers.
+        std::vector<float> silence(8000, 0.0f);
+        parakeet_result* r = parakeet_transcribe_ex(ctx_, silence.data(), (int)silence.size(), 0);
+        if (r)
+            parakeet_result_free(r);
+    }
+
     std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
                                              const whisper_params& params) override {
         std::vector<crispasr_segment> out;
@@ -72,6 +84,15 @@ public:
         // who toggles --temperature back off doesn't keep the previous
         // sampling state from a prior file.
         parakeet_set_temperature(ctx_, params.temperature, params.seed);
+
+        // PLAN #98: CTC-WS hotword phrase boost
+        if (!params.hotwords.empty()) {
+            auto hw = core_context_bias::parse_hotwords(params.hotwords);
+            std::vector<const char*> ptrs;
+            for (auto& s : hw)
+                ptrs.push_back(s.c_str());
+            parakeet_set_hotwords(ctx_, ptrs.data(), (int)ptrs.size(), params.hotwords_boost);
+        }
 
         // Issue #89 / PLAN #104: encoding path selection.
         //
