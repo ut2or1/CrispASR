@@ -19,9 +19,9 @@ permissions:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -64,9 +64,9 @@ jobs:
   # CPU; users on Skylake-X / Ice Lake / Tiger Lake / Sapphire Rapids
   # / Zen 4 can opt into the faster build.
   build-linux-x86_64-avx512:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -102,18 +102,18 @@ jobs:
           files: release/crispasr-linux-x86_64-avx512.tar.gz
           fail_on_unmatched_files: false
 
-  # ── Linux x86_64 CLI — CUDA variant ─────────────────────────────────────────
+  # ── Linux x86_64 CLI — CUDA 12 variant ──────────────────────────────────────
   # Static CLI binary linked with CUDA 12.8. Useful for Kaggle / Colab /
   # any Linux box with an NVIDIA GPU: download, chmod +x, run — no build step.
   # Targets sm_75 (T4), sm_86 (A100/3090), sm_89 (L4/4090), sm_120 (Blackwell)
   # plus sm_120 virtual for future compat. Ships as a self-contained tarball
   # alongside crispasr-quantize so users can convert + run in one download.
   build-linux-x86_64-cuda:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     env:
       CUDA_VERSION: "12.8.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -162,15 +162,133 @@ jobs:
           files: release/crispasr-linux-x86_64-cuda.tar.gz
           fail_on_unmatched_files: false
 
+  # ── Linux x86_64 CLI — CUDA 13 variant (#152) ────────────────────────────────
+  # Same as build-linux-x86_64-cuda but compiled against CUDA 13.0.
+  # CUDA 13 ships a new libcudart.so.13 (not ABI-compatible with .so.12),
+  # so users with CUDA 13 drivers/toolkit need a separate binary.
+  # Targets sm_75 (T4), sm_86 (A100/3090), sm_89 (L4/4090), sm_120 (Blackwell)
+  # plus sm_120 virtual for future compat.
+  build-linux-x86_64-cuda13:
+    runs-on: ubuntu-22.04
+    env:
+      CUDA_VERSION: "13.0.0"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev
+
+      - name: Install CUDA Toolkit 13.0.0
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: '13.0.0'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "nvrtc-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev"]'
+
+      - name: Build
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_CUDA=ON \
+            -DGGML_OPENBLAS=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120a-real;120-virtual" \
+            -DCRISPASR_BUILD_TESTS=OFF \
+            -DCRISPASR_BUILD_EXAMPLES=ON \
+            -DCRISPASR_BUILD_SERVER=OFF
+          cmake --build build --target crispasr-cli crispasr-quantize -j $(nproc)
+
+      - name: Package
+        run: |
+          mkdir -p release/crispasr-linux-x86_64-cuda13
+          cp build/bin/crispasr release/crispasr-linux-x86_64-cuda13/
+          cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-cuda13/
+          cd release && tar czf crispasr-linux-x86_64-cuda13.tar.gz crispasr-linux-x86_64-cuda13/
+          ls -lh crispasr-linux-x86_64-cuda13.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-linux-x86_64-cuda13
+          path: release/crispasr-linux-x86_64-cuda13.tar.gz
+
+      - name: Attach crispasr-linux-x86_64-cuda13.tar.gz to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: release/crispasr-linux-x86_64-cuda13.tar.gz
+          fail_on_unmatched_files: false
+
+  # ── Linux x86_64 CLI — Vulkan variant ──────────────────────────────────────
+  # GPU-accelerated CLI for systems without NVIDIA CUDA (AMD, Intel Arc,
+  # or NVIDIA via the Vulkan ICD). Useful as a fallback in environments
+  # where the CUDA release binary is incompatible. Ships libvulkan
+  # dynamically linked — the host must have a Vulkan-capable driver.
+  build-linux-x86_64-vulkan:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install deps + Vulkan SDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libopenblas-dev
+          # Install LunarG Vulkan SDK (provides libvulkan-dev + glslc).
+          # Ubuntu 22.04 doesn't ship a glslc package; the SDK is the
+          # reliable way to get both headers and the shader compiler.
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list \
+            https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk
+
+      - name: Build
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_VULKAN=ON \
+            -DGGML_OPENBLAS=ON \
+            -DCRISPASR_BUILD_TESTS=OFF \
+            -DCRISPASR_BUILD_EXAMPLES=ON \
+            -DCRISPASR_BUILD_SERVER=OFF
+          cmake --build build --target crispasr-cli crispasr-quantize -j $(nproc)
+
+      - name: Package
+        run: |
+          mkdir -p release/crispasr-linux-x86_64-vulkan
+          cp build/bin/crispasr release/crispasr-linux-x86_64-vulkan/
+          cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-vulkan/
+          cd release && tar czf crispasr-linux-x86_64-vulkan.tar.gz crispasr-linux-x86_64-vulkan/
+          ls -lh crispasr-linux-x86_64-vulkan.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-linux-x86_64-vulkan
+          path: release/crispasr-linux-x86_64-vulkan.tar.gz
+
+      - name: Attach crispasr-linux-x86_64-vulkan.tar.gz to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: release/crispasr-linux-x86_64-vulkan.tar.gz
+          fail_on_unmatched_files: false
+
   # ── Linux ARM64 CLI binaries ─────────────────────────────────────────────────
-  # Mirror of build-linux on GitHub's ubuntu-24.04-arm runner. NEON is the
+  # Mirror of build-linux on GitHub's ubuntu-22.04-arm runner. NEON is the
   # native SIMD path on aarch64, so OpenBLAS adds little — keep it on (same
   # as x86_64) for consistent CPU code paths and easy A/B comparison;
   # `libopenblas-dev` has aarch64 binaries in Ubuntu's apt repo.
   build-linux-arm64:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -203,9 +321,9 @@ jobs:
           fail_on_unmatched_files: false
 
   build-python-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -279,9 +397,9 @@ jobs:
   # ggml backend libs + libcrispasr_helpers.so + $ORIGIN RPATH so the
   # tarball is self-contained.
   build-python-linux-arm64:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -347,7 +465,7 @@ jobs:
   build-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -390,7 +508,7 @@ jobs:
   build-libs-macos-arm64:
     runs-on: macos-latest # arm64 since macos-13 was retired
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -412,7 +530,7 @@ jobs:
             -DCRISPASR_BUILD_EXAMPLES=OFF \
             -DCRISPASR_BUILD_SERVER=OFF
           cmake --build build-libs --config Release \
-            -j $(sysctl -n hw.logicalcpu) --target crispasr
+            -j $(sysctl -n hw.logicalcpu) --target crispasr-lib
 
       - name: Package
         run: |
@@ -457,9 +575,9 @@ jobs:
   # at the extract dir instead of cmake-building from source. CPU + OpenBLAS
   # only — GPU-aware variants (CUDA/Vulkan) are a separate matrix slot.
   build-libs-linux-x86_64:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -476,7 +594,7 @@ jobs:
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
             -DCRISPASR_BUILD_SERVER=OFF
-          cmake --build build-libs --config Release -j $(nproc) --target crispasr
+          cmake --build build-libs --config Release -j $(nproc) --target crispasr-lib
 
       - name: Package
         run: |
@@ -524,9 +642,9 @@ jobs:
   # downstream consumers (crispasr-sys / Dart / wrapper bindings) pull
   # from. See that job's comment for the per-CPU rationale.
   build-libs-linux-x86_64-avx512:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -545,7 +663,7 @@ jobs:
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
             -DCRISPASR_BUILD_SERVER=OFF
-          cmake --build build-libs --config Release -j $(nproc) --target crispasr
+          cmake --build build-libs --config Release -j $(nproc) --target crispasr-lib
 
       - name: Package
         run: |
@@ -587,9 +705,9 @@ jobs:
   # GPU variants for arm64 (CUDA-Jetson, Vulkan-mobile) are out of scope
   # for this round — add separate jobs when there's user demand.
   build-libs-linux-arm64:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -606,7 +724,7 @@ jobs:
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
             -DCRISPASR_BUILD_SERVER=OFF
-          cmake --build build-libs --config Release -j $(nproc) --target crispasr
+          cmake --build build-libs --config Release -j $(nproc) --target crispasr-lib
 
       - name: Package
         run: |
@@ -658,7 +776,7 @@ jobs:
   build-libs-windows-x86_64:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -673,7 +791,7 @@ jobs:
             -DCRISPASR_BUILD_SERVER=OFF `
             -DGGML_NATIVE=OFF `
             -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
-          cmake --build build-libs --config Release -j $env:NUMBER_OF_PROCESSORS --target crispasr
+          cmake --build build-libs --config Release -j $env:NUMBER_OF_PROCESSORS --target crispasr-lib
 
       - name: Package
         shell: pwsh
@@ -722,7 +840,7 @@ jobs:
   build-libs-windows-x86_64-vulkan:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -752,7 +870,7 @@ jobs:
             -DGGML_CUDA=OFF ^
             -DGGML_NATIVE=OFF ^
             -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
-          cmake --build build-libs --config Release -j %NUMBER_OF_PROCESSORS% --target crispasr
+          cmake --build build-libs --config Release -j %NUMBER_OF_PROCESSORS% --target crispasr-lib
 
       - name: Package
         shell: pwsh
@@ -814,11 +932,11 @@ jobs:
   # link against a libcrispasr-cuda tarball typically have CUDA
   # already.
   build-libs-linux-x86_64-cuda:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     env:
       CUDA_VERSION: "12.8.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -834,7 +952,7 @@ jobs:
           # Jimver/cuda-toolkit's `sub-packages` prepends `cuda-` and
           # appends `-12-8`. That works for cuda-nvcc / cuda-cudart /
           # cuda-nvrtc / cuda-nvrtc-dev which all exist as that exact
-          # name in NVIDIA's Ubuntu 24.04 apt repo. cuBLAS is the
+          # name in NVIDIA's Ubuntu apt repo. cuBLAS is the
           # exception: NVIDIA publishes it as `libcublas-dev-12-8`
           # (lib- prefix, not cuda-), so it has to go through
           # `non-cuda-sub-packages` instead.
@@ -851,7 +969,7 @@ jobs:
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
             -DCRISPASR_BUILD_SERVER=OFF
-          cmake --build build-libs --config Release -j $(nproc) --target crispasr
+          cmake --build build-libs --config Release -j $(nproc) --target crispasr-lib
 
       - name: Package
         run: |
@@ -898,7 +1016,7 @@ jobs:
     env:
       CUDA_VERSION: "12.8.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -924,7 +1042,7 @@ jobs:
             -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real;120-virtual" ^
             -DGGML_NATIVE=OFF ^
             -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
-          cmake --build build-libs --config Release -j %NUMBER_OF_PROCESSORS% --target crispasr
+          cmake --build build-libs --config Release -j %NUMBER_OF_PROCESSORS% --target crispasr-lib
 
       - name: Package
         shell: pwsh
@@ -989,7 +1107,7 @@ jobs:
   build-libs-windows-x86_64-cpu-legacy:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -1005,7 +1123,7 @@ jobs:
             -DGGML_NATIVE=OFF `
             -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF `
             -DGGML_AVX=ON
-          cmake --build build-libs --config Release -j $env:NUMBER_OF_PROCESSORS --target crispasr
+          cmake --build build-libs --config Release -j $env:NUMBER_OF_PROCESSORS --target crispasr-lib
 
       - name: Package
         shell: pwsh
@@ -1044,7 +1162,7 @@ jobs:
   build-windows-cpu:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -1084,7 +1202,7 @@ jobs:
   build-windows-cpu-legacy:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -1124,7 +1242,7 @@ jobs:
     env:
       CUDA_VERSION: "12.8.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -1183,7 +1301,7 @@ jobs:
   build-windows-vulkan:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -1259,7 +1377,7 @@ jobs:
   build-android-arm64:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
@@ -1280,7 +1398,7 @@ jobs:
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
             -DCRISPASR_BUILD_SERVER=OFF
-          cmake --build build-android --config Release -j $(nproc) --target crispasr
+          cmake --build build-android --config Release -j $(nproc) --target crispasr-lib
 
       - name: Package
         run: |
@@ -1327,7 +1445,7 @@ jobs:
   # to transient permission issues). softprops won't clobber files that
   # already exist on the release.
   publish:
-    needs: [build-linux, build-linux-x86_64-avx512, build-linux-x86_64-cuda, build-linux-arm64, build-python-linux, build-python-linux-arm64, build-macos, build-libs-macos-arm64, build-libs-linux-x86_64, build-libs-linux-x86_64-avx512, build-libs-linux-arm64, build-libs-linux-x86_64-cuda, build-libs-windows-x86_64, build-libs-windows-x86_64-vulkan, build-libs-windows-x86_64-cuda, build-libs-windows-x86_64-cpu-legacy, build-windows-cpu, build-windows-cpu-legacy, build-windows-cuda, build-windows-vulkan, build-android-arm64]
+    needs: [build-linux, build-linux-x86_64-avx512, build-linux-x86_64-cuda, build-linux-x86_64-cuda13, build-linux-arm64, build-python-linux, build-python-linux-arm64, build-macos, build-libs-macos-arm64, build-libs-linux-x86_64, build-libs-linux-x86_64-avx512, build-libs-linux-arm64, build-libs-linux-x86_64-cuda, build-libs-windows-x86_64, build-libs-windows-x86_64-vulkan, build-libs-windows-x86_64-cuda, build-libs-windows-x86_64-cpu-legacy, build-windows-cpu, build-windows-cpu-legacy, build-windows-cuda, build-windows-vulkan, build-android-arm64]
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:

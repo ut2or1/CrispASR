@@ -1348,6 +1348,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_REPEAT:
         case GGML_OP_CONV_TRANSPOSE_1D:
             return true;
+        // CrispASR patch (PR #160 col2im_1d) — MUST RE-APPLY after ggml bump.
+        case GGML_OP_COL2IM_1D:
+            return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16;
         // CrispASR patch (PR #07-metal-aa-snake-beta) — MUST RE-APPLY after ggml bump.
         case GGML_OP_AA_SNAKE_BETA:
             return op->src[0]->type == GGML_TYPE_F32 &&
@@ -1938,10 +1941,20 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
 }
 
 void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    if (buf->is_shared) {
+    if (buf->is_shared && !getenv("CRISPASR_FORCE_BLIT_COPY")) {
         memcpy((char *) tensor->data + offset, data, size);
+        // CrispASR debug (#83 r9 follow-up #5): probe CPU/GPU cache coherency
+        // hypothesis. CRISPASR_FORCE_DMB=1 inserts a full memory barrier
+        // after the host memcpy so the GPU is guaranteed to observe the
+        // writes when the subsequent Metal command buffer executes.
+        if (getenv("CRISPASR_FORCE_DMB")) {
+            __sync_synchronize();
+        }
         return;
     }
+    // CrispASR debug (#83 r9 follow-up #5): if CRISPASR_FORCE_BLIT_COPY=1,
+    // use the blit-encoder path even for shared-mode buffers, so the GPU
+    // executes a copy command that the next compute submission waits on.
 
     @autoreleasepool {
         // src

@@ -40,7 +40,7 @@ jobs:
 
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Validate compose YAML
         run: |
@@ -52,7 +52,15 @@ jobs:
           print("compose-yaml-ok")
           PY
 
+      - name: Cache smoke-test model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: models/ggml-base.en.bin
+          key: ggml-model-base-en-v1
+
       - name: Download a smoke-test model
+        if: steps.model-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p models cache
           ./models/download-ggml-model.sh base.en
@@ -91,7 +99,7 @@ jobs:
 
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Build Hugging Face Space image
-        run: docker build -f hf-space/Dockerfile -t crispasr-hf-space .
+        run: docker build -t crispasr-hf-space hf-space/

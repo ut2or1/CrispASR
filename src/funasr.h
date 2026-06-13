@@ -47,8 +47,9 @@ struct funasr_context;
 
 struct funasr_context_params {
     int n_threads;
-    int verbosity; // 0=silent 1=normal 2=verbose
-    bool use_gpu;  // false => force CPU backend
+    int verbosity;     // 0=silent 1=normal 2=verbose
+    bool use_gpu;      // false => force CPU backend
+    float temperature; // 0 = greedy argmax (default)
 };
 
 struct funasr_context_params funasr_context_default_params(void);
@@ -57,8 +58,29 @@ struct funasr_context* funasr_init_from_file(const char* path_model, struct funa
 
 void funasr_free(struct funasr_context* ctx);
 
+// Beam search width. 1 = greedy (default); >1 = replay-from-prefix beam.
+void funasr_set_beam_size(struct funasr_context* ctx, int beam_size);
+
+// Language hint for the prompt (matches upstream get_prompt(language=...)).
+// nullptr or "" = default ("语音转写："); "en" / "English" / "中文" etc.
+// = "语音转写成{lang}：". Call before transcribe; sticky across calls.
+void funasr_set_language(struct funasr_context* ctx, const char* lang);
+
 // Transcribe 16 kHz mono PCM. Returns malloc'd UTF-8 string; caller frees with free().
 char* funasr_transcribe(struct funasr_context* ctx, const float* samples, int n_samples);
+
+// Variant that additionally returns per-emitted-token ids + softmax probs.
+struct funasr_result {
+    char* text;
+    int32_t* token_ids;
+    float* token_probs;
+    int n_tokens;
+};
+struct funasr_result* funasr_transcribe_with_probs(struct funasr_context* ctx, const float* samples, int n_samples);
+void funasr_result_free(struct funasr_result* r);
+
+// Single-id detokenize.
+const char* funasr_token_text(struct funasr_context* ctx, int id);
 
 // Pull one intermediate activation out of the pipeline for diff testing.
 // Returns malloc'd F32 buffer; caller frees with free(). *n_out is set

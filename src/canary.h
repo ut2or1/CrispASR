@@ -77,6 +77,19 @@ struct canary_result* canary_transcribe_ex(struct canary_context* ctx, const flo
                                            const char* source_lang, const char* target_lang, bool punctuation,
                                            int64_t t_offset_cs);
 
+// PLAN #114 P3 second half — parakeet-style long-audio entry. Same
+// semantics as canary_transcribe_ex but computes mel for the full audio
+// (so PerFeatureZ uses global statistics — the NeMo convention) and
+// encodes in overlapping mel chunks of `chunk_seconds` with
+// `overlap_seconds` on each side, concatenating encoder outputs and
+// running a single AED decode over the concat. Use this entry for
+// audio longer than ~30 s; the encoder's bidirectional attention
+// amplifies acoustic noise past that window in the single-pass path.
+// chunk_seconds <= 0 → 8 (parakeet's default); overlap_seconds < 0 → 2.
+struct canary_result* canary_transcribe_streamed(struct canary_context* ctx, const float* samples, int n_samples,
+                                                 const char* source_lang, const char* target_lang, bool punctuation,
+                                                 int64_t t_offset_cs, int chunk_seconds, int overlap_seconds);
+
 // Vocabulary helpers
 int canary_n_vocab(struct canary_context* ctx);
 const char* canary_token_to_str(struct canary_context* ctx, int token_id);
@@ -86,6 +99,9 @@ int canary_str_to_token(struct canary_context* ctx, const char* str);
 // softmax instead of argmax. Default 0 keeps the bit-identical greedy
 // path. Sticky on the context until the next call.
 void canary_set_temperature(struct canary_context* ctx, float temperature, uint64_t seed);
+
+// §90 beam-search width. n > 1 activates beam search; n <= 0 clamped to 1 (greedy).
+void canary_set_beam_size(struct canary_context* ctx, int n);
 
 // Hyper-parameters
 int canary_frame_dur_cs(struct canary_context* ctx);

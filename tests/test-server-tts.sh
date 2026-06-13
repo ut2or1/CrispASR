@@ -28,9 +28,11 @@ for arg in "$@"; do
     esac
 done
 
-# Locate the binary.
+# Locate the binary. Prefer build/ (the canonical CMake out tree) so a
+# stale build-ninja-compile/ tree doesn't mask the freshly built binary
+# during local iteration.
 CRISPASR=""
-for cand in build-ninja-compile/bin/crispasr build/bin/crispasr ./bin/crispasr; do
+for cand in build/bin/crispasr build-ninja-compile/bin/crispasr ./bin/crispasr; do
     if [ -x "$cand" ]; then CRISPASR="$cand"; break; fi
 done
 if [ -z "$CRISPASR" ]; then
@@ -71,8 +73,10 @@ echo "Starting crispasr-server on :$PORT (talker=qwen3-tts-customvoice 0.6B)…"
     > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
-# Wait for /health to come up (model load can take 10-30s on M1).
-for i in $(seq 1 60); do
+# Wait for /health. Model load + Metal pipeline-cache build is highly
+# variable on M1 (10-120s); give it a generous window so a cold-cache
+# first run doesn't false-fail.
+for i in $(seq 1 180); do
     if curl -sf "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; then
         break
     fi
@@ -85,7 +89,7 @@ for i in $(seq 1 60); do
 done
 
 if ! curl -sf "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; then
-    echo "ERROR: server did not become ready within 60s. Log:"
+    echo "ERROR: server did not become ready within 180s. Log:"
     cat "$SERVER_LOG"
     exit 2
 fi
@@ -244,6 +248,16 @@ if [ -s "$TMPWAV" ]; then
     assert "WAV starts with RIFF" "RIFF" "$head4"
     bytes89=$(dd if="$TMPWAV" bs=1 skip=8 count=4 2>/dev/null)
     assert "RIFF format is WAVE" "WAVE" "$bytes89"
+    # Sample-rate field (offset 24, 4 bytes LE). qwen3-tts emits at
+    # 24 kHz natively, so the WAV header must declare 24000. Pre-#122
+    # the rate was hardcoded to 24000 at the call site, masking the
+    # mismatch for non-24k backends — this assertion is the regression
+    # guard for the qwen3-tts default branch.
+    rate=$(python3 -c "import struct,sys; f=open('$TMPWAV','rb'); f.seek(24); print(struct.unpack('<I', f.read(4))[0])")
+    assert "WAV sample_rate is 24000 (qwen3-tts native rate)" "24000" "$rate"
+    # Byte-rate (offset 28) and block-align (offset 32) consistency.
+    byte_rate=$(python3 -c "import struct,sys; f=open('$TMPWAV','rb'); f.seek(28); print(struct.unpack('<I', f.read(4))[0])")
+    assert "WAV byte_rate = rate*2 (mono int16)" "48000" "$byte_rate"
     SIZE=$(wc -c < "$TMPWAV" | tr -d ' ')
     if [ "$SIZE" -gt 1000 ]; then
         echo "  ✓ WAV body is non-trivial ($SIZE bytes)"
@@ -420,6 +434,58 @@ code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
     -d '{"input":"x","voice":"nonexistent_voice_name"}' \
     "http://127.0.0.1:$PORT/v1/audio/speech")
 assert "unknown CustomVoice → 500" "500" "$code"
+
+# ─────────────────── voice-clone consent gate ──────────────────────────
+echo
+echo "=== voice-clone consent & spoken_disclaimer ==="
+
+# Voice ending in .wav without consent_attestation → 400
+out=$(curl -s -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"input":"clone test","voice":"clone.wav"}' \
+    "http://127.0.0.1:$PORT/v1/audio/speech")
+assert_contains "clone without consent → 400 consent_required" "consent_required" "$out"
+
+# With consent_attestation → should be accepted (may fail synthesis on
+# CustomVoice which doesn't support .wav cloning, but the consent gate
+# should pass — we check for non-400).
+code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"input":"clone test","voice":"clone.wav","consent_attestation":"I have consent"}' \
+    "http://127.0.0.1:$PORT/v1/audio/speech")
+if [ "$code" != "400" ]; then
+    echo "  ✓ clone with consent passes gate (HTTP $code)"
+    PASS=$((PASS + 1))
+else
+    echo "  ✗ clone with consent still rejected as 400"
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES="$FAILED_NAMES\n    - clone consent gate"
+fi
+
+# spoken_disclaimer=false should be accepted (JSON boolean field).
+# The server should log spoken_disclaimer=no in the CONSENT line.
+code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"input":"disclaimer opt-out","voice":"clone.wav","consent_attestation":"I have consent","spoken_disclaimer":false}' \
+    "http://127.0.0.1:$PORT/v1/audio/speech")
+if [ "$code" != "400" ]; then
+    echo "  ✓ spoken_disclaimer=false accepted (HTTP $code)"
+    PASS=$((PASS + 1))
+else
+    echo "  ✗ spoken_disclaimer=false rejected as 400"
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES="$FAILED_NAMES\n    - spoken_disclaimer opt-out"
+fi
+
+# Verify the audit log records spoken_disclaimer=no
+if grep -q 'spoken_disclaimer=no' "$SERVER_LOG"; then
+    echo "  ✓ audit log records spoken_disclaimer=no"
+    PASS=$((PASS + 1))
+else
+    echo "  ✗ audit log missing spoken_disclaimer=no"
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES="$FAILED_NAMES\n    - audit log spoken_disclaimer"
+fi
 
 # ─────────────────────────── 401 path ────────────────────────────────────
 # Re-running the server with --api-key is heavy; skip unless explicitly

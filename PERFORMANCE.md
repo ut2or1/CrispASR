@@ -34,7 +34,7 @@ and where the gaps are. Last refresh: **2026-05-04** (after PLAN §79 —
 | backend | KV_QUANT | KV_QUANT_K/_V | KV_ON_CPU | N_GPU_LAYERS | notes |
 |---|:-:|:-:|:-:|:-:|---|
 | canary (1B) | ✓ | ✓ | ✓ | · | flash_attn_ext default, -17 % on JFK with q8_0/q4_0 |
-| cohere (2B) | ✓ | ✓ | ✓ | · | flash_attn_ext available; +11 % regression vs cast-on-read on JFK with q8_0/q4_0 — long-form rerun needed before promoting (see PLAN) |
+| cohere (2B) | ✓ | ✓ | ✓ | · | cast-on-read default (13 % faster on 30 s chunks); `CRISPASR_COHERE_FLASH=1` for unchunked long-form (-26 % win at 300 s) — see §5 |
 | kyutai-stt (1B) | ✓ | ✓ | ✓ | · | flash_attn_ext native, quant-safe |
 | firered-asr (900M) | — | — | — | — | inline AED, no exposed transformer KV |
 | moonshine-tiny / streaming | — | — | — | — | tiny decoder, no exposed KV |
@@ -83,13 +83,21 @@ and where the gaps are. Last refresh: **2026-05-04** (after PLAN §79 —
    dGPU should be even more favourable; deferred until a CUDA host
    is available. If a platform regresses, gate via env
    (`CRISPASR_FORCE_CPU_WEIGHTS=1`).
-5. **Cohere flash_attn_ext regresses on short audio.** JFK (~11 s)
-   with q8_0 K / q4_0 V is +11 % slower under flash than under the
-   cast-on-read fallback (canary on the same workload is -17 %, so
-   the kernel works — cohere's cache layout or head dim flips the
-   crossover). Need a multi-minute clip to confirm flash pulls ahead
-   on long-form before promoting it to the recommended path; until
-   then short-form users on cohere should treat flash as opt-in.
+5. **Cohere flash_attn_ext: crossover confirmed (PLAN #73 closeout,
+   2026-06-04).** Long-form rerun on FLEURS EN, VPS x86 CPU, 2
+   threads, `cohere-transcribe-q4_k.gguf`:
+
+   | audio | flash-attn (s) | cast-on-read (s) | delta |
+   |---|---:|---:|---|
+   | 60 s | 202.72 | 179.13 | flash **+13% slower** |
+   | 300 s | 820.37 | 1114.96 | flash **-26% faster** |
+
+   Crossover is between 60 s and 300 s. Flash wins decisively on
+   unchunked long-form (5+ min) due to O(n) vs O(n²) attention scaling.
+   But with default 30 s auto-chunking, each decode pass is short-form.
+   **Recommendation:** cast-on-read is now the cohere default (13%
+   faster on the chunked path that all normal users hit). For unchunked
+   long-form, set `CRISPASR_COHERE_FLASH=1`.
 
 ### Stacking the four knobs
 
@@ -114,6 +122,154 @@ CRISPASR_N_GPU_LAYERS=10 \
 See [`docs/cli.md`](docs/cli.md) "Memory footprint" for the full env-
 var reference and the llama.cpp parity comparison table; HISTORY §79
 for the implementation write-up.
+
+---
+
+## Kaggle T4 GPU — 2026-06-03
+
+Platform: Tesla T4 (16 GB VRAM), 4 CPU threads, CUDA. Commit: latest
+`main` (post `b102060a`). Run via `tools/kaggle-benchmark-all-backends.py`.
+**30 backends tested, 30 pass.** First run to cover all backends added in
+the June 2-3 script completeness audit: granite-4.1-plus, granite-4.1-nar,
+fun-asr-mlt-nano, voxtral4b.
+
+### Speed ranking (11.0 s JFK, Q4_K unless noted, greedy)
+
+| Rank | Backend | RTx | WER | Architecture |
+|---|---|---|---|---|
+| 1 | SenseVoice Small | **17.3x** | 0.0% | Encoder (multitask) |
+| 2 | FastConformer CTC Large | 7.7x | 0.0% | Encoder-CTC |
+| 3 | Data2Vec Base | 6.9x | 4.5% | Encoder-CTC |
+| 4 | Canary 1B | 6.8x | 0.0% | Encoder-AED |
+| 5 | Moonshine Tiny | 6.7x | 9.1% | Encoder-Decoder |
+| 6 | Wav2Vec2 XLSR-EN | 6.4x | 0.0% | Encoder-CTC |
+| 7 | HuBERT Large | 6.2x | 0.0% | Encoder-CTC |
+| 8 | OmniASR CTC 1B v2 | 6.2x | 4.5% | Encoder-CTC |
+| 9 | Cohere Transcribe | 6.1x | 0.0% | Encoder-AED |
+| 10 | Fun-ASR Nano 2512 | 5.5x | 0.0% | Encoder-LLM (enc GPU, LLM CPU) |
+| 11 | Parakeet TDT 0.6B | 5.3x | 0.0% | Encoder-TDT |
+| 12 | Paraformer-zh NAR | 4.3x | 0.0% | Encoder (NAR) |
+| 13 | Qwen3 ASR 0.6B | 4.0x | 0.0% | Encoder-LLM |
+| 14 | GLM ASR Nano | 3.9x | 0.0% | Encoder-LLM |
+| 15 | Mega-ASR 1.7B | 2.6x | 0.0% | Encoder-LLM (qwen3) |
+| 16 | Moonshine Streaming Tiny | 2.5x | 0.0% | Encoder-Decoder |
+| 17 | Granite Speech 1B | 2.5x | 0.0% | Encoder-LLM |
+| 18 | Granite Speech 4.1 2B | 2.4x | 0.0% | Encoder-LLM |
+| 19 | Voxtral Mini 3B | 2.3x | 0.0% | Encoder-LLM |
+| 20 | OmniASR LLM 300M | 1.4x | 4.5% | Encoder-LLM |
+| 21 | Kyutai STT 1B | 1.3x | 0.0% | Encoder-AED |
+| 22 | VibeVoice ASR | 1.2x | 4.5% | Encoder-LLM |
+| 23 | Voxtral 4B Realtime | 0.9x | 0.0% | Encoder-LLM (streaming) |
+| 24 | Granite Speech 4.1 2B+ | 0.8x | 0.0% | Encoder-LLM |
+| 25 | Gemma-4-E2B 2.3B | 0.8x | 9.1% | Encoder-LLM |
+| 26 | Granite Speech 4.1 NAR | 0.6x | 0.0% | Encoder-CTC (non-AR) |
+| 27 | FireRed ASR2 AED | 0.5x | 0.0% | Encoder-AED |
+| 28 | Whisper (base) | 0.4x | 0.0% | Encoder-Decoder |
+| 29 | MiMo-ASR | 0.2x | 0.0% | Encoder-LLM (CPU-forced, #115) |
+| 30 | Fun-ASR MLT Nano 2512 | 0.1x | 0.0% | Encoder-LLM (F16 on CPU) |
+
+### Notes
+
+- **30/30 pass, 24/30 at WER 0.0%** on JFK. The 4.5%/9.1% WER backends
+  have minor word-boundary differences (e.g. "americans" → "americas").
+- **mimo-asr (0.2x RT):** still CPU-forced (PLAN #115 option A). GPU fix
+  landed in `3ef9f87e` (June 2) — needs validation run to flip default.
+- **fun-asr-mlt-nano (0.1x RT):** running F16 (~2 GB) on CPU. Q8_0 quant
+  exists on HF (`cstr/funasr-mlt-nano-GGUF/funasr-mlt-nano-2512-q8_0.gguf`)
+  and should be GPU-safe; switching would recover 5-10x speed.
+### TTS benchmark (same run, P100 GPU)
+
+First comprehensive TTS benchmark across 11 backends. Phrase: "The quick
+brown fox jumps over the lazy dog." Each model auto-downloaded, synthesised,
+output WAV checked for >1 KB, then cleaned up.
+
+| Rank | Backend | Status | Wall (s) | WAV size | Notes |
+|---|---|---|---|---|---|
+| 1 | Piper LessAC Medium | PASS | 3.7 | 103 KB | Fastest TTS, 22 kHz VITS |
+| 2 | SpeechT5 TTS | PASS | 4.6 | 56 KB | 16 kHz, deterministic |
+| 3 | Bark Small | PASS | 16.9 | 245 KB | 3-stage GPT-2, 24 kHz |
+| 4 | Kokoro 82M | PASS | 17.5 | 152 KB | Needs espeak-ng (installed) |
+| 5 | Pocket TTS 100M | PASS | 72.1 | 181 KB | Continuous-latent AR, 24 kHz |
+| 6 | CSM 1B | PASS | 213.4 | 165 KB | Llama-3.2 + Mimi, 24 kHz |
+| 7 | Orpheus 3B-FT | PASS | 269.7 | 205 KB | Llama-3.2 + SNAC, 24 kHz |
+| — | FastPitch 60M | TIMEOUT | >30 | 0 | Timeout too short (30s) |
+| — | F5-TTS v1 Base | FAIL | 4.1 | 0 | Needs `--voice <ref.wav>` |
+| — | Parler TTS Mini v1.1 | TIMEOUT | >180 | 0 | Too slow on CPU path |
+| — | Dia 1.6B | TIMEOUT | >240 | 0 | Too slow on CPU path |
+
+**7/11 pass.** FastPitch needs a longer timeout (model download is slow, not
+inference). F5-TTS requires a reference audio for voice cloning. Parler-TTS
+and Dia are AR LLM-based and need GPU acceleration or longer timeouts.
+
+---
+
+## Kaggle P100 GPU — 2026-05-31
+
+Platform: Tesla P100-PCIE (16 GB VRAM), 4 CPU threads, CUDA **sm_60**
+(auto-detected — the kernel pins `CMAKE_CUDA_ARCHITECTURES` from
+`nvidia-smi compute_cap`, so the build is correct whether the box is a
+T4/P100/A100/L4). Commit: `7bc3ef5b`. Run via
+`tools/kaggle-benchmark-all-backends.py` (now on the shared
+`tools/kaggle/kaggle_harness.py`). **27 backends tested, 26 pass.**
+
+First run to cover all six newly-registered ASR backends (marked †):
+sensevoice, paraformer, mega-asr, granite-4.1, funasr, mimo-asr.
+
+### Speed ranking (11.0 s JFK, Q4_K unless noted, greedy)
+
+| Rank | Backend | RTx | Time | WER | Architecture |
+|---|---|---|---|---|---|
+| 1 | SenseVoice Small † | **19.8x** | 0.6s | 0.0% | Encoder (multitask) |
+| 2 | FastConformer CTC | 8.9x | 1.2s | 0.0% | Encoder-CTC |
+| 3 | Moonshine Tiny | 8.6x | 1.3s | 9.1% | Encoder-Decoder |
+| 4 | Canary 1B | 8.0x | 1.4s | 9.1% | Encoder-AED |
+| 5 | Data2Vec Base | 7.5x | 1.5s | 4.5% | Encoder-CTC |
+| 6 | OmniASR CTC 1B | 7.0x | 1.6s | 9.1% | Encoder-CTC |
+| 7 | HuBERT Large | 6.9x | 1.6s | 0.0% | Encoder-CTC |
+| 8 | Wav2Vec2 XLSR-EN | 6.9x | 1.6s | 0.0% | Encoder-CTC |
+| 9 | Cohere Transcribe | 6.6x | 1.7s | 0.0% | Encoder-AED |
+| 10 | Parakeet TDT 0.6B | 6.0x | 1.8s | 0.0% | Encoder-TDT |
+| 11 | Whisper base | 5.6x | 2.0s | 0.0% | Encoder-Decoder |
+| 12 | Paraformer-zh NAR † | 5.0x | 2.2s | 0.0% | Encoder (NAR) |
+| 13 | GLM ASR Nano | 4.7x | 2.4s | 0.0% | Encoder-LLM |
+| 14 | Qwen3 ASR 0.6B | 4.4x | 2.5s | 0.0% | Encoder-LLM |
+| 15 | Moonshine Streaming Tiny | 2.9x | 3.8s | 0.0% | Encoder-Decoder |
+| 16 | Mega-ASR 1.7B † | 2.9x | 3.9s | 0.0% | Encoder-LLM (qwen3) |
+| 17 | Granite Speech 1B | 2.8x | 3.9s | 0.0% | Encoder-LLM |
+| 18 | Granite Speech 4.1 2B † | 2.7x | 4.1s | 0.0% | Encoder-LLM |
+| 19 | Voxtral Mini 3B | 2.5x | 4.4s | 0.0% | Encoder-LLM |
+| 20 | OmniASR LLM 300M | 1.6x | 7.0s | 4.5% | Encoder-LLM |
+| 21 | Kyutai STT 1B | 1.5x | 7.5s | 0.0% | Encoder-AED |
+| 22 | VibeVoice ASR | 1.3x | 8.6s | 4.5% | Encoder-LLM |
+| 23 | Voxtral 4B Realtime | 0.9x | 11.9s | 0.0% | Encoder-LLM |
+| 24 | Gemma-4-E2B 2.3B | 0.8x | 13.6s | 0.0% | Encoder-LLM |
+| 25 | FireRed ASR2 AED | 0.6x | 19.2s | 0.0% | Encoder-AED |
+| 26 | MiMo-ASR † | 0.3x | 38.0s | 0.0% | Encoder-LLM (CPU-forced, #115) |
+| 27 | FunASR Nano † | ~1.0x | ~10.6s | 0.0% | Encoder-LLM (enc GPU, LLM CPU) |
+
+### Notes
+
+- **funasr is FIXED (§136, 2026-06-01).** The original benchmark showed
+  6.0× RT / 1.8s but **100% WER** — the `ggml_backend_sched` produced
+  all-NaN logits on CUDA (issue #125). The fix (`f94fec90`) splits
+  weights: encoder on GPU, LLM+KV on CPU. Now ~1.0× RT / 10.6s wall-clock
+  (including model load) with **0% WER**. Slower than the broken all-GPU
+  run because the Qwen2-0.6B decode is CPU-bound. The encoder (70 SANM
+  blocks) still benefits from GPU — for longer audio the encoder
+  dominates and the GPU speedup matters more. `FUNASR_LLM_GPU=1`
+  overrides to all-GPU for future testing once the upstream sched bug
+  is fixed.
+- **SenseVoice debuts at #1** (19.8× RT, 0% WER) — encoder-only multitask
+  model, fastest backend now measured.
+- **mimo-asr** runs at 0.3× (38 s) because PLAN #115 forces it to CPU; it
+  transcribes correctly. The 420 s timeout budgeted for it was ample.
+- P100 (sm_60, ~9.3 TFLOPS fp32) lands the LLM-AR tail a touch faster than
+  the 2026-04-26 T4 run (e.g. voxtral-3B 2.5× vs 2.4×, granite-1B 2.8× vs
+  1.7×); CTC/encoder backends are comparable. Cross-run deltas are also
+  affected by Q4_K model refreshes since April.
+- Two non-fatal HF pre-download `401`s (the Kaggle Secrets API was
+  flaking, so no HF token) fell back to the C++ downloader; all models are
+  public `cstr/*` so downloads still succeeded.
 
 ---
 
@@ -1131,6 +1287,56 @@ JSON sidecars (clean, WDDM-warm):
 reference): `a1000-{post-cg,postsiglu}-q8_0-driver596-10r.json`.
 New sched-debug log: `bench-issue81/sched-debug-postsiglu.log`.
 
+#### Phase 1 update (2026-05-24) — FA per-head mask lands (#06)
+
+Per-head additive mask in `FLASH_ATTN_EXT` now runs on CUDA
+(MMA-F16 path) behind `GGML_CUDA_CRISPASR_FA_PERHEAD_MASK=ON`.
+Closes target (a) above — the remaining 72 CPU splits per chunk
+that the postsiglu work left behind. Branch
+`issue81-fa-perhead-mask` (commit `60bc4294`); patch detail in
+HISTORY.md §92 and `tools/upstream-prs/06-cuda-fa-perhead-mask.md`.
+
+**Structural impact (sched-debug, short clip / 3 chunks):**
+
+| count | postsiglu (FA OFF, May 23) | FA ON (May 24) |
+|---|---:|---:|
+| total SPLIT lines | 147 | **3** |
+| CPU splits | 72 | **0** |
+| CUDA0 splits | 75 | 3 |
+| `FLASH_ATTN_EXT` on CPU | 72 | **0** |
+| `FLASH_ATTN_EXT` total nodes | 72 | 72 (all CUDA0) |
+
+Each chunk now runs as a single CUDA0 split — no per-layer
+CPU↔GPU round trip, no per-FA scheduler break. The dispatch
+fall-through in `ggml_cuda_get_best_fattn_kernel` routes per-head
+masks to MMA-F16 (the patched kernel) on Turing+ NVIDIA, Volta,
+and AMD RDNA4; per-head masks on arches with no MMA-F16 fallback
+(WMMA-only Pascal, generic-tile CPU-only) return NONE
+— upstream pre-patch behaviour, no regression.
+
+**Wallclock A/B (this session — GPU stuck in P8 / 315 MHz both
+runs; treat as cold-GPU lower bound, not the warm-GPU target):**
+
+| audio | OFF (`dll-postsiglu`) | ON (`dll-faon`) | delta |
+|---|---:|---:|---:|
+| short clip (11 s JFK, 9 calls) | 2.526 s / 490.1 ms p50 | **1.587 s / 368.1 ms p50** | −37 % mean, −25 % p50 |
+| long clip (60 s tiled, 150 calls) | 12.450 s / 500.3 ms p50 | 12.204 s / 467.7 ms p50 | −2 % mean, −6.5 % p50 |
+
+The short-clip 37 % win and the structural 0-CPU-split result
+are unambiguous. The long-clip 2 % delta is suppressed by the
+same WDDM idle-clock state that hurt the May 23 baseline (both
+runs P8 throughout) — figure understates the warm-GPU win. The
+`probe_postsiglu_leak.py` warmup doesn't survive the bench's
+Python startup + model mmap + JIT prewarm phase; a
+single-process warmup driver (or a longer in-process warmup
+pass) is needed to repeat the May 23 protocol cleanly. Target
+on warm GPU: ~2.4 s long-clip mean / ~150 ms p50 / RTx ~24×.
+
+JSON sidecars: `bench-issue81/results/wer-{off,on}.json`
+(correctness), `bench-issue81/results/a1000-fa-{off,on}.json`
+(wallclock cold-GPU), `bench-issue81/sched-debug-fa{off,on}.log`
+(split-count A/B).
+
 ---
 
 ## Reproduce
@@ -1212,33 +1418,49 @@ Test audio: first 60 s of the issue #89 reporter's exact YouTube clip
 
 ### Issue #89 fix verification — parakeet-tdt-0.6b-ja
 
-**Final state (NeMo-style streamed pipeline, commit `97d2b4f`):**
+**Final state — streamed encoding is always on (default
+`CRISPASR_PARAKEET_STREAM_THRESHOLD=0`, see commit "always route
+parakeet through streamed encode").**
 
-Audio ≤60 s uses single-pass encoding (best quality).  Audio >60 s uses
-the streamed pipeline: global z-norm + overlapping 8 s encoder chunks +
-single TDT decode pass.
+Global z-norm + overlapping 8 s encoder chunks + single TDT decode pass.
 
-| path | chars | first_ts | last_ts | coverage% | gaps | notes |
-|---|---:|---:|---:|---:|---:|---|
-| **auto (single-pass ≤60 s)** | **294** | **0.16** | **59.84** | **99.5** | **0** | **default for ≤60 s** |
-| **auto (streamed >60 s)** | **294** | **0.16** | **59.84** | **99.5** | **0** | **default for >60 s** |
-| `STREAM_THRESHOLD=0` (forced streamed) | 294 | 0.16 | 59.84 | 99.5 | 0 | identical to single-pass |
-| `--vad` (silero) | 281 | 0.36 | 59.87 | 93.1 | 1 | VAD segmentation |
-| `--vad --vad-model firered` | 238 | 0.28 | 58.01 | 85.1 | 1 | firered VAD |
-| old: 30 s independent chunks | 195 | 0.16 | 58.02 | 59.7 | 2 | **pre-fix (broken)** |
-| old: 60 s auto-chunk | 0 | — | — | 0.0 | — | **pre-fix (catastrophic)** |
+The earlier "single-pass ≤60 s" default produced 99.5 % coverage on the
+cached MP3-derived copy of the reporter's clip but only ~33 % on a
+fresh `yt-dlp` extract of the same YouTube video (lenhone, issue #89
+comment 4529025103). Both extracts are perceptually identical
+(duration 60.000 s, 0.998 waveform correlation, ~0.3 % RMS diff from
+codec quantization) but the FastConformer encoder's full-clip
+bidirectional attention amplified that quantization noise enough
+(encoder output std differed by 14 %: 0.2069 vs 0.2415) to drive the
+TDT decoder into emit-blank-forever past frame 250 (≈20 s). The
+streamed path keeps attention local to 8 s windows, so codec
+perturbations don't amplify and the decoder runs to the end.
+
+| path | audio | chars | first_ts | last_ts | coverage% | gaps |
+|---|---|---:|---:|---:|---:|---:|
+| **streamed (default)** | reporter's MP3-derived `yt_60s.wav` | **309** | **0.00** | **55.84** | **~99** | **0** |
+| **streamed (default)** | fresh `yt-dlp` Opus→PCM `o_9dWkRPYC0_60s.wav` | **314** | **0.00** | **55.84** | **~99** | **0** |
+| old: single-pass ≤60 s | reporter's MP3-derived `yt_60s.wav` | 309 | 0.16 | 59.84 | 99.5 | 0 |
+| old: single-pass ≤60 s | fresh `yt-dlp` Opus→PCM `o_9dWkRPYC0_60s.wav` | 91 | 0.16 | 20.08 | **~33** | 0 |
+| `--vad` (silero) | reporter's MP3-derived | 281 | 0.36 | 59.87 | 93.1 | 1 |
+| `--vad --vad-model firered` | reporter's MP3-derived | 238 | 0.28 | 58.01 | 85.1 | 1 |
+| old: 30 s independent chunks | reporter's MP3-derived | 195 | 0.16 | 58.02 | 59.7 | 2 |
 
 **Key findings:**
-- The NeMo-style streamed pipeline gives **99.5 % coverage** — identical
-  to single-pass encoding — by using global z-norm (computed over the full
-  audio) with chunked encoding (8 s chunks for safe memory usage).
-- `--vad` (silero) gives 93 % coverage with speech-boundary segmentation.
-  Useful when you want per-utterance SRT entries rather than continuous
-  transcription.
-- The old 30 s independent-chunk approach (pre-fix) lost content due to
-  TDT decoder cold-start on each chunk (each chunk reset the LSTM state).
-- **Recommendation for Japanese:** just run `crispasr -m parakeet-tdt-0.6b-ja.gguf
-  -f audio.wav -osrt` — the auto path handles any duration.
+- Single-pass encoding over the full clip is **not robust**: a 0.3 %
+  RMS difference between two codec-quantized copies of the same speech
+  flips the encoder into emit-blank mode at the 20 s mark on one and
+  not the other. The streamed path is robust to that perturbation.
+- The streamed pipeline gives ~99 % coverage on both audio variants.
+- `--vad` (silero) gives 93 % coverage with speech-boundary
+  segmentation.  Useful when you want per-utterance SRT entries rather
+  than continuous transcription.
+- The old 30 s independent-chunk approach (pre-fix) lost content due
+  to TDT decoder cold-start on each chunk (each chunk reset the LSTM
+  state).
+- **Recommendation for Japanese:** just run `crispasr -m
+  parakeet-tdt-0.6b-ja.gguf -f audio.wav -osrt` — the default routes
+  through streamed and handles any duration on any audio source.
 
 ### Robustness validation — 2026-05-23
 
@@ -1246,6 +1468,15 @@ Full sweep on the reporter's 60 s clip (commit `0c24178e`, CPU-only).
 Streamed pipeline output is **byte-identical to single-pass** across
 every chunk/overlap combination tested — the global z-norm makes chunk
 boundaries transparent to the TDT decoder.
+
+> **Caveat (added 2026-05-24).** The "identical to single-pass" column
+> below is only true on the cached MP3-derived audio (`/mnt/storage/
+> samples/o_9dWkRPYC0.mp3` → `yt_60s.wav`). On a fresh `yt-dlp` extract
+> of the same YouTube video, single-pass collapses to ~20 s of output
+> while streamed still covers the whole clip — see the "single-pass
+> not robust" finding above. The streamed-vs-streamed numbers across
+> chunk and overlap sizes (300+ chars, 99 %+ coverage) hold across
+> both audio derivations.
 
 **Chunk-size sweep** (streamed, overlap=2 s):
 
@@ -1350,16 +1581,287 @@ definitions and `tests/test_benchmark_metrics.py` for 14 pytest unit
 tests that validate the computation (including the issue #89 failure
 signature: <5 % coverage on 300 s audio).
 
+### Multi-backend long-form Japanese — 120 s sweep (2026-05-24, issue #89 follow-up)
+
+Test audio: first **120 s** of the issue #89 reporter's exact YouTube
+clip (`o_9dWkRPYC0`, fresh `yt-dlp` Opus→WAV extract, the file lenhone
+actually reports against — md5 `d1f2ef…`, *not* the cached MP3-derived
+copy). Apple M1 Metal, default flags unless noted.
+
+Speech runs out around 01:37; the remaining ~22 s is short pause +
+follow-on talking. All "covers full speech" rows below land around
+01:37 → 02:00.
+
+| backend | mode | segments | first → last ts | coverage | notes |
+|---|---|---:|---|---|---|
+| **parakeet-tdt-0.6b-ja** (default, streamed TDT) | full | 12 | 0:00 → 1:37.84 | full speech | post-fix `33f9a162` |
+| **parakeet-tdt-0.6b-ja** + `--vad` | full | 14 | 0:00 → 1:58.39 | full speech | cleaner per-utterance |
+| **parakeet-tdt-0.6b-ja** + `--parakeet-decoder ctc` (hybrid CTC head) | full | 12 | 0:00 → 1:37.84 | full speech | byte-identical to streamed-TDT — confirms encoder is fine |
+| **parakeet-tdt-0.6b-ja** + `STREAM_THRESHOLD=999` (forced single-pass) | full | many | 0:00 → ~14 s then kana-by-kana fragmentation | **broken** | the issue #89 bug; reproduces the lenhone complaint |
+| **sensevoice-small** (CTC, multilingual) | `--vad` | 13 | 0:00 → 2:00 | full speech | accurate, minor JA glitches (`スピーク**ジャ**プネス**ナチャパ**`); 19.8× RT |
+| **voxtral-mini-3b** (LLM AR, multilingual) | default chunking | partial | 0:00 → 0:27 then 1:47 → 2:00 | **drops 0:27 → 1:47 (~80 s)** | LLM decoder loses a middle chunk |
+| **cohere-transcribe** (Conformer, multilingual) | default chunking | 4 | 0:00 → 1:53 | **sparse with multi-tens-of-seconds gaps** | only ~0:00, 0:50, 1:18, 1:48 anchors |
+| **canary-1b-v2** (NeMo multilingual seq2seq) | default | broken | n/a | hallucinates `"I am not aware of anything"` in English | needs proper language-prompt wiring; out of scope here |
+
+**Best on this 120 s clip:** parakeet-tdt-0.6b-ja (post-fix, streamed
+TDT) and sensevoice-small are tied — both produce full speech coverage
+with sentence-level segmentation. Parakeet via the CTC head produces
+*byte-identical* output to streamed-TDT, which confirms the encoder
+isn't the problem: only TDT-decoded-over-the-full-utterance is.
+
+**The new finding (voxtral, cohere):** these aren't parakeet-specific
+failures. voxtral and cohere both drop the middle of a 120 s clip on
+this audio, with different symptoms:
+
+- **voxtral-mini-3b**: LLM decoder loses one middle chunk entirely
+  (segments span 0:00 → 0:27, then skip to 1:47 → 2:00). The chunker
+  hands the AR decoder its middle window, the decoder either runs to
+  max_new_tokens before catching up to the audio or skips ahead via
+  prompt conditioning that misfires on this clip. Not investigated
+  deeply yet; this is an open follow-up — see PLAN #114.
+- **cohere-transcribe**: at the default chunk size, the energy chunker
+  hands the encoder a small number of long slices and the Conformer
+  encoder hits a similar long-bidirectional-attention-amplifies-noise
+  regime as parakeet single-pass on lenhone's audio. Only ~4 segments
+  emitted across 120 s, with gaps of tens of seconds between them.
+
+**Upstream behaviour for the same long-form failure:**
+
+- **NeMo parakeet / canary**: stock `model.transcribe()` does single-
+  pass over the full utterance (verified locally — NeMo's own
+  `transcribe()` produces 47 chars and stops at ~20 s on the same
+  lenhone WAV, *exactly* matching our pre-fix single-pass). For long
+  audio NeMo ships `nemo.collections.asr.parts.utils.streaming_utils.
+  BatchedFrameASRTDT` / `FrameBatchChunkedCTC` and
+  `nemo.collections.asr.parts.utils.transcribe_utils.
+  get_buffered_pred_feat_rnnt`, plus the
+  `examples/asr/asr_chunked_inference/rnnt/speech_to_text_buffered_
+  infer_rnnt.py` reference script. Our `parakeet_transcribe_streamed`
+  is the same shape: global-z-norm + chunked encode + single TDT
+  decode, with overlap-skip on chunk boundaries. The difference is
+  ours is now the default; upstream `transcribe()` is not.
+- **Mistral voxtral**: the reference HuggingFace integration chunks at
+  ~30 s with overlap; the long-form failure we see at 120 s is partly
+  an artefact of how our energy-chunker hands the slices to the LLM
+  decoder (not upstream-identical chunking).
+- **Cohere Transcribe**: the released model is intended for
+  ≤ a few minutes per call; the hosted product does server-side VAD +
+  chunking, the released weights do not.
+
+**Implication.** The "default fine on a single transcribe() call over
+the whole file" affordance is fragile across this whole class of
+models. Going forward we should probably treat *every* `CAP_UNBOUNDED
+_INPUT` backend the way we now treat parakeet: ship a chunked /
+streamed default that the user doesn't have to opt into. See PLAN
+#114 for the open architectural question and the per-backend ladder.
+
+### Cross-length × cross-backend matrix — 60 / 120 / 300 / 600 s (2026-05-25)
+
+Same audio (lenhone's fresh `yt-dlp` extract), extended to longer
+durations. Linux x86 CPU on the issue #89 VPS (`168.119.190.252`),
+sequential to avoid memory contention (we paused / split the queue
+when the kernel went into thrash territory). `tools/longform_vps.sh`
+is the harness; `tools/analyze_longform.py` parses the per-cell
+JSON output.
+
+> **Matrix v1 vs v2 (2026-05-25 afternoon recheck).** The numbers
+> below were collected in two passes. The first pass (matrix v1)
+> ran on the VPS binary `bd8b98cf` (May 24), which **predates** the
+> per-backend opt-out fixes for cohere (`dc2295b2`), gemma4-e2b /
+> glm-asr (`46f6848d`), kyutai-stt (`eaee2319`), and voxtral
+> (`6fef8790`) that landed during the matrix run. Those fixes
+> remove an external overlap-save context wrap that the LLM-decoder
+> backends couldn't trim back from correctly. Their pre-fix coverage
+> of ~9-65 % at 120 s+ was driven by the wrap, not the model
+> architecture. **Matrix v2 (post-opt-out, rebuilt VPS binary
+> `13059e0c`)** shows the true post-fix behaviour. Both passes are
+> kept so the reader can see the cost of the missing opt-out.
+
+**Coverage % (covered span / clip duration, computed from segment
+timestamps).** Higher = better. Bold = best at that length.
+
+**Matrix v2 (post-opt-out, what main looks like today):**
+
+| backend / mode               |  60 s |  120 s |   300 s |   600 s |
+|---|---:|---:|---:|---:|
+| **parakeet streamed-TDT** (default)       | **93.1** | 81.5 | **96.6** | **99.3** |
+| parakeet CTC head (byte-identical)        | **93.1** | 81.5 | **96.6** | **99.3** |
+| **voxtral-mini-3b** (default chunking)    | **100.0** | **100.0** | **100.0** | wall-time timeout (`rc=124` at 900 s in 15 min limit; LLM-AR CPU-bound, not a coverage failure) |
+| **voxtral-mini-3b** streamed (option A — this PR's pipeline) — single LLM context | **100 %**, 11 segs / 470 chars | **100 %**, 527 chars | **100 %**, 1276 chars / 863 tokens (post-`a5165c84` max_new scaling fix; was 781 chars / 512-tok cap pre-fix) | hung on contended M1 (80 MB free out of 16 GB → Metal allocator stall — see HISTORY 2026-05-25 (late) "Distinguishing slow vs hung run") |
+| **cohere-transcribe** (default chunking)  | **96.3** | **97.9** | **98.1** | **97.9** (22 segs, full 0:00 → 10:00, 577 s wall) |
+| parakeet single-pass (`STREAM_THRESHOLD=999`, opt-in regression bait) | 33.2 | 81.7 | **1.5** | 99.9 |
+| parakeet + `--vad` (silero)               | 86.7 | 82.0 | 76.3 | 84.0 |
+| canary-1b-v2                              | (still hallucinates English at every length — separate prompt-wiring bug, PLAN #114 P3) | | | |
+
+**Largest gap (seconds) between consecutive segments, matrix v2:**
+
+| backend / mode               |  60 s |  120 s |   300 s |   600 s |
+|---|---:|---:|---:|---:|
+| parakeet streamed-TDT                | 0.0 | 0.0 | 0.0 | 0.0 |
+| voxtral default (post-opt-out)       | 0.0 | 0.0 | 0.0 | timeout |
+| cohere default (post-opt-out)        | 1.2 | 1.2 | 1.2 | 2.2 |
+
+The pre-fix gap pathologies — voxtral 21.9 / 78.2 / 240.9 / 545.5 s and cohere up to 50 s — are entirely gone with the opt-out fixes. What remains is the cohere baseline ~1.2 s gap between chunks (natural energy-chunker boundaries, well under a sentence pause).
+
+**Wall time (s), matrix v2:**
+
+| backend / mode               |  60 s |  120 s |   300 s |   600 s |
+|---|---:|---:|---:|---:|
+| voxtral default (post-opt-out)       | 237 | 393 | 834 | timeout (>900 s) |
+| cohere default (post-opt-out)        |  70 | 125 | 290 | 577 |
+
+cohere is consistently ~2× realtime at 300-600 s on VPS x86 CPU. voxtral-mini-3B is ~1.4-2× slower than cohere at the same length (LLM AR decode at 3 B params) and hits the wall around the 10 min mark. Apple Silicon Metal would close most of that gap — the LLM-AR rows on Mac are typically 5-10× faster than x86 CPU on this size class.
+
+**Matrix v1 (pre-opt-out, kept as historical reference for what we
+fixed):**
+
+| backend / mode               |  60 s |  120 s |   300 s |   600 s |
+|---|---:|---:|---:|---:|
+| **parakeet streamed-TDT** (default)        | **93.1** | 81.5 | **96.6** | **99.3** |
+| **parakeet CTC head**                       | **93.1** | 81.5 | **96.6** | **99.3** |
+| parakeet single-pass (`STREAM_THRESHOLD=999`) | 33.2 | 81.7 | **1.5** | 99.9 |
+| parakeet + `--vad` (silero)                 | 86.7 | **82.0** | 76.3 | 84.0 |
+| voxtral-mini-3b (default chunking)          | 63.5 | 34.8 | 19.7 | 9.1 |
+| cohere-transcribe (default chunking)        | **95.0** | **91.5** | 58.8 | 61.8 |
+| cohere-transcribe + `--vad`                 | **96.8** | 90.8 | **92.5** | **91.4** |
+| canary-1b-v2 (default)                      | 99.7* | 99.9* | 99.3* | OOM (rc=137) |
+
+*Canary's coverage% is misleading — the transcribed text is `"I am not aware of anything, I am not aware of…"` (English) at every duration. It's a separate language-prompt-wiring bug, not a long-audio bug. See PLAN #114 P3.
+
+**Largest gap (seconds) between consecutive emitted segments** —
+catches the "drops a middle chunk" failure that the coverage% can
+under-report when the missing region is bracketed by emitted text on
+both sides.
+
+| backend / mode               |  60 s |  120 s |   300 s |   600 s |
+|---|---:|---:|---:|---:|
+| parakeet streamed-TDT                       |  0.0 |  0.0 |  0.0 |  0.0 |
+| parakeet CTC head                           |  0.0 |  0.0 |  0.0 |  0.0 |
+| parakeet single-pass                        |  0.0 |  0.0 |  0.0 |  0.0 |
+| parakeet + `--vad`                          |  5.8 | 12.0 | 30.1 | 30.1 |
+| **voxtral-mini-3b**                         | **21.9** | **78.2** | **240.9** | **545.5** |
+| cohere-transcribe                           |  0.0 |  3.4 | **50.0** | **50.0** |
+| cohere-transcribe + `--vad`                 |  1.4 |  4.2 |  4.2 | 19.0 |
+| canary-1b-v2                                |  0.0 |  0.0 |  0.0 | n/a |
+
+**Wall time (s) / realtime factor.** Apple Silicon would be 5-10×
+faster on the parakeet rows; numbers below are the Linux x86 VPS.
+
+| backend / mode               |  60 s |  120 s |   300 s |   600 s |
+|---|---:|---:|---:|---:|
+| parakeet streamed-TDT                       |  55 |  99 |  236 |  463 |
+| parakeet CTC head                           |  54 | 102 |  236 |  462 |
+| parakeet single-pass                        |  45 |  86 |  235 |  627 |
+| parakeet + `--vad`                          |  55 |  97 |  225 |  457 |
+| voxtral-mini-3b                             | 166 | 165 |  189 |  193 |
+| cohere-transcribe                           |  79 | 144 |  349 |  673 |
+| cohere-transcribe + `--vad`                 |  65 | 117 |  279 |  557 |
+| cohere-asr-ja (Q4_K, JA audio)             |  31 | 140 |    — |    — |
+| cohere-asr-ja (Q4_K, EN audio)             |  39 | 104 |    — |    — |
+| canary-1b-v2                                |  68 | 122 |  381 | OOM  |
+
+(voxtral wall time is roughly constant because it silently skips
+most of the input — see the gap column.)
+
+### Per-backend take-aways from the matrix
+
+**parakeet (the post-fix default).** streamed-TDT and CTC-head are
+byte-identical at every length (CTC head is a frame-synchronous
+fallback that bypasses the TDT blank-runaway entirely; streamed-TDT
+keeps the TDT decoder but bounds the encoder's bidirectional
+attention to 8 s windows so it can't accumulate the codec-noise
+amplification). The 120 s coverage dip to 81.5 % is the *audio*, not
+the model: the clip's speech runs out at ~01:37 and the next ~22 s
+is silence + a sentence-start, so coverage measured against the full
+120 s under-counts. Both paths produce the same actual content.
+
+**parakeet single-pass.** Catastrophically non-monotonic: 33 % at
+60 s, 82 % at 120 s, **1.5 %** at 300 s, 99.9 % at 600 s. This is the
+"per-feature z-norm depends on the full audio's mel statistics"
+problem manifesting as random walks across the stable/unstable
+boundary. The single-pass path is genuinely unsafe; the "works at
+600 s" cell is luck, not a property.
+
+**parakeet + `--vad`.** Coverage drops to 76-87 % across lengths
+because VAD trims silence (by design). Larger gaps at longer
+durations because the underlying clip has more silence stretches.
+Good for "I want per-utterance SRT entries" use cases, less so for
+"I want continuous transcription with maximum coverage."
+
+**voxtral-mini-3b.** **In matrix v1: worst long-form behaviour we
+measured.** Coverage halved with each length doubling: 64 → 35 → 20 →
+9 %. In matrix v2 (post-opt-out, commit `6fef8790` removing the
+external overlap-save wrap), coverage jumps to **100 % at 60 / 120 /
+300 s**: the LLM AR decoder *was* processing all chunks fine; the
+matrix-v1 word-timestamp trim was discarding most of the emitted text
+because voxtral's emitted word timestamps don't honour the original
+slice frame, so the trim treated almost everything as "outside the
+slice range." Two additional fixes shipped together with this matrix:
+
+  * `6fef8790` — voxtral opt-out from the external overlap-save wrap
+    (the immediate >90 % fix; default-chunked voxtral is now sound).
+  * **PR #114 voxtral_transcribe_streamed** (matching the upstream
+    Mistral `apply_transcription_request` pattern): per-30 s encode,
+    concatenate audio embeds, **single LLM AR decode** over the whole
+    sequence. Result on the 60 s clip is **denser segmentation** (11
+    segments / ~470 chars vs 3 segments / 280 chars on default
+    chunking) because the LLM doesn't cold-start at every 30 s
+    boundary; it sees one continuous audio stream. Both paths produce
+    correct content; streamed is the more upstream-faithful default.
+
+**cohere-transcribe.** **In matrix v1: degraded from 95 % at 60 s to
+**59 %** at 300 s and **62 %** at 600 s, with 50 s gaps.** In matrix
+v2 (post-opt-out, commit `dc2295b2` removing the external overlap-save
+wrap for cohere), default chunking jumps to **96-98 %** at 60 / 120 /
+300 s with gaps ≤ 1.2 s. The pre-fix gap-growth was driven by the
+overlap-save wrap, not the model itself. `--vad` is no longer a
+mandatory rescue — it's available for users who want per-utterance
+SRT segmentation, but coverage parity is now native.
+
+**canary-1b-v2.** Separate bug. Coverage looks fine because the
+decoder emits text for the full duration, but the text is English
+`"I am not aware of anything"` in a loop regardless of input
+language. Language-prompt wiring problem, not a long-audio problem.
+600 s OOM-killed (rc=137) on the 7.6 GB VPS — likely the AED
+decoder's hidden-state stack growing past the available memory.
+
+### What's the right default per backend, post-matrix v2
+
+| backend | recommended default | why |
+|---|---|---|
+| parakeet (any variant)         | streamed-TDT (default since `33f9a162`) | best coverage at all lengths, byte-identical to CTC-head when available |
+| voxtral-mini-3b                | streamed (this PR — Mistral `apply_transcription_request` shape) | 100 % coverage at 60-300 s, single LLM context, denser segmentation; default-chunked + opt-out (`6fef8790`) also lands at 100 % |
+| cohere-transcribe              | default chunking + opt-out (`dc2295b2`)         | 96-98 % at 60-300 s; `--vad` available but no longer required for coverage |
+| canary-1b-v2                   | fix lang-prompt bug first; then streamed-encode port | currently broken at all durations on JA; long-audio fix on hold |
+| qwen3-asr / granite-speech / mimo-asr | post-opt-out default chunking (audit pending) | LLM-AR class — opt-out gate is `glm-asr` / `gemma4-e2b` / `kyutai-stt` (`46f6848d`, `eaee2319`); voxtral-style streamed is a follow-up improvement, not a coverage fix |
+| fastconformer-ctc / wav2vec2 / firered-asr | current single-pass (CTC is robust) | no observed failure; defer streamed port until reported |
+| sensevoice-small               | `--vad`                                          | already the recommendation; matrix v1 confirms 99 %+ at 120 s |
+| whisper                        | unchanged                                        | internal 30 s seek handles long audio by design |
+
+### Reproducer
+
+```bash
+# Driver — runs all 32 cells sequentially with memory backpressure
+bash tools/longform_vps.sh   # outputs to /mnt/akademie_storage/longform_results/
+
+# Parser — JSON outputs → coverage table
+python tools/analyze_longform.py /path/to/longform_results/
+```
+
+Both scripts in this commit. Audio: `/mnt/akademie_storage/yt_{60,120,300,600}s.wav` on the VPS (PCM s16le, 16 kHz mono, fresh `yt-dlp` extract of `youtube.com/watch?v=o_9dWkRPYC0`).
+
 ---
 
 ## Beam search — quality vs speed (2026-05-23, PLAN #90)
 
 **Knob:** `--beam-size N` (CLI) / `CRISPASR_BEAM_SIZE=N` (env) /
 `crispasr_session_set_beam_size(session, N)` (C API).
-Default N=1 (greedy). N > 1 activates `core_beam_decode::run_with_probs`
-on LLM-decoder backends: qwen3-asr, granite-speech, voxtral.
-Non-AR backends (parakeet, canary, fastconformer-ctc, etc.) ignore the
-flag — beam search only makes sense on autoregressive token decoders.
+Default N=1 (greedy). N > 1 activates beam search on supported backends.
+LLM-decoder backends (qwen3-asr, granite-speech, voxtral, gemma4-e2b) use
+`core_beam_decode::run_with_probs` (replay-from-prefix). Encoder-decoder
+backends (canary, cohere) use `core_beam_decode::run_with_probs_branched`
+(KV snapshots). Transducer backends (parakeet) use a dedicated TDT/RNNT
+label-looping beam search. CTC-only and NAR backends ignore the flag.
 
 Benchmark script: `tools/benchmark_vitw_beam.py` — runs against
 [`zhifeixie/Voices-in-the-Wild-Bench`](https://huggingface.co/datasets/zhifeixie/Voices-in-the-Wild-Bench)
@@ -1424,3 +1926,346 @@ python tools/benchmark_vitw_beam.py \
     --n 8 --beams 1,2,4 \
     --json tools/vitw_beam_results.json
 ```
+
+### MAES beam search for transducers (2026-06-03, §134)
+
+MAES (Modified Adaptive Expansion Search) is a transducer-specific beam
+search that's more efficient than the label-looping beam above. It processes
+one encoder frame at a time with up to N adaptive non-blank expansions per
+frame, using gamma-threshold pruning to kill low-probability branches.
+
+**Knob:** `CRISPASR_PARAKEET_MAES=1` + `--beam-size N` (CLI), or
+`--parakeet-decoder maes` + `--beam-size N`, or
+`parakeet_set_maes(ctx, true, num_steps, gamma, beta)` (C API).
+Config: `CRISPASR_MAES_NUM_STEPS` (default 2), `CRISPASR_MAES_GAMMA` (2.3),
+`CRISPASR_MAES_BETA` (2).
+
+Supports both TDT (Token-and-Duration Transducer) and pure RNNT models.
+
+#### MAES vs greedy on FLEURS English (CPU, Hetzner CCX13, 4 threads)
+
+| Model | Audio | Greedy | MAES beam=4 | Speed cost |
+|---|---|---|---|---|
+| tdt-0.6b-v2 (1K vocab) | 10s | "...by 25%." | "...by 25 years." | — |
+| tdt-0.6b-v3 (8K vocab) | 10s | "...by 25-30 years." | "...by 25 to 30 years." | — |
+| tdt-0.6b-v2 | 60s | 5 sentences | 6 sentences (recovered full missing sentence) | +35% |
+| tdt-1.1b (8K vocab) | 10s | "...by twenty five to thirty years" | identical | — |
+| tdt_ctc-110m (1K vocab) | 10s | garbled | same garble | — |
+| rnnt-0.6b (8K vocab) | 10s | "...by twenty five to thirty years" | identical | — |
+| rnnt-1.1b (8K vocab) | 60s | truncated at "lettering" | identical | +25% |
+
+#### When to use MAES vs standard beam
+
+| scenario | recommendation |
+|---|---|
+| Parakeet TDT with small vocab (v2, 1K BPE) | MAES beam=4 — measurable quality gain |
+| Parakeet TDT/RNNT with large vocab (8K BPE) | greedy — already strong baseline, MAES matches but costs 25-35% |
+| Parakeet with hotwords (CTC-WS) | label-looping beam — hotword trie not yet wired into MAES |
+| Tiny model (110M) | neither — model capacity is the bottleneck |
+
+### CTC prefix beam search (2026-06-03, §134)
+
+Shared `core_ctc::prefix_beam_search()` with optional gamma-threshold
+pruning. Available for any CTC backend via `--beam-size N`.
+Currently wired into: parakeet-CTC, sensevoice, wav2vec2 (16 languages).
+
+CTC beam search has not yet been benchmarked for WER improvement — the
+primary benefit is expected to be on character-level CTC models (wav2vec2)
+where the small vocab makes greedy more error-prone than BPE models.
+
+### Transducer + encoder-decoder beam search (2026-06-02, issue #136 + §139)
+
+Parakeet TDT/RNNT label-looping beam (`b3cdcebd`), canary + cohere
+AED branched-KV beam (§90 runtime, adapter wiring `§139`), gemma4-e2b
+replay-from-prefix beam (§139). All on VPS CPU-only (no GPU).
+
+**JFK 11 s — wall time (user time in parentheses)**
+
+| backend | model | beam=1 | beam=2 | beam=4 |
+|---|---|---|---|---|
+| parakeet | parakeet-tdt-0.6b-v3 F16 | 27 s (30 s) | 26 s (31 s) | 15 s (32 s) |
+| canary | canary-1b-v2 Q4_K | 27 s (37 s) | 32 s (50 s) | 42 s (68 s) |
+| cohere | cohere-transcribe F16 | 125 s (91 s) | 104 s (107 s) | 120 s (118 s) |
+
+Notes:
+- Parakeet beam adds ~7 % user time at beam=4 (LSTM predictor + joint
+  head are tiny; encoder dominates). Wall time variance is system load.
+- Canary beam=4 costs ~84 % more user time (8-layer decoder × KV
+  snapshot/restore per beam step).
+- Cohere F16 model is ~3 GB; beam=4 KV snapshots increase peak memory
+  substantially. beam=4 was OOM-killed on the FLEURS-10s test.
+- All backends produce identical text on JFK at beam=1/2/4.
+
+**FLEURS 10 s — canary beam=4 vs greedy**
+
+| beam | output |
+|---|---|
+| 1 | "…Styles in the West could lag behind by twenty five percent. 25 to 30 years." |
+| 4 | "…styles in the west could lag behind by twenty five percent. 25 to 30 years." |
+
+Minor capitalization difference (proper-noun casing on "Styles"/"West").
+
+**FLEURS 60 s — parakeet beam=4 vs greedy**
+
+| beam | output diff |
+|---|---|
+| 1 | "…, and which was made famous…" |
+| 4 | "… and which was made famous…" (comma dropped) |
+
+Both valid; stylistic punctuation variation.
+
+**Overhead summary (user time)**
+
+| backend | beam=2 | beam=4 | beam=8 |
+|---|---|---|---|
+| parakeet (TDT LSTM) | ~3 % | ~7 % | ~20 % |
+| moonshine-streaming | ~24 % | ~56 % | — |
+| canary | ~35 % | ~84 % | — |
+| cohere | ~18 % | ~30 % | OOM (F16) |
+
+Parakeet beam search is nearly free because the decoder is a tiny
+LSTM (~10 KB state per beam). Canary and cohere have 8-layer
+transformer decoders with full KV snapshot/restore, so the cost
+scales with decoder depth × sequence length × beam width.
+
+### Translation beam search (m2m100 + madlad/t5, 2026-06-02)
+
+**m2m100-418m Q8_0 — en→de (CPU-only VPS)**
+
+| sentence | beam=1 user | beam=4 user | output |
+|---|---|---|---|
+| "Hello world, how are you today?" | 6 s | 21 s (3.4×) | "Hallo Welt, wie bist du heute?" |
+| "The president said he would not attend…" | 7 s | 45 s (6.4×) | "Der Präsident sagte, er würde wegen der Wetterbedingungen nicht an der Sitzung teilnehmen." |
+
+Translation beam is expensive: the decoder-only replay cost is
+O(beam × T²) where T is the output length, and for translation the
+decoder does more work per token than for ASR. Identical output on
+these clean inputs; benefit is on ambiguous source text.
+
+## Multi-backend long-form comparison — 2026-05-26 (PLAN #114 P3 closeout)
+
+Live runs on M1 Metal with the post-PLAN-#114-P3 binaries. Inputs from
+`/Volumes/backups/code/audio_samples/` (mirrored from VPS — see that
+dir's CLAUDE.md). All backends invoked with `-l <lang>`, `-np`, `-nt`,
+default settings (`CANARY_STREAM_THRESHOLD_S=0` after `10c2fba5`).
+
+### EN 60 s (FLEURS English, narration)
+
+```
+audio_samples/en/fleurs_60s.wav  (60 s, 16 kHz mono)
+```
+
+| Backend | Chars | Notes |
+|---|---|---|
+| parakeet-tdt-0.6b-v3 | ~217 → **520** (post `e1904a1e`) | The 217 was with the c=8 chunk default that ships well for the JA-only model. Empirical sweep on EN+DE FLEURS 60s+300s showed c=8 collapses on the multilingual v3 model: EN 60s drops to 23% of the c=40 max. Fix `e1904a1e` adds a per-model chunk default keyed off `vocab_size` (< 4000 ⇒ JA model ⇒ c=8 preserved; ≥ 4000 ⇒ v3 / multilingual ⇒ c=30). v3+EN60 improved 186 → 520 chars (2.8×), v3+EN300 492 → 1550 chars (3.15×), v3+DE60 502 → 679, v3+DE300 2496 → 3064, ja+JA60 1674 unchanged. Root cause is *encoder* context, not decoder cold-start — see the corrected LEARNINGS section on the Independent-chunk failure mode. |
+| canary-1b-v2 | ~735 | Full content but visible artifacts: `"twenty five. to thirty"` (model splits a number), `"Save for You"` (AED re-emits with different capitalization → after case-insensitive LCS the dup is dropped but the leftover `"Save for You"` reads as a sentence start), `"Yeah, yeah, ×14"` (degenerate-loop guard fired at the configured 14-token window). |
+| voxtral-mini-3b-2507 | **~826** | **Clean.** Includes extra content like `"in which was made famous to foreigners after a glowing account of its splendorous recorded by Lord Byron"` that canary missed entirely. No boundary artifacts. |
+| cohere-transcribe | **~864** | **Clean.** Similar coverage to voxtral, `"world's"` instead of `"world"` (model preference), `"Northern Marianas"` instead of `"Northern Mariana's"`. |
+
+### DE 60 s (FLEURS German, narration)
+
+```
+audio_samples/de/fleurs_60s.wav  (60 s, 16 kHz mono)
+```
+
+| Backend | Notes |
+|---|---|
+| canary-1b-v2 | Full content but boundary dups: `"Geld-Technologie-Technologie-Technologie-Technologie"` (early-chunk loop, partly caught by the guard at 4 reps before the window opened), `"T-Rex war war"`, `"Rückseite der der Unabhängigkeitserklärung"`, `"Männer und Frauen. Frauen"`, `"Spitze. der Spitze"`. The LCS-merge + word-snap + case-insensitive LCS pipeline caught some but not all — these are exact-token re-emissions across chunks that an LCS strict-prefix match still leaks. |
+| voxtral-mini-3b-2507 | **Clean, single-pass-quality.** No boundary artifacts visible. Catches `"Juden und Nicht-Juden gleichermaßen"` (post-segment continuation) that canary missed. |
+| cohere-transcribe | **Clean.** `"Tri-Rex"` is a minor model error (not a boundary artifact), otherwise identical-shape transcript to voxtral. |
+
+### Architectural takeaway
+
+The data confirms the design-notes table in PLAN #114 ("Streaming-pattern
+design"): the **voxtral-pattern backends** (voxtral, cohere — 30 s
+disjoint chunks → audio embeds concat → one LLM AR decode) produce
+cleaner long-form output than the **NeMo-pattern backends** (canary —
+8 s overlap chunks → per-chunk decode → LCS-merge + word-snap +
+case-insensitive LCS dedup). The voxtral pattern's lack of overlap means
+no duplication enters the input, so no dedup is needed; the NeMo
+pattern's overlap (necessary for bidirectional encoder context) requires
+dedup, and any imperfect dedup pass leaves visible artifacts.
+
+This is not a universal win for the voxtral pattern though — it requires
+a long-context AR LLM (voxtral's 3 B, cohere's 1.3 B). Canary's AED was
+trained on 8–30 s clips and cannot absorb a full 5 min in a single decode
+(`<eos>` lands at the first internal utterance boundary). Parakeet's TDT
+could in principle use the voxtral pattern but doesn't currently —
+something to revisit if parakeet's truncation behaviour on the EN 60 s
+clip turns out to be a streamed-path bug rather than a one-off.
+
+### Six-commit canary thread that produced the "full content" column above
+
+| SHA | What |
+|---|---|
+| `dfe1af3b` | lang-whitelist (en/de/fr/es only) — refused unsupported langs before they could hallucinate |
+| `7177c931` | `canary_transcribe_streamed` first cut (concat-then-decode → truncated at AED `<eos>`) |
+| `63fdbe46` | NeMo `FrameBatchMultiTaskAED` analogon — per-chunk AED decode with prompt re-injection |
+| `62766dae` | LCS boundary dedup |
+| `10c2fba5` | splice-punct cleanup + `CANARY_STREAM_THRESHOLD_S=0` default |
+| `361df3e2` | window-based degenerate-loop guard |
+| `935ffbee` | word-snap heuristic (extend LCS drop to next word-start) |
+| `5e402ee9` | case-insensitive LCS (ASCII lowercase canonical id) |
+
+Before this thread canary truncated to ~460 chars on the 1.3 m
+De-Abwasch article and ~360 chars on EN FLEURS 60 s; after, full
+coverage (~1196 chars and ~735 chars respectively).
+
+## Parakeet long-form option matrix — 2026-05-26 (PLAN #114 follow-up)
+
+Empirical sweep across all the dispatch knobs the parakeet backend
+exposes, on the same three 60 s fixtures used elsewhere in this
+section. Default mode includes the `e1904a1e` per-model chunk default
+(v3 → c=30 internal, ja → c=8 internal).
+
+| Mode | v3 + EN 60s | v3 + DE 60s | v3 + JA 60s | ja + JA 60s |
+|---|---|---|---|---|
+| **default** (backend streamed, c=auto) | 520 | 679 | 605 | **1674** |
+| `CRISPASR_PARAKEET_STREAM_CHUNK=8` forced | 187 | 503 | 375 | **1674** |
+| `CRISPASR_PARAKEET_STREAM_CHUNK=30` forced | 520 | 679 | 605 | 508 |
+| `CRISPASR_PARAKEET_STREAM_THRESHOLD=999` (single-pass) | **626** | 621 | 599 | 271 |
+| `--vad --vad-model silero` | 368 | **709** | 637 | 1627 |
+| `--chunk-seconds 30 --chunk-overlap 0` (no LCS) | 713 | 689 | 608 | 1413 |
+| `--chunk-seconds 30 --chunk-overlap 3` (LCS) | **755** | 665 | **660** | **1942** |
+
+### Headline finding: dispatcher-side `--chunk-seconds 30 --chunk-overlap 3` wins on 3 of 4 cases — **shipped as the new default in `98381810`**
+
+The internal-streamed-path default that previously shipped was **not** the
+quality-optimal long-form mode. The CLI's dispatcher-side chunking +
+overlap-save context wrap + LCS-merge dedup recovers more content than
+the backend's single-pass-over-concat-encoder design.
+
+**Shipped as the new default 2026-05-26 (`98381810`)** by dropping
+`CAP_INTERNAL_CHUNKING` from the parakeet backend's capabilities
+declaration. The dispatcher's `should_auto_chunk_long` fallback then
+fires for audio > 30 s — chunking at 30 s, overlap-save 3 s, LCS-merge
+dedup — exactly the matrix's winning mode. Short audio (< 30 s) is
+unaffected: the dispatcher only auto-chunks past the threshold, so the
+11 s JFK case still routes through a single backend call.
+
+After-the-fix matrix (the previous matrix was with `CAP_INTERNAL_CHUNKING`
+declared, blocking the auto-chunk path):
+
+| case | old default | new default | Δ |
+|---|---|---|---|
+| JFK 11s | 109 | 109 | unchanged |
+| v3 + EN 60s | 520 | **755** | **+45 %** |
+| v3 + DE 60s | 679 | 665 | -2 % |
+| v3 + JA 60s | 605 | **660** | +9 % |
+| ja + JA 60s | 1674 | **1942** | **+16 %** |
+| v3 + EN 300s | 1550 | **3865** | **+150 %** |
+| v3 + DE 300s | 3064 | **3288** | +7 % |
+
+The longer the audio, the bigger the win — EN 300 s scales from +45 % at
+60 s to +150 % at 300 s. The internal-streamed-path's quality
+degradation compounds with audio length; the dispatcher chunks scale
+linearly.
+
+Wall time on M1 Metal: 300 s EN now takes ~86 s (was ~30 s) — 3.5×
+realtime. Acceptable for the quality gains; users can still pass
+`CRISPASR_PARAKEET_STREAM_THRESHOLD=99999` to force the older
+single-pass path if the wall-time matters more than coverage.
+
+### Headline finding: dispatcher-side `--chunk-seconds 30 --chunk-overlap 3` wins on 3 of 4 cases (original 4-trial sweep)
+
+Why this works: the dispatcher splits the 60 s input into ~30 s chunks
+with ±3 s acoustic overlap, calls the backend once per chunk (each
+call sees a 33 s window), and LCS-merges the boundary tokens. Inside
+each backend call, parakeet's internal streamed path now runs as a
+single 30 s encoder window (no further sub-chunking), which is
+exactly the encoder context size the v3 model was trained for. The
+backend's own "streamed over 60 s with c=30" instead splits the 60 s
+mel into two ~30 s chunks internally — but the per-chunk encoder
+passes don't see the bidirectional context across the cut as cleanly
+as the dispatcher's per-call boundaries do (the dispatcher feeds each
+chunk independently with its own mel-norm; the backend's streamed
+path applies global mel-norm first then splits).
+
+### When each mode wins
+
+| Audio profile | Recommended mode | Why |
+|---|---|---|
+| Continuous EN/DE long-form, supported v3 lang | `--chunk-seconds 30 --chunk-overlap 3` | Highest coverage; modest wallclock overhead (12 s for 60 s audio) |
+| JA model on JA long-form | `--chunk-seconds 30 --chunk-overlap 3` OR default | Both recover most content; LCS edges default by 16 % on the tested clip |
+| Short audio (< 30 s) | default | Single backend call, no dispatcher overhead |
+| Speech-with-long-silences | `--vad --vad-model silero` | VAD trims silences and feeds the backend with bounded slices; can outperform chunking when speech density is uneven |
+| Reference parity / debugging | `CRISPASR_PARAKEET_STREAM_THRESHOLD=999` | Forces `parakeet_transcribe_ex`, the bit-exact single-pass path |
+
+### Caveats
+
+- The dispatcher's chunk-overlap wrap is what `kBlocked` opts cohere /
+  gemma4-e2b / kyutai-stt etc. *out* of (LCS doesn't compose with
+  their internal-chunking pipelines). Parakeet is intentionally NOT
+  in `kBlocked` — the dispatcher's wrap and LCS dedup are correct for
+  TDT's frame-synchronous output.
+- The default did NOT change to `--chunk-seconds 30 --chunk-overlap 3`
+  because that would force a dispatcher change visible to every
+  caller (server API, Python session, …) without their request.
+  Users who want the +45 % EN coverage today pass the flags
+  explicitly; the option matrix above is the documentation.
+- Single-pass occasionally wins (v3 + EN 60s: 626 chars vs 520
+  internal-streamed default) — for clips that comfortably fit a single
+  encoder forward pass on the model's hardware, the streamed wrapper
+  is overhead. `CRISPASR_PARAKEET_STREAM_THRESHOLD=99999` makes
+  single-pass the default.
+
+### Reproduce
+
+```
+B=build/bin/crispasr
+V3=/Volumes/backups/ai/crispasr/parakeet-tdt-0.6b-v3-q4_k.gguf
+JA=/Volumes/backups/ai/crispasr/parakeet-tdt-0.6b-ja-q4_k.gguf
+EN60=/Volumes/backups/code/audio_samples/en/fleurs_60s.wav
+DE60=/Volumes/backups/code/audio_samples/de/fleurs_60s.wav
+JA60=/Volumes/backups/ai/long-clips/yt_60s.wav
+
+# default
+$B --backend parakeet -m $V3 -f $EN60 -np -nt
+# --chunk-seconds 30 --chunk-overlap 3
+$B --backend parakeet -m $V3 -f $EN60 -np -nt --chunk-seconds 30 --chunk-overlap 3
+# (etc)
+```
+
+### Coverage parity check vs cohere / canary on 300 s — 2026-05-26
+
+User direction: "are these after-numbers complete? compare to what
+other models deliver". Right — char-count delta vs the previous parakeet
+default proves we *improved*, but says nothing about *complete*. Real
+test: how does parakeet's new default compare against the best
+long-form-capable backends on the same audio.
+
+Ran parakeet (post-`98381810` default) vs cohere vs canary on the
+300 s FLEURS clips. Voxtral skipped — its mem-thrash failure mode on
+M1 with the 300 s clip is documented in
+[`feedback_torch_omp_deadlock`](../memory/feedback_torch_omp_deadlock.md);
+sat at 5 s CPU / 30 min wall and was killed.
+
+**EN FLEURS 300 s:**
+
+| Backend | chars | wall (s) | × RT | vs cohere |
+|---|---|---|---|---|
+| parakeet (default) | **3865** | 66 | 5.0× | -3 % |
+| cohere | 3994 | 94 | 3.2× | (ref) |
+| canary | 2971 | 74 | 4.1× | -26 % |
+
+**DE FLEURS 300 s:**
+
+| Backend | chars | wall (s) | × RT | vs cohere |
+|---|---|---|---|---|
+| parakeet (default) | **3288** | 69 | 4.3× | -0.3 % |
+| cohere | 3299 | 87 | 3.4× | (ref) |
+| canary | 3532 | 273 | 1.1× | +7 %, 3.1× slower |
+
+**Headline.** Parakeet's post-fix default is now within **3 % of cohere
+on EN 300 s and within 0.3 % on DE 300 s** at higher throughput
+(66 / 69 s wall vs cohere's 94 / 87 s). The numbers are complete in
+the same sense as cohere — coverage parity with the best long-form
+backend, at faster wallclock. The previous default (CAP_INTERNAL_CHUNKING
+set) was 60 % below cohere on EN 300 s; the fix closes that gap.
+
+Canary on DE wins on coverage (3532 chars) but pays 4× the wall time
+(273 s) — a different trade-off. For German-only workflows where wall
+time is bounded, canary's per-chunk AED decode produces slightly more
+content; for general use, parakeet's faster path with coverage-parity
+is the recommended default.
+

@@ -94,6 +94,95 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `max_tokens` | Generated-token cap for supported autoregressive ASR backends |
 | `max_new_tokens` | Alias for `max_tokens` |
 | `frequency_penalty` | Opt-in repeated generated-token penalty for supported autoregressive ASR backends (`0.0` disabled) |
+| `translate` | `true`/`false` — translate to English (backends with `CAP_TRANSLATE`) |
+| `source_lang` | Source language for AST backends (canary, cohere) |
+| `target_lang` | Target language for AST backends |
+| `punctuation` | `true`/`false` — enable/disable punctuation (default: `true`; `false` strips punctuation from output) |
+| `diarize` | `true`/`false` — enable speaker diarization |
+| `diarize_method` | `energy`, `xcorr`, `vad-turns`, `pyannote`, `sherpa` (default: `energy`) |
+| `diarize_embedder` | Speaker-embedding model for cross-slice clustering (path or `auto`) |
+| `diarize_cluster_threshold` | Cosine merge threshold for embedding clustering (default: 0.5) |
+| `diarize_max_speakers` | Upper bound on speaker cluster count (default: 8) |
+| `vad` | `true`/`false` — enable VAD pre-processing |
+| `vad_threshold` | VAD speech probability threshold (default: 0.5) |
+| `vad_min_speech_duration_ms` | Minimum speech segment duration in ms (default: 250) |
+| `vad_min_silence_duration_ms` | Minimum silence gap to split on in ms (default: 100) |
+| `vad_max_speech_duration_s` | Maximum speech segment duration in seconds |
+| `vad_speech_pad_ms` | Padding around speech segments in ms (default: 30) |
+| `hotwords` | Comma-separated hotword list for biased decoding |
+| `hotwords_boost` | Log-prob boost per hotword token match (default: 2.0) |
+| `suppress_regex` | Regex pattern to suppress from output |
+| `suppress_nst` | `true`/`false` — suppress non-speech tokens |
+| `grammar` | GBNF grammar string for constrained decoding |
+| `grammar_rule` | Root rule name for the grammar |
+| `best_of` | Whisper best-of-N sampling candidates |
+| `beam_size` | Whisper beam search width |
+| `entropy_thold` | Entropy threshold for decoder fallback |
+| `logprob_thold` | Log-probability threshold for decoder fallback |
+| `no_speech_thold` | No-speech probability threshold |
+| `temperature_inc` | Temperature increment for fallback retries |
+| `no_fallback` | `true`/`false` — disable temperature fallback |
+| `detect_language` | `true`/`false` — run language detection |
+| `lid_backend` | Language-ID backend (`whisper`/`silero`/`firered`; `off`/`none` to disable) |
+| `lid_model` | Optional language-ID model path |
+| `no_timestamps` | `true`/`false` — omit timestamps from output |
+| `split_on_word` | `true`/`false` — split segments on word boundaries |
+| `max_len` | Maximum segment length in characters |
+| `chunk_seconds` | Maximum chunk duration for long audio (default: 30) |
+
+The `/inference` endpoint accepts the same CrispASR extension fields.
+
+### Server startup flags (resident post-processors)
+
+A few options are set once at launch rather than per request — the model is
+loaded resident and applied to every transcription:
+
+- `--punc-model auto|firered|fullstop|punctuate-all|pcs|<path>` — restore
+  punctuation on backends that emit none (parakeet RNNT/CTC, etc.). Auto-enabled
+  for non-PnC CTC backends, matching the CLI.
+- `--truecase-model auto|crf|lstm|<path>` — truecasing applied after punctuation.
+- `--no-warmup` (or `CRISPASR_NO_WARMUP=1`) — skip the startup warmup transcribe
+  (workaround for GPU drivers that hang/crash in warmup; see #165).
+
+### Diarization example
+
+```bash
+# Speaker diarization (energy method — works on stereo audio):
+curl http://localhost:8080/v1/audio/transcriptions \
+  -F "file=@meeting.wav" \
+  -F "response_format=verbose_json" \
+  -F "diarize=true"
+
+# Pyannote diarization (works on mono, needs pyannote-seg GGUF):
+crispasr --server -m model.gguf --diarize --diarize-method pyannote \
+  --sherpa-segment-model pyannote-seg-3.0.gguf
+
+curl http://localhost:8080/v1/audio/transcriptions \
+  -F "file=@meeting.wav" \
+  -F "response_format=verbose_json" \
+  -F "diarize=true" \
+  -F "diarize_method=pyannote"
+```
+
+### Translation example
+
+```bash
+# Translate non-English audio to English (whisper, canary, cohere):
+curl http://localhost:8080/v1/audio/transcriptions \
+  -F "file=@german.wav" \
+  -F "translate=true" \
+  -F "response_format=json"
+```
+
+### Hotwords example
+
+```bash
+# Boost domain-specific terms:
+curl http://localhost:8080/v1/audio/transcriptions \
+  -F "file=@audio.wav" \
+  -F "hotwords=CrispASR,GGUF,parakeet" \
+  -F "hotwords_boost=3.0"
+```
 
 `GET /v1/models` returns an OpenAI-compatible model list with the
 currently loaded model.
@@ -134,6 +223,8 @@ curl http://localhost:8080/v1/audio/speech \
 | `frequency_penalty` | `0.0` | Opt-in repeated generated-token penalty for AR TTS backends. `0.0` disabled. |
 | `speed` | `1.0` | Tempo multiplier `0.25 .. 4.0` (OpenAI range). Applied as a post-synth linear resampler. Out-of-range returns 400 with `code=invalid_speed`. |
 | `response_format` | `"wav"` | `wav` (16-bit PCM RIFF, 24 kHz mono — default), `pcm` (OpenAI spec: 24 kHz signed 16-bit LE raw, no header), or `f32` (crispasr-specific raw float32 for downstream DSP). |
+| `consent_attestation` | empty | Required when `voice` ends in `.wav` (voice cloning). A free-text statement attesting speaker consent, e.g. `"I have the speaker's consent"`. Logged for audit. |
+| `spoken_disclaimer` | `true` | Set to `false` to skip the audible AI-disclosure prefix on voice-cloned output. Machine-readable provenance (watermark + C2PA) is always applied. When `false`, the caller assumes responsibility for providing appropriate AI-disclosure to end users. |
 
 **Returns:**
 
@@ -242,6 +333,34 @@ resp = client.audio.speech.create(
 resp.stream_to_file("out.wav")
 ```
 
+## Speech-to-speech endpoint
+
+`POST /v1/audio/speech-to-speech` runs end-to-end audio-in → audio-out
+on S2S-capable backends (`lfm2-audio`, `mini-omni2`). Non-S2S backends
+return 400.
+
+```bash
+crispasr --server --backend lfm2-audio -m lfm2-audio-1.5b-q5_k.gguf
+```
+
+```bash
+curl http://localhost:8080/v1/audio/speech-to-speech \
+  -F "file=@input.wav" \
+  -F "response_format=wav" \
+  -o output.wav -D -
+# X-Transcript header contains the intermediate ASR text (URL-encoded)
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `file` | (required) | Audio file upload (multipart). Decoded to 16 kHz mono float32 internally. |
+| `language` | `en` | Language hint passed to the backend. |
+| `response_format` | `wav` | Output encoding: `wav`, `pcm` (int16 LE), `f32` (raw float32), `mp3`, `opus`. |
+
+The intermediate ASR transcript (if the backend produces one) is
+returned in the `X-Transcript` response header (URL-encoded). Output
+audio is watermarked automatically, same as TTS.
+
 ### Deferred
 
 | Feature | Status |
@@ -251,6 +370,51 @@ resp.stream_to_file("out.wav")
 | `POST /v1/voices` (multipart upload for runtime provisioning) | Pending — security review (size limits, content-type validation, disk quota). |
 | `DELETE /v1/voices/{name}` | Pending alongside upload. |
 | Native-backend `speed` (duration knobs vs server-side resample) | Pending — backend-by-backend. |
+
+## Translation endpoint
+
+`POST /v1/translate` is the text-to-text translation counterpart — the HTTP
+analogue of the CLI `--text` mode. Available whenever the loaded backend has
+`CAP_TRANSLATE` (e.g. `m2m100`).
+
+```bash
+crispasr --server -m m2m100-418m-q8_0.gguf --backend m2m100 &
+
+curl http://localhost:8080/v1/translate \
+  -H "Content-Type: application/json" \
+  -d '{"input": "Hello world, how are you today?", "source_lang": "en", "target_lang": "de"}'
+# {"text": "Hallo Welt, wie bist du heute?"}
+```
+
+| Field | Meaning |
+|---|---|
+| `input` | Text to translate (required; `text` also accepted) |
+| `source_lang` | Source language (falls back to the server's `--tr-sl`/`-sl` default) |
+| `target_lang` | Target language (required unless a server default is set) |
+| `max_tokens` | Optional output-token cap |
+
+Returns `400` if the loaded backend lacks `CAP_TRANSLATE` or `input` is missing.
+
+## Real-time streaming (WebSocket)
+
+Pass `--ws-port N` to expose a real-time streaming-ASR WebSocket alongside the
+HTTP server (`-1` = off, the default; `0` = HTTP port + 1; `N` = port N). This
+is the server analogue of the CLI `--stream` path.
+
+```bash
+crispasr --server -m ggml-base.en.bin --backend whisper --ws-port 0
+# → WS ws://127.0.0.1:8081
+```
+
+Clients connect, send binary frames of 16 kHz mono **float32** PCM, and receive
+JSON updates as audio accumulates:
+
+```json
+{"text": "And so my fellow Americans", "t0": 0.0, "t1": 30.0, "counter": 1}
+{"text": "...ask what you can do for your country", "t0": 0.0, "t1": 30.0, "counter": 3, "final": true}
+```
+
+Whisper-only today. (Each connection opens its own streaming session.)
 
 ## Docker Compose
 

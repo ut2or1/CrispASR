@@ -19,6 +19,7 @@
 #include "crispasr_backend.h"
 #include "crispasr_backend_utils.h"
 #include "whisper_params.h"
+#include "core/beam_decode.h"
 #include "core/greedy_decode.h"
 
 #include "voxtral4b.h"
@@ -41,7 +42,7 @@ public:
 
     uint32_t capabilities() const override {
         return CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_PUNCTUATION_TOGGLE | CAP_FLASH_ATTN |
-               CAP_TOKEN_CONFIDENCE | CAP_DIARIZE | CAP_PARALLEL_PROCESSORS;
+               CAP_TOKEN_CONFIDENCE | CAP_BEAM_SEARCH | CAP_DIARIZE | CAP_PARALLEL_PROCESSORS;
     }
 
     bool init(const whisper_params& p) override {
@@ -158,48 +159,105 @@ public:
             if (run == 0)
                 dec_cfg.vocab_size = vocab;
 
-            int next = 0;
-            float next_p = 1.0f;
-            if (dec_cfg.temperature > 0.0f) {
-                std::mt19937_64 seed_rng((dec_cfg.seed != 0 ? dec_cfg.seed : (uint64_t)std::random_device{}()) ^
-                                         (uint64_t)(run * 0x9E3779B97F4A7C15ull));
-                next = core_greedy_decode::sample_temp(logits, vocab, dec_cfg.temperature, seed_rng);
+            if (params.beam_size > 1) {
+                // Beam search via replay-from-prefix. The replay lambda
+                // embeds each suffix token, injects the corresponding
+                // audio adapter frame (same offset logic as the pre_hook),
+                // and forwards through the LLM.
+                auto replay = [&](voxtral4b_context* c, const int32_t* toks, int n, int prompt_len) -> float* {
+                    const int d = pdim;
+                    std::vector<float> embeds((size_t)n * d);
+                    for (int i = 0; i < n; i++) {
+                        float* e = voxtral4b_embed_tokens(c, &toks[i], 1);
+                        if (!e)
+                            return nullptr;
+                        std::memcpy(embeds.data() + (size_t)i * d, e, d * sizeof(float));
+                        std::free(e);
+                        // Inject audio adapter frame at position prompt_len + i
+                        int apos = prompt_len + i;
+                        if (apos < N_enc) {
+                            for (int j = 0; j < d; j++)
+                                embeds[(size_t)i * d + j] += audio_embeds[(size_t)apos * d + j];
+                        }
+                    }
+                    float* lg = voxtral4b_run_llm_kv(c, embeds.data(), n, prompt_len, nullptr, nullptr);
+                    return lg; // already malloc'd
+                };
+                core_beam_decode::Config bcfg;
+                bcfg.max_new_tokens = dec_cfg.max_new_tokens;
+                bcfg.eos_id = EOS;
+                bcfg.vocab_size = vocab;
+                bcfg.beam_size = params.beam_size;
+                bcfg.prompt_len = T_prompt;
+                auto br = core_beam_decode::run_with_probs(ctx_, logits, replay, bcfg);
+                free(logits);
+
+                // Convert beam result to greedy result format
+                core_greedy_decode::Result dec;
+                dec.tokens.reserve(br.tokens.size());
+                dec.probs.reserve(br.probs.size());
+                for (size_t i = 0; i < br.tokens.size(); i++) {
+                    dec.tokens.push_back(br.tokens[i]);
+                    dec.probs.push_back(br.probs[i]);
+                }
+
+                double sum = 0.0;
+                int cnt = 0;
+                for (size_t i = 0; i < dec.probs.size(); i++) {
+                    if ((int32_t)dec.tokens[i] == EOS)
+                        break;
+                    sum += (double)dec.probs[i];
+                    cnt++;
+                }
+                const double score = (cnt > 0) ? (sum / cnt) : 0.0;
+                if (run == 0 || score > best_score) {
+                    best_score = score;
+                    best_dec = std::move(dec);
+                }
             } else {
-                next = core_greedy_decode::argmax(logits, vocab);
-            }
-            next_p = core_greedy_decode::softmax_of(logits, vocab, next, logits[next]);
-            free(logits);
+                int next = 0;
+                float next_p = 1.0f;
+                if (dec_cfg.temperature > 0.0f) {
+                    std::mt19937_64 seed_rng((dec_cfg.seed != 0 ? dec_cfg.seed : (uint64_t)std::random_device{}()) ^
+                                             (uint64_t)(run * 0x9E3779B97F4A7C15ull));
+                    next = core_greedy_decode::sample_temp(logits, vocab, dec_cfg.temperature, seed_rng);
+                } else {
+                    next = core_greedy_decode::argmax(logits, vocab);
+                }
+                next_p = core_greedy_decode::softmax_of(logits, vocab, next, logits[next]);
+                free(logits);
 
-            // Streaming pre-forward hook: add the next audio encoder frame
-            // to the tail embedding before each LLM forward step.
-            int adapter_pos = T_prompt;
-            auto pre_hook = [&](int /*step*/, float* tail) -> bool {
-                if (adapter_pos >= N_enc)
-                    return false;
-                for (int j = 0; j < pdim; j++)
-                    tail[j] += audio_embeds[(size_t)adapter_pos * pdim + j];
-                adapter_pos++;
-                return true;
-            };
+                // Streaming pre-forward hook: add the next audio encoder frame
+                // to the tail embedding before each LLM forward step.
+                int adapter_pos = T_prompt;
+                auto pre_hook = [&](int /*step*/, float* tail) -> bool {
+                    if (adapter_pos >= N_enc)
+                        return false;
+                    for (int j = 0; j < pdim; j++)
+                        tail[j] += audio_embeds[(size_t)adapter_pos * pdim + j];
+                    adapter_pos++;
+                    return true;
+                };
 
-            auto dec = core_greedy_decode::run_with_probs(ctx_,
-                                                          /*first_token=*/next,
-                                                          /*first_prob=*/next_p,
-                                                          /*initial_n_past=*/T_prompt, voxtral4b_embed_tokens,
-                                                          voxtral4b_run_llm_kv, pre_hook, dec_cfg);
+                auto dec = core_greedy_decode::run_with_probs(ctx_,
+                                                              /*first_token=*/next,
+                                                              /*first_prob=*/next_p,
+                                                              /*initial_n_past=*/T_prompt, voxtral4b_embed_tokens,
+                                                              voxtral4b_run_llm_kv, pre_hook, dec_cfg);
 
-            double sum = 0.0;
-            int cnt = 0;
-            for (size_t i = 0; i < dec.probs.size(); i++) {
-                if ((int32_t)dec.tokens[i] == EOS)
-                    break;
-                sum += (double)dec.probs[i];
-                cnt++;
-            }
-            const double score = (cnt > 0) ? (sum / cnt) : 0.0;
-            if (run == 0 || score > best_score) {
-                best_score = score;
-                best_dec = std::move(dec);
+                double sum = 0.0;
+                int cnt = 0;
+                for (size_t i = 0; i < dec.probs.size(); i++) {
+                    if ((int32_t)dec.tokens[i] == EOS)
+                        break;
+                    sum += (double)dec.probs[i];
+                    cnt++;
+                }
+                const double score = (cnt > 0) ? (sum / cnt) : 0.0;
+                if (run == 0 || score > best_score) {
+                    best_score = score;
+                    best_dec = std::move(dec);
+                }
             }
         }
         free(prompt_embeds);
@@ -210,15 +268,24 @@ public:
 
         // ---- Detokenize, filtering streaming control tokens (id < 1000) ----
         std::string transcript;
-        for (int32_t id : best_dec.tokens) {
+        std::vector<crispasr_token> tok_vec;
+        for (size_t i = 0; i < best_dec.tokens.size(); i++) {
+            int32_t id = best_dec.tokens[i];
             if (id == EOS)
                 break;
             if (id < 1000)
                 continue; // skip STREAMING_PAD / STREAMING_WORD / etc.
             int len = 0;
             const uint8_t* bytes = voxtral4b_token_text(ctx_, id, &len);
-            if (bytes && len > 0)
-                transcript.append((const char*)bytes, (size_t)len);
+            if (bytes && len > 0) {
+                std::string piece((const char*)bytes, (size_t)len);
+                transcript.append(piece);
+                crispasr_token tok;
+                tok.id = id;
+                tok.text = std::move(piece);
+                tok.confidence = (i < best_dec.probs.size()) ? best_dec.probs[i] : -1.0f;
+                tok_vec.push_back(std::move(tok));
+            }
         }
         while (!transcript.empty() && (transcript.front() == ' ' || transcript.front() == '\t')) {
             transcript.erase(transcript.begin());
@@ -231,6 +298,7 @@ public:
         seg.t0 = t_offset_cs;
         seg.t1 = t_offset_cs + (int64_t)((double)n_samples / 16000.0 * 100.0);
         seg.text = transcript;
+        seg.tokens = std::move(tok_vec);
         out.push_back(std::move(seg));
         return out;
     }

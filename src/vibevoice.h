@@ -88,6 +88,11 @@ float* vibevoice_run_connector(struct vibevoice_context* ctx, const char* prefix
 float* vibevoice_encode_speech(struct vibevoice_context* ctx, const float* samples, int n_samples, int* n_frames,
                                int* d_lm);
 
+// Returns true if the loaded model contains the acoustic (at_enc.*) and
+// semantic (st_enc.*) tokenizer encoder tensors needed for transcription.
+// TTS-only variants (vibevoice-realtime-0.5b etc.) return false.
+bool vibevoice_has_asr(const struct vibevoice_context* ctx);
+
 // ── TTS API (requires GGUF converted with --include-decoder) ─────────────────
 
 // Synthesize speech from text. Returns malloc'd 24 kHz mono PCM float array.

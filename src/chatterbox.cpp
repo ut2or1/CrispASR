@@ -299,6 +299,16 @@ static std::vector<int32_t> tokenize_text_bpe(const cb_tokenizer& tok, const std
 }
 
 // Plain HF BPE tokenization used by base Chatterbox.
+//
+// The python `EnTokenizer.encode` (resemble-ai/chatterbox) does
+// `txt.replace(' ', '[SPACE]')` BEFORE calling the underlying HF
+// tokenizer. So spaces DO produce `[SPACE]` tokens in the output, and
+// the BPE merges per non-space chunk. We replicate that: replace
+// ' ' → "[SPACE]" eagerly, then split into pieces at every
+// "[SPACE]" marker (each marker emits its own token directly via
+// vocab lookup) plus at punctuation/alnum boundaries (so "there,"
+// becomes "there" + "," — python's HF tokenizer also splits this way
+// via the merges table since 'there,' is not in vocab).
 static std::vector<int32_t> tokenize_text_hf_bpe(const cb_tokenizer& tok, const std::string& text) {
     if (!tok.has_bpe) {
         return tokenize_text(tok, text);
@@ -2363,16 +2373,21 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
             t3_use_gpu = false;
             s3gen_use_gpu = false;
         } else if (force_gpu) {
-            fprintf(stderr, "chatterbox: T3+s3gen forced to GPU (CRISPASR_CHATTERBOX_FORCE_GPU=1) — "
-                            "S3Gen GPU path is broken; expect garbled audio.\n");
+            // PLAN #83 R9 #5 (2026-05-24): the "S3Gen GPU path is broken"
+            // warning that used to live here is stale. Bug A (sched src
+            // mutation) and Bug B (sched parallel-sync) are both fixed; GPU
+            // residency now hits s3gen_mel cos_min=0.999976 on M1 Metal
+            // (matches the prior workaround baseline). Production CPU
+            // residency is the default; this branch is for users who
+            // explicitly opt into GPU.
+            fprintf(stderr, "chatterbox: T3+s3gen forced to GPU (CRISPASR_CHATTERBOX_FORCE_GPU=1).\n");
             if (s3gen_cpu_override) {
                 fprintf(stderr,
                         "chatterbox: s3gen forced to CPU (CRISPASR_CHATTERBOX_S3GEN_CPU=1) — T3 stays on GPU.\n");
                 s3gen_use_gpu = false;
             }
         } else if (split_t3_cpu) {
-            fprintf(stderr, "chatterbox: T3 → CPU, s3gen → GPU (CRISPASR_CHATTERBOX_T3_CPU_S3GEN_GPU=1). "
-                            "WARNING: s3gen GPU path is broken; expect garbled audio.\n");
+            fprintf(stderr, "chatterbox: T3 → CPU, s3gen → GPU (CRISPASR_CHATTERBOX_T3_CPU_S3GEN_GPU=1).\n");
             t3_use_gpu = false;
         } else {
             // Default split. T3 GPU is a real speedup on CUDA/Vulkan/etc but
@@ -2876,6 +2891,15 @@ extern "C" float* chatterbox_synthesize(struct chatterbox_context* ctx, const ch
         se_buf.resize(192);
         ggml_backend_tensor_get(ctx->conds.gen_embedding, se_buf.data(), 0, 192 * sizeof(float));
         spk_emb = se_buf.data();
+    }
+
+    if (!prompt_tokens && !spk_emb) {
+        const bool is_gpt2 = (ctx->hp.arch == "chatterbox_turbo" || ctx->hp.arch == "kartoffelbox");
+        if (is_gpt2) {
+            fprintf(stderr, "chatterbox-turbo: WARNING — no voice conditioning loaded. "
+                            "Audio will be unconditioned (noisy/quiet). Use --voice ref.wav or "
+                            "ensure the T3 GGUF includes baked conds.pt tensors.\n");
+        }
     }
 
     float* pcm =

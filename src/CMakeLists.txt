@@ -1,6 +1,7 @@
 # TODO: should not use this
 if (WIN32)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+    # _USE_MATH_DEFINES is set globally in the top-level CMakeLists.txt
 
     if (BUILD_SHARED_LIBS)
         set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
@@ -101,9 +102,9 @@ if (CRISPASR_OPENVINO)
     set_target_properties(${TARGET} PROPERTIES FOLDER "libs")
 endif()
 
-# crispasr (formerly whisper)
+# crispasr-lib (formerly whisper)
 
-add_library(crispasr
+add_library(crispasr-lib
             ../include/crispasr.h
             crispasr-arch.h
             crispasr.cpp
@@ -136,6 +137,10 @@ add_library(crispasr
             # and by the C-ABI `crispasr_align_words_abi`. Both canary-ctc
             # and qwen3-forced-aligner paths route through one call.
             crispasr_aligner.cpp
+            # Built-in G2P phonemizers (EN/DE/FR/ES). LTS rules + optional
+            # IPA dict auto-download. Used by kokoro TTS for espeak-free
+            # phonemization.
+            phonemizer.cpp
             # HF download + filesystem cache (shared with CLI). Consumed
             # by the library's VAD / LID / diarize auto-download paths
             # and by the CLI's `-m auto` resolver.
@@ -170,7 +175,7 @@ add_library(crispasr
 # RNNoise uses C99 VLAs and M_PI — both unsupported by MSVC out of the box.
 # Exclude the whole feature on Windows rather than patching vendored sources.
 if (NOT MSVC)
-    target_sources(crispasr PRIVATE
+    target_sources(crispasr-lib PRIVATE
         crispasr_enhance.h
         crispasr_enhance.cpp
         rnnoise/rnnoise.h
@@ -181,7 +186,7 @@ if (NOT MSVC)
         rnnoise/celt_lpc.c
         rnnoise/kiss_fft.c
     )
-    target_compile_definitions(crispasr PRIVATE CRISPASR_RNNOISE=1)
+    target_compile_definitions(crispasr-lib PRIVATE CRISPASR_RNNOISE=1)
 endif()
 
 # RNNoise's C sources predate the strict implicit-decl errors that
@@ -195,7 +200,7 @@ if (NOT MSVC)
             COMPILE_FLAGS "-Wno-implicit-function-declaration -Wno-unused-but-set-variable -Wno-unused-function -Wno-unused-variable"
     )
 endif()
-add_library(whisper ALIAS crispasr)
+add_library(whisper ALIAS crispasr-lib)
 
 # miniaudio.h on Apple includes <AVFoundation/AVFoundation.h> which
 # contains ObjC syntax (@class, @protocol). When compiling as pure
@@ -206,25 +211,30 @@ if(APPLE)
         PROPERTIES LANGUAGE OBJCXX)
 endif()
 
-set_target_properties(crispasr PROPERTIES
+set_target_properties(crispasr-lib PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${SOVERSION}
     OUTPUT_NAME crispasr
 )
 
-target_include_directories(crispasr PUBLIC . ../include)
-target_compile_features   (crispasr PUBLIC cxx_std_11) # don't bump
+target_include_directories(crispasr-lib PUBLIC . ../include)
+
+set(CRISPASR_LIB_CXX_STANDARD cxx_std_11)
+if (GGML_CUDA AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
+    set(CRISPASR_LIB_CXX_STANDARD cxx_std_17)
+endif()
+target_compile_features   (crispasr-lib PUBLIC ${CRISPASR_LIB_CXX_STANDARD}) # don't bump
 
 if (CMAKE_CXX_BYTE_ORDER STREQUAL "BIG_ENDIAN")
-    target_compile_definitions(crispasr PRIVATE CRISPASR_BIG_ENDIAN)
+    target_compile_definitions(crispasr-lib PRIVATE CRISPASR_BIG_ENDIAN)
 endif()
 
 if (CRISPASR_EXTRA_FLAGS)
-    target_compile_options(crispasr PRIVATE ${CRISPASR_EXTRA_FLAGS})
+    target_compile_options(crispasr-lib PRIVATE ${CRISPASR_EXTRA_FLAGS})
 endif()
 
 find_package(Threads REQUIRED)
-target_link_libraries(crispasr PUBLIC ggml Threads::Threads)
+target_link_libraries(crispasr-lib PUBLIC ggml Threads::Threads audioseal crispasr-core snac)
 
 # `crispasr_cache.cpp` calls WinHTTP for HF auto-download on Windows. MSVC
 # auto-links winhttp.lib via `#pragma comment(lib, "winhttp.lib")` inside
@@ -235,24 +245,24 @@ target_link_libraries(crispasr PUBLIC ggml Threads::Threads)
 # tests don't have to remember to add it. Mirrors how Threads::Threads
 # already flows through.
 if (WIN32)
-    target_link_libraries(crispasr PUBLIC winhttp)
+    target_link_libraries(crispasr-lib PUBLIC winhttp)
 endif()
 
 if (CRISPASR_COREML)
-    target_link_libraries(crispasr PRIVATE crispasr.coreml)
+    target_link_libraries(crispasr-lib PRIVATE crispasr.coreml)
 endif()
 
 if (CRISPASR_OPENVINO)
-    target_link_libraries(crispasr PRIVATE crispasr.openvino)
+    target_link_libraries(crispasr-lib PRIVATE crispasr.openvino)
 endif()
 
 if (CRISPASR_MKL)
-    target_link_libraries(crispasr PRIVATE MKL::MKL)
+    target_link_libraries(crispasr-lib PRIVATE MKL::MKL)
 endif()
 
 if (BUILD_SHARED_LIBS)
-    set_target_properties(crispasr PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    target_compile_definitions(crispasr PRIVATE CRISPASR_SHARED CRISPASR_BUILD)
+    set_target_properties(crispasr-lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_definitions(crispasr-lib PRIVATE CRISPASR_SHARED CRISPASR_BUILD)
 endif()
 
 # Cohere Transcribe library (Conformer encoder + transformer decoder)
@@ -353,6 +363,30 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# LFM2 Audio — LiquidAI LFM2.5-Audio-1.5B-JP (FastConformer enc + LFM2 hybrid
+# conv+attention backbone + depthformer). ASR + TTS in one model.
+# ---------------------------------------------------------------------------
+add_library(lfm2_audio STATIC
+            lfm2_audio.h
+            lfm2_audio.cpp
+            )
+target_include_directories(lfm2_audio PUBLIC . ../include)
+target_compile_features   (lfm2_audio PUBLIC cxx_std_17)
+set_target_properties(lfm2_audio PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (lfm2_audio PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+if(NOT MSVC)
+    target_compile_options(lfm2_audio PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(lfm2_audio PRIVATE GGML_USE_METAL)
+    target_link_libraries(lfm2_audio PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(lfm2_audio PRIVATE GGML_USE_CUDA)
+    target_link_libraries(lfm2_audio PUBLIC ggml-cuda)
+endif()
+
+# ---------------------------------------------------------------------------
 # OpenMP — optional shared dependency for parallelisable hot loops in the
 # per-model encoders (currently cohere; granite linked as preparation for
 # follow-up parallelisation). find_package runs once here so every model
@@ -395,6 +429,18 @@ if(NOT MSVC)
     target_compile_options(crispasr-core PRIVATE -O3)
 endif()
 set_target_properties(crispasr-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# ---------------------------------------------------------------------------
+# snac — Standalone SNAC 24 kHz codec decoder (shared by orpheus, mini-omni2)
+# ---------------------------------------------------------------------------
+add_library(snac STATIC core/snac.h core/snac.cpp)
+set_target_properties(snac PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(snac PUBLIC .)
+target_compile_features   (snac PUBLIC cxx_std_17)
+target_link_libraries     (snac PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(snac PRIVATE -O3)
+endif()
 
 # ---------------------------------------------------------------------------
 # crispasr-llama-core — vendored llama.cpp built as a private STATIC lib
@@ -476,6 +522,29 @@ endif()
 if(WIN32)
     # llama-mmap.cpp uses PrefetchVirtualMemory which needs Win 8.1+.
     target_compile_definitions(crispasr-llama-core PRIVATE _WIN32_WINNT=0x0602)
+endif()
+
+# ---------------------------------------------------------------------------
+# Nemotron — nvidia/nemotron-3.5-asr-streaming-0.6b (Cache-Aware FastConformer + RNNT)
+# ---------------------------------------------------------------------------
+add_library(nemotron STATIC
+            nemotron.h
+            nemotron.cpp
+            )
+target_include_directories(nemotron PUBLIC . ../include)
+target_compile_features   (nemotron PUBLIC cxx_std_17)
+set_target_properties(nemotron PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (nemotron PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+if(NOT MSVC)
+    target_compile_options(nemotron PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(nemotron PRIVATE GGML_USE_METAL)
+    target_link_libraries(nemotron PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(nemotron PRIVATE GGML_USE_CUDA)
+    target_link_libraries(nemotron PUBLIC ggml-cuda)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -708,6 +777,18 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# mini-omni2 — gpt-omni/mini-omni2 (Whisper-small + Qwen2-0.5B)
+# ---------------------------------------------------------------------------
+add_library(mini-omni2 STATIC mini_omni2.h mini_omni2.cpp)
+set_target_properties(mini-omni2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(mini-omni2 PUBLIC .)
+target_compile_features   (mini-omni2 PUBLIC cxx_std_17)
+target_link_libraries     (mini-omni2 PUBLIC crispasr-core snac ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(mini-omni2 PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # kyutai-stt — Kyutai STT (stt-1b-en_fr, stt-2.6b-en)
 # ---------------------------------------------------------------------------
 add_library(kyutai-stt STATIC kyutai_stt.h kyutai_stt.cpp)
@@ -791,6 +872,18 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# moss_audio — OpenMOSS-Team/MOSS-Audio-4B-Instruct (Whisper encoder + DeepStack + Qwen3 LLM)
+# ---------------------------------------------------------------------------
+add_library(moss_audio STATIC moss_audio.h moss_audio.cpp)
+set_target_properties(moss_audio PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(moss_audio PUBLIC .)
+target_compile_features   (moss_audio PUBLIC cxx_std_17)
+target_link_libraries     (moss_audio PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(moss_audio PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # qwen3_tts — Qwen/Qwen3-TTS (Qwen3 talker + 16-codebook RVQ output)
 # ---------------------------------------------------------------------------
 add_library(qwen3_tts STATIC qwen3_tts.h qwen3_tts.cpp)
@@ -805,13 +898,25 @@ endif()
 # ---------------------------------------------------------------------------
 # orpheus — canopylabs/orpheus-3b-0.1-ft (Llama-3.2-3B + SNAC 24 kHz codec)
 # ---------------------------------------------------------------------------
-add_library(orpheus STATIC orpheus.h orpheus.cpp orpheus_snac.h orpheus_snac.cpp)
+add_library(orpheus STATIC orpheus.h orpheus.cpp)
 set_target_properties(orpheus PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(orpheus PUBLIC .)
 target_compile_features   (orpheus PUBLIC cxx_std_17)
-target_link_libraries     (orpheus PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+target_link_libraries     (orpheus PUBLIC crispasr-core snac ggml ggml-base ggml-cpu)
 if(NOT MSVC)
     target_compile_options(orpheus PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# audioseal — Meta AudioSeal watermark generator + detector (MIT, ~5M params)
+# ---------------------------------------------------------------------------
+add_library(audioseal STATIC audioseal.h audioseal.cpp)
+set_target_properties(audioseal PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(audioseal PUBLIC .)
+target_compile_features   (audioseal PUBLIC cxx_std_17)
+target_link_libraries     (audioseal PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(audioseal PRIVATE -O3)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -827,6 +932,28 @@ target_compile_features   (chatterbox PUBLIC cxx_std_17)
 target_link_libraries     (chatterbox PUBLIC crispasr-core ggml ggml-base ggml-cpu)
 if(NOT MSVC)
     target_compile_options(chatterbox PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# tada-tts — HumeAI/tada-3b-ml (Llama-3.2-3B + FM head + TADA codec)
+# ---------------------------------------------------------------------------
+add_library(tada-tts STATIC tada_tts.h tada_tts.cpp)
+set_target_properties(tada-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(tada-tts PUBLIC .)
+target_compile_features   (tada-tts PUBLIC cxx_std_17)
+target_link_libraries     (tada-tts PUBLIC tada-codec crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(tada-tts PRIVATE -O3)
+endif()
+
+# tada-codec — TADA codec decoder (local-attention + DAC upsampler)
+add_library(tada-codec STATIC tada_codec.h tada_codec.cpp)
+set_target_properties(tada-codec PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(tada-codec PUBLIC .)
+target_compile_features   (tada-codec PUBLIC cxx_std_17)
+target_link_libraries     (tada-codec PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(tada-codec PRIVATE -O3)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -911,6 +1038,15 @@ target_compile_features   (vibevoice PUBLIC cxx_std_17)
 target_link_libraries     (vibevoice PUBLIC crispasr-core ggml ggml-base ggml-cpu)
 
 # ---------------------------------------------------------------------------
+# kugelaudio — KugelAudio-0-Open TTS (Qwen2.5-7B + DiT diffusion + VAE)
+# ---------------------------------------------------------------------------
+add_library(kugelaudio STATIC kugelaudio.h kugelaudio.cpp)
+set_target_properties(kugelaudio PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(kugelaudio PUBLIC .)
+target_compile_features   (kugelaudio PUBLIC cxx_std_17)
+target_link_libraries     (kugelaudio PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+
+# ---------------------------------------------------------------------------
 # voxcpm2_tts — openbmb/VoxCPM2 (diffusion AR TTS, 30 languages, 48kHz)
 # ---------------------------------------------------------------------------
 add_library(voxcpm2_tts STATIC voxcpm2_tts.h voxcpm2_tts.cpp)
@@ -926,9 +1062,24 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# cosyvoice3_tts — FunAudioLLM/Fun-CosyVoice3-0.5B-2512 (Qwen2-0.5B LLM +
+# DiT-CFM flow + HiFi-GAN-iSTFT vocoder). Phase 2 ships the LLM only.
+# ---------------------------------------------------------------------------
+add_library(cosyvoice3_tts STATIC cosyvoice3_tts.h cosyvoice3_tts.cpp)
+set_target_properties(cosyvoice3_tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(cosyvoice3_tts PUBLIC .)
+target_compile_features   (cosyvoice3_tts PUBLIC cxx_std_17)
+target_link_libraries     (cosyvoice3_tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(cosyvoice3_tts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # kokoro — hexgrad/Kokoro-82M + yl4579/StyleTTS2-LJSpeech (iSTFTNet TTS)
 # ---------------------------------------------------------------------------
-add_library(kokoro STATIC kokoro.h kokoro.cpp)
+# phonemizer.cpp is in crispasr-lib (line ~143); don't duplicate it here
+# or the all-in-one link (Linux/Android shared .so) gets duplicate symbols.
+add_library(kokoro STATIC kokoro.h kokoro.cpp phonemizer.h)
 set_target_properties(kokoro PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(kokoro PUBLIC .)
 target_compile_features   (kokoro PUBLIC cxx_std_17)
@@ -940,10 +1091,19 @@ endif()
 # Optional libespeak-ng linkage. When ON we replace the popen("espeak-ng …")
 # shell-out with a direct espeak_TextToPhonemes() call (saves ~30–50 ms per
 # call, removes the shell-quoting surface, works in sandboxed processes).
-# AUTO: link if pkg-config finds it OR if Homebrew layout is present;
-# otherwise silently fall back to the popen path.
+#
+# NOTE: espeak-ng is GPLv3. Static/dynamic linking at build time makes the
+# binary a GPL derivative. The default mode (AUTO) therefore uses **dlopen**
+# at runtime — the binary ships MIT-clean and loads libespeak-ng only if the
+# user has it installed (or auto-downloaded). This follows the same pattern
+# as GIMP/VLC/FFmpeg for optional GPL plugins.
+#
+# AUTO (default): try system headers for compile-time API; load the shared
+#   library at runtime via dlopen. Falls back to popen(espeak-ng) subprocess.
+# ON:  link libespeak-ng at build time (makes the binary GPLv3).
+# OFF: disable completely — popen(espeak-ng) only.
 set(CRISPASR_WITH_ESPEAK_NG "AUTO" CACHE STRING
-    "Link kokoro against libespeak-ng for in-process phonemization (AUTO/ON/OFF)")
+    "espeak-ng phonemization: AUTO=dlopen at runtime, ON=link at build time (GPLv3!), OFF=popen only")
 set_property(CACHE CRISPASR_WITH_ESPEAK_NG PROPERTY STRINGS "AUTO" "ON" "OFF")
 
 if(NOT CRISPASR_WITH_ESPEAK_NG STREQUAL "OFF")
@@ -951,43 +1111,235 @@ if(NOT CRISPASR_WITH_ESPEAK_NG STREQUAL "OFF")
     set(_espeak_include "")
     set(_espeak_lib "")
 
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(ESPEAK_NG QUIET espeak-ng)
-        if(ESPEAK_NG_FOUND)
-            set(_espeak_found TRUE)
-            set(_espeak_include ${ESPEAK_NG_INCLUDE_DIRS})
-            set(_espeak_lib     ${ESPEAK_NG_LIBRARIES})
-            set(_espeak_libdir  ${ESPEAK_NG_LIBRARY_DIRS})
+    if(CRISPASR_WITH_ESPEAK_NG STREQUAL "ON")
+        # --- Explicit build-time linking (user accepts GPLv3) ---
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(ESPEAK_NG QUIET espeak-ng)
+            if(ESPEAK_NG_FOUND)
+                set(_espeak_found TRUE)
+                set(_espeak_include ${ESPEAK_NG_INCLUDE_DIRS})
+                set(_espeak_lib     ${ESPEAK_NG_LIBRARIES})
+                set(_espeak_libdir  ${ESPEAK_NG_LIBRARY_DIRS})
+            endif()
         endif()
-    endif()
-
-    # Homebrew/macOS fallback: pkg-config sometimes isn't on PATH but the lib is.
-    if(NOT _espeak_found)
-        find_path(ESPEAK_NG_INCLUDE_DIR espeak-ng/speak_lib.h
-                  HINTS /opt/homebrew/include /usr/local/include /usr/include)
-        find_library(ESPEAK_NG_LIBRARY NAMES espeak-ng
-                     HINTS /opt/homebrew/lib /usr/local/lib /usr/lib)
-        if(ESPEAK_NG_INCLUDE_DIR AND ESPEAK_NG_LIBRARY)
-            set(_espeak_found TRUE)
-            set(_espeak_include ${ESPEAK_NG_INCLUDE_DIR})
-            set(_espeak_lib     ${ESPEAK_NG_LIBRARY})
+        if(NOT _espeak_found)
+            find_path(ESPEAK_NG_INCLUDE_DIR espeak-ng/speak_lib.h
+                      HINTS /opt/homebrew/include /usr/local/include /usr/include)
+            find_library(ESPEAK_NG_LIBRARY NAMES espeak-ng
+                         HINTS /opt/homebrew/lib /usr/local/lib /usr/lib)
+            if(ESPEAK_NG_INCLUDE_DIR AND ESPEAK_NG_LIBRARY)
+                set(_espeak_found TRUE)
+                set(_espeak_include ${ESPEAK_NG_INCLUDE_DIR})
+                set(_espeak_lib     ${ESPEAK_NG_LIBRARY})
+            endif()
+        endif()
+        if(NOT _espeak_found)
+            message(FATAL_ERROR "CRISPASR_WITH_ESPEAK_NG=ON but libespeak-ng not found. Install espeak-ng or set AUTO/OFF.")
         endif()
     endif()
 
     if(_espeak_found)
+        # Build-time linking path (GPLv3)
         target_compile_definitions(kokoro PRIVATE CRISPASR_HAVE_ESPEAK_NG=1)
         target_include_directories(kokoro PRIVATE ${_espeak_include})
         if(_espeak_libdir)
-            target_link_directories(kokoro PUBLIC ${_espeak_libdir})
+            target_link_directories(kokoro PRIVATE ${_espeak_libdir})
         endif()
-        target_link_libraries(kokoro PUBLIC ${_espeak_lib})
-        message(STATUS "kokoro: libespeak-ng enabled (in-process phonemizer)")
-    elseif(CRISPASR_WITH_ESPEAK_NG STREQUAL "ON")
-        message(FATAL_ERROR "CRISPASR_WITH_ESPEAK_NG=ON but libespeak-ng not found. Install espeak-ng or set OFF.")
+        target_link_libraries(kokoro PRIVATE ${_espeak_lib})
+        message(STATUS "kokoro: libespeak-ng linked (in-process phonemizer) — binary is GPLv3!")
     else()
-        message(STATUS "kokoro: libespeak-ng not found, falling back to popen(espeak-ng) at runtime")
+        # AUTO mode: dlopen at runtime (MIT-clean binary).
+        # Define CRISPASR_ESPEAK_DLOPEN so the runtime uses dlopen/dlsym
+        # instead of direct function calls.
+        target_compile_definitions(kokoro PRIVATE CRISPASR_ESPEAK_DLOPEN=1)
+        message(STATUS "kokoro: espeak-ng via dlopen at runtime (MIT-clean)")
     endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# outetts — OuteAI/OuteTTS LLM-based TTS + WavTokenizer codec (native ggml runtime)
+# ---------------------------------------------------------------------------
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/outetts.cpp")
+add_library(outetts STATIC outetts.h outetts.cpp outetts_wavtok.h outetts_wavtok.cpp)
+set_target_properties(outetts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(outetts PUBLIC .)
+target_compile_features   (outetts PUBLIC cxx_std_17)
+target_link_libraries     (outetts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(outetts PRIVATE -O3)
+endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# f5-tts — SWivid/F5-TTS DiT-based flow matching TTS (native ggml runtime)
+# ---------------------------------------------------------------------------
+add_library(f5-tts STATIC f5_tts.h f5_tts.cpp)
+set_target_properties(f5-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(f5-tts PUBLIC .)
+target_compile_features   (f5-tts PUBLIC cxx_std_17)
+target_link_libraries     (f5-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(f5-tts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# csm-tts — sesame/csm-1b (1B Llama backbone + depth decoder + Mimi codec)
+# ---------------------------------------------------------------------------
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/csm_tts.cpp")
+    add_library(csm-tts STATIC csm_tts.h csm_tts.cpp)
+    set_target_properties(csm-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(csm-tts PUBLIC .)
+    target_compile_features   (csm-tts PUBLIC cxx_std_17)
+    target_link_libraries     (csm-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+    if(NOT MSVC)
+        target_compile_options(csm-tts PRIVATE -O3)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# pocket-tts — kyutai/pocket-tts (100M continuous-latent AR TTS, 24 kHz)
+# ---------------------------------------------------------------------------
+add_library(pocket-tts STATIC pocket_tts.h pocket_tts.cpp)
+set_target_properties(pocket-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(pocket-tts PUBLIC .)
+target_compile_features   (pocket-tts PUBLIC cxx_std_17)
+target_link_libraries     (pocket-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(pocket-tts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# parler-tts — Parler TTS prompt-conditioned TTS (T5 + MusicGen decoder + DAC)
+# ---------------------------------------------------------------------------
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/parler_tts.cpp")
+add_library(parler-tts STATIC parler_tts.h parler_tts.cpp)
+set_target_properties(parler-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(parler-tts PUBLIC .)
+target_compile_features   (parler-tts PUBLIC cxx_std_17)
+target_link_libraries     (parler-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(parler-tts PRIVATE -O3)
+endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# zonos-tts — Zyphra/Zonos-v0.1-transformer AR TTS + DAC 44.1 kHz codec
+# ---------------------------------------------------------------------------
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/zonos_tts.cpp")
+add_library(zonos-tts STATIC zonos_tts.h zonos_tts.cpp)
+set_target_properties(zonos-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(zonos-tts PUBLIC .)
+target_compile_features   (zonos-tts PUBLIC cxx_std_17)
+target_link_libraries     (zonos-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(zonos-tts PRIVATE -O3)
+endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# bark-tts — Suno Bark TTS (native ggml runtime)
+# ---------------------------------------------------------------------------
+add_library(bark-tts STATIC bark_tts.h bark_tts.cpp)
+set_target_properties(bark-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(bark-tts PUBLIC .)
+target_compile_features   (bark-tts PUBLIC cxx_std_17)
+target_link_libraries     (bark-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(bark-tts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# dia-tts — Nari Labs Dia TTS (native ggml runtime)
+# ---------------------------------------------------------------------------
+add_library(dia-tts STATIC dia_tts.h dia_tts.cpp)
+set_target_properties(dia-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(dia-tts PUBLIC .)
+target_compile_features   (dia-tts PUBLIC cxx_std_17)
+target_link_libraries     (dia-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(dia-tts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# fastpitch-tts — NVIDIA FastPitch parallel TTS (native ggml runtime)
+# ---------------------------------------------------------------------------
+add_library(fastpitch-tts STATIC fastpitch_tts.h fastpitch_tts.cpp)
+set_target_properties(fastpitch-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(fastpitch-tts PUBLIC .)
+target_compile_features   (fastpitch-tts PUBLIC cxx_std_17)
+target_link_libraries     (fastpitch-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(fastpitch-tts PRIVATE -O3)
+endif()
+
+# bert-encoder — BERT encoder for MeloTTS conditioning
+# ---------------------------------------------------------------------------
+add_library(bert-encoder STATIC bert_encoder.h bert_encoder.cpp)
+set_target_properties(bert-encoder PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(bert-encoder PUBLIC .)
+target_compile_features   (bert-encoder PUBLIC cxx_std_17)
+target_link_libraries     (bert-encoder PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(bert-encoder PRIVATE -O3)
+endif()
+
+# melotts — myshell-ai/MeloTTS VITS2 TTS (native ggml runtime)
+# ---------------------------------------------------------------------------
+add_library(melotts STATIC melotts.h melotts.cpp)
+set_target_properties(melotts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(melotts PUBLIC .)
+target_compile_features   (melotts PUBLIC cxx_std_17)
+target_link_libraries     (melotts PUBLIC crispasr-core ggml ggml-base ggml-cpu bert-encoder)
+if(NOT MSVC)
+    target_compile_options(melotts PRIVATE -O3)
+endif()
+
+# openvoice2 — myshell-ai/OpenVoice V2 Tone Color Converter (voice cloning)
+# ---------------------------------------------------------------------------
+add_library(openvoice2 STATIC openvoice2.h openvoice2.cpp)
+set_target_properties(openvoice2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(openvoice2 PUBLIC .)
+target_compile_features   (openvoice2 PUBLIC cxx_std_17)
+target_link_libraries     (openvoice2 PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(openvoice2 PRIVATE -O3)
+endif()
+
+# piper-tts — rhasspy/piper VITS TTS (native ggml runtime)
+# ---------------------------------------------------------------------------
+add_library(piper-tts STATIC piper_tts.h piper_tts.cpp)
+set_target_properties(piper-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(piper-tts PUBLIC .)
+target_compile_features   (piper-tts PUBLIC cxx_std_17)
+target_link_libraries     (piper-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(piper-tts PRIVATE -O3)
+endif()
+
+# Piper reuses the same espeak-ng integration as kokoro.
+if(_espeak_found)
+    target_compile_definitions(piper-tts PRIVATE CRISPASR_HAVE_ESPEAK_NG=1)
+    target_include_directories(piper-tts PRIVATE ${_espeak_include})
+    if(_espeak_libdir)
+        target_link_directories(piper-tts PRIVATE ${_espeak_libdir})
+    endif()
+    target_link_libraries(piper-tts PRIVATE ${_espeak_lib})
+    message(STATUS "piper-tts: libespeak-ng linked — binary is GPLv3!")
+elseif(NOT CRISPASR_WITH_ESPEAK_NG STREQUAL "OFF")
+    target_compile_definitions(piper-tts PRIVATE CRISPASR_ESPEAK_DLOPEN=1)
+    message(STATUS "piper-tts: espeak-ng via dlopen at runtime (MIT-clean)")
+endif()
+
+# speecht5-tts — Microsoft SpeechT5 TTS (encoder-decoder mel + HiFi-GAN)
+# ---------------------------------------------------------------------------
+add_library(speecht5-tts STATIC speecht5_tts.h speecht5_tts.cpp)
+set_target_properties(speecht5-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(speecht5-tts PUBLIC .)
+target_compile_features   (speecht5-tts PUBLIC cxx_std_17)
+target_link_libraries     (speecht5-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(speecht5-tts PRIVATE -O3)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -1020,7 +1372,7 @@ add_library(firered-lid STATIC firered_lid.h firered_lid.cpp)
 set_target_properties(firered-lid PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(firered-lid PUBLIC .)
 target_compile_features   (firered-lid PUBLIC cxx_std_17)
-target_link_libraries     (firered-lid PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+target_link_libraries     (firered-lid PUBLIC firered-asr crispasr-core ggml ggml-base ggml-cpu)
 
 # ---------------------------------------------------------------------------
 # lid-fasttext — fastText supervised LID (GlotLID-V3 + Facebook LID-176).
@@ -1045,6 +1397,13 @@ set_target_properties(firered-asr PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(firered-asr PUBLIC .)
 target_compile_features   (firered-asr PUBLIC cxx_std_17)
 target_link_libraries     (firered-asr PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+# firered_asr.cpp's CPU decoder/encoder matmuls (cpu_matmul_bt) are
+# `#pragma omp parallel for`, but the target never linked OpenMP — so the
+# pragmas were no-ops and the AED beam decoder ran single-threaded
+# (~1.4 s/token at beam 5). Link OpenMP so the matmuls actually parallelize.
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(firered-asr PUBLIC OpenMP::OpenMP_CXX)
+endif()
 if(NOT MSVC)
     target_compile_options(firered-asr PRIVATE -O3)
 endif()
@@ -1113,9 +1472,9 @@ target_include_directories(text-lid-dispatch PUBLIC .)
 target_compile_features   (text-lid-dispatch PUBLIC cxx_std_17)
 target_link_libraries     (text-lid-dispatch PUBLIC crispasr-core lid-fasttext lid-cld3)
 # `text_lid_resolve_path()` calls into crispasr_cache::ensure_cached_file
-# and crispasr_registry_lookup — both compiled into the crispasr shared
+# and crispasr_registry_lookup — both compiled into the crispasr-lib shared
 # library, not separate targets. The symbols resolve when the consumer
-# (crispasr-lid, libcrispasr) links text-lid-dispatch + crispasr together.
+# (crispasr-lid, libcrispasr) links text-lid-dispatch + crispasr-lib together.
 if(NOT MSVC)
     target_compile_options(text-lid-dispatch PRIVATE -O3)
 endif()
@@ -1199,95 +1558,116 @@ endif()
 #
 # Adding a new backend is a three-line change here: (1) build the
 # backend target as usual elsewhere in this file, (2) add
-# `target_link_libraries(crispasr PUBLIC <target>)` below, (3) add the
+# `target_link_libraries(crispasr-lib PUBLIC <target>)` below, (3) add the
 # `crispasr_<backend>_*` wrappers to crispasr_c_api.cpp.
 # ---------------------------------------------------------------------------
+if (TARGET nemotron)
+    target_link_libraries(crispasr-lib PUBLIC nemotron)
+endif()
 if (TARGET parakeet)
-    target_link_libraries(crispasr PUBLIC parakeet)
+    target_link_libraries(crispasr-lib PUBLIC parakeet)
 endif()
 if (TARGET canary)
-    target_link_libraries(crispasr PUBLIC canary)
+    target_link_libraries(crispasr-lib PUBLIC canary)
+endif()
+if (TARGET lfm2_audio)
+    target_link_libraries(crispasr-lib PUBLIC lfm2_audio)
 endif()
 if (TARGET qwen3_asr)
-    target_link_libraries(crispasr PUBLIC qwen3_asr)
+    target_link_libraries(crispasr-lib PUBLIC qwen3_asr)
 endif()
 if (TARGET cohere)
-    target_link_libraries(crispasr PUBLIC cohere)
+    target_link_libraries(crispasr-lib PUBLIC cohere)
 endif()
 if (TARGET granite_speech)
-    target_link_libraries(crispasr PUBLIC granite_speech)
+    target_link_libraries(crispasr-lib PUBLIC granite_speech)
+endif()
+if (TARGET granite_nle)
+    target_link_libraries(crispasr-lib PUBLIC granite_nle)
 endif()
 if (TARGET canary_ctc)
-    target_link_libraries(crispasr PUBLIC canary_ctc)
+    target_link_libraries(crispasr-lib PUBLIC canary_ctc)
 endif()
 if (TARGET voxtral)
-    target_link_libraries(crispasr PUBLIC voxtral)
+    target_link_libraries(crispasr-lib PUBLIC voxtral)
 endif()
 if (TARGET voxtral4b)
-    target_link_libraries(crispasr PUBLIC voxtral4b)
+    target_link_libraries(crispasr-lib PUBLIC voxtral4b)
 endif()
 if (TARGET wav2vec2-ggml)
-    target_link_libraries(crispasr PUBLIC wav2vec2-ggml)
+    target_link_libraries(crispasr-lib PUBLIC wav2vec2-ggml)
 endif()
 if (TARGET ctc-align)
-    target_link_libraries(crispasr PUBLIC ctc-align)
+    target_link_libraries(crispasr-lib PUBLIC ctc-align)
 endif()
 if (TARGET glm-asr)
-    target_link_libraries(crispasr PUBLIC glm-asr)
+    target_link_libraries(crispasr-lib PUBLIC glm-asr)
+endif()
+if (TARGET mini-omni2)
+    target_link_libraries(crispasr-lib PUBLIC mini-omni2)
 endif()
 if (TARGET kyutai-stt)
-    target_link_libraries(crispasr PUBLIC kyutai-stt)
+    target_link_libraries(crispasr-lib PUBLIC kyutai-stt)
 endif()
 if (TARGET firered-asr)
-    target_link_libraries(crispasr PUBLIC firered-asr)
+    target_link_libraries(crispasr-lib PUBLIC firered-asr)
 endif()
 if (TARGET firered-vad)
-    target_link_libraries(crispasr PUBLIC firered-vad)
+    target_link_libraries(crispasr-lib PUBLIC firered-vad)
 endif()
 if (TARGET marblenet-vad)
-    target_link_libraries(crispasr PUBLIC marblenet-vad)
+    target_link_libraries(crispasr-lib PUBLIC marblenet-vad)
 endif()
 if (TARGET crispasr-vad-encdec)
-    target_link_libraries(crispasr PUBLIC crispasr-vad-encdec)
+    target_link_libraries(crispasr-lib PUBLIC crispasr-vad-encdec)
 endif()
 if (TARGET firered-lid)
-    target_link_libraries(crispasr PUBLIC firered-lid)
+    target_link_libraries(crispasr-lib PUBLIC firered-lid)
 endif()
 if (TARGET lid-fasttext)
-    target_link_libraries(crispasr PUBLIC lid-fasttext)
+    target_link_libraries(crispasr-lib PUBLIC lid-fasttext)
 endif()
 if (TARGET omniasr)
-    target_link_libraries(crispasr PUBLIC omniasr)
+    target_link_libraries(crispasr-lib PUBLIC omniasr)
 endif()
 if (TARGET vibevoice)
-    target_link_libraries(crispasr PUBLIC vibevoice)
+    target_link_libraries(crispasr-lib PUBLIC vibevoice)
+endif()
+if (TARGET kugelaudio)
+    target_link_libraries(crispasr-lib PUBLIC kugelaudio)
 endif()
 if (TARGET ecapa-lid)
-    target_link_libraries(crispasr PUBLIC ecapa-lid)
+    target_link_libraries(crispasr-lib PUBLIC ecapa-lid)
 endif()
 if (TARGET titanet)
-    target_link_libraries(crispasr PUBLIC titanet)
+    target_link_libraries(crispasr-lib PUBLIC titanet)
 endif()
 if (TARGET moonshine)
-    target_link_libraries(crispasr PUBLIC moonshine)
+    target_link_libraries(crispasr-lib PUBLIC moonshine)
 endif()
 if (TARGET moonshine_streaming)
-    target_link_libraries(crispasr PUBLIC moonshine_streaming)
+    target_link_libraries(crispasr-lib PUBLIC moonshine_streaming)
 endif()
 if (TARGET gemma4_e2b)
-    target_link_libraries(crispasr PUBLIC gemma4_e2b)
+    target_link_libraries(crispasr-lib PUBLIC gemma4_e2b)
 endif()
 if (TARGET mimo_tokenizer)
-    target_link_libraries(crispasr PUBLIC mimo_tokenizer)
+    target_link_libraries(crispasr-lib PUBLIC mimo_tokenizer)
 endif()
 if (TARGET mimo_asr)
-    target_link_libraries(crispasr PUBLIC mimo_asr)
+    target_link_libraries(crispasr-lib PUBLIC mimo_asr)
+endif()
+if (TARGET moss_audio)
+    target_link_libraries(crispasr-lib PUBLIC moss_audio)
 endif()
 if (TARGET qwen3_tts)
-    target_link_libraries(crispasr PUBLIC qwen3_tts)
+    target_link_libraries(crispasr-lib PUBLIC qwen3_tts)
 endif()
 if (TARGET orpheus)
-    target_link_libraries(crispasr PUBLIC orpheus)
+    target_link_libraries(crispasr-lib PUBLIC orpheus)
+endif()
+if (TARGET tada-tts)
+    target_link_libraries(crispasr-lib PUBLIC tada-tts)
 endif()
 if (TARGET chatterbox)
     # libcrispasr.so calls chatterbox_set_temperature / set_top_p /
@@ -1313,64 +1693,118 @@ if (TARGET chatterbox)
     # add_dependencies() restores the build-order edge the generator
     # expression alone wouldn't establish.
     if (UNIX AND NOT APPLE AND BUILD_SHARED_LIBS)
-        target_link_libraries(crispasr PUBLIC
+        target_link_libraries(crispasr-lib PUBLIC
             "-Wl,--whole-archive"
             "$<TARGET_FILE:chatterbox>"
             "-Wl,--no-whole-archive")
-        add_dependencies(crispasr chatterbox)
+        add_dependencies(crispasr-lib chatterbox)
     else()
-        target_link_libraries(crispasr PUBLIC chatterbox)
+        target_link_libraries(crispasr-lib PUBLIC chatterbox)
     endif()
 endif()
 if (TARGET indextts)
-    target_link_libraries(crispasr PUBLIC indextts)
+    target_link_libraries(crispasr-lib PUBLIC indextts)
 endif()
 if (TARGET m2m100)
-    target_link_libraries(crispasr PUBLIC m2m100)
+    target_link_libraries(crispasr-lib PUBLIC m2m100)
 endif()
 if (TARGET t5_translate)
-    target_link_libraries(crispasr PUBLIC t5_translate)
+    target_link_libraries(crispasr-lib PUBLIC t5_translate)
 endif()
 if (TARGET voxcpm2_tts)
-    target_link_libraries(crispasr PUBLIC voxcpm2_tts)
+    target_link_libraries(crispasr-lib PUBLIC voxcpm2_tts)
+endif()
+if (TARGET cosyvoice3_tts)
+    target_link_libraries(crispasr-lib PUBLIC cosyvoice3_tts)
+endif()
+if (TARGET csm-tts)
+    target_link_libraries(crispasr-lib PUBLIC csm-tts)
+endif()
+if (TARGET bark-tts)
+    target_link_libraries(crispasr-lib PUBLIC bark-tts)
+endif()
+if (TARGET dia-tts)
+    target_link_libraries(crispasr-lib PUBLIC dia-tts)
+endif()
+if (TARGET fastpitch-tts)
+    target_link_libraries(crispasr-lib PUBLIC fastpitch-tts)
+endif()
+if (TARGET parler-tts)
+    target_link_libraries(crispasr-lib PUBLIC parler-tts)
+endif()
+if (TARGET speecht5-tts)
+    target_link_libraries(crispasr-lib PUBLIC speecht5-tts)
 endif()
 if (TARGET kokoro)
-    target_link_libraries(crispasr PUBLIC kokoro)
+    target_link_libraries(crispasr-lib PUBLIC kokoro)
+endif()
+if (TARGET outetts)
+    target_link_libraries(crispasr-lib PUBLIC outetts)
+endif()
+if (TARGET zonos-tts)
+    target_link_libraries(crispasr-lib PUBLIC zonos-tts)
+endif()
+if (TARGET f5-tts)
+    target_link_libraries(crispasr-lib PUBLIC f5-tts)
+endif()
+if (TARGET pocket-tts)
+    target_link_libraries(crispasr-lib PUBLIC pocket-tts)
+endif()
+if (TARGET bert-encoder)
+    target_link_libraries(crispasr-lib PUBLIC bert-encoder)
+endif()
+if (TARGET melotts)
+    target_link_libraries(crispasr-lib PUBLIC melotts)
+endif()
+if (TARGET openvoice2)
+    target_link_libraries(crispasr-lib PUBLIC openvoice2)
+endif()
+if (TARGET piper-tts)
+    target_link_libraries(crispasr-lib PUBLIC piper-tts)
+endif()
+if (TARGET funasr)
+    target_link_libraries(crispasr-lib PUBLIC funasr)
+endif()
+if (TARGET paraformer)
+    target_link_libraries(crispasr-lib PUBLIC paraformer)
+endif()
+if (TARGET sensevoice)
+    target_link_libraries(crispasr-lib PUBLIC sensevoice)
 endif()
 if (TARGET fireredpunc)
-    target_link_libraries(crispasr PUBLIC fireredpunc)
+    target_link_libraries(crispasr-lib PUBLIC fireredpunc)
 endif()
 if (TARGET truecaser)
-    target_link_libraries(crispasr PUBLIC truecaser)
+    target_link_libraries(crispasr-lib PUBLIC truecaser)
 endif()
 if (TARGET truecaser_crf)
-    target_link_libraries(crispasr PUBLIC truecaser_crf)
+    target_link_libraries(crispasr-lib PUBLIC truecaser_crf)
 endif()
 if (TARGET truecaser_lstm)
-    target_link_libraries(crispasr PUBLIC truecaser_lstm)
+    target_link_libraries(crispasr-lib PUBLIC truecaser_lstm)
 endif()
 if (TARGET pcs)
-    target_link_libraries(crispasr PUBLIC pcs)
+    target_link_libraries(crispasr-lib PUBLIC pcs)
 endif()
 # Pyannote segmentation is not a backend; it's consumed by
 # crispasr_diarize.cpp for the "pyannote" method. Still needs linking in
 # so the native diarizer's symbols resolve at libcrispasr load time.
 if (TARGET pyannote-seg)
-    target_link_libraries(crispasr PUBLIC pyannote-seg)
+    target_link_libraries(crispasr-lib PUBLIC pyannote-seg)
 endif()
 # Silero LID engine used by crispasr_lid.cpp's native Silero path.
 if (TARGET silero-lid)
-    target_link_libraries(crispasr PUBLIC silero-lid)
+    target_link_libraries(crispasr-lib PUBLIC silero-lid)
 endif()
 # CLD3 text-LID — sibling of lid-fasttext, routed via the auto-routing
 # text-LID dispatcher in src/text_lid_dispatch.cpp.
 if (TARGET lid-cld3)
-    target_link_libraries(crispasr PUBLIC lid-cld3)
+    target_link_libraries(crispasr-lib PUBLIC lid-cld3)
 endif()
 # Text-LID dispatcher — selects between fastText and CLD3 by GGUF arch.
-# crispasr (the main library) and crispasr-lid both go through this.
+# crispasr-lib (the main library) and crispasr-lid both go through this.
 if (TARGET text-lid-dispatch)
-    target_link_libraries(crispasr PUBLIC text-lid-dispatch)
+    target_link_libraries(crispasr-lib PUBLIC text-lid-dispatch)
 endif()
 
 # Text-LLM chat backend — PRIVATE link: llama.h identifiers are
@@ -1378,10 +1812,10 @@ endif()
 # Symbols downstream consumers see are only the `crispasr_chat_*` ABI
 # from include/crispasr_chat.h. See docs/prompts/chat-abi.md.
 if (TARGET crispasr-llama-core)
-    target_link_libraries(crispasr PRIVATE crispasr-llama-core)
+    target_link_libraries(crispasr-lib PRIVATE crispasr-llama-core)
 endif()
 
-install(TARGETS crispasr LIBRARY)
+install(TARGETS crispasr-lib LIBRARY)
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../include/crispasr_chat.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
@@ -1390,28 +1824,28 @@ install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../include/crispasr_chat.h
 # legacy consumers that know the project as crispasr — not as
 # CrispASR — open the library under its old name.
 if (BUILD_SHARED_LIBS)
-    set_target_properties(crispasr PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    target_compile_definitions(crispasr PRIVATE CRISPASR_SHARED CRISPASR_BUILD)
+    set_target_properties(crispasr-lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_definitions(crispasr-lib PRIVATE CRISPASR_SHARED CRISPASR_BUILD)
     if (APPLE)
-        add_custom_command(TARGET crispasr POST_BUILD
+        add_custom_command(TARGET crispasr-lib POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E create_symlink
-                $<TARGET_FILE_NAME:crispasr>
-                $<TARGET_FILE_DIR:crispasr>/libwhisper.dylib
-            COMMENT "Creating libwhisper.dylib -> $<TARGET_FILE_NAME:crispasr> alias"
+                $<TARGET_FILE_NAME:crispasr-lib>
+                $<TARGET_FILE_DIR:crispasr-lib>/libwhisper.dylib
+            COMMENT "Creating libwhisper.dylib -> $<TARGET_FILE_NAME:crispasr-lib> alias"
         )
     elseif (UNIX)
-        add_custom_command(TARGET crispasr POST_BUILD
+        add_custom_command(TARGET crispasr-lib POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E create_symlink
-                $<TARGET_FILE_NAME:crispasr>
-                $<TARGET_FILE_DIR:crispasr>/libwhisper.so
-            COMMENT "Creating libwhisper.so -> $<TARGET_FILE_NAME:crispasr> alias"
+                $<TARGET_FILE_NAME:crispasr-lib>
+                $<TARGET_FILE_DIR:crispasr-lib>/libwhisper.so
+            COMMENT "Creating libwhisper.so -> $<TARGET_FILE_NAME:crispasr-lib> alias"
         )
     elseif (WIN32)
-        add_custom_command(TARGET crispasr POST_BUILD
+        add_custom_command(TARGET crispasr-lib POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                $<TARGET_FILE:crispasr>
-                $<TARGET_FILE_DIR:crispasr>/whisper.dll
-            COMMENT "Copying $<TARGET_FILE:crispasr> to whisper.dll alias"
+                $<TARGET_FILE:crispasr-lib>
+                $<TARGET_FILE_DIR:crispasr-lib>/whisper.dll
+            COMMENT "Copying $<TARGET_FILE:crispasr-lib> to whisper.dll alias"
         )
     endif()
 endif()

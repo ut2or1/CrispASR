@@ -18,6 +18,9 @@
 #include <direct.h>
 #include <io.h>
 #include <sys/stat.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
@@ -335,6 +338,10 @@ static bool fetch_libcurl(const std::string& url, const std::string& dest, bool 
 // ─── public API ──────────────────────────────────────────────────────────────
 
 std::string dir(const std::string& cache_dir_override) {
+#ifdef __EMSCRIPTEN__
+    // WASM: use Emscripten MEMFS. Models are written by JS via FS.writeFile.
+    return cache_dir_override.empty() ? "/models" : cache_dir_override;
+#endif
     if (!cache_dir_override.empty()) {
         mkdir(cache_dir_override.c_str(), 0755); // create leaf dir if absent
         return cache_dir_override;
@@ -366,6 +373,14 @@ bool file_present(const std::string& path) {
 }
 
 bool fetch(const std::string& url, const std::string& dest, bool quiet) {
+#ifdef __EMSCRIPTEN__
+    // WASM: no network from C++ side. Models are pre-loaded by JS into MEMFS.
+    (void)url;
+    (void)dest;
+    (void)quiet;
+    fprintf(stderr, "crispasr: download not available in WASM — load model via JS FS.writeFile\n");
+    return false;
+#endif
 #ifdef _WIN32
     // ── WinHTTP: built-in Windows HTTPS stack, no shell-quoting issues ──────
     if (!quiet)
@@ -459,6 +474,7 @@ static std::vector<std::string> well_known_search_dirs(const std::string& cache_
     if (const char* env = std::getenv("CRISPASR_MODELS_DIR"); env && *env) {
         dirs.emplace_back(env);
     }
+    dirs.emplace_back("/mnt/storage/gguf-models");
     dirs.emplace_back("/Volumes/backups/ai/crispasr-models");
 
     const char* home = std::getenv("HOME");

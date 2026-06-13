@@ -5,6 +5,7 @@
 #include "ggml-cpp.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 
 #ifdef CRISPASR_USE_COREML
 #include "coreml/whisper-encoder.h"
@@ -190,8 +191,54 @@ static bool ggml_graph_compute_helper(struct ggml_cgraph* graph, int n_threads, 
     return ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS;
 }
 
+// Persistent threadpool for CPU backends.  Without this, every
+// ggml_backend_cpu_graph_compute call creates a disposable threadpool,
+// spawning n_threads-1 pthreads on non-OpenMP builds.  After hundreds of
+// encoder/decoder calls the accumulated mmap/munmap for thread stacks
+// fragments memory and degrades perf 2-5× — the #132 pattern.
+//
+// Each CPU backend gets its own pool so that multiple whisper_state
+// instances (e.g. Ruby bindings) don't race on shared threadpool fields.
+#include <mutex>
+#include <unordered_map>
+struct cpu_pool_entry {
+    ggml_threadpool_t pool = nullptr;
+    int n_threads = 0;
+};
+static std::mutex g_cpu_pools_mtx;
+static std::unordered_map<ggml_backend_t, cpu_pool_entry> g_cpu_pools;
+
+static void whisper_ensure_cpu_threadpool(ggml_backend_sched_t sched, int n_threads) {
+    std::lock_guard<std::mutex> lock(g_cpu_pools_mtx);
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+        if (!ggml_backend_is_cpu(backend))
+            continue;
+
+        auto& entry = g_cpu_pools[backend];
+        if (entry.pool && entry.n_threads >= n_threads) {
+            ggml_backend_cpu_set_threadpool(backend, entry.pool);
+            continue;
+        }
+        // (Re)create with the requested size.
+        if (entry.pool) {
+            ggml_backend_cpu_set_threadpool(backend, nullptr);
+            ggml_threadpool_free(entry.pool);
+        }
+        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
+        entry.pool = ggml_threadpool_new(&tpp);
+        entry.n_threads = entry.pool ? n_threads : 0;
+        if (entry.pool) {
+            ggml_backend_cpu_set_threadpool(backend, entry.pool);
+        }
+    }
+}
+
 static bool ggml_graph_compute_helper(ggml_backend_sched_t sched, struct ggml_cgraph* graph, int n_threads,
                                       bool sched_reset = true) {
+    // Lazy-init persistent threadpool on the CPU backend (#132).
+    whisper_ensure_cpu_threadpool(sched, n_threads);
+
     for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
         ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -4762,6 +4809,9 @@ struct whisper_vad_context {
     struct ggml_tensor* h_state;
     struct ggml_tensor* c_state;
     std::vector<float> probs;
+    std::vector<float> window_buf;          // pre-allocated per-chunk window (#132)
+    std::vector<uint8_t> work_buf;          // pre-allocated ggml_cplan work buffer (#132)
+    ggml_threadpool_t threadpool = nullptr; // persistent 1-thread pool for inner loop (#132)
 };
 
 struct whisper_vad_context_params whisper_vad_default_context_params(void) {
@@ -5044,6 +5094,15 @@ static bool whisper_vad_init_context(whisper_vad_context* vctx) {
         }
 
         CRISPASR_LOG_INFO("%s: compute buffer (VAD)   = %7.2f MB\n", __func__, whisper_sched_size(vctx->sched) / 1e6);
+    }
+
+    // Create a persistent 1-thread pool used by the inner chunk loop.
+    // This avoids creating/destroying a disposable threadpool on every
+    // chunk (~250 per 8 s audio).  After many server requests the
+    // accumulated malloc/free fragmentation degrades performance (#132).
+    {
+        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(1);
+        vctx->threadpool = ggml_threadpool_new(&tpp);
     }
 
     return true;
@@ -5410,11 +5469,20 @@ bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* sa
     vctx->probs.resize(n_chunks);
     CRISPASR_LOG_INFO("%s: props size: %u\n", __func__, n_chunks);
 
-    std::vector<float> window(vctx->n_window, 0.0f);
+    // Use pre-allocated window buffer to avoid per-call heap allocation
+    // that fragments memory across repeated server requests (#132).
+    if ((int)vctx->window_buf.size() != vctx->n_window) {
+        vctx->window_buf.resize(vctx->n_window, 0.0f);
+    }
+    auto& window = vctx->window_buf;
 
     auto& sched = vctx->sched.sched;
 
     ggml_cgraph* gf = whisper_vad_build_graph(*vctx);
+
+    // Reset scheduler before re-allocation to prevent internal buffer
+    // accumulation across repeated VAD runs (fixes #132 70x regression).
+    ggml_backend_sched_reset(sched);
 
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
         CRISPASR_LOG_ERROR("%s: failed to allocate the compute buffer\n", __func__);
@@ -5424,7 +5492,27 @@ bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* sa
     struct ggml_tensor* frame = ggml_graph_get_tensor(gf, "frame");
     struct ggml_tensor* prob = ggml_graph_get_tensor(gf, "prob");
 
-    // we are going to reuse the graph multiple times for each chunk
+    // We reuse the same graph for all chunks.  The inner loop previously
+    // went through ggml_graph_compute_helper → ggml_backend_sched →
+    // ggml_backend_cpu_graph_compute, which created (and destroyed) a
+    // disposable ggml_threadpool on *every single chunk*.  With n_threads > 1
+    // that means n_chunks × (n_threads-1) pthread_create/join cycles per
+    // request.  After a few hundred server requests the accumulated glibc
+    // thread-stack mmap/munmap fragmentation degrades performance 5× (#132).
+    //
+    // Fix: pre-compute a ggml_cplan once (with n_threads=1 — the graph is
+    // tiny, multi-threading hurts), allocate its work buffer once, and call
+    // ggml_graph_compute directly per chunk.  This bypasses the scheduler
+    // overhead and all threadpool creation entirely.
+
+    struct ggml_cplan cplan = ggml_graph_plan(gf, /*n_threads=*/1, vctx->threadpool);
+
+    // Persistent work buffer — reused across calls via vctx member.
+    if (vctx->work_buf.size() < cplan.work_size) {
+        vctx->work_buf.resize(cplan.work_size);
+    }
+    cplan.work_data = vctx->work_buf.data();
+
     const int64_t t_start_vad_us = ggml_time_us();
 
     for (int i = 0; i < n_chunks; i++) {
@@ -5435,27 +5523,19 @@ bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* sa
 
         if (chunk_len < vctx->n_window) {
             CRISPASR_LOG_INFO("%s: chunk_len: %d < n_window: %d\n", __func__, chunk_len, vctx->n_window);
-            std::vector<float> partial_chunk(vctx->n_window, 0.0f);
-            std::copy(samples + idx_start, samples + idx_end, partial_chunk.begin());
-
-            // Copy the zero-padded chunk to the window.
-            const int samples_to_copy_max = vctx->n_window;
-            const int samples_to_copy_cur = std::min(samples_to_copy_max, (int)partial_chunk.size());
-            std::copy(partial_chunk.begin(), partial_chunk.begin() + samples_to_copy_cur, window.begin());
-            if (samples_to_copy_cur < samples_to_copy_max) {
-                std::fill(window.begin() + samples_to_copy_cur, window.end(), 0.0f);
-            }
+            // Zero-pad the last partial chunk directly into window.
+            std::copy(samples + idx_start, samples + idx_end, window.begin());
+            std::fill(window.begin() + chunk_len, window.end(), 0.0f);
         } else {
             // Copy current frame samples to the window.
-            const int samples_to_copy = std::min(idx_end - idx_start, vctx->n_window);
-            std::copy(samples + idx_start, samples + idx_start + samples_to_copy, window.begin());
+            std::copy(samples + idx_start, samples + idx_start + vctx->n_window, window.begin());
         }
 
         // Set the frame tensor data with the samples.
         ggml_backend_tensor_set(frame, window.data(), 0, ggml_nelements(frame) * sizeof(float));
 
-        // do not reset the scheduler - we will reuse the graph in the next chunk
-        if (!ggml_graph_compute_helper(sched, gf, vctx->n_threads, false)) {
+        // Direct graph compute — no scheduler, no threadpool churn.
+        if (ggml_graph_compute(gf, &cplan) != GGML_STATUS_SUCCESS) {
             CRISPASR_LOG_ERROR("%s: failed to compute VAD graph\n", __func__);
             break;
         }
@@ -5466,8 +5546,9 @@ bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* sa
         //CRISPASR_LOG_DEBUG("chunk %d: p = %7.3f\n", i, probs[i]);
     }
 
-    vctx->t_vad_us += ggml_time_us() - t_start_vad_us;
-    CRISPASR_LOG_INFO("%s: vad time = %.2f ms processing %d samples\n", __func__, 1e-3f * vctx->t_vad_us, n_samples);
+    const int64_t t_this_vad = ggml_time_us() - t_start_vad_us;
+    vctx->t_vad_us = t_this_vad; // per-call only, not accumulated (#132)
+    CRISPASR_LOG_INFO("%s: vad time = %.2f ms processing %d samples\n", __func__, 1e-3f * t_this_vad, n_samples);
 
     ggml_backend_sched_reset(sched);
 
@@ -5753,6 +5834,10 @@ void whisper_vad_free(whisper_vad_context* ctx) {
 
         for (auto& backend : ctx->backends) {
             ggml_backend_free(backend);
+        }
+
+        if (ctx->threadpool) {
+            ggml_threadpool_free(ctx->threadpool);
         }
 
         delete[] ctx->model.hparams.encoder_in_channels;
@@ -6191,6 +6276,30 @@ struct whisper_full_params* whisper_full_default_params_by_ref(enum whisper_samp
     struct whisper_full_params* result = new whisper_full_params();
     *result = params;
     return result;
+}
+
+// ABI-stable pointer wrappers for FFI bindings (Dart, etc.) that cannot
+// pass `whisper_context_params` / `whisper_full_params` by value across
+// the C ABI. Without these, large-struct args silently corrupted on
+// platforms where the SysV / AAPCS rules differ from the FFI binding's
+// assumption — typically observed as garbage `use_gpu / gpu_device /
+// vad / vad_model_path` once Dart called whisper_init_from_file_with_params
+// or whisper_full directly. Each wrapper just dereferences the pointer
+// and forwards to the canonical by-value entry point, so the upstream
+// implementation stays untouched.
+struct whisper_context* whisper_init_from_file_with_params_by_ref(const char* path_model,
+                                                                  struct whisper_context_params* params) {
+    return whisper_init_from_file_with_params(path_model, *params);
+}
+
+struct whisper_context* whisper_init_from_file_with_params_no_state_by_ref(const char* path_model,
+                                                                           struct whisper_context_params* params) {
+    return whisper_init_from_file_with_params_no_state(path_model, *params);
+}
+
+int whisper_full_by_ref(struct whisper_context* ctx, struct whisper_full_params* params, const float* samples,
+                        int n_samples) {
+    return whisper_full(ctx, *params, samples, n_samples);
 }
 
 struct whisper_full_params whisper_full_default_params(enum whisper_sampling_strategy strategy) {
@@ -7107,6 +7216,15 @@ static bool whisper_vad(struct whisper_context* ctx, struct whisper_state* state
 
 int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* state, struct whisper_full_params params,
                             const float* samples, int n_samples) {
+    // Reset all schedulers so a second whisper_full() call on the same
+    // context doesn't hit GGML_ASSERT(!sched->is_alloc) if a previous
+    // call left a scheduler in the allocated state (e.g. early return,
+    // or the Java/Go bindings reusing the context across tests).
+    ggml_backend_sched_reset(state->sched_conv.sched);
+    ggml_backend_sched_reset(state->sched_encode.sched);
+    ggml_backend_sched_reset(state->sched_cross.sched);
+    ggml_backend_sched_reset(state->sched_decode.sched);
+
     // clear old results
     auto& result_all = state->result_all;
 

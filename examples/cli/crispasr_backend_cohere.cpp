@@ -30,13 +30,18 @@ public:
 
     uint32_t capabilities() const override {
         return CAP_TIMESTAMPS_NATIVE | CAP_WORD_TIMESTAMPS | CAP_TOKEN_CONFIDENCE | CAP_DIARIZE |
-               CAP_PUNCTUATION_TOGGLE | CAP_FLASH_ATTN | CAP_TEMPERATURE | CAP_PARALLEL_PROCESSORS | CAP_AUTO_DOWNLOAD;
+               CAP_PUNCTUATION_TOGGLE | CAP_FLASH_ATTN | CAP_TEMPERATURE | CAP_BEAM_SEARCH | CAP_PARALLEL_PROCESSORS |
+               CAP_AUTO_DOWNLOAD;
     }
 
     bool init(const whisper_params& p) override {
         cohere_context_params cp = cohere_context_default_params();
         cp.n_threads = p.n_threads;
-        cp.use_flash = p.flash_attn;
+        // Cohere: cast-on-read is 13% faster than flash on chunked
+        // short-form (30s auto-chunks). Flash only wins on unchunked
+        // long-form (>5 min). Force flash via CRISPASR_COHERE_FLASH=1.
+        // See PERFORMANCE.md §5 (PLAN #73 closeout).
+        cp.use_flash = (getenv("CRISPASR_COHERE_FLASH") != nullptr);
         cp.use_gpu = crispasr_backend_should_use_gpu(p);
         cp.no_punctuation = !p.punctuation;
         cp.diarize = false;
@@ -69,6 +74,7 @@ public:
 
         // Sticky decode-time sampling controls.
         cohere_set_temperature(ctx_, params.temperature, params.seed);
+        cohere_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
         cohere_set_max_new_tokens(ctx_, params.max_new_tokens);
         cohere_set_frequency_penalty(ctx_, params.frequency_penalty);
 

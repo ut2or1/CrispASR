@@ -16,6 +16,7 @@ static int g_cpu_n_threads = 4;
 
 #include "voxcpm2_tts.h"
 #include "core/attention.h"
+#include "core/conv.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/torch_rng.h"
@@ -50,6 +51,14 @@ static int g_cpu_n_threads = 4;
 static bool vox_env_bool(const char* k) {
     const char* v = std::getenv(k);
     return v && *v && std::strcmp(v, "0") != 0;
+}
+
+// Like vox_env_bool but defaults to true (opt-out instead of opt-in).
+static bool vox_env_bool_default_on(const char* k) {
+    const char* v = std::getenv(k);
+    if (!v || !*v)
+        return true;                 // unset → on
+    return std::strcmp(v, "0") != 0; // "0" → off, anything else → on
 }
 
 static double vox_now_ms() {
@@ -301,10 +310,23 @@ struct voxcpm2_context {
     vox_kv_cache tslm_kv;
     vox_kv_cache ralm_kv;
 
-    // GGUF weight storage — owned here
+    // GGUF weight storage — owned here (CPU-resident when GPU is discrete)
     ggml_context* ggml_ctx = nullptr;
     ggml_backend_buffer_t weight_buf = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
+
+    // GPU weight mirrors.  On discrete GPUs (Vulkan, CUDA) the primary
+    // weight buffer is CPU-resident so that legacy paths (tensor_data_f32,
+    // matmul_mv_ggml, rms_norm_cpu, …) can dereference tensor->data.
+    // Graph-build functions reference gpu_weights instead so the ggml
+    // cgraph runs entirely on the GPU backend — no cross-backend copies.
+    // On unified-memory backends (Metal) these stay empty; ctx->weights
+    // is used everywhere.
+    vox_weights gpu_weights;
+    ggml_context* gpu_ggml_ctx = nullptr;
+    ggml_backend_buffer_t gpu_weight_buf = nullptr;
+    std::map<std::string, ggml_tensor*> gpu_tensors;
+    bool has_gpu_weights = false;
 
     // Runtime params
     int n_threads = 4;
@@ -319,11 +341,11 @@ struct voxcpm2_context {
     // RNG for CFM noise generation (seeded per synthesis call)
     mt19937_state rng;
 
-    // VOXCPM2_USE_GRAPH backend pool. Init unconditionally so the gate
-    // can be flipped per-call without re-loading the model. Weights still
-    // live on backend_cpu (legacy CPU paths read them directly via
-    // tensor->data); the graph paths run on this same CPU backend, gaining
-    // amortised graph build/alloc and ggml's planner.
+    // Helper: return gpu_weights for graph build (GPU-resident) or weights
+    // for legacy paths (always CPU-accessible).
+    const vox_weights& graph_weights() const { return has_gpu_weights ? gpu_weights : weights; }
+
+    // VOXCPM2_USE_GRAPH backend pool.
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     std::vector<uint8_t> compute_meta;
@@ -378,6 +400,10 @@ struct voxcpm2_context {
     ggml_backend_buffer_t vae_wn_ggml_buf = nullptr;
     std::map<std::string, ggml_tensor*> vae_wn_ggml_tensors;
 
+    // Pre-permuted ConvTranspose1d weights for decomposed col2im path
+    ggml_context* vae_perm_ctx = nullptr;
+    ggml_backend_buffer_t vae_perm_buf = nullptr;
+
     // Cached TSLM step graphs (qwen3-style multi-bucket pattern). Each
     // bucket is topology-invariant across n_past because Lk is pinned
     // to bucket_lk and positions is passed as runtime kv_indices — the
@@ -394,6 +420,11 @@ struct voxcpm2_context {
         ggml_context* arena_ctx = nullptr;
         ggml_cgraph* gf = nullptr;
         ggml_gallocr_t galloc = nullptr;
+        // Cached output tensor pointers — ggml_graph_get_tensor's hash
+        // is invalidated by ggml_gallocr_reserve, so we look up once
+        // after build and reuse on subsequent calls.
+        ggml_tensor* cached_hidden_out = nullptr;
+        ggml_tensor* cached_stop_probs = nullptr;
     };
     std::array<TslmBucket, 5> tslm_buckets;
 
@@ -409,6 +440,14 @@ struct voxcpm2_context {
     bool tslm_kv_synced = false; // true once tslm_kv (CPU vector) has been
                                  // copied into the backend tensor for this
                                  // synthesis call.
+
+    // RALM backend KV (mirrors TSLM pattern but for RALM's 8 layers)
+    ggml_context* ralm_kv_ctx = nullptr;
+    ggml_backend_buffer_t ralm_kv_buf = nullptr;
+    ggml_tensor* ralm_kv_k = nullptr;
+    ggml_tensor* ralm_kv_v = nullptr;
+    int ralm_kv_max_ctx = 0;
+    bool ralm_kv_synced = false;
 };
 
 // Stream struct
@@ -906,6 +945,206 @@ static void sync_tslm_kv_cpu_to_backend(voxcpm2_context* ctx) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RALM backend KV init + sync + graph (mirrors TSLM pattern, 8 layers,
+// no RoPE)
+// ---------------------------------------------------------------------------
+
+static bool init_ralm_kv_backend(voxcpm2_context* ctx) {
+    if (ctx->ralm_kv_k) {
+        return true;
+    }
+    const vox_hparams& hp = ctx->hp;
+    const int hd = (int)hp.ralm_head_dim;
+    const int n_kv = (int)hp.ralm_n_kv;
+    const int n_lay = (int)hp.ralm_n_layers;
+    const int max_ctx = ctx->ralm_kv.max_ctx > 0 ? ctx->ralm_kv.max_ctx : 4096;
+
+    ggml_init_params kp = {ggml_tensor_overhead() * 4 + 1024, nullptr, /*no_alloc=*/true};
+    ctx->ralm_kv_ctx = ggml_init(kp);
+    if (!ctx->ralm_kv_ctx) {
+        return false;
+    }
+    ctx->ralm_kv_k = ggml_new_tensor_4d(ctx->ralm_kv_ctx, GGML_TYPE_F32, hd, max_ctx, n_kv, n_lay);
+    ctx->ralm_kv_v = ggml_new_tensor_4d(ctx->ralm_kv_ctx, GGML_TYPE_F32, hd, max_ctx, n_kv, n_lay);
+    ggml_set_name(ctx->ralm_kv_k, "ralm_kv_k");
+    ggml_set_name(ctx->ralm_kv_v, "ralm_kv_v");
+    const size_t kb = ggml_nbytes(ctx->ralm_kv_k);
+    const size_t vb = ggml_nbytes(ctx->ralm_kv_v);
+    ctx->ralm_kv_buf = ggml_backend_alloc_buffer(ctx->backend, kb + vb);
+    if (!ctx->ralm_kv_buf) {
+        fprintf(stderr, "voxcpm2: failed to alloc ralm kv backend buffer (%zu bytes)\n", kb + vb);
+        return false;
+    }
+    char* base = (char*)ggml_backend_buffer_get_base(ctx->ralm_kv_buf);
+    ggml_backend_tensor_alloc(ctx->ralm_kv_buf, ctx->ralm_kv_k, base);
+    ggml_backend_tensor_alloc(ctx->ralm_kv_buf, ctx->ralm_kv_v, base + kb);
+    ggml_backend_buffer_clear(ctx->ralm_kv_buf, 0);
+    ctx->ralm_kv_max_ctx = max_ctx;
+    return true;
+}
+
+static void sync_ralm_kv_cpu_to_backend(voxcpm2_context* ctx) {
+    const vox_hparams& hp = ctx->hp;
+    const int hd = (int)hp.ralm_head_dim;
+    const int n_kv = (int)hp.ralm_n_kv;
+    const int n_lay = (int)hp.ralm_n_layers;
+    const int n_past = ctx->ralm_kv.n_past;
+    const int max_ctx = ctx->ralm_kv_max_ctx;
+    if (n_past <= 0 || !ctx->ralm_kv_k || !ctx->ralm_kv_v) {
+        return;
+    }
+    std::vector<float> stage((size_t)max_ctx * n_kv * hd, 0.0f);
+    const size_t layer_bytes = (size_t)max_ctx * n_kv * hd * sizeof(float);
+    for (int layer = 0; layer < n_lay; layer++) {
+        // K
+        std::fill(stage.begin(), stage.end(), 0.0f);
+        for (int kvh = 0; kvh < n_kv; kvh++) {
+            for (int pos = 0; pos < n_past; pos++) {
+                float* dst = stage.data() + (size_t)(kvh * max_ctx + pos) * hd;
+                const float* src = ctx->ralm_kv.k_cache[layer].data() + (size_t)pos * n_kv * hd + (size_t)kvh * hd;
+                std::memcpy(dst, src, (size_t)hd * sizeof(float));
+            }
+        }
+        ggml_backend_tensor_set(ctx->ralm_kv_k, stage.data(), (size_t)layer * layer_bytes, layer_bytes);
+        // V
+        std::fill(stage.begin(), stage.end(), 0.0f);
+        for (int kvh = 0; kvh < n_kv; kvh++) {
+            for (int pos = 0; pos < n_past; pos++) {
+                float* dst = stage.data() + (size_t)(kvh * max_ctx + pos) * hd;
+                const float* src = ctx->ralm_kv.v_cache[layer].data() + (size_t)pos * n_kv * hd + (size_t)kvh * hd;
+                std::memcpy(dst, src, (size_t)hd * sizeof(float));
+            }
+        }
+        ggml_backend_tensor_set(ctx->ralm_kv_v, stage.data(), (size_t)layer * layer_bytes, layer_bytes);
+    }
+}
+
+// Build the per-step RALM cgraph (all 8 layers, T=1). Same structure as
+// build_tslm_step_graph but simpler: no RoPE (rope_theta=0 makes
+// ggml_rope_ext a no-op), uses RALM hparams/weights/KV. Dynamic (non-
+// bucketed) build only — RALM's max_ctx is small and per-step cost is low.
+static ggml_cgraph* build_ralm_step_graph(voxcpm2_context* ctx, int n_past) {
+    const vox_hparams& hp = ctx->hp;
+    const vox_weights& W = ctx->graph_weights();
+    const int d = (int)hp.ralm_d_model;
+    const int n_q = (int)hp.ralm_n_heads;
+    const int n_kv = (int)hp.ralm_n_kv;
+    const int hd = (int)hp.ralm_head_dim;
+    const int n_kv_grp = n_q / n_kv;
+    const float eps = hp.rms_norm_eps;
+    const float attn_scale = 1.0f / std::sqrt((float)hd);
+    const int T = 1;
+    const int Lk = n_past + T;
+
+    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), /*no_alloc=*/true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
+
+    ggml_tensor* hidden_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, T);
+    ggml_set_name(hidden_in, "ralm_hidden_in");
+    ggml_set_input(hidden_in);
+
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_name(positions, "ralm_positions");
+    ggml_set_input(positions);
+
+    // No RoPE: set rope_theta = 0.0f so ggml_rope_ext rotates by zero.
+    const core_attn::KvSelfAttnParams kvp = {
+        /*n_heads*/ n_q,
+        /*n_kv_heads*/ n_kv,
+        /*head_dim*/ hd,
+        /*n_kv_grp*/ n_kv_grp,
+        /*n_ctx_orig*/ 0,
+        /*rope_theta*/ 0.0f,
+        /*rope_beta_fast*/ 0.0f,
+        /*rope_beta_slow*/ 0.0f,
+        /*attn_scale*/ attn_scale,
+        /*qk_norm_eps*/ 0.0f,
+        /*gqa_mode*/ core_attn::GQA_MANUAL_CONT,
+        /*rope_type*/ GGML_ROPE_TYPE_NEOX,
+        /*n_rot*/ 0,
+        /*v_rms_norm*/ false,
+        /*rope_freq_factors*/ nullptr,
+    };
+
+    ggml_tensor* cur = hidden_in;
+    for (uint32_t il = 0; il < hp.ralm_n_layers; il++) {
+        const vox_lm_layer& L = W.ralm_layers[il];
+        ggml_tensor* residual = cur;
+
+        // Attention block (RMSNorm x scale -> kv_self_attn -> residual).
+        ggml_tensor* x = ggml_rms_norm(ctx0, cur, eps);
+        x = ggml_mul(ctx0, x, L.attn_norm_w);
+
+        ggml_tensor* attn =
+            core_attn::kv_self_attn(ctx0, gf, x, L.attn_q_w, L.attn_k_w, L.attn_v_w, L.attn_o_w,
+                                    /*q_norm_w*/ nullptr, /*k_norm_w*/ nullptr, positions, /*causal_mask*/ nullptr,
+                                    ctx->ralm_kv_k, ctx->ralm_kv_v, (int)il, n_past, kvp,
+                                    /*qkv_w=*/nullptr, /*fixed_kv_len=*/Lk,
+                                    /*kv_indices=*/nullptr);
+        cur = ggml_add(ctx0, residual, attn);
+
+        // FFN block (RMSNorm x scale -> SwiGLU -> residual).
+        residual = cur;
+        x = ggml_rms_norm(ctx0, cur, eps);
+        x = ggml_mul(ctx0, x, L.ffn_norm_w);
+        ggml_tensor* mlp = core_ffn::swiglu(ctx0, x, L.ffn_gate_w, L.ffn_up_w, L.ffn_down_w);
+        cur = ggml_add(ctx0, residual, mlp);
+    }
+
+    // Final RMSNorm x ralm_output_norm.
+    cur = ggml_rms_norm(ctx0, cur, eps);
+    cur = ggml_mul(ctx0, cur, W.ralm_output_norm);
+    ggml_set_name(cur, "ralm_hidden_out");
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gf, cur);
+
+    ggml_free(ctx0);
+    return gf;
+}
+
+// Run one RALM step through the graph. Lazily inits the backend KV and
+// syncs from the CPU cache on first call per synthesis.
+static std::vector<float> ralm_step_graph(voxcpm2_context* ctx, const float* hidden_in, int pos) {
+    const int d = (int)ctx->hp.ralm_d_model;
+
+    // Init backend KV on first call
+    if (!ctx->ralm_kv_k) {
+        if (!init_ralm_kv_backend(ctx)) {
+            fprintf(stderr, "voxcpm2: ralm kv backend init failed\n");
+            return std::vector<float>(d, 0.0f);
+        }
+    }
+    if (!ctx->ralm_kv_synced) {
+        sync_ralm_kv_cpu_to_backend(ctx);
+        ctx->ralm_kv_synced = true;
+    }
+
+    ggml_cgraph* gf = build_ralm_step_graph(ctx, pos);
+    if (!ggml_gallocr_alloc_graph(ctx->galloc, gf)) {
+        fprintf(stderr, "voxcpm2: ralm_step gallocr alloc failed\n");
+        return std::vector<float>(d, 0.0f);
+    }
+
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "ralm_hidden_in"), hidden_in, 0, (size_t)d * sizeof(float));
+    int32_t pos_i = pos;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "ralm_positions"), &pos_i, 0, sizeof(int32_t));
+
+    if (ggml_backend_is_cpu(ctx->backend)) {
+        ggml_backend_cpu_set_n_threads(ctx->backend, g_cpu_n_threads);
+    }
+    if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "voxcpm2: ralm_step graph compute failed\n");
+        return std::vector<float>(d, 0.0f);
+    }
+
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "ralm_hidden_out");
+    std::vector<float> result(d);
+    ggml_backend_tensor_get(out, result.data(), 0, (size_t)d * sizeof(float));
+    return result;
+}
+
 // Build the per-step TSLM cgraph (all 28 layers, T=1). Reuses
 // core_attn::kv_self_attn (NEOX RoPE with LongRoPE freq_factors, GQA
 // expansion, flash-attn) and core_ffn::swiglu. The graph writes the new
@@ -917,7 +1156,7 @@ static void sync_tslm_kv_cpu_to_backend(voxcpm2_context* ctx) {
 static ggml_cgraph* build_tslm_step_graph(voxcpm2_context* ctx, int n_past, int fixed_kv_len = 0,
                                           ggml_context* arena_ctx = nullptr) {
     const vox_hparams& hp = ctx->hp;
-    const vox_weights& W = ctx->weights;
+    const vox_weights& W = ctx->graph_weights();
     const int d = (int)hp.tslm_d_model;
     const int n_q = (int)hp.tslm_n_heads;
     const int n_kv = (int)hp.tslm_n_kv;
@@ -1017,6 +1256,62 @@ static ggml_cgraph* build_tslm_step_graph(voxcpm2_context* ctx, int n_past, int 
     ggml_set_output(cur);
     ggml_build_forward_expand(gf, cur);
 
+    // Stop predictor: FSQ(hidden) → stop_proj(+bias) → SiLU → stop_head → softmax.
+    //
+    // Python checks stop on the FSQ'd output from the PREVIOUS step:
+    //   fsq_out = fsq_out_proj(round(tanh(fsq_in_proj(hidden)) * 9) / 9)
+    //   stop_probs = softmax(stop_head(silu(stop_proj(fsq_out) + bias)))
+    //
+    // Computing the full chain (FSQ + stop) inside the graph ensures the
+    // stop decision uses the same GPU dequantization + matmul path as the
+    // hidden state. Without FSQ, the stop predictor sees out-of-distribution
+    // inputs and never fires on Vulkan (#164). We implement round(x) as
+    // floor(x + 0.5) to avoid ggml_round, which produces NaN on CUDA.
+    // The stop predictor weights were trained on FSQ'd inputs, so feeding raw
+    // hidden state is out-of-distribution and fails on Vulkan (#164).
+    // FSQ: round(tanh(in_proj(hidden)) * 9) / 9 → out_proj.
+    // We implement round(x) as floor(x + 0.5) to avoid ggml_round, which
+    // produces NaN on some CUDA backends.
+    if (W.stop_proj_w && W.stop_proj_b && W.stop_head_w && W.fsq_in_proj_w && W.fsq_out_proj_w) {
+        // FSQ path
+        ggml_tensor* fsq_in = ggml_mul_mat(ctx0, W.fsq_in_proj_w, cur);
+        if (W.fsq_in_proj_b) {
+            fsq_in = ggml_add(ctx0, fsq_in, W.fsq_in_proj_b);
+        }
+        ggml_tensor* th = ggml_tanh(ctx0, fsq_in);
+        th = ggml_scale(ctx0, th, 9.0f);
+        // round(x) = floor(x + 0.5) — avoids ggml_round NaN on CUDA
+        ggml_tensor* half_const = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
+        ggml_set_name(half_const, "fsq_half");
+        ggml_set_input(half_const);
+        th = ggml_add(ctx0, th, half_const);
+        th = ggml_floor(ctx0, th);
+        th = ggml_scale(ctx0, th, 1.0f / 9.0f);
+        ggml_tensor* fsq_out = ggml_mul_mat(ctx0, W.fsq_out_proj_w, th);
+        if (W.fsq_out_proj_b) {
+            fsq_out = ggml_add(ctx0, fsq_out, W.fsq_out_proj_b);
+        }
+
+        ggml_tensor* sp = ggml_mul_mat(ctx0, W.stop_proj_w, fsq_out);
+        sp = ggml_add(ctx0, sp, W.stop_proj_b);
+        sp = ggml_silu(ctx0, sp);
+        ggml_tensor* sl = ggml_mul_mat(ctx0, W.stop_head_w, sp);
+        sl = ggml_soft_max(ctx0, sl);
+        ggml_set_name(sl, "stop_probs");
+        ggml_set_output(sl);
+        ggml_build_forward_expand(gf, sl);
+    } else if (W.stop_proj_w && W.stop_proj_b && W.stop_head_w) {
+        // Fallback without FSQ (missing FSQ weights)
+        ggml_tensor* sp = ggml_mul_mat(ctx0, W.stop_proj_w, cur);
+        sp = ggml_add(ctx0, sp, W.stop_proj_b);
+        sp = ggml_silu(ctx0, sp);
+        ggml_tensor* sl = ggml_mul_mat(ctx0, W.stop_head_w, sp);
+        sl = ggml_soft_max(ctx0, sl);
+        ggml_set_name(sl, "stop_probs");
+        ggml_set_output(sl);
+        ggml_build_forward_expand(gf, sl);
+    }
+
     if (!arena_ctx) {
         ggml_free(ctx0);
     }
@@ -1071,6 +1366,11 @@ static ggml_cgraph* get_or_build_tslm_step_graph(voxcpm2_context* ctx, int bucke
         bk.arena_meta.clear();
         return nullptr;
     }
+    // Cache output tensor pointers NOW — ggml_graph_get_tensor uses a
+    // hash table that ggml_gallocr_reserve (below) resets internally.
+    // After reserve, name-based lookup silently fails on reused graphs.
+    bk.cached_hidden_out = ggml_graph_get_tensor(bk.gf, "hidden_out");
+    bk.cached_stop_probs = ggml_graph_get_tensor(bk.gf, "stop_probs");
     bk.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
     if (!bk.galloc || !ggml_gallocr_reserve(bk.galloc, bk.gf)) {
         if (bk.galloc) {
@@ -1099,7 +1399,8 @@ static ggml_cgraph* get_or_build_tslm_step_graph(voxcpm2_context* ctx, int bucke
 // attention work on the masked tail — flash-attn computes Q·K^T over
 // the full Lk even when the tail is -inf masked, so 128 is meaningfully
 // cheaper than 2048 for short prompts; multi-bucket lets us pick.
-static std::vector<float> tslm_step_graph(voxcpm2_context* ctx, const float* hidden_in, int pos) {
+static std::vector<float> tslm_step_graph(voxcpm2_context* ctx, const float* hidden_in, int pos,
+                                          float* out_stop_score = nullptr) {
     const int d = (int)ctx->hp.tslm_d_model;
     int32_t pos_i = pos;
 
@@ -1107,8 +1408,13 @@ static std::vector<float> tslm_step_graph(voxcpm2_context* ctx, const float* hid
     ggml_gallocr_t galloc = nullptr;
     int Lk = 0;
     bool bucketed = false;
+    // VOXCPM2_NO_BUCKET=1 forces the dynamic (non-bucketed) graph path,
+    // which uses ggml_cpy for KV writes instead of ggml_set_rows. This
+    // works around a NaN bug where ggml_set_rows on CUDA corrupts the
+    // KV cache on the second AR step (#164).
+    static const bool no_bucket = vox_env_bool("VOXCPM2_NO_BUCKET");
     const int needed_lk = pos + 1;
-    const int bucket_idx = tslm_pick_bucket(needed_lk);
+    const int bucket_idx = no_bucket ? -1 : tslm_pick_bucket(needed_lk);
     if (bucket_idx >= 0) {
         gf = get_or_build_tslm_step_graph(ctx, bucket_idx);
         if (gf) {
@@ -1143,6 +1449,13 @@ static std::vector<float> tslm_step_graph(voxcpm2_context* ctx, const float* hid
                                 mask.size() * sizeof(ggml_fp16_t));
     }
 
+    // FSQ half-constant for floor(x + 0.5) rounding (#164)
+    ggml_tensor* fsq_half_t = ggml_graph_get_tensor(gf, "fsq_half");
+    if (fsq_half_t) {
+        const float half_val = 0.5f;
+        ggml_backend_tensor_set(fsq_half_t, &half_val, 0, sizeof(float));
+    }
+
     if (ggml_backend_is_cpu(ctx->backend)) {
         ggml_backend_cpu_set_n_threads(ctx->backend, g_cpu_n_threads);
     }
@@ -1151,9 +1464,48 @@ static std::vector<float> tslm_step_graph(voxcpm2_context* ctx, const float* hid
         return std::vector<float>(d, 0.0f);
     }
 
-    ggml_tensor* out = ggml_graph_get_tensor(gf, "hidden_out");
+    // Output tensor pointers. Scan graph nodes directly — ggml_graph_get_tensor
+    // does the same linear scan, but we explicitly search to be robust against
+    // any gallocr hash-table invalidation (#164).
+    ggml_tensor* out = nullptr;
+    ggml_tensor* sp_tensor = nullptr;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        ggml_tensor* nd = ggml_graph_node(gf, i);
+        if (std::strcmp(nd->name, "hidden_out") == 0)
+            out = nd;
+        else if (std::strcmp(nd->name, "stop_probs") == 0)
+            sp_tensor = nd;
+    }
     std::vector<float> result(d);
-    ggml_backend_tensor_get(out, result.data(), 0, (size_t)d * sizeof(float));
+    if (out) {
+        ggml_backend_tensor_get(out, result.data(), 0, (size_t)d * sizeof(float));
+    }
+
+    // Check for NaN in hidden_out — if the TSLM graph produces NaN,
+    // the entire AR loop is poisoned. Log once per synthesis for diag.
+    if (ctx->verbosity >= 1 && !result.empty() && std::isnan(result[0])) {
+        fprintf(stderr, "voxcpm2: WARNING: tslm_step_graph hidden_out[0]=NaN at pos=%d\n", pos);
+    }
+
+    // Extract stop score from the graph if available and requested.
+    if (out_stop_score) {
+        if (sp_tensor) {
+            float probs[2] = {0.0f, 0.0f};
+            ggml_backend_tensor_get(sp_tensor, probs, 0, 2 * sizeof(float));
+            float s = probs[1]; // p(stop) = softmax[1]
+            // Guard against NaN — the TSLM graph can produce NaN on some
+            // CUDA backends when the hidden state diverges. Fall back to
+            // -1.0 (CPU stop_score path) rather than poisoning subsequent
+            // stop checks (#164).
+            *out_stop_score = std::isnan(s) ? -1.0f : s;
+        } else {
+            *out_stop_score = -1.0f; // signal: not available
+            if (ctx->verbosity >= 1) {
+                fprintf(stderr, "voxcpm2: stop_probs tensor NOT found in graph (n_nodes=%d)\n", ggml_graph_n_nodes(gf));
+            }
+        }
+    }
+
     return result;
 }
 
@@ -1448,7 +1800,7 @@ static std::vector<float> locenc_forward(voxcpm2_context* ctx, const float* patc
 
 static ggml_cgraph* build_locenc_graph(voxcpm2_context* ctx, ggml_context* arena_ctx = nullptr) {
     const vox_hparams& hp = ctx->hp;
-    const vox_weights& W = ctx->weights;
+    const vox_weights& W = ctx->graph_weights();
     const int d = (int)hp.locenc_d_model;
     const int n_q = (int)hp.locenc_n_heads;
     const int n_kv = (int)hp.locenc_n_kv;
@@ -1890,7 +2242,7 @@ static std::vector<float> locdit_forward(voxcpm2_context* ctx, const float* x_ra
 
 static ggml_cgraph* build_locdit_graph(voxcpm2_context* ctx, ggml_context* arena_ctx = nullptr) {
     const vox_hparams& hp = ctx->hp;
-    const vox_weights& W = ctx->weights;
+    const vox_weights& W = ctx->graph_weights();
     const int d = (int)hp.locdit_d_model;
     const int n_q = (int)hp.locdit_n_heads;
     const int n_kv = (int)hp.locdit_n_kv;
@@ -2213,7 +2565,7 @@ static std::vector<float> cfm_euler_solve(voxcpm2_context* ctx, const float* mu,
     // (build_locdit_graph + locdit_forward_graph) instead of the
     // ~30 per-matmul tiny graphs. Same algebra; one graph build/alloc
     // per locdit call instead of one per matmul.
-    const bool use_graph = vox_env_bool("VOXCPM2_USE_GRAPH");
+    const bool use_graph = vox_env_bool_default_on("VOXCPM2_USE_GRAPH");
     auto locdit_call = [&](const float* x_tc, const float* mu_in, float t_cur, const float* cond_in,
                            float dt_in) -> std::vector<float> {
         if (use_graph) {
@@ -2910,11 +3262,13 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
     };
     std::vector<WnEntry> wn_entries;
     std::vector<std::string> alpha_names; // for snake1d inv_alpha precompute
+    std::vector<std::string> bias_names;  // bias tensors that need GPU copies
     std::vector<std::string> sr_names;    // "vae.dec.sr_cond.<b>"
 
     // layer.0: depthwise k=7, groups=feat_dim=64
     wn_entries.push_back({"vae.dec.layer.0", "vae.dec.layer.0.weight_g", "vae.dec.layer.0.weight_v",
                           /*out_ch*/ 64, /*in_ch*/ 1, /*ksize*/ 7});
+    bias_names.push_back("vae.dec.layer.0.bias");
     // layer.1: 1x1 dense, 64 -> 2048
     {
         auto it_g = T.find("vae.dec.layer.1.weight_g");
@@ -2922,6 +3276,7 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
         wn_entries.push_back({"vae.dec.layer.1", "vae.dec.layer.1.weight_g", "vae.dec.layer.1.weight_v",
                               /*out_ch*/ out_ch1, /*in_ch*/ 64, /*ksize*/ 1});
     }
+    bias_names.push_back("vae.dec.layer.1.bias");
 
     // Upsample blocks 2..7
     static const int up_rates[] = {8, 6, 5, 2, 2, 2};
@@ -2943,6 +3298,7 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
             ksize_up = 2 * up_rates[b];
         wn_entries.push_back({lp + ".block.1", lp + ".block.1.weight_g", lp + ".block.1.weight_v",
                               /*out_ch (wn arg)*/ Cc_in, /*in_ch (wn arg)*/ out_ch_b, /*ksize*/ ksize_up});
+        bias_names.push_back(lp + ".block.1.bias");
 
         // 3x residual units .block.{2,3,4} operating on out_ch_b channels
         for (int r = 0; r < 3; r++) {
@@ -2953,9 +3309,11 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
             // .1: depthwise k=7, channels=out_ch_b
             wn_entries.push_back({rp + ".1", rp + ".1.weight_g", rp + ".1.weight_v",
                                   /*out_ch*/ out_ch_b, /*in_ch*/ 1, /*ksize*/ 7});
+            bias_names.push_back(rp + ".1.bias");
             // .3: 1x1 dense, out_ch_b -> out_ch_b
             wn_entries.push_back({rp + ".3", rp + ".3.weight_g", rp + ".3.weight_v",
                                   /*out_ch*/ out_ch_b, /*in_ch*/ out_ch_b, /*ksize*/ 1});
+            bias_names.push_back(rp + ".3.bias");
         }
 
         Cc_in = out_ch_b;
@@ -2966,9 +3324,12 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
     // layer.9: k=7 dense, last_ch -> 1
     wn_entries.push_back({"vae.dec.layer.9", "vae.dec.layer.9.weight_g", "vae.dec.layer.9.weight_v",
                           /*out_ch*/ 1, /*in_ch*/ Cc_in, /*ksize*/ 7});
+    bias_names.push_back("vae.dec.layer.9.bias");
 
-    // Sum tensor overhead — generous, will be exact once we count
-    const size_t n_tensors_estimate = wn_entries.size() + alpha_names.size() + 2 * sr_names.size() + 16;
+    // Sum tensor overhead — generous, will be exact once we count.
+    // Includes: wn weights + inv_alpha + alpha copies + bias copies + sr scale/bias.
+    const size_t n_tensors_estimate =
+        wn_entries.size() + 2 * alpha_names.size() + bias_names.size() + 2 * sr_names.size() + 16;
     const size_t meta_size = ggml_tensor_overhead() * n_tensors_estimate;
 
     ggml_init_params ip = {
@@ -3015,12 +3376,34 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
         if (it == T.end() || !it->second)
             continue;
         int C = (int)ggml_nelements(it->second);
+        // inv_alpha tensor (precomputed 1/(alpha + eps))
         ggml_tensor* t = ggml_new_tensor_1d(ctx->vae_wn_ggml_ctx, GGML_TYPE_F32, C);
         if (!t)
             return false;
         std::string key = name + ".inv";
         ggml_set_name(t, key.c_str());
         M[key] = t;
+        // GPU copy of alpha itself — the graph references alpha tensors
+        // directly, which must be on the compute backend (#164 VAE crash).
+        ggml_tensor* ta = ggml_new_tensor_1d(ctx->vae_wn_ggml_ctx, GGML_TYPE_F32, C);
+        if (!ta)
+            return false;
+        ggml_set_name(ta, name.c_str());
+        M[name] = ta;
+    }
+
+    // GPU copies of bias tensors. The GGUF-loaded biases live in the CPU
+    // weight buffer; the VAE graph needs them on the compute backend.
+    for (const auto& name : bias_names) {
+        auto it = T.find(name);
+        if (it == T.end() || !it->second)
+            continue;
+        int C = (int)ggml_nelements(it->second);
+        ggml_tensor* t = ggml_new_tensor_1d(ctx->vae_wn_ggml_ctx, GGML_TYPE_F32, C);
+        if (!t)
+            return false;
+        ggml_set_name(t, name.c_str());
+        M[name] = t;
     }
 
     for (const auto& sr_pfx : sr_names) {
@@ -3076,20 +3459,37 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
         ggml_backend_tensor_set(M[e.key], w.data(), 0, w.size() * sizeof(float));
     }
 
-    // Snake1d inv_alpha = 1 / (α + 1e-9) per channel (matches Python's
-    // (alpha + 1e-9).reciprocal() semantics — including for tiny α the
-    // legacy CPU path silently rewrote as 1.0).
+    // Snake1d: populate inv_alpha + copy alpha to the compute backend.
     for (const auto& name : alpha_names) {
         auto it = T.find(name);
         if (it == T.end() || !it->second)
             continue;
         int C = (int)ggml_nelements(it->second);
         const float* a = (const float*)it->second->data;
+        // inv_alpha = 1 / (α + 1e-9) per channel (matches Python's
+        // (alpha + 1e-9).reciprocal() semantics)
         std::vector<float> inv(C);
         for (int i = 0; i < C; i++) {
             inv[i] = 1.0f / (a[i] + 1e-9f);
         }
         ggml_backend_tensor_set(M[name + ".inv"], inv.data(), 0, inv.size() * sizeof(float));
+        // Copy alpha itself to the GPU (#164 — graph must not reference
+        // CPU-resident tensors on discrete GPU backends like Vulkan).
+        if (M.count(name)) {
+            ggml_backend_tensor_set(M[name], a, 0, (size_t)C * sizeof(float));
+        }
+    }
+
+    // Copy bias tensors to the compute backend.
+    for (const auto& name : bias_names) {
+        auto it = T.find(name);
+        if (it == T.end() || !it->second)
+            continue;
+        int C = (int)ggml_nelements(it->second);
+        const float* b = (const float*)it->second->data;
+        if (M.count(name)) {
+            ggml_backend_tensor_set(M[name], b, 0, (size_t)C * sizeof(float));
+        }
     }
 
     // SR conditioning: scale_embed/bias_embed PyTorch shape (C, 4) — bucket
@@ -3119,6 +3519,30 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
             for (int c = 0; c < C; c++)
                 bv[c] = be[(size_t)c * 4 + sr_bucket];
             ggml_backend_tensor_set(M[sr_pfx + ".sr_bias"], bv.data(), 0, bv.size() * sizeof(float));
+        }
+    }
+
+    // Permute ConvTranspose1d upsample weights for decomposed col2im path.
+    // The 6 transposed conv weights are stored in M as "vae.dec.layer.{2..7}.block.1".
+    {
+        const int n = 6;
+        ggml_tensor* srcs[6];
+        ggml_tensor** dsts[6];
+        // Temporary storage for the permuted weight pointers; they'll be
+        // inserted into M after the batch call.
+        ggml_tensor* perm_ptrs[6] = {};
+        for (int b = 0; b < n; b++) {
+            std::string key = "vae.dec.layer." + std::to_string(b + 2) + ".block.1";
+            auto it = M.find(key);
+            srcs[b] = (it != M.end()) ? it->second : nullptr;
+            dsts[b] = &perm_ptrs[b];
+        }
+        core_convt::permute_convt1d_weights_batch(srcs, dsts, n, ctx->backend, &ctx->vae_perm_ctx, &ctx->vae_perm_buf);
+        for (int b = 0; b < n; b++) {
+            if (perm_ptrs[b]) {
+                std::string key = "vae.dec.layer." + std::to_string(b + 2) + ".block.1.perm";
+                M[key] = perm_ptrs[b];
+            }
         }
     }
 
@@ -3205,12 +3629,22 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
         auto it = M.find(key);
         return it == M.end() ? nullptr : it->second;
     };
+    // Bias and Alpha: prefer GPU copies from M (created by vae_wn_init_ggml
+    // to avoid mixing CPU/GPU tensors in the graph — #164 Vulkan crash).
     auto Bias = [&](const std::string& prefix) -> ggml_tensor* {
-        auto it = Tens.find(prefix + ".bias");
+        std::string key = prefix + ".bias";
+        auto it_m = M.find(key);
+        if (it_m != M.end())
+            return it_m->second;
+        auto it = Tens.find(key);
         return (it == Tens.end()) ? nullptr : it->second;
     };
     auto Alpha = [&](const std::string& prefix) -> ggml_tensor* {
-        auto it = Tens.find(prefix + ".alpha");
+        std::string key = prefix + ".alpha";
+        auto it_m = M.find(key);
+        if (it_m != M.end())
+            return it_m->second;
+        auto it = Tens.find(key);
         return (it == Tens.end()) ? nullptr : it->second;
     };
     auto InvAlpha = [&](const std::string& prefix) -> ggml_tensor* { return Wget(prefix + ".alpha.inv"); };
@@ -3270,7 +3704,18 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
         }
 
         // Transposed conv (upsample)
-        cur = causal_transposed_conv1d_ggml(ctx0, cur, Wget(lp + ".block.1"), Bias(lp + ".block.1"), up_rates[b]);
+        {
+            ggml_tensor* wp = Wget(lp + ".block.1.perm");
+            if (wp) {
+                ggml_tensor* w = Wget(lp + ".block.1");
+                const int K = w ? (int)w->ne[0] : 2 * up_rates[b];
+                cur = core_convt::convt1d_decomp_tf(ctx0, cur, wp, Bias(lp + ".block.1"), up_rates[b], K,
+                                                    /*crop_left=*/0, /*crop_right=*/K - up_rates[b]);
+            } else {
+                cur =
+                    causal_transposed_conv1d_ggml(ctx0, cur, Wget(lp + ".block.1"), Bias(lp + ".block.1"), up_rates[b]);
+            }
+        }
         if (trace) {
             std::string nm = "g_block_" + std::to_string(b) + "_upsample";
             ggml_set_name(cur, nm.c_str());
@@ -3402,7 +3847,7 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std
     if (n_patches == 0)
         return {};
 
-    if (vox_env_bool("VOXCPM2_USE_GRAPH")) {
+    if (vox_env_bool_default_on("VOXCPM2_USE_GRAPH")) {
         return vae_decode_graph(ctx, patches);
     }
 
@@ -4296,10 +4741,17 @@ static bool vox_load_weights(voxcpm2_context* ctx, const char* path) {
     free_metadata(meta);
 
     // --- Pass 2: weights ---
-    // Load onto ctx->backend (Metal when use_gpu on Apple Silicon, else
-    // CPU). Caller (voxcpm2_init_from_file) has already set ctx->backend
-    // / ctx->backend_cpu.
+    // Load onto a host-visible backend so legacy CPU paths can
+    // dereference tensor->data. On unified-memory backends (Metal) this
+    // is the GPU backend itself; on discrete GPUs (Vulkan, CUDA) it's
+    // the CPU backend. GPU mirrors are created later by the caller.
     ggml_backend_t weight_backend = ctx->backend ? ctx->backend : get_cpu_backend();
+    if (weight_backend && weight_backend != ctx->backend_cpu) {
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(weight_backend);
+        if (buft && !ggml_backend_buft_is_host(buft)) {
+            weight_backend = ctx->backend_cpu;
+        }
+    }
     WeightLoad wl;
     if (!load_weights(path, weight_backend, "voxcpm2", wl))
         return false;
@@ -4518,6 +4970,10 @@ static bool vox_load_weights(voxcpm2_context* ctx, const char* path) {
     W.stop_proj_w = try_get(T, "stop.proj.weight");
     W.stop_proj_b = try_get(T, "stop.proj.bias");
     W.stop_head_w = try_get(T, "stop.head.weight"); // [2048, 2], no bias
+    if (!W.stop_proj_w || !W.stop_proj_b) {
+        fprintf(stderr, "voxcpm2: WARNING: stop predictor weights missing — AR loop will run to max_len (%d steps)\n",
+                ctx->max_len);
+    }
 
     // VAE decoder (graceful degradation when absent)
     // vae_decode() accesses ctx->tensors directly; these fields are kept for reference.
@@ -4528,6 +4984,10 @@ static bool vox_load_weights(voxcpm2_context* ctx, const char* path) {
     W.vae_out_snake_a = try_get(T, "vae.dec.layer.8.alpha");
     W.vae_sr_cond_w = try_get(T, "vae.dec.sr_cond.2.scale_embed");
     W.vae_sr_cond_b = try_get(T, "vae.dec.sr_cond.2.bias_embed");
+    if (T.find("vae.dec.layer.0.weight_g") == T.end()) {
+        fprintf(stderr, "voxcpm2: WARNING: VAE decoder weights missing — output will be silent\n"
+                        "         Ensure audiovae.pth/safetensors was included during GGUF conversion.\n");
+    }
 
     // KV caches
     const int kv_max_ctx = 4096;
@@ -4615,7 +5075,7 @@ static vox_prefill_inputs build_prefill_inputs_impl(voxcpm2_context* ctx, const 
     int d_dit = (int)hp.locdit_d_model;
     int P_frames = (int)hp.patch_frames;
     int feat_dim_vae = 64;
-    const bool use_graph = vox_env_bool("VOXCPM2_USE_GRAPH");
+    const bool use_graph = vox_env_bool_default_on("VOXCPM2_USE_GRAPH");
 
     // 1. Tokenise (vox_tokenize already appends audio_start_token).
     std::vector<int32_t> text_tokens = vox_tokenize(ctx->tokenizer, text);
@@ -4822,6 +5282,27 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
     std::vector<std::vector<float>> patches;
     float stop_thresh = 0.5f;
     int step = 0;
+    float graph_stop_score = -1.0f; // < 0 = not yet computed; set by tslm_step_graph
+
+    // Effective max_len: Python _generate() caps the AR loop at
+    //   min(int(target_text_length * retry_badcase_ratio_threshold + 10), max_len)
+    // with retry_badcase_ratio_threshold = 6.0 and max_len = 2000.
+    // This prevents runaway generation when the stop predictor fails to fire.
+    int n_text_tokens = have_ref ? ((int)pi.all_tokens.size() - pi.T_ref - 2) : (int)pi.all_tokens.size();
+    int text_based_ceil = (int)(n_text_tokens * 6.0f) + 10;
+    int effective_max = std::min(ctx->max_len, std::max(20, text_based_ceil));
+    if (ctx->verbosity >= 2) {
+        fprintf(stderr, "voxcpm2: max_len=%d (text_ceil=%d, configured=%d)\n", effective_max, text_based_ceil,
+                ctx->max_len);
+    }
+
+    // Energy-based silence detection: if the last N consecutive patches all
+    // have near-zero energy (< eps), stop early — the model is generating
+    // silence and won't recover. This catches missing VAE weights, broken
+    // stop predictors, and degenerate model states.
+    const int silence_window = 5;
+    const float silence_eps = 1e-8f;
+    int consecutive_silent = 0;
 
     // Per-substep accumulators gated on VOXCPM2_BENCH=1. Cheap (one
     // vox_now_ms / step) but skips the prints when not requested.
@@ -4836,8 +5317,9 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
     // through the graph (no further CPU↔backend traffic). Resetting
     // tslm_kv_synced here ensures every synthesis call re-syncs from the
     // fresh prefill cache.
-    const bool use_graph_tslm = vox_env_bool("VOXCPM2_USE_GRAPH");
+    const bool use_graph_tslm = vox_env_bool_default_on("VOXCPM2_USE_GRAPH");
     ctx->tslm_kv_synced = false;
+    ctx->ralm_kv_synced = false;
 
     // Python AR loop order (from voxcpm2.py _inference, lines 1060-1108):
     //   1. Build mu → CFM solve → LocEnc → enc_to_lm → collect patch
@@ -4846,7 +5328,7 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
     // Python min_len=2 by default (stop only if step > min_len).
     int min_len = 2;
 
-    while (step < ctx->max_len) {
+    while (step < effective_max) {
         double t0_step = vox_now_ms();
 
         // 1a. CFM Euler solve (LocDiT)
@@ -4888,17 +5370,41 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
         patches.push_back(patch_tf);
         prev_patch_raw = patch_tf;
 
-        // 2. Stop check — BEFORE TSLM step, using PREVIOUS tslm_hidden
-        // Python: stop_head(stop_actn(stop_proj(lm_hidden))).argmax() == 1
-        // At step 0, tslm_hidden is the normed prefill output (not FSQ'd).
-        // At step >0, tslm_hidden is the FSQ'd output from the previous step.
+        // 1f. Energy-based silence detection
+        {
+            float energy = 0.0f;
+            for (float v : patch_tf)
+                energy += v * v;
+            if (energy < silence_eps) {
+                consecutive_silent++;
+                if (consecutive_silent >= silence_window && step > min_len) {
+                    if (ctx->verbosity >= 1) {
+                        fprintf(stderr, "voxcpm2: stopped at step %d — %d consecutive silent patches (energy < %.1e)\n",
+                                step + 1, consecutive_silent, silence_eps);
+                    }
+                    break;
+                }
+            } else {
+                consecutive_silent = 0;
+            }
+        }
+
+        // 2. Stop check — BEFORE TSLM step, using PREVIOUS tslm_hidden.
+        // When the graph path is active, use the stop score computed inside
+        // the TSLM graph (same numerical path as the hidden state — avoids
+        // compounding divergence between graph flash_attn and CPU scalar
+        // attention that caused the stop predictor to never fire, #164).
+        // At step 0, graph_stop_score is < 0 (not yet computed), so we
+        // fall through to the CPU stop_score as before.
         {
             tb = bench ? vox_now_ms() : 0;
-            float sp = stop_score(ctx, tslm_hidden.data(), cpu_be);
+            const bool have_graph_stop = use_graph_tslm && graph_stop_score >= 0.0f;
+            float sp = have_graph_stop ? graph_stop_score : stop_score(ctx, tslm_hidden.data(), cpu_be);
             if (bench)
                 sum_stop += vox_now_ms() - tb;
-            if (ctx->verbosity >= 2) {
-                fprintf(stderr, "voxcpm2: step %d stop=%.3f (%.1f ms)\n", step, sp, vox_now_ms() - t0_step);
+            if (ctx->verbosity >= 2 || (step < 3 && ctx->verbosity >= 1)) {
+                fprintf(stderr, "voxcpm2: step %d stop=%.4f (%s, graph_raw=%.4f) (%.1f ms)\n", step, sp,
+                        have_graph_stop ? "graph" : "cpu", graph_stop_score, vox_now_ms() - t0_step);
             }
             if (sp > stop_thresh && step > min_len) {
                 if (ctx->verbosity >= 1) {
@@ -4917,11 +5423,32 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
                     if (!init_tslm_kv_backend(ctx)) {
                         fprintf(stderr, "voxcpm2: tslm kv backend init failed; falling back to legacy step\n");
                     } else {
-                        sync_tslm_kv_cpu_to_backend(ctx);
+                        // Replay prefill through the graph to populate the
+                        // backend KV cache directly, avoiding the numerical
+                        // divergence between legacy CPU attention (used by
+                        // prefill) and ggml_flash_attn_ext (used by graph
+                        // steps). sync_tslm_kv_cpu_to_backend transposes
+                        // the layout correctly, but the KV VALUES from the
+                        // legacy attention path compound differently through
+                        // 28 layers, causing the stop predictor to never
+                        // fire (#164).
+                        const int n_prefill = ctx->tslm_kv.n_past;
+                        if (n_prefill > 0 && !pi.combined_embed.empty()) {
+                            const int d = (int)ctx->hp.tslm_d_model;
+                            ctx->tslm_kv.n_past = 0;
+                            for (int t = 0; t < n_prefill; t++) {
+                                const float* emb = pi.combined_embed.data() + (size_t)t * d;
+                                tslm_step_graph(ctx, emb, t);
+                                ctx->tslm_kv.n_past = t + 1;
+                            }
+                            if (ctx->verbosity >= 1) {
+                                fprintf(stderr, "voxcpm2: replayed %d prefill tokens through graph KV\n", n_prefill);
+                            }
+                        }
                         ctx->tslm_kv_synced = true;
                     }
                 }
-                tslm_hidden = tslm_step_graph(ctx, enc_lm.data(), tslm_pos);
+                tslm_hidden = tslm_step_graph(ctx, enc_lm.data(), tslm_pos, &graph_stop_score);
             } else {
                 std::vector<float> h = enc_lm;
                 for (int l = 0; l < (int)ctx->hp.tslm_n_layers; l++) {
@@ -4962,16 +5489,20 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
         // 3d. RALM step
         tb = bench ? vox_now_ms() : 0;
         {
-            std::vector<float> h = fusion_out;
-            for (int l = 0; l < (int)ctx->hp.ralm_n_layers; l++) {
-                ralm_layer_step(ctx, l, h.data(), cpu_be);
+            int ralm_pos = ctx->ralm_kv.n_past;
+            if (use_graph_tslm) {
+                ralm_hidden = ralm_step_graph(ctx, fusion_out.data(), ralm_pos);
+            } else {
+                std::vector<float> h = fusion_out;
+                for (int l = 0; l < (int)ctx->hp.ralm_n_layers; l++) {
+                    ralm_layer_step(ctx, l, h.data(), cpu_be);
+                }
+                std::vector<float> normed(d_ralm);
+                rms_norm_cpu(h.data(), tensor_data_f32(ctx->weights.ralm_output_norm), normed.data(), d_ralm,
+                             ctx->hp.rms_norm_eps);
+                ralm_hidden = normed;
             }
             ctx->ralm_kv.n_past++;
-
-            std::vector<float> normed(d_ralm);
-            rms_norm_cpu(h.data(), tensor_data_f32(ctx->weights.ralm_output_norm), normed.data(), d_ralm,
-                         ctx->hp.rms_norm_eps);
-            ralm_hidden = normed;
         }
         if (bench)
             sum_ralm += vox_now_ms() - tb;
@@ -4982,6 +5513,12 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
         step++;
     }
 
+    if (step >= effective_max && ctx->verbosity >= 1) {
+        fprintf(stderr,
+                "voxcpm2: WARNING: AR loop hit max_len ceiling (%d steps) without stop predictor firing.\n"
+                "         Output may be longer than expected. Set VOXCPM2_MAX_LEN to override.\n",
+                effective_max);
+    }
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "voxcpm2: AR loop %d steps, %.1f ms\n", step, vox_now_ms() - t0_ar);
     }
@@ -5056,15 +5593,15 @@ struct voxcpm2_context* voxcpm2_init_from_file(const char* path_model, struct vo
     ctx->max_len = params.max_len > 0 ? params.max_len : 2000;
     ctx->seed = params.seed;
 
-    // Backend pool. With `use_gpu`, init_best picks Metal on Apple Silicon
-    // (the only relevant target for now — CUDA/Vulkan are untested for
-    // this backend). On Apple Silicon, Metal allocates in unified-memory
-    // "shared" mode, so `tensor->data` stays CPU-readable and the
-    // remaining legacy `matmul_mv_ggml` paths (TSLM/RALM prefill, LocEnc,
-    // VAE encode/decode, FSQ, stop) keep working against the same
-    // weight pointers the graph paths use. On non-shared Metal (rare on
-    // M-series) or discrete GPUs the legacy paths would SIGSEGV — we'd
-    // need to graph-ify them first; for now fall back to CPU there.
+    // Backend pool. With `use_gpu`, init_best picks Metal / Vulkan / CUDA.
+    // On Apple Silicon, Metal allocates in unified-memory "shared" mode, so
+    // `tensor->data` stays CPU-readable and the remaining legacy CPU paths
+    // (matmul_mv_ggml, rms_norm_cpu, …) work against the same pointers the
+    // graph paths use. On discrete GPUs (Vulkan, CUDA) the default buffer
+    // is device-local VRAM — CPU can't dereference tensor->data. Instead
+    // we load weights to CPU for legacy paths and create GPU mirror copies
+    // for graph-build functions, giving both worlds native-speed access
+    // with no cross-backend copies at compute time.
     ctx->backend_cpu = get_cpu_backend();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "voxcpm2: failed to init CPU backend\n");
@@ -5083,10 +5620,186 @@ struct voxcpm2_context* voxcpm2_init_from_file(const char* path_model, struct vo
         ctx->backend = ctx->backend_cpu;
     }
 
+    // Detect whether the GPU backend's buffer is host-visible. If not,
+    // weights will be loaded to CPU and mirrored to GPU (see below).
+    bool needs_gpu_mirror = false;
+    if (ctx->backend != ctx->backend_cpu) {
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx->backend);
+        needs_gpu_mirror = (buft && !ggml_backend_buft_is_host(buft));
+    }
+
     if (!vox_load_weights(ctx, path_model)) {
         fprintf(stderr, "voxcpm2: failed to load '%s'\n", path_model);
         voxcpm2_free(ctx);
         return nullptr;
+    }
+
+    // On discrete GPUs: weights were loaded to CPU (vox_load_weights
+    // checks ggml_backend_buft_is_host internally). Create GPU copies
+    // for the graph-build paths so ggml_backend_graph_compute runs
+    // entirely on the GPU with zero cross-backend data movement.
+    if (needs_gpu_mirror) {
+        ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(ctx->backend);
+
+        // 1. Allocate a GPU ggml context with mirror tensors.
+        size_t ctx_size = ctx->tensors.size() * ggml_tensor_overhead() + 1024;
+        ggml_init_params ip = {ctx_size, nullptr, /*no_alloc=*/true};
+        ctx->gpu_ggml_ctx = ggml_init(ip);
+        if (!ctx->gpu_ggml_ctx) {
+            fprintf(stderr, "voxcpm2: failed to create GPU mirror context\n");
+            voxcpm2_free(ctx);
+            return nullptr;
+        }
+
+        for (auto& [name, cpu_t] : ctx->tensors) {
+            ggml_tensor* gpu_t = ggml_dup_tensor(ctx->gpu_ggml_ctx, cpu_t);
+            ggml_set_name(gpu_t, name.c_str());
+            ctx->gpu_tensors[name] = gpu_t;
+        }
+
+        // 2. Allocate GPU buffer for all mirror tensors.
+        ctx->gpu_weight_buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx->gpu_ggml_ctx, gpu_buft);
+        if (!ctx->gpu_weight_buf) {
+            fprintf(stderr, "voxcpm2: failed to allocate GPU weight buffer — "
+                            "falling back to CPU\n");
+            ggml_free(ctx->gpu_ggml_ctx);
+            ctx->gpu_ggml_ctx = nullptr;
+            ctx->gpu_tensors.clear();
+            ctx->backend = ctx->backend_cpu;
+        } else {
+            // 3. Copy data CPU → GPU.
+            for (auto& [name, cpu_t] : ctx->tensors) {
+                auto it = ctx->gpu_tensors.find(name);
+                if (it != ctx->gpu_tensors.end()) {
+                    ggml_backend_tensor_copy(cpu_t, it->second);
+                }
+            }
+
+            // 4. Populate gpu_weights struct by looking up GPU tensors.
+            vox_weights& GW = ctx->gpu_weights;
+            auto& GT = ctx->gpu_tensors;
+            auto gt = [&](const char* n) -> ggml_tensor* {
+                auto it = GT.find(n);
+                return it != GT.end() ? it->second : nullptr;
+            };
+            GW.tslm_token_embd = gt("tslm.token_embd.weight");
+            GW.tslm_output_norm = gt("tslm.output_norm.weight");
+            GW.tslm_rope_short = gt("tslm.rope_short_factors");
+            GW.tslm_rope_long = gt("tslm.rope_long_factors");
+            GW.tslm_layers.resize(ctx->hp.tslm_n_layers);
+            for (uint32_t i = 0; i < ctx->hp.tslm_n_layers; i++) {
+                auto& L = GW.tslm_layers[i];
+                char nb[256];
+                auto fn = [&](const char* sfx) {
+                    snprintf(nb, sizeof(nb), "tslm.blk.%u.%s", i, sfx);
+                    return nb;
+                };
+                L.attn_norm_w = gt(fn("attn_norm.weight"));
+                L.attn_q_w = gt(fn("attn_q.weight"));
+                L.attn_k_w = gt(fn("attn_k.weight"));
+                L.attn_v_w = gt(fn("attn_v.weight"));
+                L.attn_o_w = gt(fn("attn_output.weight"));
+                L.ffn_norm_w = gt(fn("ffn_norm.weight"));
+                L.ffn_gate_w = gt(fn("ffn_gate.weight"));
+                L.ffn_up_w = gt(fn("ffn_up.weight"));
+                L.ffn_down_w = gt(fn("ffn_down.weight"));
+            }
+            GW.ralm_output_norm = gt("ralm.output_norm.weight");
+            GW.ralm_layers.resize(ctx->hp.ralm_n_layers);
+            for (uint32_t i = 0; i < ctx->hp.ralm_n_layers; i++) {
+                auto& L = GW.ralm_layers[i];
+                char nb[256];
+                auto fn = [&](const char* sfx) {
+                    snprintf(nb, sizeof(nb), "ralm.blk.%u.%s", i, sfx);
+                    return nb;
+                };
+                L.attn_norm_w = gt(fn("attn_norm.weight"));
+                L.attn_q_w = gt(fn("attn_q.weight"));
+                L.attn_k_w = gt(fn("attn_k.weight"));
+                L.attn_v_w = gt(fn("attn_v.weight"));
+                L.attn_o_w = gt(fn("attn_output.weight"));
+                L.ffn_norm_w = gt(fn("ffn_norm.weight"));
+                L.ffn_gate_w = gt(fn("ffn_gate.weight"));
+                L.ffn_up_w = gt(fn("ffn_up.weight"));
+                L.ffn_down_w = gt(fn("ffn_down.weight"));
+            }
+            GW.fsq_in_proj_w = gt("fsq.in_proj.weight");
+            GW.fsq_in_proj_b = gt("fsq.in_proj.bias");
+            GW.fsq_out_proj_w = gt("fsq.out_proj.weight");
+            GW.fsq_out_proj_b = gt("fsq.out_proj.bias");
+            GW.locenc_cls_token = gt("locenc.cls_token");
+            GW.locenc_in_proj_w = gt("locenc.in_proj.weight");
+            GW.locenc_in_proj_b = gt("locenc.in_proj.bias");
+            GW.locenc_norm_w = gt("locenc.output_norm.weight");
+            GW.locenc_layers.resize(ctx->hp.locenc_n_layers);
+            for (uint32_t i = 0; i < ctx->hp.locenc_n_layers; i++) {
+                auto& L = GW.locenc_layers[i];
+                char nb[256];
+                auto fn = [&](const char* sfx) {
+                    snprintf(nb, sizeof(nb), "locenc.blk.%u.%s", i, sfx);
+                    return nb;
+                };
+                L.norm1_w = gt(fn("attn_norm.weight"));
+                L.norm2_w = gt(fn("ffn_norm.weight"));
+                L.attn_q_w = gt(fn("attn_q.weight"));
+                L.attn_k_w = gt(fn("attn_k.weight"));
+                L.attn_v_w = gt(fn("attn_v.weight"));
+                L.attn_o_w = gt(fn("attn_output.weight"));
+                L.ffn_gate_w = gt(fn("ffn_gate.weight"));
+                L.ffn_up_w = gt(fn("ffn_up.weight"));
+                L.ffn_down_w = gt(fn("ffn_down.weight"));
+            }
+            GW.locdit_in_proj_w = gt("locdit.in_proj.weight");
+            GW.locdit_in_proj_b = gt("locdit.in_proj.bias");
+            GW.locdit_cond_proj_w = gt("locdit.cond_proj.weight");
+            GW.locdit_cond_proj_b = gt("locdit.cond_proj.bias");
+            GW.locdit_time_mlp_0_w = gt("locdit.time_mlp.0.weight");
+            GW.locdit_time_mlp_0_b = gt("locdit.time_mlp.0.bias");
+            GW.locdit_time_mlp_1_w = gt("locdit.time_mlp.1.weight");
+            GW.locdit_time_mlp_1_b = gt("locdit.time_mlp.1.bias");
+            GW.locdit_dt_mlp_0_w = gt("locdit.dt_mlp.0.weight");
+            GW.locdit_dt_mlp_0_b = gt("locdit.dt_mlp.0.bias");
+            GW.locdit_dt_mlp_1_w = gt("locdit.dt_mlp.1.weight");
+            GW.locdit_dt_mlp_1_b = gt("locdit.dt_mlp.1.bias");
+            GW.locdit_norm_w = gt("locdit.output_norm.weight");
+            GW.locdit_out_proj_w = gt("locdit.out_proj.weight");
+            GW.locdit_out_proj_b = gt("locdit.out_proj.bias");
+            GW.locdit_layers.resize(ctx->hp.locdit_n_layers);
+            for (uint32_t i = 0; i < ctx->hp.locdit_n_layers; i++) {
+                auto& L = GW.locdit_layers[i];
+                char nb[256];
+                auto fn = [&](const char* sfx) {
+                    snprintf(nb, sizeof(nb), "locdit.blk.%u.%s", i, sfx);
+                    return nb;
+                };
+                L.norm1_w = gt(fn("attn_norm.weight"));
+                L.norm2_w = gt(fn("ffn_norm.weight"));
+                L.attn_q_w = gt(fn("attn_q.weight"));
+                L.attn_k_w = gt(fn("attn_k.weight"));
+                L.attn_v_w = gt(fn("attn_v.weight"));
+                L.attn_o_w = gt(fn("attn_output.weight"));
+                L.ffn_gate_w = gt(fn("ffn_gate.weight"));
+                L.ffn_up_w = gt(fn("ffn_up.weight"));
+                L.ffn_down_w = gt(fn("ffn_down.weight"));
+            }
+            GW.enc_to_lm_w = gt("proj.enc_to_lm.weight");
+            GW.enc_to_lm_b = gt("proj.enc_to_lm.bias");
+            GW.lm_to_dit_w = gt("proj.lm_to_dit.weight");
+            GW.lm_to_dit_b = gt("proj.lm_to_dit.bias");
+            GW.res_to_dit_w = gt("proj.res_to_dit.weight");
+            GW.res_to_dit_b = gt("proj.res_to_dit.bias");
+            GW.fusion_w = gt("proj.fusion.weight");
+            GW.fusion_b = gt("proj.fusion.bias");
+            GW.stop_proj_w = gt("stop.proj.weight");
+            GW.stop_proj_b = gt("stop.proj.bias");
+            GW.stop_head_w = gt("stop.head.weight");
+
+            ctx->has_gpu_weights = true;
+            if (params.verbosity >= 1) {
+                fprintf(stderr, "voxcpm2: created GPU weight mirror on %s (%.0f MB)\n", ggml_backend_name(ctx->backend),
+                        (double)ggml_backend_buffer_get_size(ctx->gpu_weight_buf) / (1024.0 * 1024.0));
+            }
+        }
     }
 
     // Generous arena: ~9 nodes/layer × 12 LocDiT layers + I/O ≈ 130 nodes;
@@ -5148,6 +5861,22 @@ void voxcpm2_free(struct voxcpm2_context* ctx) {
         ggml_free(ctx->tslm_kv_ctx);
         ctx->tslm_kv_ctx = nullptr;
     }
+    if (ctx->ralm_kv_buf) {
+        ggml_backend_buffer_free(ctx->ralm_kv_buf);
+        ctx->ralm_kv_buf = nullptr;
+    }
+    if (ctx->ralm_kv_ctx) {
+        ggml_free(ctx->ralm_kv_ctx);
+        ctx->ralm_kv_ctx = nullptr;
+    }
+    if (ctx->vae_perm_buf) {
+        ggml_backend_buffer_free(ctx->vae_perm_buf);
+        ctx->vae_perm_buf = nullptr;
+    }
+    if (ctx->vae_perm_ctx) {
+        ggml_free(ctx->vae_perm_ctx);
+        ctx->vae_perm_ctx = nullptr;
+    }
     if (ctx->vae_wn_ggml_buf) {
         ggml_backend_buffer_free(ctx->vae_wn_ggml_buf);
         ctx->vae_wn_ggml_buf = nullptr;
@@ -5160,6 +5889,16 @@ void voxcpm2_free(struct voxcpm2_context* ctx) {
     if (ctx->galloc) {
         ggml_gallocr_free(ctx->galloc);
         ctx->galloc = nullptr;
+    }
+    // GPU weight mirrors (discrete GPU only)
+    ctx->gpu_tensors.clear();
+    if (ctx->gpu_weight_buf) {
+        ggml_backend_buffer_free(ctx->gpu_weight_buf);
+        ctx->gpu_weight_buf = nullptr;
+    }
+    if (ctx->gpu_ggml_ctx) {
+        ggml_free(ctx->gpu_ggml_ctx);
+        ctx->gpu_ggml_ctx = nullptr;
     }
     if (ctx->weight_buf) {
         ggml_backend_buffer_free(ctx->weight_buf);

@@ -107,6 +107,11 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # logits" entry point the way the speech-LLMs do.
     "cohere":     "reference_backends.cohere",
     "parakeet":   "reference_backends.parakeet",
+    # Parakeet-TDT MAES beam decoding. Same model as "parakeet" but captures
+    # transducer component intermediates (prediction net, joint net) plus
+    # full MAES decode output. Config via MAES_BEAM_SIZE / MAES_NUM_STEPS /
+    # MAES_GAMMA / MAES_BETA env vars (defaults: 4 / 2 / 2.3 / 2).
+    "parakeet-maes": "reference_backends.parakeet_maes",
     # NeMo Canary (FastConformer + Transformer decoder). model_dir may be
     # the HF id "nvidia/canary-1b-v2" or a local .nemo path. The C++ diff
     # branch ("canary") compares mel_spectrogram + encoder_output; the
@@ -130,6 +135,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # NOTE: audio must be 16 kHz on entry (shared loader); the backend
     # resamples to 24 kHz internally.
     "vibevoice":  "reference_backends.vibevoice",
+    # KugelAudio-0-Open TTS (Qwen2.5-7B + diffusion + acoustic VAE).
+    # model_dir = kugelaudio/kugelaudio-0-open (HF id) or local snapshot.
+    # audio arg is unused (TTS). Text from KUGELAUDIO_TEXT env.
+    "kugelaudio": "reference_backends.kugelaudio",
     # MiMo-Audio-Tokenizer encoder (PCM → 8-channel RVQ codes).
     # model_dir = the MiMo-Audio-Tokenizer HF snapshot. 16 kHz mono PCM is
     # resampled to 24 kHz internally.
@@ -210,6 +219,50 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # model_dir = openbmb/VoxCPM2 HF snapshot. Audio arg = reference WAV
     # for voice cloning (optional). Synth text from VOXCPM2_SYN_TEXT env.
     "voxcpm2-tts": "reference_backends.voxcpm2_tts",
+    # CosyVoice3 TTS — Phase 3b: single-DiT-block stages only (flow
+    # model is the only thing wired through extract_stage so far).
+    # model_dir = FunAudioLLM/Fun-CosyVoice3-0.5B-2512 HF snapshot.
+    # Audio arg is unused (the per-block test vector is seeded random).
+    "cosyvoice3-tts": "reference_backends.cosyvoice3_tts",
+    # F5-TTS v1 Base: DiT-based flow-matching TTS with Vocos vocoder.
+    # model_dir = /mnt/storage/f5-tts (containing F5TTS_v1_Base/ + vocos/).
+    # Audio arg is a reference voice WAV for cloning (16 kHz); synth text
+    # from F5_TTS_SYN_TEXT env var (default "Hello world.").
+    "f5-tts":     "reference_backends.f5_tts",
+    # Parler TTS: T5 encoder + MusicGen decoder + DAC 44 kHz.
+    # model_dir = parler-tts/parler-tts-mini-v1.1 HF snapshot.
+    # Audio arg unused (text-driven). Text from PARLER_TEXT / PARLER_DESC
+    # env vars. See reference_backends/parler_tts.py for the full list.
+    "parler-tts": "reference_backends.parler_tts",
+    # MOSS-Audio-4B-Instruct: Whisper encoder + DeepStack 3-tap adapter +
+    # Qwen3-4B LM. First audio-understanding (not just ASR) backend.
+    # model_dir = OpenMOSS-Team/MOSS-Audio-4B-Instruct HF snapshot or local
+    # dir. GitHub source (modeling code) expected at ref/moss_audio/github/
+    # or via MOSS_AUDIO_GITHUB env. Prompt from MOSS_AUDIO_PROMPT env.
+    "moss-audio":  "reference_backends.moss_audio",
+    # TADA-3B-ML TTS: Llama-3.2-3B + per-token flow matching + TADA codec.
+    # model_dir = HumeAI/tada-3b-ml HF id or local snapshot.
+    # Audio arg is unused (text-driven). Text from TADA_SYN_TEXT env var.
+    "tada-tts":   "reference_backends.tada_tts",
+    # Zyphra/Zonos-v0.1-transformer: GPT-style AR TTS with 9-codebook DAC.
+    # model_dir = Zyphra/Zonos-v0.1-transformer HF id or local snapshot.
+    # Audio arg is unused (text-driven). Text + seed from env vars:
+    #   ZONOS_TTS_TEXT (default "Hello world.")
+    #   ZONOS_TTS_SEED (default 42)
+    #   ZONOS_TTS_MAX_TOKENS (default 200)
+    #   ZONOS_TTS_LANGUAGE (default "en-us")
+    # Stages: conditioning_prefix, phoneme_ids, prefill_logits, output_codes.
+    "zonos-tts":  "reference_backends.zonos_tts_reference",
+    # LiquidAI LFM2.5-Audio-1.5B-JP: FastConformer encoder + LFM2 hybrid
+    # conv+attention backbone + depthformer. ASR+TTS in one model.
+    # model_dir = LiquidAI/LFM2.5-Audio-1.5B-JP HF id or local snapshot.
+    # Prompt from LFM2_PROMPT env var (default "Perform ASR in japanese.").
+    "lfm2-audio": "reference_backends.lfm2_audio",
+    # gpt-omni/mini-omni2: Whisper-small encoder + SwiGLU adapter +
+    # Qwen2-0.5B LLM. Custom litgpt framework (not HF). model_dir = cloned
+    # repo with lit_model.pth + small.pt + model_config.yaml. Needs the
+    # litgpt package on sys.path (set MINI_OMNI2_REPO or put it in model_dir).
+    "mini-omni2": "reference_backends.mini_omni2",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import
@@ -422,7 +475,9 @@ def main() -> None:
     for env_key in ("QWEN3_TTS_SYN_TEXT", "QWEN3_TTS_REF_TEXT", "QWEN3_TTS_LANG", "QWEN3_TTS_VOICE",
                     "KOKORO_PHONEMES", "KOKORO_VOICE", "KOKORO_SEED", "CHATTERBOX_SYN_TEXT",
                     "VOXCPM2_SYN_TEXT", "VOXCPM2_USE_REF",
-                    "LID_TEXT", "CLD3_TEXT"):
+                    "F5_TTS_SYN_TEXT", "F5_TTS_REF_TEXT", "F5_TTS_SEED",
+                    "F5_TTS_STEPS", "F5_TTS_CFG", "F5_TTS_SWAY",
+                    "LID_TEXT", "CLD3_TEXT", "LFM2_PROMPT"):
         val = os.environ.get(env_key)
         if val is not None:
             meta[env_key.lower()] = val

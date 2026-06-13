@@ -9,6 +9,7 @@
 #include "crispasr_diarize_cli.h"      // crispasr_apply_diarize / pyannote cache (#107)
 #include "crispasr_speaker_embedder.h" // pluggable speaker embedder (#107 P3)
 #include "crispasr_stream_punc.h"      // streaming punctuation mode helpers (#112)
+#include "crispasr_cache.h"            // crispasr_cache::ensure_cached_file (for --hf-repo, #128)
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
 #include "crispasr_output.h"   // crispasr_make_disp_segments — split-on-punct (#29)
@@ -32,6 +33,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <shellapi.h>
 #endif
 
 // helper function to replace substrings
@@ -437,6 +439,8 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.hotwords_boost = std::stof(ARGV_NEXT);
     } else if (arg == "--warmup") {
         params.warmup = true;
+    } else if (arg == "--no-warmup") {
+        params.no_warmup = true;
     } else if (arg == "--parakeet-decoder") {
         params.parakeet_decoder = ARGV_NEXT;
     } else if (arg == "--lid-backend") {
@@ -504,7 +508,11 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
     std::string arg = argv[i];
 #define ARGV_NEXT (((i + 1) < argc) ? argv[++i] : requires_value_error(arg))
 
-    if (arg == "--tts") {
+    if (arg == "--s2s") {
+        params.s2s = true;
+    } else if (arg == "--s2s-output") {
+        params.s2s_output = ARGV_NEXT;
+    } else if (arg == "--tts") {
         params.tts_text = ARGV_NEXT;
     } else if (arg == "--tts-output") {
         params.tts_output = ARGV_NEXT;
@@ -528,12 +536,31 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.tts_codec_quant = ARGV_NEXT;
     } else if (arg == "--ref-text") {
         params.tts_ref_text = ARGV_NEXT;
+    } else if (arg == "--ref-asr") {
+        params.tts_ref_asr = ARGV_NEXT;
     } else if (arg == "--instruct") {
         params.tts_instruct = ARGV_NEXT;
     } else if (arg == "--voice-dir") {
         params.tts_voice_dir = ARGV_NEXT;
     } else if (arg == "--tts-max-input-chars") {
         params.tts_max_input_chars = std::stoi(ARGV_NEXT);
+    } else if (arg == "--watermark-model") {
+        params.watermark_model = ARGV_NEXT;
+    } else if (arg == "--detect-watermark") {
+        params.detect_watermark_file = ARGV_NEXT;
+    } else if (arg == "--c2pa-cert") {
+        params.c2pa_cert = ARGV_NEXT;
+    } else if (arg == "--c2pa-key") {
+        params.c2pa_key = ARGV_NEXT;
+    } else if (arg == "--i-have-rights") {
+        // Voice-cloning consent attestation. Required when --voice points
+        // to a .wav reference file (i.e. voice cloning). By passing this
+        // flag the user attests: "I have the consent of the speaker whose
+        // voice this clones, or it is my own voice."
+        params.tts_voice_clone_consent = true;
+        params.tts_consent_attestation = "CLI --i-have-rights flag";
+    } else if (arg == "--no-spoken-disclaimer") {
+        params.tts_no_spoken_disclaimer = true;
     } else if (arg == "--cors-origin") {
         params.server_cors_origin = ARGV_NEXT;
     } else if (arg == "--chat-model") {
@@ -545,6 +572,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.chat_n_ctx = std::stoi(ARGV_NEXT);
     } else if (arg == "--chat-gpu-layers") {
         params.chat_n_gpu_layers = std::stoi(ARGV_NEXT);
+    } else if (arg == "--g2p-dict") {
+        params.g2p_dict = ARGV_NEXT;
     } else if (arg == "--tts-trim-silence") {
         params.tts_trim_silence = true;
     } else if (arg == "--text") {
@@ -557,6 +586,21 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.translate_target_lang = whisper_param_turn_lowercase(ARGV_NEXT);
     } else if (arg == "--auto-download") {
         params.auto_download = true;
+    } else if (arg == "--hf-repo" || arg == "-hfr") {
+        // Issue #128 — llama-server-compatible convenience. Accept
+        // either "OWNER/REPO" alone or "OWNER/REPO:FILE" shorthand.
+        std::string raw = ARGV_NEXT;
+        auto colon = raw.find(':');
+        if (colon != std::string::npos) {
+            params.hf_repo = raw.substr(0, colon);
+            params.hf_file = raw.substr(colon + 1);
+        } else {
+            params.hf_repo = raw;
+        }
+        params.auto_download = true; // --hf-repo implies auto-download
+    } else if (arg == "--hf-file" || arg == "-hff") {
+        params.hf_file = ARGV_NEXT;
+        params.auto_download = true;
     } else if (arg == "--dry-run-resolve") {
         params.dry_run_resolve = true;
     } else if (arg == "--dry-run-ignore-cache") {
@@ -567,6 +611,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.server_host = ARGV_NEXT;
     } else if (arg == "--port") {
         params.server_port = std::stoi(ARGV_NEXT);
+    } else if (arg == "--ws-port") {
+        params.server_ws_port = std::stoi(ARGV_NEXT);
     } else if (arg == "--api-keys") {
         params.server_api_keys = ARGV_NEXT;
     } else if (arg == "--stream-step") {
@@ -709,7 +755,7 @@ static bool whisper_params_parse(int argc, char** argv, whisper_params& params) 
 static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params& params) {
     fprintf(stderr, "\n");
     fprintf(stderr, "usage: %s [options] file0 file1 ...\n", argv[0]);
-    fprintf(stderr, "supported audio formats: flac, mp3, ogg, wav\n");
+    fprintf(stderr, "supported audio formats: wav, mp3, flac, ogg (native); m4a, aac, opus, webm, wma (via ffmpeg)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "options:\n");
     fprintf(stderr, "  -h,        --help                 [default] show this help message and exit\n");
@@ -732,7 +778,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr, "  -sow,      --split-on-word        [%-7s] split on word rather than on token\n",
             params.split_on_word ? "true" : "false");
     fprintf(stderr, "  -bo N,     --best-of N            [%-7d] number of best candidates to keep\n", params.best_of);
-    fprintf(stderr, "  -bs N,     --beam-size N          [%-7d] beam size for beam search\n", params.beam_size);
+    fprintf(stderr, "  -bs N,     --beam-size N          [%-7s] beam size (default: greedy, -bs 5 for beam search)\n",
+            params.beam_size > 0 ? std::to_string(params.beam_size).c_str() : "greedy");
     fprintf(stderr, "  -ac N,     --audio-ctx N          [%-7d] audio context size (0 - all)\n", params.audio_ctx);
     fprintf(stderr, "  -wt N,     --word-thold N         [%-7.2f] word timestamp probability threshold\n",
             params.word_thold);
@@ -910,6 +957,14 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.cache_dir.empty() ? "default" : params.cache_dir.c_str());
     fprintf(stderr, "  --auto-download                   [%-7s] auto-download missing models without prompting\n",
             params.auto_download ? "true" : "false");
+    fprintf(stderr, "  -hfr REPO, --hf-repo OWNER/REPO[:FILE]    fetch model from arbitrary HuggingFace repo "
+                    "(llama-server-compatible). e.g. --hf-repo cstr/parakeet-tdt-0.6b-v3-GGUF -m "
+                    "parakeet-tdt-0.6b-v3-q4_k.gguf, or the shorthand --hf-repo "
+                    "cstr/parakeet-tdt-0.6b-v3-GGUF:parakeet-tdt-0.6b-v3-q4_k.gguf. Implies --auto-download.\n");
+    fprintf(stderr,
+            "  -hff FNAME, --hf-file FNAME       %-7s   filename within --hf-repo (alternative to "
+            "the OWNER/REPO:FILE shorthand)\n",
+            "");
     fprintf(stderr, "  --dry-run-resolve                 [%-7s] print resolved model / companion paths and exit\n",
             params.dry_run_resolve ? "true" : "false");
     fprintf(stderr, "  --dry-run-ignore-cache            [%-7s] dry-run as if cache were empty\n",
@@ -932,8 +987,16 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.server ? "true" : "false");
     fprintf(stderr, "  --host HOST                       [%-7s] server bind address\n", params.server_host.c_str());
     fprintf(stderr, "  --port PORT                       [%-7d] server port\n", params.server_port);
+    fprintf(stderr,
+            "  --ws-port PORT                    [%-7d] server: real-time WebSocket ASR streaming port "
+            "(-1 off, 0 = port+1)\n",
+            params.server_ws_port);
     fprintf(stderr, "  --api-keys K1,K2                  [%-7s] comma-separated server API keys\n",
             params.server_api_keys.empty() ? "" : "(set)");
+    fprintf(
+        stderr,
+        "  --no-warmup                       [%-7s] server: skip startup warmup (workaround for Vulkan hangs, #165)\n",
+        params.no_warmup ? "true" : "false");
     fprintf(stderr, "  --stream-step N                   [%-7d] chunk size in ms for streaming\n",
             params.stream_step_ms);
     fprintf(stderr,
@@ -981,6 +1044,12 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.lcs_min_length);
     fprintf(stderr, "             -m auto                        download a default model for the chosen backend\n");
     // Text-To-Speech (TTS) parameters — vibevoice and qwen3-tts backends
+    fprintf(stderr, "\nSpeech-to-speech (S2S) options:\n");
+    fprintf(stderr, "             --s2s                   [%-7s] speech-to-speech mode: audio input → audio output\n",
+            params.s2s ? "true" : "false");
+    fprintf(stderr, "             --s2s-output FNAME      [%-7s] output WAV path (default: s2s_output.wav)\n",
+            params.s2s_output.c_str());
+
     fprintf(stderr, "\nText-to-speech (TTS) options:\n");
     fprintf(stderr,
             "             --tts \"TEXT\"            synthesise TEXT and write WAV to --tts-output (24 kHz mono)\n");
@@ -990,8 +1059,16 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "             --voice PATH            [%-7s] voice prompt: GGUF voice pack or reference WAV\n"
             "                                                 (.wav → 1.5B WAV cloning; .gguf → voice pack)\n",
             params.tts_voice.c_str());
-    fprintf(stderr, "             --ref-text \"TEXT\"        reference transcription (qwen3-tts; required when --voice "
-                    "is a WAV)\n");
+    fprintf(stderr,
+            "             --i-have-rights                    required for voice cloning (.wav); attests consent\n"
+            "                                                 of the cloned speaker or that it is your own voice\n"
+            "             --no-spoken-disclaimer              skip audible AI-disclosure prefix on voice-cloned\n"
+            "                                                 output (watermark + C2PA provenance still applied)\n");
+    fprintf(stderr,
+            "             --ref-text \"TEXT\"        reference transcription (qwen3-tts/f5-tts; auto-transcribed "
+            "if omitted)\n");
+    fprintf(stderr, "             --ref-asr BACKEND       [%-7s] ASR backend for auto-transcribing ref audio\n",
+            params.tts_ref_asr.empty() ? "whisper" : params.tts_ref_asr.c_str());
     fprintf(stderr, "             --instruct \"TEXT\"        natural-language voice/style description "
                     "(qwen3-tts: VoiceDesign = voice description; CustomVoice = style control)\n");
     fprintf(stderr,
@@ -1004,6 +1081,17 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "             --tts-max-input-chars N  [%-7d] server: cap on /v1/audio/speech `input` "
             "length (0 = no cap)\n",
             params.tts_max_input_chars);
+    fprintf(stderr,
+            "             --g2p-dict SOURCE        [%-7s] G2P dict: 'olaph' (MIT), 'open-dict' (CC-BY-SA), or path to "
+            "file\n",
+            params.g2p_dict.empty() ? "olaph" : params.g2p_dict.c_str());
+    fprintf(stderr, "             --watermark-model PATH           AudioSeal GGUF for neural watermarking "
+                    "(upgrades built-in spread-spectrum)\n");
+    fprintf(stderr, "             --detect-watermark PATH          read WAV file and detect AI watermark "
+                    "(prints confidence + exits)\n");
+    fprintf(stderr, "             --c2pa-cert PATH                 X.509 cert for C2PA Content Credentials signing\n"
+                    "             --c2pa-key PATH                  private key for C2PA signing "
+                    "(generate both with scripts/generate-c2pa-cert.sh)\n");
     fprintf(stderr, "             --cors-origin ORIGIN     server: opt-in CORS for browser clients "
                     "('*' for any, or scheme://host[:port])\n");
     fprintf(stderr, "             --chat-model PATH        server: enable POST /v1/chat/completions backed by "
@@ -1790,6 +1878,29 @@ int main(int argc, char** argv) {
     // are still encoded in the system's code page. In this way, we can print
     // non-ASCII characters to the console, and access files with non-ASCII paths.
     SetConsoleOutputCP(CP_UTF8);
+    // Get the true Unicode command line and convert to UTF-8.
+    // This bypasses CP_ACP entirely — works on any locale (GBK, Shift-JIS, etc.).
+    int wargc = 0;
+    LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    std::vector<std::string> _argv_utf8;
+    std::vector<char*> _argv_ptr;
+    if (wargv && wargc > 0) {
+        _argv_utf8.reserve((size_t)wargc);
+        _argv_ptr.reserve((size_t)wargc);
+        for (int ai = 0; ai < wargc; ai++) {
+            int ulen = WideCharToMultiByte(CP_UTF8, 0, wargv[ai], -1, nullptr, 0, nullptr, nullptr);
+            if (ulen > 1) {
+                _argv_utf8.emplace_back((size_t)(ulen - 1), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, wargv[ai], -1, &_argv_utf8.back()[0], ulen, nullptr, nullptr);
+            } else {
+                _argv_utf8.emplace_back();
+            }
+            _argv_ptr.push_back(&_argv_utf8.back()[0]);
+        }
+        LocalFree(wargv);
+        argc = wargc;
+        argv = _argv_ptr.data();
+    }
 #endif
 
     whisper_params params;
@@ -1849,6 +1960,42 @@ int main(int argc, char** argv) {
         ggml_backend_load_all();
     }
 
+    // Issue #128 — resolve --hf-repo / --hf-file early, before any
+    // model-path interpretation downstream. Synthesise the HF resolve
+    // URL, fetch via the existing cache, then rewrite params.model
+    // to the cached path so the rest of the pipeline treats it as a
+    // local file.
+    if (!params.hf_repo.empty()) {
+        std::string file = params.hf_file;
+        if (file.empty()) {
+            // The -m value is the second source of truth for the
+            // filename (matches llama-server's `--hf-repo R --model
+            // -m F` shape). If -m is "auto"/"default"/empty we have
+            // no filename to use — fail loudly.
+            if (!params.model.empty() && !is_auto_model_arg(params.model)) {
+                const auto sep = params.model.find_last_of('/');
+                file = sep == std::string::npos ? params.model : params.model.substr(sep + 1);
+            }
+        }
+        if (file.empty()) {
+            fprintf(stderr,
+                    "error: --hf-repo '%s' needs a filename: either pass "
+                    "--hf-file FILE or -m FILE, or use the shorthand "
+                    "--hf-repo OWNER/REPO:FILE\n",
+                    params.hf_repo.c_str());
+            return 2;
+        }
+        const std::string url = "https://huggingface.co/" + params.hf_repo + "/resolve/main/" + file;
+        const std::string label = "hf-repo[" + params.hf_repo + "]";
+        const std::string cached =
+            crispasr_cache::ensure_cached_file(file, url, params.no_prints, label.c_str(), params.cache_dir);
+        if (cached.empty()) {
+            fprintf(stderr, "error: --hf-repo fetch failed for %s/%s\n", params.hf_repo.c_str(), file.c_str());
+            return 1;
+        }
+        params.model = cached;
+    }
+
     // remove non-existent files
     for (auto it = params.fname_inp.begin(); it != params.fname_inp.end();) {
         const auto fname_inp = it->c_str();
@@ -1893,6 +2040,13 @@ int main(int argc, char** argv) {
             }
         }
         return ok ? 0 : 1;
+    }
+
+    // --detect-watermark is a standalone verb that doesn't need any model
+    // or input files — route directly to the backend (which handles it
+    // and exits before any model resolution).
+    if (!params.detect_watermark_file.empty()) {
+        return crispasr_run_backend(params);
     }
 
     if (params.fname_inp.empty() && !params.stream && params.tts_text.empty() && params.text_input.empty()) {
@@ -2129,9 +2283,9 @@ int main(int argc, char** argv) {
                     "%s: processing '%s' (%d samples, %.1f sec), %d threads, %d processors, %d beams + best of %d, "
                     "lang = %s, task = %s, %stimestamps = %d ...\n",
                     __func__, fname_inp.c_str(), int(pcmf32.size()), float(pcmf32.size()) / CRISPASR_SAMPLE_RATE,
-                    params.n_threads, params.n_processors, params.beam_size, params.best_of, params.language.c_str(),
-                    params.translate ? "translate" : "transcribe", params.tinydiarize ? "tdrz = 1, " : "",
-                    params.no_timestamps ? 0 : 1);
+                    params.n_threads, params.n_processors, std::max(1, params.beam_size), params.best_of,
+                    params.language.c_str(), params.translate ? "translate" : "transcribe",
+                    params.tinydiarize ? "tdrz = 1, " : "", params.no_timestamps ? 0 : 1);
 
             if (params.print_colors) {
                 fprintf(stderr, "%s: color scheme: red (low confidence), yellow (medium), green (high confidence)\n",
@@ -2180,7 +2334,7 @@ int main(int argc, char** argv) {
             wparams.carry_initial_prompt = params.carry_initial_prompt;
 
             wparams.greedy.best_of = params.best_of;
-            wparams.beam_search.beam_size = params.beam_size;
+            wparams.beam_search.beam_size = params.beam_size > 0 ? params.beam_size : 5;
 
             wparams.temperature_inc = params.no_fallback ? 0.0f : params.temperature_inc;
             wparams.temperature = params.temperature;
@@ -2194,7 +2348,7 @@ int main(int argc, char** argv) {
             wparams.suppress_nst = params.suppress_nst;
 
             // Resolve `--vad` without `--vad-model` to the canonical
-            // ggml-silero-v5.1.2.bin in the cache, downloading on first
+            // ggml-silero-v6.2.0.bin in the cache, downloading on first
             // use — matches the auto-cache UX of every non-whisper
             // backend (#33). Path must outlive whisper_full(); kept on
             // this stack frame.

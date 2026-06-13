@@ -56,10 +56,13 @@ if (EMSCRIPTEN)
     set(CMAKE_CXX_STANDARD 17)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-    option(CRISPASR_WASM_SINGLE_FILE "crispasr: embed WASM inside the generated crispasr.js" ON)
+    option(CRISPASR_WASM            "crispasr: build WASM/JS target (Emscripten)"              ON)
+    option(CRISPASR_WASM_SINGLE_FILE "crispasr: embed WASM inside the generated crispasr.js"   ON)
 
-    # TODO: without these, we get the following error:
-    #       wasm-ld: error: --shared-memory is disallowed by crispasr.o because it was not compiled with 'atomics' or 'bulk-memory' features.
+    # Multithreaded WASM: -pthread enables SharedArrayBuffer-based threading
+    # in the browser. The hosting page MUST set COOP/COEP headers:
+    #   Cross-Origin-Opener-Policy: same-origin
+    #   Cross-Origin-Embedder-Policy: require-corp
     set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -pthread")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
 
@@ -128,6 +131,19 @@ option(COHERE_MKL "cohere: link Intel MKL for ggml GEMM + mel filterbank" OFF)
 
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
+
+# Bump tensor name limit for models with long hierarchical names (e.g.
+# Pocket TTS Mimi decoder transformer: 71 chars). Must be set before
+# add_subdirectory(ggml) so the definition propagates to all targets.
+add_compile_definitions(GGML_MAX_NAME=128)
+
+# MSVC's <cmath> doesn't expose M_PI unless _USE_MATH_DEFINES is set.
+# NOMINMAX prevents <windows.h> from defining min/max macros that conflict
+# with std::min/std::max (#152). Both are defined globally so all targets
+# (src, tests, examples) get them on Windows.
+if (WIN32)
+    add_compile_definitions(_USE_MATH_DEFINES NOMINMAX)
+endif()
 
 # Wire COHERE_MKL into ggml's BLAS backend before add_subdirectory(ggml).
 # This must happen here so the values are visible to the ggml subproject.
@@ -205,6 +221,13 @@ if (NOT TARGET ggml)
 endif()
 add_subdirectory(src)
 
+# ---------------------------------------------------------------------------
+# WASM / JS bindings (Emscripten only, all backends)
+# ---------------------------------------------------------------------------
+if(EMSCRIPTEN AND CRISPASR_WASM)
+    add_subdirectory(bindings/javascript)
+endif()
+
 #
 # install
 #
@@ -222,10 +245,10 @@ set(CRISPASR_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Locatio
 
 get_directory_property(CRISPASR_TRANSIENT_DEFINES COMPILE_DEFINITIONS)
 
-set_target_properties(crispasr PROPERTIES PUBLIC_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/include/crispasr.h)
-install(TARGETS crispasr LIBRARY PUBLIC_HEADER)
+set_target_properties(crispasr-lib PROPERTIES PUBLIC_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/include/crispasr.h)
+install(TARGETS crispasr-lib LIBRARY PUBLIC_HEADER)
 
-target_compile_definitions(crispasr PRIVATE
+target_compile_definitions(crispasr-lib PRIVATE
     CRISPASR_VERSION="${PROJECT_VERSION}"
 )
 
@@ -297,7 +320,7 @@ if (MSVC)
     endfunction()
 
     if (CRISPASR_BUILD_EXAMPLES)
-        disable_msvc_warnings(crispasr)
+        disable_msvc_warnings(crispasr-lib)
         disable_msvc_warnings(common)
         disable_msvc_warnings(common-sdl)
         disable_msvc_warnings(lsp)

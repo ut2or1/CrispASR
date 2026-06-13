@@ -72,26 +72,34 @@ add_test(NAME ${TEST_TARGET}
     -f ${PROJECT_SOURCE_DIR}/samples/jfk.wav)
 set_tests_properties(${TEST_TARGET} PROPERTIES LABELS "small;en")
 
+# CLI integration tests — use auto-download to fetch real whisper models.
+# Set CRISPASR_MODELS_DIR to a local cache dir to avoid network downloads.
 set(TEST_TARGET test-crispasr-cli-medium)
 add_test(NAME ${TEST_TARGET}
     COMMAND $<TARGET_FILE:crispasr-cli>
-    -m ${PROJECT_SOURCE_DIR}/models/for-tests-ggml-medium.bin -l fr
+    --backend whisper -m auto --auto-download -l fr
     -f ${PROJECT_SOURCE_DIR}/samples/jfk.wav)
-set_tests_properties(${TEST_TARGET} PROPERTIES LABELS "medium")
+set_tests_properties(${TEST_TARGET} PROPERTIES
+    LABELS "medium;live"
+    TIMEOUT 300)
 
 set(TEST_TARGET test-crispasr-cli-medium.en)
 add_test(NAME ${TEST_TARGET}
     COMMAND $<TARGET_FILE:crispasr-cli>
-    -m ${PROJECT_SOURCE_DIR}/models/for-tests-ggml-medium.en.bin
+    --backend whisper -m auto --auto-download
     -f ${PROJECT_SOURCE_DIR}/samples/jfk.wav)
-set_tests_properties(${TEST_TARGET} PROPERTIES LABELS "medium;en")
+set_tests_properties(${TEST_TARGET} PROPERTIES
+    LABELS "medium;en;live"
+    TIMEOUT 300)
 
 set(TEST_TARGET test-crispasr-cli-large)
 add_test(NAME ${TEST_TARGET}
     COMMAND $<TARGET_FILE:crispasr-cli>
-    -m ${PROJECT_SOURCE_DIR}/models/for-tests-ggml-large.bin
+    --backend whisper -m auto --auto-download -l fr
     -f ${PROJECT_SOURCE_DIR}/samples/jfk.wav)
-set_tests_properties(${TEST_TARGET} PROPERTIES LABELS "large")
+set_tests_properties(${TEST_TARGET} PROPERTIES
+    LABELS "large;live"
+    TIMEOUT 300)
 
 if (CRISPASR_FFMPEG)
     set(TEST_TARGET test-crispasr-cli-tiny-mp3)
@@ -101,6 +109,27 @@ if (CRISPASR_FFMPEG)
       -m ${PROJECT_SOURCE_DIR}/models/for-tests-ggml-tiny.en.bin
       -f ${PROJECT_SOURCE_DIR}/samples/jfk.mp3)
     set_tests_properties(${TEST_TARGET} PROPERTIES LABELS "tiny;mp3")
+
+    # ─── test-ffmpeg-transcode — Catch2 unit tests for container decode (issue #129) ─
+    set(FFMPEG_TEST test-ffmpeg-transcode)
+    add_executable(${FFMPEG_TEST} ${FFMPEG_TEST}.cpp)
+    target_include_directories(${FFMPEG_TEST} PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/examples
+        ${FFMPEG_INCLUDE_DIRS}
+    )
+    target_link_libraries(${FFMPEG_TEST} PRIVATE
+        Catch2::Catch2WithMain
+        common
+    )
+    target_compile_definitions(${FFMPEG_TEST} PRIVATE
+        SAMPLES_DIR="${PROJECT_SOURCE_DIR}/samples"
+    )
+    catch_discover_tests(${FFMPEG_TEST}
+        TEST_SPEC "[ffmpeg]"
+        PROPERTIES LABELS "unit;ffmpeg"
+    )
 endif()
 
 #VAD test tests VAD in isolation
@@ -182,7 +211,7 @@ target_include_directories(test-params PRIVATE
 )
 target_link_libraries(test-params PRIVATE
     Catch2::Catch2WithMain
-    crispasr
+    crispasr-lib
     common
 )
 catch_discover_tests(test-params
@@ -280,7 +309,7 @@ target_include_directories(test-diarize-pyannote PRIVATE
 )
 target_link_libraries(test-diarize-pyannote PRIVATE
     Catch2::Catch2WithMain
-    crispasr
+    crispasr-lib
 )
 catch_discover_tests(test-diarize-pyannote
     TEST_SPEC "[unit]"
@@ -300,11 +329,14 @@ target_include_directories(test-diarize-pyannote-live PRIVATE
 )
 target_link_libraries(test-diarize-pyannote-live PRIVATE
     Catch2::Catch2WithMain
-    crispasr
+    crispasr-lib
 )
 catch_discover_tests(test-diarize-pyannote-live
     TEST_SPEC "[live]"
-    PROPERTIES LABELS "live;diarize"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
 # Agglomerative cosine clustering used by --diarize-embedder (#107 P3b).
@@ -317,7 +349,7 @@ target_include_directories(test-speaker-cluster PRIVATE
 )
 target_link_libraries(test-speaker-cluster PRIVATE
     Catch2::Catch2WithMain
-    crispasr
+    crispasr-lib
 )
 catch_discover_tests(test-speaker-cluster
     TEST_SPEC "[unit]"
@@ -341,6 +373,26 @@ target_link_libraries(test-punctuation-policy PRIVATE
     common
 )
 catch_discover_tests(test-punctuation-policy
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test - punc - resolve — Catch2 unit tests for the shared --punc-model
+# resolver (CLI/server parity). Pure string mapping, header-only, no model load.
+add_executable(test-punc-resolve
+    test_punc_resolve.cpp
+)
+target_include_directories(test-punc-resolve PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/examples
+    ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-punc-resolve PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-punc-resolve
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit"
 )
@@ -377,7 +429,97 @@ target_link_libraries(test-paraformer PRIVATE
 )
 catch_discover_tests(test-paraformer
     TEST_SPEC "[paraformer]"
-    PROPERTIES LABELS "live;paraformer"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test - lfm2-audio — live integration tests for LFM2-Audio ASR + TTS
+add_executable(test-lfm2-audio
+    test_lfm2_audio_live.cpp
+)
+target_include_directories(test-lfm2-audio PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-lfm2-audio PRIVATE
+    Catch2::Catch2WithMain
+    lfm2_audio
+)
+catch_discover_tests(test-lfm2-audio
+    TEST_SPEC "[lfm2]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test - snac — unit + live tests for core/snac.h (SNAC 24kHz decoder)
+add_executable(test-snac
+    test_snac_unit.cpp
+)
+target_include_directories(test-snac PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-snac PRIVATE
+    Catch2::Catch2WithMain
+    snac
+)
+catch_discover_tests(test-snac
+    TEST_SPEC "[unit][snac]"
+    PROPERTIES
+        LABELS unit
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+catch_discover_tests(test-snac
+    TEST_SPEC "[live][snac]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test - mini-omni2 — live integration tests for Mini-Omni2 ASR + TTS + S2S
+add_executable(test-mini-omni2
+    test_mini_omni2_live.cpp
+)
+target_include_directories(test-mini-omni2 PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-mini-omni2 PRIVATE
+    Catch2::Catch2WithMain
+    mini-omni2
+    orpheus
+)
+catch_discover_tests(test-mini-omni2
+    TEST_SPEC "[mini-omni2]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test - moss-audio — live integration tests for MOSS-Audio-4B audio understanding
+add_executable(test-moss-audio
+    test_moss_audio_live.cpp
+)
+target_include_directories(test-moss-audio PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-moss-audio PRIVATE
+    Catch2::Catch2WithMain
+    moss_audio
+)
+catch_discover_tests(test-moss-audio
+    TEST_SPEC "[moss-audio]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
 # ─── test - context - bias — Catch2 unit tests for CTC-WS phrase-boost trie (PLAN #98)
@@ -460,16 +602,13 @@ target_include_directories(test-flash-attn-defaults PRIVATE
 # Link every backend whose header we touch. CMake auto-skips
 # missing targets via the if(TARGET …) guards so a slim build
 # (e.g. iOS device-only with fewer backends) still configures.
-set(_flash_attn_test_libs Catch2::Catch2WithMain)
-foreach(_be parakeet canary cohere qwen3_asr voxtral voxtral4b
-             granite_speech vibevoice qwen3_tts orpheus kokoro
-             chatterbox)
-    if (TARGET ${_be})
-        list(APPEND _flash_attn_test_libs ${_be})
-    endif()
-endforeach()
-target_link_libraries(test-flash-attn-defaults PRIVATE ${_flash_attn_test_libs})
-unset(_flash_attn_test_libs)
+# Link crispasr-lib (which already pulls every backend) rather than
+# enumerating individual backend libraries — this avoids missing
+# transitive dependencies (e.g. kokoro → phonemizer → crispasr_cache).
+target_link_libraries(test-flash-attn-defaults PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
 catch_discover_tests(test-flash-attn-defaults
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;flash_attn"
@@ -568,6 +707,29 @@ catch_discover_tests(test-issue-89-long-audio-fallback
     PROPERTIES LABELS "unit;long-audio;issue-89"
 )
 
+# ─── test-issue-150-cjk-fallback — issue #150 regression guard
+#
+# Pins split_text_at_punct via crispasr_make_disp_segments: the 42-char CJK
+# subtitle fallback must only fire for text containing CJK/kana/Hangul, not
+# for long English sentences where it would split words at raw character
+# boundaries (e.g. "about" → "abo" / "ut").  Compiles crispasr_output.cpp
+# directly — no model load, pure CPU.
+add_executable(test-issue-150-cjk-fallback
+    test-issue-150-cjk-fallback.cpp
+    ${PROJECT_SOURCE_DIR}/examples/cli/crispasr_output.cpp
+)
+target_include_directories(test-issue-150-cjk-fallback PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-issue-150-cjk-fallback PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-issue-150-cjk-fallback
+    TEST_SPEC "[issue-150]"
+    PROPERTIES LABELS "unit;output;issue-150"
+)
+
 # ─── test-internal-chunking-gate — CAP_INTERNAL_CHUNKING regression guard
 #
 # Pins the auto-chunk fallback skip for backends that declare
@@ -639,7 +801,7 @@ target_include_directories(test-lcs-c-abi PRIVATE
     ${PROJECT_SOURCE_DIR}/include
 )
 target_link_libraries(test-lcs-c-abi PRIVATE
-    crispasr
+    crispasr-lib
     Catch2::Catch2WithMain
 )
 catch_discover_tests(test-lcs-c-abi
@@ -703,11 +865,40 @@ target_include_directories(test-session-setters PRIVATE
 )
 target_link_libraries(test-session-setters PRIVATE
     Catch2::Catch2WithMain
-    crispasr
+    crispasr-lib
 )
 catch_discover_tests(test-session-setters
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit"
+)
+
+# ─── test-session-beam — functional beam-search regression test (§90).
+#
+# [unit][beam]  — setter API (null guard, width clamping). No model.
+# [beam][.live] — end-to-end: beam_size=1 no-regression + beam 2-4
+#                 produce non-empty output. Gated on CRISPASR_MODEL_WHISPER
+#                 (+ optionally CRISPASR_MODEL_GLM_ASR).
+add_executable(test-session-beam
+    test-session-beam.cpp
+)
+target_include_directories(test-session-beam PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-session-beam PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+catch_discover_tests(test-session-beam
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;beam"
+)
+catch_discover_tests(test-session-beam
+    TEST_SPEC "[.live]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
 # ─── test - registry — Catch2 unit tests for crispasr_model_registry
@@ -733,6 +924,28 @@ catch_discover_tests(test-registry
     PROPERTIES LABELS "unit"
 )
 
+# ─── test-companion-resolve — Catch2 unit tests for companion resolution (#146 / #148)
+#
+# Verifies the companion pre-download guard: sibling discovery, cache probe,
+# and correct companion size in download prompts. No network, no models.
+add_executable(test-companion-resolve test-companion-resolve.cpp
+    ${PROJECT_SOURCE_DIR}/src/crispasr_model_registry.cpp
+    ${PROJECT_SOURCE_DIR}/src/crispasr_cache.cpp
+)
+target_include_directories(test-companion-resolve PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-companion-resolve PRIVATE
+    Catch2::Catch2WithMain
+)
+if(WIN32)
+    target_link_libraries(test-companion-resolve PRIVATE winhttp)
+endif()
+catch_discover_tests(test-companion-resolve
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
 # ─── test_server_wav_writer — Catch2 unit tests for crispasr_make_wav_int16
 #
 #Header - only WAV serializer used by / v1 / audio / speech and crispasr_diff.
@@ -748,6 +961,63 @@ target_link_libraries(test_server_wav_writer PRIVATE
 catch_discover_tests(test_server_wav_writer
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit"
+)
+
+# ─── test_watermark — Catch2 unit tests for the spread-spectrum audio
+#watermark (embed + detect round-trip, SNR, robustness).
+#Pure CPU, no model dependencies — ~10 ms total.
+add_executable(test_watermark test_watermark.cpp)
+target_include_directories(test_watermark PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test_watermark PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test_watermark
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test_tts_provenance — Catch2 unit tests for TTS AI-provenance
+#compliance (WAV LIST/INFO, ID3v2, C2PA, consent gate, watermark edge cases).
+#Pure CPU, no model dependencies.
+add_executable(test_tts_provenance test_tts_provenance.cpp)
+target_include_directories(test_tts_provenance PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test_tts_provenance PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test_tts_provenance
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test_audioseal — Catch2 unit tests for AudioSeal ggml watermark.
+#API surface tests run unconditionally. Live model tests require
+#AUDIOSEAL_GGUF env var pointing at an audioseal.gguf.
+add_executable(test_audioseal test_audioseal.cpp)
+target_include_directories(test_audioseal PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test_audioseal PRIVATE
+    Catch2::Catch2WithMain
+    audioseal
+)
+catch_discover_tests(test_audioseal
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test_audioseal_cosine — standalone cosine comparison against PyTorch ref.
+# Not a Catch2 test — standalone main(). Run manually after generating
+# reference with Python. Requires AUDIOSEAL_GGUF env var.
+add_executable(test_audioseal_cosine test_audioseal_cosine.cpp)
+target_include_directories(test_audioseal_cosine PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test_audioseal_cosine PRIVATE
+    audioseal
 )
 
 # ─── test_server_chunking — Catch2 unit tests for the sentence splitter
@@ -800,6 +1070,86 @@ catch_discover_tests(test-core-decode
     PROPERTIES LABELS "unit"
 )
 
+# ─── test-core-sentencepiece — core/sentencepiece.h Viterbi tokenizer ─────────
+# Verifies the extracted SentencePiece unigram tokenizer against an
+# independent brute-force Viterbi (fuzzed) + hand-computed segmentations.
+add_executable(test-core-sentencepiece test-core-sentencepiece.cpp)
+target_include_directories(test-core-sentencepiece PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-core-sentencepiece PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-core-sentencepiece
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-core-istft — core/istft.h inverse-STFT overlap-add ──────────────────
+# Verifies the extracted iSTFT against an independent full-DFT reference
+# (fuzzed) + a forward-STFT→iSTFT sinusoid round-trip.
+add_executable(test-core-istft test-core-istft.cpp)
+target_include_directories(test-core-istft PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-core-istft PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-core-istft
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-core-cross-attn — core/cross_attn.h manual path (ggml graph) ────────
+# Computes the header's cross-attention graph and compares to a plain-C++ MHA
+# reference (verifies the bug-fixed V-transpose + unscaled T5 contract).
+add_executable(test-core-cross-attn test-core-cross-attn.cpp)
+target_include_directories(test-core-cross-attn PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-core-cross-attn PRIVATE
+    Catch2::Catch2WithMain
+    ggml ggml-base ggml-cpu
+)
+catch_discover_tests(test-core-cross-attn
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-core-adaln — core/adaln.h AdaLN-Zero modulation (ggml graph) ────────
+add_executable(test-core-adaln test-core-adaln.cpp)
+target_include_directories(test-core-adaln PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-core-adaln PRIVATE
+    Catch2::Catch2WithMain
+    ggml ggml-base ggml-cpu
+)
+catch_discover_tests(test-core-adaln
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-core-seanet — core/seanet_decoder.h convt1d_crop fix (ggml graph) ───
+add_executable(test-core-seanet test-core-seanet.cpp)
+target_include_directories(test-core-seanet PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-core-seanet PRIVATE
+    Catch2::Catch2WithMain
+    ggml ggml-base ggml-cpu
+)
+catch_discover_tests(test-core-seanet
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
 # ─── test-audio-chunking — Catch2 unit tests for audio_chunking::find_energy_min_split
 #
 # Covers the energy-minimum detection helper directly: quiet window selection,
@@ -831,7 +1181,7 @@ target_include_directories(test_slice_timestamps PRIVATE
 )
 target_link_libraries(test_slice_timestamps PRIVATE
     Catch2::Catch2WithMain
-    crispasr
+    crispasr-lib
 )
 catch_discover_tests(test_slice_timestamps
     TEST_SPEC "[unit]"
@@ -866,11 +1216,14 @@ target_link_libraries(test_qwen3_tts_talker PRIVATE qwen3_tts)
 add_executable(test-chat-ggml test-chat-ggml.cpp)
 target_link_libraries(test-chat-ggml PRIVATE
     Catch2::Catch2WithMain
-    crispasr
+    crispasr-lib
 )
 catch_discover_tests(test-chat-ggml
     TEST_SPEC "[chat]"
-    PROPERTIES LABELS "chat;integration"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
 # ─── test_metal_norm_repro — ggml_norm Metal vs CPU bit-exactness ────────────
@@ -920,3 +1273,153 @@ add_test(NAME benchmark-quick
 set_tests_properties(benchmark-quick PROPERTIES
     LABELS "benchmark"
     TIMEOUT 600)
+
+# --- test-f5-tts --- standalone F5-TTS DiT+Vocos smoke test
+add_executable(test-f5-tts test-f5-tts.cpp)
+target_include_directories(test-f5-tts PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-f5-tts PRIVATE f5-tts)
+
+# ─── test-piper-tts — standalone Piper VITS TTS smoke test ─────────────────
+add_executable(test-piper-tts test-piper-tts.cpp)
+target_include_directories(test-piper-tts PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-piper-tts PRIVATE piper-tts)
+
+# ─── test-g2p-en — Catch2 tests for English G2P (ARPAbet, LTS, phonemizer) ──
+add_executable(test-g2p-en test-g2p-en.cpp
+    ${PROJECT_SOURCE_DIR}/src/phonemizer.cpp)
+target_include_directories(test-g2p-en PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-g2p-en PRIVATE
+    Catch2::Catch2WithMain
+)
+# Need dl for dlopen on Linux
+if(NOT WIN32 AND NOT APPLE)
+    target_link_libraries(test-g2p-en PRIVATE dl)
+endif()
+catch_discover_tests(test-g2p-en
+    EXTRA_ARGS --colour-mode ansi
+    PROPERTIES LABELS "unit;g2p;phonemizer"
+    PROPERTIES TIMEOUT 30
+)
+
+# ─── test-g2p-de — Catch2 tests for German G2P ──────────────────────────────
+add_executable(test-g2p-de test-g2p-de.cpp)
+target_include_directories(test-g2p-de PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-g2p-de PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-g2p-de
+    EXTRA_ARGS --colour-mode ansi
+    PROPERTIES LABELS "unit;g2p;german"
+    PROPERTIES TIMEOUT 30
+)
+
+# ─── test-g2p-fr — Catch2 tests for French G2P ──────────────────────────────
+add_executable(test-g2p-fr test-g2p-fr.cpp)
+target_include_directories(test-g2p-fr PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-g2p-fr PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-g2p-fr
+    EXTRA_ARGS --colour-mode ansi
+    PROPERTIES LABELS "unit;g2p;french"
+    PROPERTIES TIMEOUT 30
+)
+
+# ─── test-g2p-es — Catch2 tests for Spanish G2P ─────────────────────────────
+add_executable(test-g2p-es test-g2p-es.cpp)
+target_include_directories(test-g2p-es PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-g2p-es PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-g2p-es
+    EXTRA_ARGS --colour-mode ansi
+    PROPERTIES LABELS "unit;g2p;spanish"
+    PROPERTIES TIMEOUT 30
+)
+
+# ─── test-espeak-phonemize — Catch2 tests for espeak-ng phonemization ───────
+# Tests espeak availability, piper text/IPA synthesis, input validation.
+# Requires PIPER_TEST_MODEL env var or -DPIPER_TEST_MODEL=... for live tests.
+add_executable(test-espeak-phonemize test-espeak-phonemize.cpp)
+target_include_directories(test-espeak-phonemize PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-espeak-phonemize PRIVATE
+    Catch2::Catch2WithMain
+    piper-tts
+)
+catch_discover_tests(test-espeak-phonemize
+    EXTRA_ARGS --colour-mode ansi
+    PROPERTIES LABELS "espeak;piper;tts"
+    PROPERTIES TIMEOUT 120
+)
+
+# ─── test-piper-roundtrip — live TTS→ASR integration test ───────────────────
+# Synthesizes text with piper, transcribes with whisper, checks output.
+if(TARGET crispasr-cli)
+add_test(NAME test-piper-roundtrip
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-piper-roundtrip.sh
+            $<TARGET_FILE:crispasr-cli>
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-piper-roundtrip PROPERTIES
+    LABELS "live;tts;piper;espeak;roundtrip"
+    TIMEOUT 300)
+endif()
+
+# ─── test-progress-output — live test: -pp/--print-progress emits per-slice
+# progress on stderr for unified backends (issue #130).
+add_test(NAME test-progress-output
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-progress-output.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-progress-output PROPERTIES
+    LABELS "live;progress"
+    TIMEOUT 300)
+
+# ─── test-dry-run-resolve — offline regression: --dry-run-resolve must preview
+# the same model a real `-m <alias>` would load (sub-variant keys, §166).
+# Needs only the built binary (no models / network); SKIPs if absent.
+add_test(NAME test-dry-run-resolve
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-dry-run-resolve.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-dry-run-resolve PROPERTIES
+    LABELS "cli"
+    TIMEOUT 60)
+
+# ─── test-server-ws-stream — live: --ws-port real-time WebSocket ASR streaming.
+# Raw-socket client (stdlib only) verifies the RFC 6455 handshake + a streaming
+# transcription. Needs a whisper ggml model; SKIPs otherwise.
+add_test(NAME test-server-ws-stream
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-server-ws-stream.py
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-server-ws-stream PROPERTIES
+    LABELS "live;server"
+    TIMEOUT 300)
+
+# ─── test-release-workflow — validate release.yml targets (issue #131).
+# Static test: no binary or model needed, just parses YAML.
+add_test(NAME test-release-workflow
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_release_workflow.py
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-release-workflow PROPERTIES
+    LABELS "unit;ci"
+    TIMEOUT 30)

@@ -106,6 +106,18 @@ const char* parakeet_token_to_str(struct parakeet_context* ctx, int token_id);
 // until the next call. seed == 0 means time-based RNG.
 void parakeet_set_temperature(struct parakeet_context* ctx, float temperature, uint64_t seed);
 
+// Beam search for TDT/RNNT decode. beam_size == 1 (default) is greedy.
+// beam_size > 1 runs a label-looping beam search that keeps multiple
+// hypotheses alive — especially beneficial with hotword phrase boost.
+void parakeet_set_beam_size(struct parakeet_context* ctx, int beam_size);
+
+// MAES (Modified Adaptive Expansion Search) beam decoding. Requires
+// beam_size > 1. More efficient than label-looping beam search for
+// transducers: processes one frame at a time with adaptive expansion.
+// gamma = pruning threshold (lower = more pruning); num_steps = max
+// non-blank expansions per frame; beta = extra candidates beyond beam.
+void parakeet_set_maes(struct parakeet_context* ctx, bool enable, int num_steps, float gamma, int beta);
+
 // CTC decode mode (hybrid TDT+CTC models only).
 void parakeet_set_ctc_mode(struct parakeet_context* ctx, bool ctc);
 bool parakeet_has_ctc(struct parakeet_context* ctx);
@@ -167,6 +179,29 @@ int parakeet_run_encoder_dump(struct parakeet_context* ctx, const float* mel, in
 // Internal smoke test: take raw 16 kHz mono PCM, run mel + encoder, print
 // encoder-output statistics. Returns T_enc on success or -1.
 int parakeet_test_audio(struct parakeet_context* ctx, const float* samples, int n_samples);
+
+// ---- Transducer component entry points (for crispasr-diff testing) ----
+// These expose the predictor (LSTM) and joint network intermediates so
+// crispasr-diff can validate each component against a PyTorch reference
+// before testing the full decode loop.
+
+// Run the joint encoder projection on encoder output.
+// Input:  enc_frames row-major (T_enc, d_model)
+// Output: malloc'd (T_enc, joint_hidden) row-major. Caller must free().
+float* parakeet_joint_project_encoder(struct parakeet_context* ctx, const float* enc_frames, int T_enc, int d_model,
+                                      int* out_joint_hidden);
+
+// Run predictor on blank/SOS token (initial state).
+// Output: malloc'd (1, pred_hidden) — the LSTM output after feeding blank.
+// Caller must free().
+float* parakeet_predictor_initial(struct parakeet_context* ctx, int* out_pred_hidden);
+
+// Run full joint step at a single encoder frame + predictor output.
+// proj_enc: (joint_hidden,) — output of parakeet_joint_project_encoder for one frame
+// pred_out: (pred_hidden,) — output of predictor step
+// Output: malloc'd (vocab_total,) raw logits. Caller must free().
+float* parakeet_joint_step(struct parakeet_context* ctx, const float* proj_enc, const float* pred_out,
+                           int* out_vocab_total);
 
 #ifdef __cplusplus
 }

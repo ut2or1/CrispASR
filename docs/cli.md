@@ -60,6 +60,12 @@ crispasr --gpu-backend vulkan -dev 1 -m auto -f audio.wav
 # Half-VRAM voxtral4b
 CRISPASR_KV_QUANT=q4_0 CRISPASR_GGUF_MMAP=1 crispasr --backend voxtral4b -m auto -f audio.wav
 
+# TTS — synthesize speech from text
+crispasr --backend kokoro -m auto --tts "Hello, how are you?" -o output.wav
+
+# S2S — speech-to-speech (audio in → audio out)
+crispasr --backend lfm2-audio -m auto -f input.wav --s2s -o reply.wav
+
 # List every backend + capabilities
 crispasr --list-backends
 ```
@@ -73,6 +79,14 @@ crispasr --list-backends
 | `-f FNAME`, `--file FNAME` | Input audio (can repeat; also accepts positional filenames) |
 | `-t N`, `--threads N` | Thread count (default: `min(4, nproc)`) |
 | `-l LANG`, `--language LANG` | ISO-639-1 code (default: `en`) |
+| `--tts "TEXT"` | Synthesize speech from text (requires `CAP_TTS` backend). Output to `-o file.wav` |
+| `--tts-output FNAME` | Output path for TTS WAV (default: stdout / `tts_output.wav`) |
+| `--s2s` | Speech-to-speech mode: audio in → audio out (requires `CAP_S2S` backend, e.g. `lfm2-audio`, `mini-omni2`) |
+| `--s2s-output FNAME` | Output path for S2S WAV |
+| `--voice PATH` | Voice reference for TTS cloning (WAV file or GGUF voice pack) |
+| `--server` | Run as HTTP server with persistent model (see [`server.md`](server.md)) |
+| `--ws-port N` | Server: real-time WebSocket ASR streaming port (`-1` off, `0` = HTTP port + 1) |
+| `--no-warmup` | Server: skip the startup warmup transcribe (workaround for GPU drivers that hang in warmup, #165) |
 | `--list-backends` | Print the capability matrix and exit |
 
 ## Output
@@ -121,7 +135,7 @@ per-token `tokens[]` arrays when the backend populates them.
 
 | Flag | Meaning |
 |---|---|
-| `--vad` | Enable Silero VAD. Auto-downloads `ggml-silero-v5.1.2.bin` (~885 KB) to `~/.cache/crispasr/` on first use |
+| `--vad` | Enable Silero VAD. Auto-downloads `ggml-silero-v6.2.0.bin` (~885 KB) to `~/.cache/crispasr/` on first use |
 | `--vad-model FNAME` | Override the VAD model path (default: auto) |
 | `-vt F` | VAD threshold (default 0.5) |
 | `-vspd N` | VAD min speech duration (ms, default 250) |
@@ -130,35 +144,66 @@ per-token `tokens[]` arrays when the backend populates them.
 | `--chunk-overlap F` | Overlap context (seconds) at chunk boundaries (default 3.0) |
 | `--lcs-dedup auto\|on\|off` | NeMo-style sub-word LCS dedup across chunk boundaries (default `auto` — fires when chunking with overlap) |
 | `--lcs-min-length N` | Minimum LCS length to act on (default 1; raise to 3-4 on long-silence audio where blank tokens dominate boundaries) |
-| `--parakeet-decoder ctc\|tdt` | Select CTC or TDT decode head for hybrid parakeet models |
+| `--parakeet-decoder ctc\|tdt\|maes` | Select decode strategy: `ctc` (CTC head), `tdt` (TDT greedy/beam, default), `maes` (MAES beam search — requires `-bs N` with N>1) |
+| `-bs N`, `--beam-size N` | Parakeet TDT/RNNT beam search width (default 1 = greedy). `2`–`4` recommended with hotwords or MAES. CTC decode is frame-synchronous and always greedy |
 
-### Parakeet long-audio streaming (issue #89)
+### MAES beam search (§134)
 
-Parakeet handles long audio internally via a NeMo-inspired streamed
-pipeline.  Audio ≤60 s is processed in a single encoder pass (best
-quality: 99.5 % coverage on the reporter's 60 s Japanese podcast clip).
-Audio >60 s is encoded in overlapping 8 s chunks with global z-norm,
-then decoded in one TDT pass — safe for any length without z-norm drift.
+MAES (Modified Adaptive Expansion Search) is a transducer-specific beam
+search that processes one encoder frame at a time with adaptive expansion.
+More efficient than the label-looping beam for transducers.
 
-**Env vars for tuning** (e.g. for issue triage on your hardware):
+```bash
+# Via --parakeet-decoder maes:
+crispasr -m parakeet-tdt-0.6b-v3.gguf -f audio.wav --parakeet-decoder maes --beam-size 4
+
+# Via env var:
+CRISPASR_PARAKEET_MAES=1 crispasr -m model.gguf -f audio.wav --beam-size 4
+```
+
+**Tuning env vars:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `CRISPASR_PARAKEET_MAES` | 0 | Set to 1 to enable MAES (alternative to `--parakeet-decoder maes`) |
+| `CRISPASR_MAES_NUM_STEPS` | 2 | Max non-blank expansions per frame |
+| `CRISPASR_MAES_GAMMA` | 2.3 | Pruning threshold (lower = more aggressive) |
+| `CRISPASR_MAES_BETA` | 2 | Extra candidates beyond beam_size |
+
+Works with both TDT and RNNT parakeet models. CTC beam search is
+separate (activated by `--beam-size N` with CTC models, uses shared
+`core_ctc::prefix_beam_search`).
+
+### Parakeet streamed encoding (issue #89)
+
+Parakeet always encodes audio in overlapping 8 s windows (global
+z-norm + chunked encode + single TDT decode pass). The bidirectional
+FastConformer encoder is numerically unstable when the attention spans
+the whole utterance: codec-level perturbations as small as 0.3 % RMS
+flipped the encoder output std by ~14 % on the issue #89 reporter's
+clip, driving the TDT decoder into emit-blank-forever past ~20 s. Local
+8 s attention windows do not amplify that noise.
+
+**Env vars for tuning:**
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CRISPASR_PARAKEET_STREAM_THRESHOLD` | 60 | Switch from single-pass to streamed at this duration (seconds).  Set 0 = always streamed, 999 = always single-pass |
-| `CRISPASR_PARAKEET_STREAM_CHUNK` | 8 | Encoder chunk size (seconds) for the streamed path |
+| `CRISPASR_PARAKEET_STREAM_THRESHOLD` | 0 | Use single-pass (no chunked encode) for audio ≤ this duration (seconds).  `0` = always streamed.  `999` = single-pass for audio under ~16 minutes (escape hatch for bit-exact NeMo reproduction). |
+| `CRISPASR_PARAKEET_STREAM_CHUNK` | 8 | Encoder chunk size (seconds) |
 | `CRISPASR_PARAKEET_STREAM_OVERLAP` | 2 | Encoder overlap (seconds) between consecutive chunks |
 
 **Example: transcribe a 5-minute Japanese podcast:**
 
 ```bash
-# Auto mode — uses single-pass for first 60s, streamed for the rest:
+# Default — streamed encoding for any length:
 crispasr -m parakeet-tdt-0.6b-ja.gguf -f podcast.wav -osrt
 
-# Force single-pass even for long audio (may fail on some Vulkan/AMD):
+# Opt into single-pass for short audio (matches upstream NeMo bit-exactly
+# on clips where the encoder doesn't go unstable):
 CRISPASR_PARAKEET_STREAM_THRESHOLD=999 \
-  crispasr -m parakeet-tdt-0.6b-ja.gguf -f podcast.wav -osrt
+  crispasr -m parakeet-tdt-0.6b-ja.gguf -f short_clip.wav -osrt
 
-# With VAD for finest segmentation (93%+ coverage, best subtitles):
+# With VAD for finest segmentation:
 crispasr -m parakeet-tdt-0.6b-ja.gguf -f podcast.wav --vad -osrt
 ```
 
@@ -180,10 +225,10 @@ segments (< 3 s) are auto-merged, and oversized segments are split at
 
 # Or point at an existing GGUF
 ./build/bin/crispasr --backend parakeet -m parakeet.gguf -f long_audio.wav \
-    --vad-model ~/models/ggml-silero-v5.1.2.bin -osrt
+    --vad-model ~/models/ggml-silero-v6.2.0.bin -osrt
 ```
 
-The cached model lives at `~/.cache/crispasr/ggml-silero-v5.1.2.bin`
+The cached model lives at `~/.cache/crispasr/ggml-silero-v6.2.0.bin`
 (~885 KB). If you don't pass `--vad`, whisper falls back to fixed
 30-second chunking (`-ck 30`). Backends with `CAP_UNBOUNDED_INPUT`
 (parakeet, canary, wav2vec2, firered-asr, fastconformer-ctc,
@@ -212,13 +257,13 @@ crispasr --backend parakeet -m parakeet.gguf -f long_audio.wav \
   `voxtral`, `voxtral4b`, `qwen3`): use a CTC aligner together with
   `--vad`. Without VAD, leading silence can throw off sentence
   starts, especially for the qwen3 forced aligner.
-- **Long audio (>60 s):** parakeet automatically switches to the
-  NeMo-style streamed pipeline — global z-norm + overlapping 8 s
-  encoder chunks + single TDT decode pass. No manual `--chunk-seconds`
-  needed. Tune with `CRISPASR_PARAKEET_STREAM_THRESHOLD` (default 60),
-  `CRISPASR_PARAKEET_STREAM_CHUNK` (default 8), and
-  `CRISPASR_PARAKEET_STREAM_OVERLAP` (default 2). See the "Parakeet
-  long-audio streaming" section above for details.
+- **Any length:** parakeet routes through the NeMo-style streamed
+  pipeline — global z-norm + overlapping 8 s encoder chunks + single
+  TDT decode pass — by default, regardless of duration. No manual
+  `--chunk-seconds` needed. Tune chunk/overlap with
+  `CRISPASR_PARAKEET_STREAM_CHUNK` (default 8) and
+  `CRISPASR_PARAKEET_STREAM_OVERLAP` (default 2). See the
+  "Parakeet streamed encoding" section above for details.
 - **If parakeet OOMs on very long audio:** lower the stream chunk size
   with `CRISPASR_PARAKEET_STREAM_CHUNK=4`. The default 8 s chunks use
   ~30 MB per chunk for the encoder; 4 s halves that.
@@ -370,7 +415,7 @@ upstream tools like SubtitleEdit.
 | `-tp F`, `--temperature F` | Sampling temperature. `0` = pure argmax (default, bit-identical). `> 0` enables multinomial sampling for whisper, voxtral, voxtral4b, qwen3, granite |
 | `--seed N` | RNG seed for sampling. `0` = non-deterministic. Used by temperature-sampling ASR backends and TTS backends that sample; CLI values override backend-specific env seeds |
 | `-bo N`, `--best-of N` | Number of best candidates to keep when temperature > 0 (whisper + some AR backends) |
-| `-bs N`, `--beam-size N` | Beam search width (whisper only) |
+| `-bs N`, `--beam-size N` | Beam search width. Default 5 for whisper, 1 (greedy) for other backends. 18 backends: whisper, parakeet, canary, cohere, granite, qwen3, voxtral, voxtral4b, glm-asr, kyutai-stt, moonshine, moonshine-streaming, firered-asr, omniasr, gemma4-e2b, funasr, m2m100, madlad/t5. Not applicable to CTC/NAR backends |
 | `-tpi F`, `--temperature-inc F` | Whisper temperature-fallback increment |
 | `-nf`, `--no-fallback` | Disable temperature fallback (equivalent to `--temperature-inc 0`) |
 | `--frequency-penalty F` | Opt-in repeated generated-token penalty for autoregressive ASR backends (`0.0` disabled). Applied to generated output tokens before greedy/sampling selection. |
@@ -421,14 +466,37 @@ crispasr --backend parakeet -m auto -f meeting.wav \
     --hotwords-file names.txt --hotwords-boost 3.0
 ```
 
+### Beam search + hotwords (recommended for domain vocabulary)
+
+With greedy decode, a boosted token that loses to blank or a common
+word at one frame is gone forever. Beam search (`-bs 2` or higher)
+keeps alternative hypotheses alive, so a boosted rare term can survive
+in a lower-ranked beam and win later when more confirming audio
+arrives. The combination is especially effective for medical, legal,
+or brand-name vocabulary where greedy hotword boosting alone is
+insufficient.
+
+```bash
+# Beam search + hotwords for medical transcription
+crispasr --backend parakeet -m auto -f consultation.wav \
+    --hotwords "metformin,lisinopril,atorvastatin" -bs 4
+```
+
+The overhead is negligible: parakeet's TDT beam search only multiplies
+the cheap predictor+joint steps (~10 KB LSTM state per beam), while
+the encoder dominates wall time. Measured overhead: ~3 % at beam=2,
+~12 % at beam=4 on 60 s audio.
+
 ### How it works (CTC-WS)
 
 An Aho-Corasick multi-pattern trie is built from the hotword strings
 by tokenizing each word through the backend's SentencePiece vocab.
-Before each frame's argmax, the trie checks which tokens continue an
-active hotword prefix match and adds the boost to their logits. After
-argmax, the trie state advances based on the emitted token. The
-overhead is O(1) per frame — no measurable impact on throughput.
+Before each frame's argmax (or each beam expansion step), the trie
+checks which tokens continue an active hotword prefix match and adds
+the boost to their logits. After token selection, the trie state
+advances based on the emitted token. Each beam hypothesis maintains
+its own trie position. The overhead is O(1) per frame — no measurable
+impact on throughput.
 
 ## Language detection (LID)
 
@@ -936,6 +1004,27 @@ implementation. For most voxtral4b VRAM-pressure cases the
 `KV_QUANT=q4_0 + MMAP=1` combo above is sufficient; the layer-split
 features are only needed when even that doesn't fit.
 
+### TTS provenance & watermarking flags
+
+All TTS output is automatically watermarked. Additional flags control
+the neural watermark, C2PA signing, and voice-cloning consent:
+
+| Flag | Description |
+|------|-------------|
+| `--watermark-model PATH` | Load AudioSeal GGUF for neural watermarking (upgrades built-in spread-spectrum) |
+| `--detect-watermark PATH` | Read a WAV file, run watermark detection, print confidence + verdict (`>0.65` = AI-GENERATED, `0.4–0.65` = UNCERTAIN, `<0.4` = none), then exit |
+| `--i-have-rights` | Required for voice cloning (`--voice <file.wav>`); attests speaker consent |
+| `--no-spoken-disclaimer` | Skip the audible AI-disclosure prefix on voice-cloned output (watermark + C2PA still applied; caller assumes disclosure responsibility) |
+| `--g2p-dict SOURCE` | G2P pronunciation dictionary: `olaph` (MIT, default), `open-dict` (CC-BY-SA), or path to a custom dict file. Auto-downloads on first use. See [`tts.md`](tts.md) for details. |
+| `--c2pa-cert PATH` | X.509 certificate for C2PA Content Credentials signing |
+| `--c2pa-key PATH` | Private key for C2PA signing (generate both with `scripts/generate-c2pa-cert.sh`) |
+
+Debug env vars:
+- `AUDIOSEAL_DEBUG=1` — print AudioSeal tensor shapes during graph build
+- `AUDIOSEAL_DUMP_STAGES=1` — dump per-stage binary tensors to `/tmp/`
+
+See [`tts.md`](tts.md) for full watermarking documentation.
+
 ### TTS-side env vars
 
 For TTS-specific deployment knobs (codec backend selection, graph
@@ -996,8 +1085,9 @@ Differences worth flagging:
   + every TTS-side env var (`QWEN3_TTS_CODEC_GPU`,
   `QWEN3_TTS_SKIP_REF_DECODE`, `QWEN3_TTS_O15`, `KOKORO_GEN_GPU`,
   `VIBEVOICE_VAE_BACKEND`, …)
-- [`docs/server.md`](server.md) — HTTP `/inference` and OpenAI-compat
-  `/v1/audio/transcriptions`
+- [`docs/server.md`](server.md) — HTTP `/inference`, OpenAI-compat
+  `/v1/audio/transcriptions`, `/v1/audio/speech` (TTS),
+  `/v1/audio/speech-to-speech` (S2S)
 - [`docs/bindings.md`](bindings.md) — Python / Rust / Dart / Go / Java
   / Ruby — every CLI feature is reachable through the C-ABI
 - [`docs/install.md`](install.md) — full build options, GPU backends,

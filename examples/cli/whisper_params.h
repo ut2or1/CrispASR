@@ -27,7 +27,7 @@ struct whisper_params {
     int32_t max_len = 0;
     bool split_on_punct = false;
     int32_t best_of = whisper_full_default_params(CRISPASR_SAMPLING_GREEDY).greedy.best_of;
-    int32_t beam_size = whisper_full_default_params(CRISPASR_SAMPLING_BEAM_SEARCH).beam_search.beam_size;
+    int32_t beam_size = -1; // -1 = greedy; beam search only when explicitly set via -bs N
     int32_t audio_ctx = 0;
 
     float word_thold = 0.01f;
@@ -145,7 +145,8 @@ struct whisper_params {
     // 3-4 if your audio has long-silence regions where blank tokens
     // dominate the boundary token run (avoids over-slicing).
     int lcs_min_length = 1;
-    bool warmup = false;          // run a short dummy transcribe after init to amortize first-call overhead (PLAN #80e)
+    bool warmup = false;    // run a short dummy transcribe after init to amortize first-call overhead (PLAN #80e)
+    bool no_warmup = false; // --no-warmup: skip the always-on server warmup (e.g. crashes on some Vulkan drivers, #165)
     std::string parakeet_decoder; // "tdt" (default), "ctc" — selects parakeet decode head
     std::string hotwords;         // comma-separated hotword list (PLAN #98)
     float hotwords_boost = 2.0f;  // per-token log-prob boost for hotword prefix matches
@@ -185,6 +186,9 @@ struct whisper_params {
     std::string server_host = "127.0.0.1";
     int32_t server_port = 8080;
     std::string server_api_keys;
+    // --ws-port: real-time WebSocket ASR streaming on a second port.
+    //   -1 = disabled (default), 0 = server_port + 1, N = port N.
+    int32_t server_ws_port = -1;
     int32_t stream_step_ms = 3000;
     int32_t stream_length_ms = 10000;
     int32_t stream_keep_ms = 200;
@@ -243,15 +247,56 @@ struct whisper_params {
     bool dry_run_resolve = false;
     bool dry_run_ignore_cache = false;
     std::string cache_dir;
+    // Issue #128 — llama-server-style convenience flags. `--hf-repo
+    // OWNER/REPO[:FILE]` synthesises the HF resolve URL and fetches the
+    // model into the auto-download cache, then runs the rest of the
+    // pipeline as if the user had passed `-m <cached-path>`. `--hf-file
+    // FILE` overrides the FILE part when the user prefers two flags.
+    // Empty = not requested; the existing -m / --auto-download paths
+    // run unchanged.
+    std::string hf_repo;
+    std::string hf_file;
     std::string tts_text;
     std::string tts_output;
+    bool s2s = false;       // speech-to-speech mode: audio in → audio out
+    std::string s2s_output; // S2S output WAV path (default: s2s_output.wav)
     std::string tts_voice;
     int tts_steps = 20;
     std::string tts_codec_model;
     std::string tts_codec_quant;
     std::string tts_ref_text;
+    std::string tts_ref_asr;  // ASR backend for auto-transcribing ref audio (default: whisper)
     std::string tts_instruct; // VoiceDesign: natural-language voice description
     bool tts_trim_silence = false;
+
+    // AudioSeal neural watermark model (optional upgrade from spread-spectrum).
+    // When set, loads the GGUF and uses it for watermark embed/detect
+    // instead of the built-in spread-spectrum watermark.
+    std::string watermark_model;
+
+    // --detect-watermark PATH: standalone watermark detection mode.
+    // When set, reads the WAV file, runs watermark detection, prints
+    // the result, and exits. Exposes the detection API for end users.
+    std::string detect_watermark_file;
+
+    // C2PA (Content Credentials) signing — compile-time gated on
+    // CRISPASR_HAVE_C2PA. Paths to self-signed or CA-issued X.509 cert
+    // and key. Generate with: scripts/generate-c2pa-cert.sh
+    std::string c2pa_cert;
+    std::string c2pa_key;
+
+    // Voice-cloning consent gate (EU AI Act / deepfake disclosure).
+    // CLI: --i-have-rights sets this to true. Without it, voice cloning
+    // (--voice <file.wav>) is refused.
+    // Server: the request body must include a non-empty
+    // `consent_attestation` string when voice ends in .wav.
+    bool tts_voice_clone_consent = false;
+    std::string tts_consent_attestation;
+
+    // Skip the spoken AI-disclosure prefix on voice-cloned output.
+    // Machine-readable provenance (watermark + C2PA) is always retained.
+    // CLI: --no-spoken-disclaimer   Server: "spoken_disclaimer": false
+    bool tts_no_spoken_disclaimer = false;
 
     // Server mode: directory containing voice profiles for /v1/audio/speech.
     // Each profile is a sibling pair: <name>.wav + <name>.txt (the WAV is
@@ -273,6 +318,29 @@ struct whisper_params {
     // WAV/PCM/f32 dispatch. Default 1.0 = no resample. The CLI ignores
     // this; only the server route reads it.
     float tts_speed = 1.0f;
+
+    // 75c-opt-2: per-request TTS backend knobs exposed via /v1/audio/speech.
+    // Negative sentinel = "use backend default". The server route parses
+    // these from JSON and each backend adapter applies them via native
+    // setter calls when non-sentinel.
+    float tts_top_p = -1.0f;
+    float tts_min_p = -1.0f;
+    int tts_top_k = -1;
+    float tts_repetition_penalty = -1.0f;
+    float tts_cfg_scale = -1.0f;    // chatterbox cfg_weight, f5 cfg_strength
+    int tts_num_steps = -1;         // chatterbox cfm_steps, f5 ode_steps
+    float tts_noise_scale = -1.0f;  // piper VITS variance
+    float tts_noise_w = -1.0f;      // piper stochastic duration predictor
+    float tts_exaggeration = -1.0f; // chatterbox expressiveness
+    int tts_speaker_id = -1;        // piper multi-speaker model
+    int tts_max_speech_tokens = -1; // chatterbox max AR tokens
+
+    // G2P phonemizer dictionary source:
+    //   ""           → auto (OLaPh MIT preferred, then open-dict-data CC-BY-SA)
+    //   "olaph"      → OLaPh MIT dicts from cstr/g2p-dicts HuggingFace
+    //   "open-dict"  → open-dict-data CC-BY-SA from Wiktionary
+    //   path         → custom dict file path
+    std::string g2p_dict;
 
     // Server mode: when non-empty, every server response gets the
     // Access-Control-Allow-* headers set so browser clients can call us

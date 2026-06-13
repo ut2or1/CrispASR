@@ -1,164 +1,155 @@
-**Title:** `metal/ggml-alloc : two specific ggml_set_output calls on a long F32 graph cause Metal to write all-NaN`
+**Title:** `ggml-backend : sched mutates user gf src pointers in place, leaving dangling pointers across alloc_graph calls`
 
 ---
 
-This is a bug report rather than a patch. Two specific
-`ggml_set_output` calls on intermediate tensors in a 14-block
-diffusion UNet (the chatterbox-tts S3Gen conditional flow-matching
-decoder) cause Apple Silicon Metal to produce all-NaN output for
-the entire graph. Without those marks the output is finite
-(degraded from a CPU reference by `cos_min ~0.94`, but no NaN).
-Either mark alone is also finite. The bug requires the
-combination.
+`ggml_backend_sched_split_graph` rewires `node->src[j]` of the user's
+graph to point at internal `input_cpy` tensors it allocates in
+`sched->ctx`. Those tensors live until the *next* call to
+`ggml_backend_sched_split_graph`, which begins with
+`ggml_free(sched->ctx); sched->ctx = ggml_init(params)` and
+invalidates them. Between sched calls, the user's `gf->nodes[i]->src[j]`
+is therefore a dangling pointer.
 
-CPU backend produces correct output in every configuration tested.
+When the user calls `ggml_backend_sched_alloc_graph` again on the same
+gf — a common pattern, e.g. classifier-free guidance running the
+same compute graph twice per step with different inputs — the next
+`sched_split_graph` reads from those dangling pointers to decide
+whether each src needs a new cross-backend copy. The garbage flags
+rarely match `GGML_TENSOR_FLAG_INPUT`, so it silently skips creating
+the input copy. The consuming GPU kernel then reads whatever stale
+data is at the previous `input_cpy`'s offset.
 
-## Minimum repro
+## Repro
 
-UNet1D denoiser graph: ~14 sub-blocks (1 down + 12 mid + 1 up +
-final), ~396 mul_mats per pass, F32 activations throughout. The
-two trigger tensors:
-
-1. `dump_db_resnet` — output of the first DOWN block's
-   `causal_resnet_block` (shape `(T_mel, 256)` F32, here T_mel=102).
-2. Any one of `dump_mb_{0, 2, 4, 6, 8, 10, 11}_out` — output of an
-   *even-indexed* MID block, or the last one (`mb_11`). Same shape.
-
-Marking both with `ggml_set_output` → Metal writes all-NaN to the
-final output. Either alone → output is finite. Marking an
-odd-indexed `mb_*_out` (1, 3, 5, 7, 9) instead → finite,
-deterministic.
-
-## Backstory — why `set_output` was added
-
-`ggml_set_output` was added as a debug aid: without it, `ggml_gallocr`
-reuses the buffer of any tensor satisfying
-`hn->n_children == 1 && hn->n_views == 0` for downstream ops
-(see `ggml-alloc.c` around line 644). The debug dumper walked the
-graph and read every node whose name started with `dump_*` — but
-because some weren't `set_output`'d, their buffer had been
-recycled by the time `ggml_backend_tensor_get` ran, and the dump
-was stale data.
-
-Adding `ggml_set_output` to each dump point made the dump
-reliable. It also revealed the NaN.
-
-## Why this is reportable upstream
-
-- Same model + same graph + same inputs + identical seed.
-- Only difference between "Metal output finite" and "Metal output
-  all-NaN" is two specific `ggml_set_output` calls.
-- CPU backend: every configuration finite and correct.
-
-The parity pattern (even-indexed mb_*_out marks trigger; odd
-don't) is geometric, not aliasing. A per-node `ggml_gallocr` trace
-of both configurations (instrumentation merged downstream) shows
-that even-indexed `mb_*_out` tensors land at `chunk=0 offset=0`
-and odd-indexed at `chunk=0 offset=1271296` in the un-marked
-control. Pinning the low-offset slot via `set_output` →
-`FREE_SKIP_OUTPUT` blocks reuse of offset=0 and forces ~1300
-downstream allocations to shifted positions. Pinning the
-mid-offset slot only creates a small hole and a minor shift.
-
-An overlap scan over the allocator trace of both 1-mark and 2-mark
-configurations finds **zero overlapping live byte-ranges** in
-either pass — the allocator's plan is correct in both cases. The
-bug is therefore in the backend layer: a Metal kernel whose
-correctness depends on the specific address pattern produced when
-downstream allocations are shifted, or the output-staging path
-that handles `set_output`-flagged tensors, or sched-level
-interaction between OUTPUT tensors and split boundaries.
-
-## What's been ruled out
-
-These were tried during a long debug session and none of them is
-the source:
-
-1. **`mul_mat` kernel precision.** Added a `GGML_PREC_F32` Q8_0
-   path that's bit-identical to CPU's
-   `ggml_vec_dot_q8_0_q8_0_generic` (filed as separate PR 09).
-   With this kernel firing on all 350 prec-tagged UNet mul_mats,
-   the baseline drift moves from `cos_min 0.940` to `0.947`
-   (essentially no change), and the 2-mark NaN trigger is
-   unchanged.
-2. **Per-op pin to CPU.** Pinning *any* frequent op (norm, mul,
-   add, flash_attn_ext, gelu, reshape, cont, concat, permute,
-   mul_mat) restores `cos_min = 1.000` on the baseline. Pinning a
-   sparse op (conv_1d, soft_max, mish, silu, scale) doesn't help.
-   This is a sync-barrier-density signal, not an op-identity
-   signal. Doesn't address the 2-mark NaN.
-3. **`GGML_NO_INPLACE=1`.** A global allocator knob to skip
-   in-place reuse → `cos_min = -0.97` (sign-flipped garbage).
-   Some downstream code (we didn't trace which) depends on
-   in-place semantics.
-4. **`GGML_METAL_CONCURRENCY_DISABLE=1`.** No effect on either
-   the baseline drift or the 2-mark NaN. Whatever the bug is, it
-   isn't a missing barrier between *parallel* command buffers.
-5. **`kernel_norm` F32 audit.** `kernel_norm_fuse_impl` uses
-   `float sumf` accumulators end-to-end, F32 `simd_shuffle_xor`
-   reduction, F32 shmem. Clean.
-6. **`kernel_flash_attn_ext` Q downcast.** Line 6430 downcasts Q
-   from F32 to half: `sq4[j*DK4 + i] = (q4_t) q4[i]` where
-   `q4_t = half4` even in the `FA_TYPES_F32` family. Patched to
-   `float4 / simdgroup_float8x8`; doesn't fix the 2-mark NaN
-   (and changes baseline drift in unhelpful ways).
-
-## Investigation pointers
-
-- `ggml-alloc.c:622` `ggml_gallocr_allocate_node` — *not* the
-  source (verified by per-node trace + overlap scan). Adding the
-  2-mark `set_output` shifts ~1300 downstream allocation offsets
-  but produces no live-range overlap; the plan is valid.
-- `ggml-metal/ggml-metal-ops.cpp:159`
-  `ggml_metal_op_concurrency_check` — barrier insertion against
-  the shifted address layout. Disabling concurrency entirely had
-  no effect on the 2-mark NaN; this code path is unlikely to be
-  the direct cause.
-- The Metal output-staging path that copies `set_output`-flagged
-  tensors out of device memory — concurrent staging copies
-  alongside in-flight kernels writing to neighbouring tensors are
-  a plausible candidate, especially when downstream kernels are
-  now reading from offsets that wouldn't normally co-occur with
-  the pinned output.
-- Backend-sched interaction with `GGML_TENSOR_FLAG_OUTPUT` at
-  split boundaries.
-
-## How to reproduce
-
-Standalone repro needs the chatterbox model files (50 MB
-Q8_0 chatterbox-s3gen + Q8_0 chatterbox-t3) and a reference WAV.
-We can extract a minimal `test-backend-ops`-style case from this
-graph — flag this issue and we'll prepare one.
-
-Application-level repro (with our project's source):
+Application-level repro using the chatterbox S3Gen UNet (CFM solver
+runs the same gf twice per CFM step):
 
 ```
-# baseline (1 mark or 0 marks) — finite
-CRISPASR_CHATTERBOX_FORCE_GPU=1 \
-CRISPASR_S3GEN_UNET_GPU_RESIDENCY=1 \
-CRISPASR_S3GEN_UNET_MARK_DB_RESNET=1 \
-  ./crispasr --backend chatterbox --tts "Hello." \
-  --voice samples/jfk.wav --tts-output /tmp/cb.wav --seed 42
+# Without the patch: rms 14.6 (garbled audio)
+CHATTERBOX_FORCE_GPU=1 CHATTERBOX_S3GEN_UNET_GPU_RESIDENCY=1 \
+  ./chatterbox-cli --tts "Hello." --voice prompt.wav --seed 42
 
-# 2-mark trigger (DB_RESNET + mb_0_out, even index) — NaN
-CRISPASR_CHATTERBOX_FORCE_GPU=1 \
-CRISPASR_S3GEN_UNET_GPU_RESIDENCY=1 \
-CRISPASR_S3GEN_UNET_MARK_DB_RESNET=1 \
-CRISPASR_S3GEN_UNET_MARK_MB_OUT_INDEX=0 \
-  ./crispasr --backend chatterbox --tts "Hello." \
-  --voice samples/jfk.wav --tts-output /tmp/cb.wav --seed 42
-
-# 2 marks with odd index — finite
-CRISPASR_S3GEN_UNET_MARK_MB_OUT_INDEX=1 \
-[...rest same as above...]
+# Diagnostic: the dangling src[j] makes split[0] of the SECOND
+# graph_compute report n_inputs=0 (the original GGML_TENSOR_FLAG_INPUT
+# tensor "unet_input" is invisible because src[j] now points to freed
+# memory). The first graph_compute reports n_inputs=1 'unet_input'.
 ```
 
-## Production workaround
+A minimal `test-backend-ops`-style repro would be:
 
-We split the UNet weight residency: the 910 `s3.fd.*` tensors load
-on the CPU backend; the surrounding encoder/vocoder stay on GPU.
-The scheduler routes the UNet sub-graph to CPU based on weight
-residency. M1 wall-time comparable to pure CPU. Eliminates the
-2-mark NaN (and the baseline drift) because the UNet no longer
-runs on Metal at all. Not a fix — just a way to ship intelligible
-audio while the kernel-side bug is open.
+1. Build a small gf with one input tensor whose first consumer is on
+   a different backend than the input's auto-assigned backend.
+2. Call `ggml_backend_sched_alloc_graph + graph_compute` twice with
+   different input uploads.
+3. The second compute reads stale data, even though the user uploaded
+   fresh data via `ggml_backend_tensor_set` between the two calls.
+
+We can prepare one if it helps the upstream review — flag the issue.
+
+## Proposed fix
+
+Track src[j] rewires in a per-sched mutation log; restore each rewire
+to the original at the end of `ggml_backend_sched_compute_splits` so
+the user's gf is left in its original state between sched calls.
+~30 LOC across struct, split_graph, compute_splits, free.
+
+Patch in our fork: `ggml/src/ggml-backend.cpp` (`// CrispASR patch
+(#83 r9 follow-up #4)` blocks). Posting the diff below for review:
+
+```c
+// (struct ggml_backend_sched_src_mutation declared at file scope)
+struct ggml_backend_sched_src_mutation {
+    struct ggml_tensor * node;
+    struct ggml_tensor * orig_src;
+    int j;
+};
+
+// inside struct ggml_backend_sched: add fields
+struct ggml_backend_sched_src_mutation * src_mutations;
+int n_src_mutations;
+int src_mutations_capacity;
+
+// in ggml_backend_sched_split_graph, BEFORE node->src[j] = tensor_id_copy(...):
+if (sched->n_src_mutations >= sched->src_mutations_capacity) {
+    sched->src_mutations_capacity = sched->src_mutations_capacity * 2 + 16;
+    sched->src_mutations = realloc(
+        sched->src_mutations,
+        sched->src_mutations_capacity * sizeof(struct ggml_backend_sched_src_mutation));
+    GGML_ASSERT(sched->src_mutations != NULL);
+}
+sched->src_mutations[sched->n_src_mutations].node = node;
+sched->src_mutations[sched->n_src_mutations].orig_src = src;
+sched->src_mutations[sched->n_src_mutations].j = j;
+sched->n_src_mutations++;
+node->src[j] = tensor_id_copy(...);
+
+// at the END of ggml_backend_sched_compute_splits:
+for (int i = 0; i < sched->n_src_mutations; i++) {
+    const struct ggml_backend_sched_src_mutation * m = &sched->src_mutations[i];
+    m->node->src[m->j] = m->orig_src;
+}
+sched->n_src_mutations = 0;
+
+// in ggml_backend_sched_free:
+free(sched->src_mutations);
+```
+
+## What this DOES fix
+
+The dangling-pointer bug above. After this patch, repeated
+`alloc_graph + graph_compute` on the same gf correctly detects input
+tensors on every call and queues the CPU→GPU copies. Verified with
+the chatterbox repro: `split[0].n_inputs=1 'unet_input'` on every
+CFM-step call (both cond and uncond passes), kernel reads correct
+input bytes (verified via inline `ggml_backend_tensor_get` right
+before im2col dispatch).
+
+## What this does NOT fix
+
+A separate, residual issue with `unet_input` specifically: even
+after the dangling-pointer fix, with `unet_input` on the CPU
+backend (auto-assigned) and the sched copy delivering correct
+bytes to `MTL0#unet_input#0`, downstream Metal compute still
+produces wrong output (chatterbox `vocoder mel rms ~14.6` vs ref
+5.1). The kernel sees correct input bytes but the cumulative
+compute diverges from the reference.
+
+Application-side workaround (still required in our fork): pin
+`unet_input` to the Metal backend via
+`ggml_backend_sched_set_tensor_backend(sched, unet_input, c->backend)`.
+With both the ggml patch AND the app pin in place, `s3gen_mel
+cos_min` goes from 0.940 → 0.999976 (matching the CPU-residency
+production path's 0.999980).
+
+The second issue may be a Metal-side correctness bug, a precision
+issue with input-copy via the shared-buffer path, or yet another
+sched-state issue. We don't have a clean characterisation yet —
+filing this PR for the dangling-pointer half because that one is
+crisp and reproducible.
+
+---
+
+**Update (2026-05-24, late):** The second issue ("the FIRST split's
+sched-copy doesn't always reach the GPU even with this patch") was
+diagnosed in R9 follow-up #5 and turned out to be unrelated to the
+dangling-pointer issue this PR addresses. It was a Metal cache
+coherency issue on shared-storage buffers across back-to-back
+command-buffer submissions where the CPU writes between submissions:
+the default `[cmd_buf_last waitUntilCompleted]` between-submissions
+sync does not invalidate the GPU's L1/L2 cached view of a shared-
+storage `MTLBuffer` the CPU just memcpy'd, so the next compute reads
+stale data.
+
+The fix for that second issue is to construct the sched with
+`ggml_backend_sched_new(..., /*parallel=*/true, ...)`, which uses
+`MTLSharedEvent`-backed `ggml_backend_event_record / event_wait`
+between submissions; the encoded `encodeSignalEvent` /
+`encodeWaitForEvent` commands carry proper GPU cache invalidation.
+Once both `parallel=true` and this PR's dangling-pointer patch are in
+place, the chatterbox app-side workaround (pinning `unet_input`)
+is no longer needed.
+
+This PR's dangling-pointer fix is still independently necessary: the
+mutation-log restoration is correct under either `parallel=false` or
+`parallel=true`, and other ggml users hitting the dangling-src[j]
+behaviour will see correctness problems regardless of `parallel`.

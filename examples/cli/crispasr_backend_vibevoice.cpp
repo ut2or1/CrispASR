@@ -95,6 +95,20 @@ public:
             fprintf(stderr, "crispasr[vibevoice]: failed to load model '%s'\n", p.model.c_str());
             return false;
         }
+        // For the ASR backend ("vibevoice"), verify encoder tensors exist
+        // immediately so the user gets a clear diagnostic before any audio is
+        // processed.  TTS-only aliases ("vibevoice-tts", "vibevoice-1.5b")
+        // legitimately lack these tensors and must not fail here.
+        if (backend_name_ == "vibevoice" && !vibevoice_has_asr(ctx_)) {
+            fprintf(stderr,
+                    "crispasr[vibevoice]: error: '%s' is a TTS-only model (no at_enc.*/st_enc.* tensors).\n"
+                    "  Use --backend vibevoice-tts for this model, or download the ASR model:\n"
+                    "  crispasr -m auto --backend vibevoice --auto-download\n",
+                    p.model.c_str());
+            vibevoice_free(ctx_);
+            ctx_ = nullptr;
+            return false;
+        }
         return true;
     }
 
@@ -254,6 +268,11 @@ private:
 
 std::unique_ptr<CrispasrBackend> crispasr_make_vibevoice_backend() {
     return std::unique_ptr<CrispasrBackend>(new VibeVoiceBackend("vibevoice", false));
+}
+
+std::unique_ptr<CrispasrBackend> crispasr_make_vibevoice_tts_backend() {
+    // TTS-only alias — skips the ASR encoder check in init().
+    return std::unique_ptr<CrispasrBackend>(new VibeVoiceBackend("vibevoice-tts", false));
 }
 
 std::unique_ptr<CrispasrBackend> crispasr_make_vibevoice_1p5b_backend() {

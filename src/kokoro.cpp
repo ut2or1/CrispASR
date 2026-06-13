@@ -28,6 +28,7 @@
 // pass.
 
 #include "kokoro.h"
+#include "phonemizer.h"
 
 #include "core/activation.h"
 #include "core/align.h"
@@ -58,6 +59,8 @@
 
 #ifdef CRISPASR_HAVE_ESPEAK_NG
 #include <espeak-ng/speak_lib.h>
+#elif defined(CRISPASR_ESPEAK_DLOPEN)
+#include "espeak_dlopen.h"
 #endif
 
 namespace {
@@ -191,6 +194,11 @@ struct kokoro_context {
     ggml_context* ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
+
+    // Pre-permuted ConvTranspose1d weights for decomposed mul_mat + col2im_1d.
+    ggml_tensor* ups_w_perm[2] = {nullptr, nullptr}; // gen.ups.{0,1}
+    ggml_context* ctx_perm = nullptr;
+    ggml_backend_buffer_t buf_perm = nullptr;
     std::vector<uint8_t> compute_meta;
 
     // Voice pack (secondary GGUF).
@@ -1872,16 +1880,20 @@ static inline ggml_tensor* kokoro_resblock1_forward(ggml_context* ctx, ggml_tens
     return x;
 }
 
-// PyTorch ConvTranspose1d wrapper: ggml_conv_transpose_1d only supports
-// padding=0, so we run with p=0 and crop `pad` samples from each side of the
-// time axis afterwards. PyTorch formula (stride s, kernel k, padding p):
-//   T_out = (T_in - 1) * s - 2*p + k
-// ggml's p=0 output: T_unpad = (T_in - 1) * s + k. Crop p from each side.
+// PyTorch ConvTranspose1d wrapper: uses decomposed mul_mat + col2im_1d when
+// w_perm is available, otherwise falls back to ggml_conv_transpose_1d with
+// manual symmetric crop.
 //
 // in: (Cin, T) F32. w: ne=(K, Cout, Cin) F16. b: ne=(Cout,) F32.
+// w_perm: ne=(Cin, K*Cout) F32 or nullptr.
 // Returns (Cout, T_out) F32.
-static inline ggml_tensor* kokoro_convt1d_pad(ggml_context* ctx, ggml_tensor* in, ggml_tensor* w, ggml_tensor* b,
-                                              int stride, int pad) {
+static inline ggml_tensor* kokoro_convt1d_pad(ggml_context* ctx, ggml_tensor* in, ggml_tensor* w, ggml_tensor* w_perm,
+                                              ggml_tensor* b, int stride, int pad) {
+    if (w_perm) {
+        const int K = (int)w->ne[0];
+        return core_convt::convt1d_decomp(ctx, in, w_perm, b, stride, K, pad, pad);
+    }
+    // Old path — stable, works on CPU without the col2im op.
     const int Cout = (int)w->ne[1];
     ggml_tensor* xT = ggml_cont(ctx, ggml_transpose(ctx, in));         // (T, Cin)
     ggml_tensor* y = ggml_conv_transpose_1d(ctx, w, xT, stride, 0, 1); // (T_unpad, Cout, 1, 1)
@@ -2196,10 +2208,10 @@ static ggml_cgraph* kokoro_build_graph_generator(kokoro_context* c, int T_frames
         // x = ups[i](x)  with PyTorch padding handled via post-crop
         if (i == 0) {
             // k=20, s=10, p=(k-s)/2 = 5
-            x = kokoro_convt1d_pad(ctx0, x, ups0_w, ups0_b, /*s*/ 10, /*p*/ 5);
+            x = kokoro_convt1d_pad(ctx0, x, ups0_w, c->ups_w_perm[0], ups0_b, /*s*/ 10, /*p*/ 5);
         } else {
             // k=12, s=6, p=(k-s)/2 = 3
-            x = kokoro_convt1d_pad(ctx0, x, ups1_w, ups1_b, /*s*/ 6, /*p*/ 3);
+            x = kokoro_convt1d_pad(ctx0, x, ups1_w, c->ups_w_perm[1], ups1_b, /*s*/ 6, /*p*/ 3);
         }
 
         // Last upsample: reflection_pad((1, 0)) — 1 sample on the left, 0 on the right.
@@ -2648,6 +2660,29 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
         return nullptr;
     }
 
+    // ---- Permute ConvTranspose1d weights for decomposed mul_mat + col2im ----
+    {
+        const char* ups_names[2] = {"dec.gen.ups.0.weight", "dec.gen.ups.1.weight"};
+        const size_t meta_bytes = ggml_tensor_overhead() * 2 + 4096;
+        struct ggml_init_params pp = {meta_bytes, nullptr, true};
+        c->ctx_perm = ggml_init(pp);
+        std::unique_ptr<float[]> perm_bufs[2];
+        for (int i = 0; i < 2; i++) {
+            auto it = c->tensors.find(ups_names[i]);
+            if (it == c->tensors.end())
+                continue;
+            ggml_tensor* src = it->second;
+            perm_bufs[i] = core_convt::permute_convt1d_weight(src);
+            c->ups_w_perm[i] =
+                ggml_new_tensor_2d(c->ctx_perm, GGML_TYPE_F32, (int)src->ne[2], (int)src->ne[0] * (int)src->ne[1]);
+        }
+        c->buf_perm = ggml_backend_alloc_ctx_tensors(c->ctx_perm, c->backend);
+        for (int i = 0; i < 2; i++) {
+            if (c->ups_w_perm[i] && perm_bufs[i])
+                ggml_backend_tensor_set(c->ups_w_perm[i], perm_bufs[i].get(), 0, ggml_nbytes(c->ups_w_perm[i]));
+        }
+    }
+
     // ---- Schedulers ----
     {
         ggml_backend_t backends[2];
@@ -2894,7 +2929,7 @@ void rstrip_inplace(std::string& s) {
     s = s.substr(b, e - b);
 }
 
-#ifdef CRISPASR_HAVE_ESPEAK_NG
+#if defined(CRISPASR_HAVE_ESPEAK_NG) || defined(CRISPASR_ESPEAK_DLOPEN)
 // libespeak-ng's state is process-global, so all access goes through one
 // mutex. Init is one-shot; voice switches are sticky.
 std::mutex g_espeak_mu;
@@ -2909,12 +2944,17 @@ bool phonemize_espeak_lib(const std::string& lang, const std::string& text, std:
     if (g_espeak_init_failed)
         return false;
     if (!g_espeak_inited) {
-        // CRISPASR_ESPEAK_DATA_PATH overrides the default search (helps in
-        // sandboxed apps and on systems where espeak-ng-data isn't in the
-        // standard location).
         const char* path = std::getenv("CRISPASR_ESPEAK_DATA_PATH");
+#if defined(CRISPASR_HAVE_ESPEAK_NG)
         int sr = espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, 0, path,
                                    espeakINITIALIZE_PHONEME_IPA | espeakINITIALIZE_DONT_EXIT);
+#elif defined(CRISPASR_ESPEAK_DLOPEN)
+        auto& dl = espeak_dl_get();
+        if (!dl.load())
+            return false;
+        int sr = dl.Initialize(CRISPASR_ESPEAK_AUDIO_OUTPUT_SYNCHRONOUS, 0, path,
+                               CRISPASR_ESPEAK_INITIALIZE_PHONEME_IPA | CRISPASR_ESPEAK_INITIALIZE_DONT_EXIT);
+#endif
         if (sr < 0) {
             fprintf(stderr, "kokoro: espeak_Initialize failed (data path=%s) — falling back to popen\n",
                     path ? path : "<default>");
@@ -2924,18 +2964,25 @@ bool phonemize_espeak_lib(const std::string& lang, const std::string& text, std:
         g_espeak_inited = true;
     }
     if (g_espeak_voice != lang) {
+#if defined(CRISPASR_HAVE_ESPEAK_NG)
         if (espeak_SetVoiceByName(lang.c_str()) != EE_OK) {
+#elif defined(CRISPASR_ESPEAK_DLOPEN)
+        auto& dl = espeak_dl_get();
+        if (!dl.loaded || dl.SetVoiceByName(lang.c_str()) != 0) {
+#endif
             fprintf(stderr, "kokoro: espeak_SetVoiceByName('%s') failed — falling back to popen\n", lang.c_str());
             return false;
         }
         g_espeak_voice = lang;
     }
-    // espeak_TextToPhonemes returns up to a sentence/punctuation boundary
-    // and advances textptr; loop until it returns NULL.
     out.clear();
     const void* tp = text.c_str();
     while (tp) {
+#if defined(CRISPASR_HAVE_ESPEAK_NG)
         const char* chunk = espeak_TextToPhonemes(&tp, espeakCHARS_UTF8, espeakPHONEMES_IPA);
+#elif defined(CRISPASR_ESPEAK_DLOPEN)
+        const char* chunk = espeak_dl_get().TextToPhonemes(&tp, CRISPASR_ESPEAK_CHARS_UTF8, 0x02);
+#endif
         if (chunk && *chunk) {
             if (!out.empty())
                 out += ' ';
@@ -3007,7 +3054,27 @@ bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::s
     key += text;
     if (ctx->phon_cache.lookup(key, out))
         return true;
-#ifdef CRISPASR_HAVE_ESPEAK_NG
+
+    // §156 permissive G2P dicts — try builtin phonemizers first (no GPL dep).
+    // These auto-download IPA dicts from HuggingFace on first call.
+    bool builtin_ok = false;
+    if (lang == "en" || lang == "en-us" || lang == "en-gb")
+        builtin_ok = crispasr::phonemize_builtin_en(lang, text, out);
+    else if (lang == "de")
+        builtin_ok = crispasr::phonemize_builtin_de(lang, text, out);
+    else if (lang == "fr" || lang == "fr-fr")
+        builtin_ok = crispasr::phonemize_builtin_fr(lang, text, out);
+    else if (lang == "es" || lang == "es-es")
+        builtin_ok = crispasr::phonemize_builtin_es(lang, text, out);
+    if (builtin_ok && !out.empty()) {
+        if (is_cmn_lang(lang))
+            strip_cmn_tone_numbers(out);
+        ctx->phon_cache.insert(key, out);
+        return true;
+    }
+
+    // Fallback: espeak-ng (GPL) — linked, dlopen'd, or popen'd.
+#if defined(CRISPASR_HAVE_ESPEAK_NG) || defined(CRISPASR_ESPEAK_DLOPEN)
     if (phonemize_espeak_lib(lang, text, out)) {
         if (is_cmn_lang(lang))
             strip_cmn_tone_numbers(out);
@@ -3035,7 +3102,7 @@ bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::s
 extern "C" char* kokoro_phonemize_text_lib(const char* lang, const char* text) {
     if (!lang || !text)
         return nullptr;
-#ifdef CRISPASR_HAVE_ESPEAK_NG
+#if defined(CRISPASR_HAVE_ESPEAK_NG) || defined(CRISPASR_ESPEAK_DLOPEN)
     std::string out;
     if (!phonemize_espeak_lib(lang, text, out))
         return nullptr;
@@ -3074,6 +3141,40 @@ extern "C" float* kokoro_synthesize(struct kokoro_context* ctx, const char* text
         *out_n_samples = 0;
     if (!ctx || !text || !*text)
         return nullptr;
+
+    // CJK quality warnings (one-shot per language, PLAN #56)
+    static bool warned_cmn = false, warned_ja_kanji = false;
+    if (!warned_cmn && is_cmn_lang(ctx->espeak_lang)) {
+        warned_cmn = true;
+        fprintf(stderr, "kokoro: WARNING — Mandarin tone information is lost (espeak-ng tone "
+                        "numbers stripped; the 178-symbol vocab has no tone slots). For tonal "
+                        "fidelity use a misaki-based phonemizer or a dedicated Mandarin TTS.\n");
+    }
+    if (!warned_ja_kanji && (ctx->espeak_lang == "ja" || ctx->espeak_lang == "jp")) {
+        // Check for CJK Unified Ideographs (U+4E00–U+9FFF)
+        const auto* p = (const unsigned char*)text;
+        while (*p) {
+            if (p[0] >= 0xE4 && p[0] <= 0xE9 && p[1] && p[2]) {
+                uint32_t cp = ((p[0] & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+                if (cp >= 0x4E00 && cp <= 0x9FFF) {
+                    warned_ja_kanji = true;
+                    fprintf(stderr, "kokoro: WARNING — Japanese text contains kanji. espeak-ng's "
+                                    "kanji dictionary is incomplete; consider pre-converting to "
+                                    "hiragana for better phoneme accuracy.\n");
+                    break;
+                }
+                p += 3;
+            } else if (*p < 0x80) {
+                p++;
+            } else if (*p < 0xE0) {
+                p += 2;
+            } else if (*p < 0xF0) {
+                p += 3;
+            } else {
+                p += 4;
+            }
+        }
+    }
 
     std::string phonemes;
     if (!phonemize_cached(ctx, ctx->espeak_lang, text, phonemes)) {
@@ -3257,6 +3358,10 @@ extern "C" void kokoro_free(struct kokoro_context* ctx) {
         ggml_backend_buffer_free(ctx->vp.vp_buf_w);
     if (ctx->vp.vp_ctx_w)
         ggml_free(ctx->vp.vp_ctx_w);
+    if (ctx->buf_perm)
+        ggml_backend_buffer_free(ctx->buf_perm);
+    if (ctx->ctx_perm)
+        ggml_free(ctx->ctx_perm);
     if (ctx->buf_w)
         ggml_backend_buffer_free(ctx->buf_w);
     if (ctx->ctx_w)

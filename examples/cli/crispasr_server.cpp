@@ -10,15 +10,20 @@
 //   POST /inference                   — transcribe (native JSON)
 //   POST /v1/audio/transcriptions     — OpenAI-compatible endpoint
 //   POST /v1/audio/speech             — TTS (OpenAI-compatible; CAP_TTS only)
+//   POST /v1/audio/speech-to-speech   — S2S audio→audio (CAP_S2S only)
 //   POST /load                        — hot-swap model
 //   GET  /health                      — server status
 //   GET  /backends                    — list available backends
 //   GET  /v1/models                   — OpenAI-compatible model list
 //   GET  /v1/voices                   — list voices in --voice-dir (CAP_TTS only)
+//   POST /v1/voices                   — upload voice file (multipart, CAP_TTS only)
+//   DELETE /v1/voices/:name           — delete voice file (CAP_TTS only)
 //
 // Adapted from examples/server/server.cpp for multi-backend support.
 
 #include "crispasr_backend.h"
+#include "crispasr_diarize_cli.h"
+#include "crispasr_speaker_embedder.h"
 #include "crispasr_lid.h"
 #include "crispasr_lid_cli.h"
 #include "crispasr_output.h"
@@ -26,10 +31,21 @@
 #include "crispasr_vad_cli.h"
 #include "crispasr_aligner_cli.h"
 #include "whisper_params.h"
+#include "fireredpunc.h"                 // server-mode punctuation restoration (--punc-model)
+#include "pcs.h"                         // PCS (punctuation + caps + segmentation) model
+#include "crispasr_cache.h"              // ensure_cached_file() for resolving the punc model
+#include "crispasr_punc_loader.h"        // shared --punc-model alias resolution (CLI parity)
+#include "crispasr_truecase_loader.h"    // shared --truecase-model resolution + apply (CLI parity)
+#include "crispasr_punctuation_policy.h" // crispasr_should_auto_enable_punctuation()
 
-#include "common-crispasr.h" // read_audio_data
-#include "crispasr_chat.h"   // /v1/chat/completions
+#include "common-crispasr.h"     // read_audio_data
+#include "crispasr_chat.h"       // /v1/chat/completions
+#include "../server/ws_stream.h" // real-time WebSocket ASR streaming (--ws-port)
+#include "crispasr_c2pa.h"
 #include "crispasr_tts_chunking.h"
+#include "crispasr_tts_disclaimer.h"
+#include "crispasr_watermark.h"
+#include "crispasr_watermark_dispatch.h"
 #include "crispasr_wav_writer.h"
 #include "../server/httplib.h"
 #include "../json.hpp"
@@ -52,9 +68,20 @@
 
 #ifdef _WIN32
 #include <io.h> // _mktemp_s
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #else
 #include <unistd.h> // mkstemp, close, unlink
+#endif
+
+// 75e: optional MP3/Opus output encoding (compile-time gated)
+#ifdef CRISPASR_HAVE_LAME
+#include <lame/lame.h>
+#endif
+#ifdef CRISPASR_HAVE_OPUS
+#include <opus/opus.h>
 #endif
 
 // ---------------------------------------------------------------------------
@@ -62,25 +89,45 @@
 // ---------------------------------------------------------------------------
 
 static std::string scratch_dir() {
-    const char* env = std::getenv("CRISPASR_SCRATCH_DIR");
-    if (env && *env)
-        return std::string(env);
-    const char* cache = std::getenv("XDG_CACHE_HOME");
-    if (cache && *cache) {
-        std::string d = std::string(cache) + "/crispasr/scratch";
-        std::filesystem::create_directories(d);
-        return d;
+    // Pick a writable scratch dir, preferring explicit overrides. Use the
+    // non-throwing create_directories overload and fall back to the system temp
+    // dir on failure: this runs on the per-request transcription path, so a
+    // create_directories exception (e.g. a dangling cache symlink or read-only
+    // HOME) must not blow up every request.
+    std::string d;
+    if (const char* env = std::getenv("CRISPASR_SCRATCH_DIR"); env && *env)
+        return std::string(env); // explicit override: trust the caller, don't mkdir
+    else if (const char* cache = std::getenv("XDG_CACHE_HOME"); cache && *cache)
+        d = std::string(cache) + "/crispasr/scratch";
+    else if (const char* home = std::getenv("HOME"); home && *home)
+        d = std::string(home) + "/.cache/crispasr/scratch";
+    else
+        d = ".cache/crispasr/scratch";
+
+    std::error_code ec;
+    std::filesystem::create_directories(d, ec);
+    if (ec || !std::filesystem::is_directory(d, ec)) {
+        std::error_code tec;
+        std::filesystem::path fallback = std::filesystem::temp_directory_path(tec) / "crispasr-scratch";
+        std::filesystem::create_directories(fallback, tec);
+        return fallback.string();
     }
-    const char* home = std::getenv("HOME");
-    std::string d = std::string(home && *home ? home : ".") + "/.cache/crispasr/scratch";
-    std::filesystem::create_directories(d);
     return d;
 }
 
 // Create a scratch file securely via mkstemp (POSIX) or _mktemp_s (Win).
 // Writes `data` to it and returns the path. On failure returns "".
 // The caller is responsible for calling std::remove() on the returned path.
-static std::string write_temp_audio(const char* data, size_t size) {
+// Preserve the original file extension so ffmpeg and miniaudio can detect
+// the container format (critical for m4a/aac/opus/webm uploads).
+static std::string write_temp_audio(const char* data, size_t size, const std::string& original_filename = "") {
+    // Extract extension from original filename
+    std::string ext;
+    if (!original_filename.empty()) {
+        auto dot = original_filename.rfind('.');
+        if (dot != std::string::npos)
+            ext = original_filename.substr(dot); // e.g. ".m4a"
+    }
 #ifdef _WIN32
     char tmp_dir[MAX_PATH];
     if (!GetTempPathA(MAX_PATH, tmp_dir))
@@ -88,17 +135,24 @@ static std::string write_temp_audio(const char* data, size_t size) {
     char tmp_path[MAX_PATH];
     if (!GetTempFileNameA(tmp_dir, "cra", 0, tmp_path))
         return "";
-    std::ofstream f(tmp_path, std::ios::binary);
+    std::string final_path = std::string(tmp_path) + ext;
+    if (!ext.empty())
+        MoveFileA(tmp_path, final_path.c_str());
+    else
+        final_path = tmp_path;
+    std::ofstream f(final_path, std::ios::binary);
     if (!f)
         return "";
     f.write(data, (std::streamsize)size);
     f.close();
-    return std::string(tmp_path);
+    return final_path;
 #else
-    std::string tmpl_s = scratch_dir() + "/crispasr-XXXXXX";
+    std::string tmpl_s = scratch_dir() + "/crispasr-XXXXXX" + ext;
+    // mkstemps requires the suffix length
+    int suffix_len = (int)ext.size();
     std::vector<char> tmpl(tmpl_s.begin(), tmpl_s.end());
     tmpl.push_back('\0');
-    int fd = mkstemp(tmpl.data());
+    int fd = suffix_len > 0 ? mkstemps(tmpl.data(), suffix_len) : mkstemp(tmpl.data());
     if (fd < 0)
         return "";
     // Write all data; retry on partial write.
@@ -238,6 +292,20 @@ static uint64_t form_u64(const httplib::Request& req, const std::string& key, ui
     }
 }
 
+static bool form_bool(const httplib::Request& req, const std::string& key, bool def) {
+    std::string v = form_string(req, key, "");
+    if (v.empty())
+        return def;
+    // Accept "true", "1", "yes" (case-insensitive) as truthy.
+    for (auto& c : v)
+        c = (char)std::tolower((unsigned char)c);
+    if (v == "true" || v == "1" || v == "yes")
+        return true;
+    if (v == "false" || v == "0" || v == "no")
+        return false;
+    return def;
+}
+
 // JSON error response helper. Shape matches OpenAI's:
 //   { "error": { "message": ..., "type": ..., "code": ..., "param": ... } }
 // `code` is a stable machine-readable enum-string the client can switch on
@@ -278,7 +346,11 @@ struct transcription_result {
 // Load audio from a multipart file upload, transcribe it, return result.
 // Acquires model_mutex internally.
 static transcription_result do_transcribe(const httplib::MultipartFormData& audio_file, CrispasrBackend* backend,
-                                          std::mutex& model_mutex, whisper_params rp, bool need_timestamps) {
+                                          std::mutex& model_mutex, whisper_params rp, bool need_timestamps,
+                                          fireredpunc_context* punc_ctx = nullptr, pcs_context* pcs_ctx = nullptr,
+                                          truecaser_context* tc_ctx = nullptr,
+                                          truecaser_crf_context* tc_crf_ctx = nullptr,
+                                          truecaser_lstm_context* tc_lstm_ctx = nullptr) {
     transcription_result result;
     result.language = rp.language;
 
@@ -287,7 +359,7 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
                 audio_file.content.size());
 
     // Write to a secure temporary file for audio decoding.
-    std::string tmp_path = write_temp_audio(audio_file.content.data(), audio_file.content.size());
+    std::string tmp_path = write_temp_audio(audio_file.content.data(), audio_file.content.size(), audio_file.filename);
     if (tmp_path.empty()) {
         result.error = "failed to create temporary file for audio";
         return result;
@@ -324,6 +396,11 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
         result.ok = true;
         return result;
     }
+
+    // VAD (if any) already ran above — disable it for the backend so
+    // whisper_full doesn't re-run Silero on every slice (#132).
+    rp.vad = false;
+    rp.vad_model.clear();
 
     {
         std::lock_guard<std::mutex> lock(model_mutex);
@@ -399,6 +476,104 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
             }
         }
 
+        // Diarization post-step (#143): assign speaker labels to segments.
+        // Mirrors the CLI path in crispasr_run.cpp:732-743.
+        if (rp.diarize && !result.segs.empty()) {
+            const bool have_stereo = pcmf32s.size() == 2 && !pcmf32s[0].empty() && !pcmf32s[1].empty();
+
+            // Pre-compute global caches for cross-slice consistency.
+            CrispasrPyannoteCache pyannote_cache;
+            if (rp.diarize_method == "pyannote" && !pcmf32.empty()) {
+                crispasr_compute_pyannote_cache(pcmf32.data(), n_samples, rp, pyannote_cache);
+            }
+            CrispasrSherpaCache sherpa_cache;
+            if ((rp.diarize_method == "sherpa" || rp.diarize_method == "sherpa-onnx" || rp.diarize_method == "ecapa") &&
+                !pcmf32.empty()) {
+                crispasr_compute_sherpa_cache(pcmf32.data(), n_samples, rp, sherpa_cache);
+            }
+            const CrispasrPyannoteCache* pya_ptr = pyannote_cache.valid() ? &pyannote_cache : nullptr;
+            const CrispasrSherpaCache* shp_ptr = sherpa_cache.valid() ? &sherpa_cache : nullptr;
+
+            // Apply diarize per-slice. We re-walk the slices and apply
+            // diarize to the corresponding range of result.segs.
+            size_t seg_offset = 0;
+            for (size_t i = 0; i < slices.size(); ++i) {
+                const auto& sl = slices[i];
+                // Count how many segments belong to this slice (by timestamp range).
+                size_t seg_count = 0;
+                for (size_t j = seg_offset; j < result.segs.size(); ++j) {
+                    // Segments from the next slice will have t0 >= next slice's t0_cs.
+                    if (i + 1 < slices.size() && result.segs[j].t0 >= slices[i + 1].t0_cs)
+                        break;
+                    seg_count++;
+                }
+
+                if (seg_count > 0) {
+                    std::vector<crispasr_segment> slice_segs(result.segs.begin() + (ptrdiff_t)seg_offset,
+                                                             result.segs.begin() + (ptrdiff_t)(seg_offset + seg_count));
+                    if (have_stereo) {
+                        std::vector<float> sl_l(pcmf32s[0].begin() + sl.start, pcmf32s[0].begin() + sl.end);
+                        std::vector<float> sl_r(pcmf32s[1].begin() + sl.start, pcmf32s[1].begin() + sl.end);
+                        crispasr_apply_diarize(sl_l, sl_r, /*is_stereo=*/true, sl.t0_cs, slice_segs, rp, pya_ptr,
+                                               shp_ptr);
+                    } else {
+                        std::vector<float> mono_slice(pcmf32.begin() + sl.start, pcmf32.begin() + sl.end);
+                        crispasr_apply_diarize(mono_slice, mono_slice,
+                                               /*is_stereo=*/false, sl.t0_cs, slice_segs, rp, pya_ptr, shp_ptr);
+                    }
+                    // Copy back the diarized segments.
+                    for (size_t j = 0; j < seg_count; ++j)
+                        result.segs[seg_offset + j] = std::move(slice_segs[j]);
+                }
+                seg_offset += seg_count;
+            }
+
+            // Global embedding-based re-clustering (issue #107 P3).
+            if (!rp.diarize_embedder.empty() && !pcmf32.empty()) {
+                auto embedder = crispasr_make_speaker_embedder(rp.diarize_embedder, rp.n_threads, rp.cache_dir);
+                if (embedder) {
+                    crispasr_remap_speakers_via_embeddings(result.segs, pcmf32.data(), n_samples, embedder.get(), rp);
+                }
+            }
+        }
+
+        // Punctuation stripping: when `--no-punctuation` / `punctuation=false`
+        // is set and the backend doesn't natively toggle it, strip here.
+        if (!rp.punctuation) {
+            for (auto& seg : result.segs)
+                crispasr_strip_punctuation(seg);
+        }
+        // Otherwise, when a punctuation model is loaded (--punc-model), restore
+        // punctuation on each segment — the post-processor the CLI applies but
+        // the server path previously skipped, so non-PnC backends (e.g. parakeet
+        // RNNT/CTC) can return punctuated text. PCS (one model for punctuation +
+        // capitalization + segmentation) takes precedence over FireRedPunc when
+        // loaded; only one is ever resident. Serialized on its own mutex because
+        // neither context is re-entrant.
+        else if (punc_ctx || pcs_ctx) {
+            static std::mutex punc_mtx;
+            std::lock_guard<std::mutex> plk(punc_mtx);
+            for (auto& seg : result.segs) {
+                char* out =
+                    pcs_ctx ? pcs_process(pcs_ctx, seg.text.c_str()) : fireredpunc_process(punc_ctx, seg.text.c_str());
+                if (out) {
+                    seg.text = out;
+                    free(out);
+                }
+            }
+        }
+
+        // Truecasing post-step (--truecase-model), applied after punctuation —
+        // mirrors the CLI, which the server path previously skipped entirely.
+        // PCS already restores casing, so skip when PCS is active. Serialized:
+        // the truecaser contexts aren't re-entrant.
+        if (!pcs_ctx && (tc_ctx || tc_crf_ctx || tc_lstm_ctx)) {
+            static std::mutex tc_mtx;
+            std::lock_guard<std::mutex> tlk(tc_mtx);
+            for (auto& seg : result.segs)
+                crispasr_apply_truecase(tc_ctx, tc_crf_ctx, tc_lstm_ctx, seg.text);
+        }
+
         auto t1 = std::chrono::steady_clock::now();
         result.elapsed_s = std::chrono::duration<double>(t1 - t0).count();
     }
@@ -411,11 +586,127 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
 // tests can exercise it without linking the server translation unit.
 
 // ---------------------------------------------------------------------------
+// 75e: MP3 / Opus encoding helpers (compile-time gated)
+// ---------------------------------------------------------------------------
+
+#ifdef CRISPASR_HAVE_LAME
+// Encode float32 mono PCM to MP3 via libmp3lame. Returns empty on failure.
+static std::string crispasr_encode_mp3(const float* pcm, int n_samples, int sample_rate, int bitrate_kbps = 128) {
+    lame_t lame = lame_init();
+    if (!lame)
+        return {};
+    lame_set_in_samplerate(lame, sample_rate);
+    lame_set_num_channels(lame, 1);
+    lame_set_out_samplerate(lame, sample_rate);
+    lame_set_brate(lame, bitrate_kbps);
+    lame_set_quality(lame, 2); // 2 = high quality
+    lame_set_mode(lame, MONO);
+    if (lame_init_params(lame) < 0) {
+        lame_close(lame);
+        return {};
+    }
+
+    // Convert float [-1,1] → int16
+    std::vector<short> s16(n_samples);
+    for (int i = 0; i < n_samples; i++) {
+        float v = pcm[i];
+        if (v > 1.0f)
+            v = 1.0f;
+        else if (v < -1.0f)
+            v = -1.0f;
+        s16[i] = (short)(v * 32767.0f);
+    }
+
+    // Worst-case: 1.25 * n + 7200 (lame docs)
+    size_t mp3_buf_size = (size_t)(1.25f * (float)n_samples) + 7200;
+    std::vector<unsigned char> mp3_buf(mp3_buf_size);
+
+    int written = lame_encode_buffer(lame, s16.data(), nullptr, n_samples, mp3_buf.data(), (int)mp3_buf_size);
+    if (written < 0) {
+        lame_close(lame);
+        return {};
+    }
+    int flushed = lame_encode_flush(lame, mp3_buf.data() + written, (int)(mp3_buf_size - (size_t)written));
+    lame_close(lame);
+    if (flushed < 0)
+        return {};
+
+    // Prepend ID3v2 tag with AI-provenance metadata (TXXX frames)
+    std::string id3 = crispasr_make_id3v2_ai_tag();
+    id3.append((const char*)mp3_buf.data(), (size_t)(written + flushed));
+    return id3;
+}
+#endif // CRISPASR_HAVE_LAME
+
+#ifdef CRISPASR_HAVE_OPUS
+// Encode float32 mono PCM to raw Opus frames concatenated with 2-byte
+// little-endian length prefix per frame. Opus requires 48/24/16/12/8 kHz
+// input; we resample to 48 kHz if needed using linear interpolation
+// (good enough for speech; the Opus encoder does its own filtering).
+static std::string crispasr_encode_opus(const float* pcm, int n_samples, int sample_rate, int bitrate = 64000) {
+    // Resample to 48 kHz if needed
+    std::vector<float> resampled;
+    const float* src = pcm;
+    int src_n = n_samples;
+    int enc_rate = sample_rate;
+
+    // Opus supports 8000, 12000, 16000, 24000, 48000
+    if (sample_rate != 48000 && sample_rate != 24000 && sample_rate != 16000 && sample_rate != 12000 &&
+        sample_rate != 8000) {
+        enc_rate = 48000;
+        int out_n = (int)((int64_t)n_samples * 48000 / sample_rate);
+        resampled.resize(out_n);
+        for (int i = 0; i < out_n; i++) {
+            float pos = (float)i * (float)sample_rate / 48000.0f;
+            int s0 = (int)pos;
+            int s1 = std::min(s0 + 1, n_samples - 1);
+            float frac = pos - (float)s0;
+            resampled[i] = pcm[s0] * (1.0f - frac) + pcm[s1] * frac;
+        }
+        src = resampled.data();
+        src_n = out_n;
+    }
+
+    int error = 0;
+    OpusEncoder* enc = opus_encoder_create(enc_rate, 1, OPUS_APPLICATION_VOIP, &error);
+    if (error != OPUS_OK || !enc)
+        return {};
+    opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrate));
+
+    // Encode in 20ms frames
+    const int frame_samples = enc_rate / 50; // 20ms
+    // Max opus frame is 1275 bytes per channel per frame
+    std::vector<unsigned char> frame_buf(4000);
+    std::string result;
+    result.reserve((size_t)(src_n / 4)); // rough estimate
+
+    for (int offset = 0; offset + frame_samples <= src_n; offset += frame_samples) {
+        int encoded =
+            opus_encode_float(enc, src + offset, frame_samples, frame_buf.data(), (opus_int32)frame_buf.size());
+        if (encoded < 0)
+            break;
+        // Write 2-byte LE length prefix + frame data
+        uint16_t len = (uint16_t)encoded;
+        result.append((const char*)&len, 2);
+        result.append((const char*)frame_buf.data(), (size_t)encoded);
+    }
+
+    opus_encoder_destroy(enc);
+    return result;
+}
+#endif // CRISPASR_HAVE_OPUS
+
+// ---------------------------------------------------------------------------
 // Server entry point
 // ---------------------------------------------------------------------------
 
 int crispasr_run_server(whisper_params& params, const std::string& host, int port) {
     using namespace httplib;
+
+    crispasr_c2pa_startup_check();
+    if (!params.watermark_model.empty()) {
+        crispasr_wm_dispatch::init(params.watermark_model);
+    }
 
     std::vector<std::string> api_keys = split_api_keys(params.server_api_keys);
     if (const char* env_keys = getenv("CRISPASR_API_KEYS")) {
@@ -474,19 +765,83 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             fprintf(stderr, "crispasr-server: failed to init backend '%s'\n", backend_name.c_str());
             return 1;
         }
-        // #80e: warmup in server mode — always enabled (amortized over
-        // many requests).  Skipped if --no-prints is set and warmup takes
-        // < 10 ms (no point logging a trivial warmup).
-        {
+        // #80e: warmup in server mode — on by default (amortized over many
+        // requests). Opt out with --no-warmup (or CRISPASR_NO_WARMUP=1): some
+        // GPU drivers crash or hang inside the warmup transcribe — e.g. the
+        // parakeet warmup on certain Vulkan drivers (#165) — which would
+        // otherwise prevent the server from ever reaching listen(). Guard the
+        // call so a soft (throwing) warmup failure degrades to "no warmup"
+        // instead of taking the whole server down before it can serve.
+        const bool skip_warmup = params.no_warmup || [] {
+            const char* e = std::getenv("CRISPASR_NO_WARMUP");
+            return e && e[0] && e[0] != '0';
+        }();
+        if (skip_warmup) {
+            fprintf(stderr, "crispasr-server: warmup skipped (--no-warmup)\n");
+        } else {
             auto t0 = std::chrono::steady_clock::now();
-            backend->warmup();
-            auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            fprintf(stderr, "crispasr-server: warmup completed in %.0f ms\n", dt * 1000.0);
+            try {
+                backend->warmup();
+                auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                fprintf(stderr, "crispasr-server: warmup completed in %.0f ms\n", dt * 1000.0);
+            } catch (const std::exception& e) {
+                fprintf(stderr, "crispasr-server: warning: warmup failed (%s) — continuing without warmup\n", e.what());
+            } catch (...) {
+                fprintf(stderr, "crispasr-server: warning: warmup failed — continuing without warmup\n");
+            }
         }
         ready.store(true);
         fprintf(stderr, "crispasr-server: backend '%s' loaded, model '%s'\n", backend_name.c_str(),
                 params.model.c_str());
     }
+
+    // Punctuation restoration post-processor, loaded once (resident). The
+    // server path originally ignored --punc-model entirely (the step lived only
+    // in the CLI layer), so non-PnC backends such as parakeet RNNT came back
+    // unpunctuated. Mirror the CLI exactly:
+    //   1. auto-enable FireRedPunc for backends that emit no punctuation and
+    //      don't toggle it natively (CTC family), and
+    //   2. resolve the same --punc-model aliases via the shared resolver,
+    //      supporting both FireRedPunc and the PCS model.
+    // The model auto-downloads on first use.
+    if (crispasr_should_auto_enable_punctuation(backend->capabilities(), params)) {
+        params.punc_model = "auto";
+        fprintf(stderr, "crispasr-server: auto-enabling punctuation restoration for backend '%s'\n", backend->name());
+    }
+
+    std::unique_ptr<fireredpunc_context, decltype(&fireredpunc_free)> punc_ctx(nullptr, fireredpunc_free);
+    std::unique_ptr<pcs_context, decltype(&pcs_free)> pcs_ctx(nullptr, pcs_free);
+    {
+        const crispasr_punc_spec spec = crispasr_resolve_punc_model(params.punc_model);
+        std::string path = spec.direct_path;
+        if (path.empty() && !spec.cache_filename.empty())
+            path = crispasr_cache::ensure_cached_file(spec.cache_filename, spec.url, params.no_prints, "crispasr[punc]",
+                                                      params.cache_dir);
+        if (spec.kind == crispasr_punc_kind::fireredpunc && !path.empty()) {
+            punc_ctx.reset(fireredpunc_init(path.c_str()));
+            if (!punc_ctx)
+                fprintf(stderr, "crispasr-server: warning: failed to load punc model '%s' — continuing without\n",
+                        path.c_str());
+            else
+                fprintf(stderr, "crispasr-server: loaded punctuation model '%s'\n", path.c_str());
+        } else if (spec.kind == crispasr_punc_kind::pcs && !path.empty()) {
+            pcs_ctx.reset(pcs_init(path.c_str()));
+            if (!pcs_ctx)
+                fprintf(stderr, "crispasr-server: warning: failed to load PCS model '%s' — continuing without\n",
+                        path.c_str());
+            else
+                fprintf(stderr, "crispasr-server: loaded PCS model '%s'\n", path.c_str());
+        }
+    }
+
+    // Truecasing post-processor, loaded once (resident) when --truecase-model is
+    // set. The server path previously skipped truecasing entirely; resolve the
+    // same aliases the CLI does via the shared loader.
+    std::unique_ptr<truecaser_context, decltype(&truecaser_free)> tc_ctx(nullptr, truecaser_free);
+    std::unique_ptr<truecaser_crf_context, decltype(&truecaser_crf_free)> tc_crf_ctx(nullptr, truecaser_crf_free);
+    std::unique_ptr<truecaser_lstm_context, decltype(&truecaser_lstm_free)> tc_lstm_ctx(nullptr, truecaser_lstm_free);
+    crispasr_load_truecase(params.truecase_model, params.no_prints, params.cache_dir, tc_ctx, tc_crf_ctx, tc_lstm_ctx,
+                           "crispasr-server");
 
     Server svr;
 
@@ -542,8 +897,64 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         // Per-request parameter overrides.
         whisper_params rp = params;
         rp.language = form_string(req, "language", rp.language);
+        rp.source_lang = form_string(req, "source_lang", rp.source_lang);
+        rp.target_lang = form_string(req, "target_lang", rp.target_lang);
+        rp.translate = form_bool(req, "translate", rp.translate);
+        rp.punctuation = form_bool(req, "punctuation", rp.punctuation);
+        rp.diarize = form_bool(req, "diarize", rp.diarize);
+        if (rp.diarize && rp.diarize_method.empty())
+            rp.diarize_method = form_string(req, "diarize_method", "energy");
+        rp.diarize_embedder = form_string(req, "diarize_embedder", rp.diarize_embedder);
+        rp.diarize_cluster_threshold = form_float(req, "diarize_cluster_threshold", rp.diarize_cluster_threshold);
+        rp.diarize_max_speakers = form_int(req, "diarize_max_speakers", rp.diarize_max_speakers);
+        rp.vad = form_bool(req, "vad", rp.vad);
+        rp.vad_threshold = form_float(req, "vad_threshold", rp.vad_threshold);
+        rp.vad_min_speech_duration_ms = form_int(req, "vad_min_speech_duration_ms", rp.vad_min_speech_duration_ms);
+        rp.vad_min_silence_duration_ms = form_int(req, "vad_min_silence_duration_ms", rp.vad_min_silence_duration_ms);
+        rp.vad_max_speech_duration_s = form_float(req, "vad_max_speech_duration_s", rp.vad_max_speech_duration_s);
+        rp.vad_speech_pad_ms = form_int(req, "vad_speech_pad_ms", rp.vad_speech_pad_ms);
+        rp.hotwords = form_string(req, "hotwords", rp.hotwords);
+        rp.hotwords_boost = form_float(req, "hotwords_boost", rp.hotwords_boost);
+        rp.temperature = form_float(req, "temperature", rp.temperature);
+        rp.seed = form_u64(req, "seed", rp.seed);
+        rp.max_new_tokens = form_int(req, "max_new_tokens", rp.max_new_tokens);
+        rp.max_new_tokens = form_int(req, "max_tokens", rp.max_new_tokens);
+        rp.frequency_penalty = form_float(req, "frequency_penalty", rp.frequency_penalty);
+        rp.suppress_regex = form_string(req, "suppress_regex", rp.suppress_regex);
+        rp.suppress_nst = form_bool(req, "suppress_nst", rp.suppress_nst);
+        rp.grammar = form_string(req, "grammar", rp.grammar);
+        rp.grammar_rule = form_string(req, "grammar_rule", rp.grammar_rule);
+        rp.best_of = form_int(req, "best_of", rp.best_of);
+        rp.beam_size = form_int(req, "beam_size", rp.beam_size);
+        rp.entropy_thold = form_float(req, "entropy_thold", rp.entropy_thold);
+        rp.logprob_thold = form_float(req, "logprob_thold", rp.logprob_thold);
+        rp.no_speech_thold = form_float(req, "no_speech_thold", rp.no_speech_thold);
+        rp.temperature_inc = form_float(req, "temperature_inc", rp.temperature_inc);
+        rp.no_fallback = form_bool(req, "no_fallback", rp.no_fallback);
+        rp.detect_language = form_bool(req, "detect_language", rp.detect_language);
+        rp.lid_backend = form_string(req, "lid_backend", rp.lid_backend);
+        rp.lid_model = form_string(req, "lid_model", rp.lid_model);
+        rp.chunk_seconds = form_int(req, "chunk_seconds", rp.chunk_seconds);
+        rp.no_timestamps = form_bool(req, "no_timestamps", rp.no_timestamps);
+        rp.split_on_word = form_bool(req, "split_on_word", rp.split_on_word);
+        rp.max_len = form_int(req, "max_len", rp.max_len);
+        rp.split_on_punct = form_bool(req, "split_on_punct", rp.split_on_punct);
+        rp.offset_t_ms = form_int(req, "offset_t_ms", rp.offset_t_ms);
+        rp.duration_ms = form_int(req, "duration_ms", rp.duration_ms);
+        rp.max_context = form_int(req, "max_context", rp.max_context);
+        rp.audio_ctx = form_int(req, "audio_ctx", rp.audio_ctx);
+        rp.word_thold = form_float(req, "word_thold", rp.word_thold);
+        rp.carry_initial_prompt = form_bool(req, "carry_initial_prompt", rp.carry_initial_prompt);
+        rp.chunk_overlap_seconds = form_float(req, "chunk_overlap", rp.chunk_overlap_seconds);
+        rp.lcs_dedup = form_string(req, "lcs_dedup", rp.lcs_dedup);
+        rp.lcs_min_length = form_int(req, "lcs_min_length", rp.lcs_min_length);
+        rp.parakeet_decoder = form_string(req, "parakeet_decoder", rp.parakeet_decoder);
+        rp.no_auto_aligner = form_bool(req, "no_auto_aligner", rp.no_auto_aligner);
+        rp.show_alternatives = form_bool(req, "show_alternatives", rp.show_alternatives);
+        rp.n_alternatives = form_int(req, "alt_n", rp.n_alternatives);
 
-        auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp, /*need_timestamps=*/true);
+        auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp, /*need_timestamps=*/true,
+                                    punc_ctx.get(), pcs_ctx.get(), tc_ctx.get(), tc_crf_ctx.get(), tc_lstm_ctx.get());
         if (!result.ok) {
             json_error(res, 400, result.error);
             return;
@@ -571,6 +982,26 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     //   max_new_tokens   (optional) — alias for max_tokens
     //   frequency_penalty (optional) — opt-in repeated-token penalty for AR backends
     //   timestamp_granularities[] (optional) — word|segment (verbose_json)
+    //
+    // CrispASR extension fields (ignored by vanilla OpenAI clients):
+    //   translate        (optional) — true|false, translate to English
+    //   source_lang      (optional) — source language for AST backends
+    //   target_lang      (optional) — target language for AST backends
+    //   punctuation      (optional) — true|false, enable punctuation restoration
+    //   diarize          (optional) — true|false, enable speaker diarization
+    //   diarize_method   (optional) — energy|xcorr|vad-turns|pyannote|sherpa
+    //   vad              (optional) — true|false, enable VAD pre-processing
+    //   vad_threshold    (optional) — VAD speech probability threshold
+    //   hotwords         (optional) — comma-separated hotword list
+    //   hotwords_boost   (optional) — log-prob boost for hotword matches
+    //   suppress_regex   (optional) — regex pattern to suppress from output
+    //   grammar          (optional) — GBNF grammar for constrained decoding
+    //   grammar_rule     (optional) — root rule for grammar
+    //   best_of          (optional) — whisper best-of-N sampling
+    //   beam_size        (optional) — whisper beam search size
+    //   entropy_thold    (optional) — entropy threshold for decoder fail
+    //   no_speech_thold  (optional) — no-speech probability threshold
+    //   chunk_seconds    (optional) — max chunk duration for long audio
     // -----------------------------------------------------------------------
     svr.Post("/v1/audio/transcriptions", [&](const Request& req, Response& res) {
         if (!require_auth(req, res))
@@ -588,7 +1019,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         fprintf(stderr, "crispasr-server: /v1/audio/transcriptions received '%s' (%zu bytes)\n",
                 audio_file.filename.c_str(), audio_file.content.size());
 
-        // Parse OpenAI form fields.
+        // Parse OpenAI form fields + CrispASR extensions.
         std::string response_format = form_string(req, "response_format", "json");
         std::string language = form_string(req, "language", params.language);
         std::string prompt = form_string(req, "prompt", "");
@@ -607,6 +1038,13 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             return;
         }
 
+        // CrispASR extension fields (ignored by vanilla OpenAI clients).
+        bool translate = form_bool(req, "translate", params.translate);
+        std::string source_lang = form_string(req, "source_lang", params.source_lang);
+        std::string target_lang = form_string(req, "target_lang", params.target_lang);
+        bool punctuation = form_bool(req, "punctuation", params.punctuation);
+        bool diarize = form_bool(req, "diarize", params.diarize);
+        std::string diarize_method = form_string(req, "diarize_method", params.diarize_method);
         // Build per-request params.
         whisper_params rp = params;
         rp.language = language;
@@ -614,12 +1052,65 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.seed = seed;
         rp.max_new_tokens = max_new_tokens;
         rp.frequency_penalty = frequency_penalty;
+        rp.translate = translate;
+        rp.source_lang = source_lang;
+        rp.target_lang = target_lang;
+        rp.punctuation = punctuation;
+        rp.diarize = diarize;
+        if (diarize && !diarize_method.empty())
+            rp.diarize_method = diarize_method;
+        else if (diarize && rp.diarize_method.empty())
+            rp.diarize_method = "energy";
+        rp.diarize_embedder = form_string(req, "diarize_embedder", rp.diarize_embedder);
+        rp.diarize_cluster_threshold = form_float(req, "diarize_cluster_threshold", rp.diarize_cluster_threshold);
+        rp.diarize_max_speakers = form_int(req, "diarize_max_speakers", rp.diarize_max_speakers);
+        rp.vad = form_bool(req, "vad", rp.vad);
+        rp.vad_threshold = form_float(req, "vad_threshold", rp.vad_threshold);
+        rp.vad_min_speech_duration_ms = form_int(req, "vad_min_speech_duration_ms", rp.vad_min_speech_duration_ms);
+        rp.vad_min_silence_duration_ms = form_int(req, "vad_min_silence_duration_ms", rp.vad_min_silence_duration_ms);
+        rp.vad_max_speech_duration_s = form_float(req, "vad_max_speech_duration_s", rp.vad_max_speech_duration_s);
+        rp.vad_speech_pad_ms = form_int(req, "vad_speech_pad_ms", rp.vad_speech_pad_ms);
+        rp.hotwords = form_string(req, "hotwords", rp.hotwords);
+        rp.hotwords_boost = form_float(req, "hotwords_boost", rp.hotwords_boost);
+        rp.suppress_regex = form_string(req, "suppress_regex", rp.suppress_regex);
+        rp.suppress_nst = form_bool(req, "suppress_nst", rp.suppress_nst);
+        rp.grammar = form_string(req, "grammar", rp.grammar);
+        rp.grammar_rule = form_string(req, "grammar_rule", rp.grammar_rule);
+        rp.best_of = form_int(req, "best_of", rp.best_of);
+        rp.beam_size = form_int(req, "beam_size", rp.beam_size);
+        rp.entropy_thold = form_float(req, "entropy_thold", rp.entropy_thold);
+        rp.logprob_thold = form_float(req, "logprob_thold", rp.logprob_thold);
+        rp.no_speech_thold = form_float(req, "no_speech_thold", rp.no_speech_thold);
+        rp.temperature_inc = form_float(req, "temperature_inc", rp.temperature_inc);
+        rp.no_fallback = form_bool(req, "no_fallback", rp.no_fallback);
+        rp.detect_language = form_bool(req, "detect_language", rp.detect_language);
+        rp.lid_backend = form_string(req, "lid_backend", rp.lid_backend);
+        rp.lid_model = form_string(req, "lid_model", rp.lid_model);
+        rp.chunk_seconds = form_int(req, "chunk_seconds", rp.chunk_seconds);
+        rp.no_timestamps = form_bool(req, "no_timestamps", rp.no_timestamps);
+        rp.split_on_word = form_bool(req, "split_on_word", rp.split_on_word);
+        rp.max_len = form_int(req, "max_len", rp.max_len);
+        rp.split_on_punct = form_bool(req, "split_on_punct", rp.split_on_punct);
+        rp.offset_t_ms = form_int(req, "offset_t_ms", rp.offset_t_ms);
+        rp.duration_ms = form_int(req, "duration_ms", rp.duration_ms);
+        rp.max_context = form_int(req, "max_context", rp.max_context);
+        rp.audio_ctx = form_int(req, "audio_ctx", rp.audio_ctx);
+        rp.word_thold = form_float(req, "word_thold", rp.word_thold);
+        rp.carry_initial_prompt = form_bool(req, "carry_initial_prompt", rp.carry_initial_prompt);
+        rp.chunk_overlap_seconds = form_float(req, "chunk_overlap", rp.chunk_overlap_seconds);
+        rp.lcs_dedup = form_string(req, "lcs_dedup", rp.lcs_dedup);
+        rp.lcs_min_length = form_int(req, "lcs_min_length", rp.lcs_min_length);
+        rp.parakeet_decoder = form_string(req, "parakeet_decoder", rp.parakeet_decoder);
+        rp.no_auto_aligner = form_bool(req, "no_auto_aligner", rp.no_auto_aligner);
+        rp.show_alternatives = form_bool(req, "show_alternatives", rp.show_alternatives);
+        rp.n_alternatives = form_int(req, "alt_n", rp.n_alternatives);
         if (!prompt.empty())
             rp.prompt = prompt;
 
         const bool need_timestamps =
             response_format == "verbose_json" || response_format == "srt" || response_format == "vtt";
-        auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp, need_timestamps);
+        auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp, need_timestamps, punc_ctx.get(),
+                                    pcs_ctx.get(), tc_ctx.get(), tc_crf_ctx.get(), tc_lstm_ctx.get());
         if (!result.ok) {
             json_error(res, 400, result.error);
             return;
@@ -756,6 +1247,71 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     });
 
     // -----------------------------------------------------------------------
+    // POST /v1/translate — text-to-text translation (m2m100 / CAP_TRANSLATE)
+    //
+    // Body: application/json
+    //   {
+    //     "input":       "TEXT to translate",   (required; "text" also accepted)
+    //     "source_lang": "en",                  (optional; falls back to server default)
+    //     "target_lang": "de",                  (required unless a server default is set)
+    //     "max_tokens":  256                    (optional)
+    //   }
+    // Returns 200 {"text": "..."}. The HTTP analogue of the CLI `--text` mode;
+    // only meaningful when a translation backend (e.g. m2m100) is loaded.
+    // -----------------------------------------------------------------------
+    svr.Post("/v1/translate", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        if (!ready.load()) {
+            json_error(res, 503, "model is still loading");
+            return;
+        }
+        if (!(backend->capabilities() & CAP_TRANSLATE)) {
+            json_error(res, 400,
+                       "loaded backend '" + backend_name +
+                           "' does not support text translation (no CAP_TRANSLATE); load a "
+                           "translation backend (e.g. m2m100) via POST /load");
+            return;
+        }
+        nlohmann::json body;
+        try {
+            body = nlohmann::json::parse(req.body);
+        } catch (...) {
+            json_error(res, 400, "invalid JSON body", "invalid_json");
+            return;
+        }
+        std::string text = body.value("input", body.value("text", std::string()));
+        if (text.empty()) {
+            json_error(res, 400, "missing or empty 'input' field", "missing_required_field", "input");
+            return;
+        }
+        // Prefer the dedicated translator-stage langs, then the generic src/tgt,
+        // then the per-request override — same precedence as the CLI.
+        std::string src = body.value(
+            "source_lang", params.translate_source_lang.empty() ? params.source_lang : params.translate_source_lang);
+        std::string tgt = body.value(
+            "target_lang", params.translate_target_lang.empty() ? params.target_lang : params.translate_target_lang);
+        if (src.empty() || tgt.empty()) {
+            json_error(res, 400, "translation requires 'source_lang' and 'target_lang'", "missing_required_field");
+            return;
+        }
+        whisper_params rp = params;
+        rp.translate_max_tokens = body.value("max_tokens", rp.translate_max_tokens);
+        std::string out;
+        {
+            std::lock_guard<std::mutex> lock(model_mutex);
+            out = backend->translate_text(text, src, tgt, rp);
+        }
+        if (out.empty()) {
+            json_error(res, 500, "translation failed");
+            return;
+        }
+        std::ostringstream js;
+        js << "{\"text\": \"" << crispasr_json_escape(out) << "\"}";
+        res.set_content(js.str(), "application/json");
+    });
+
+    // -----------------------------------------------------------------------
     // POST /v1/audio/speech — OpenAI-compatible TTS endpoint
     //
     // Body: application/json
@@ -765,7 +1321,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     //     "voice":           "<name in --voice-dir>",    (optional)
     //     "instructions":    "<voice direction prose>",  (optional, applied via params.tts_instruct)
     //     "speed":           0.25 .. 4.0,                (optional, default 1.0)
-    //     "response_format": "wav" | "pcm" | "f32"       (optional, default "wav")
+    //     "response_format": "wav"|"pcm"|"f32"|"mp3"|"opus" (optional, default "wav")
     //   }
     //
     // Returns:
@@ -842,13 +1398,59 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         std::string requested_model = body.value("model", "");
 
         std::string voice_name = body.value("voice", "");
+        std::string consent_attestation = body.value("consent_attestation", "");
         std::string instructions = body.value("instructions", "");
-        std::string response_format = body.value("response_format", std::string("wav"));
-        if (response_format != "wav" && response_format != "pcm" && response_format != "f32") {
-            json_error(res, 400, "response_format must be one of 'wav', 'pcm', or 'f32'", "unsupported_response_format",
-                       "response_format");
+        // spoken_disclaimer defaults to true; set to false to skip the
+        // audible AI-disclosure prefix (watermark + C2PA remain).
+        const bool spoken_disclaimer = body.value("spoken_disclaimer", true);
+
+        // Voice-cloning consent gate: when the voice is a .wav reference
+        // (voice cloning), require an explicit consent_attestation field.
+        const bool is_voice_clone =
+            voice_name.size() >= 4 && (voice_name.compare(voice_name.size() - 4, 4, ".wav") == 0 ||
+                                       voice_name.compare(voice_name.size() - 4, 4, ".WAV") == 0);
+        if (is_voice_clone && consent_attestation.empty()) {
+            json_error(res, 400,
+                       "voice cloning requires a 'consent_attestation' field in the request body. "
+                       "This field should contain a statement attesting that you have the consent "
+                       "of the speaker whose voice is being cloned, or that it is your own voice. "
+                       "Example: {\"consent_attestation\": \"I have the speaker's consent\"}",
+                       "consent_required", "consent_attestation");
             return;
         }
+        if (is_voice_clone) {
+            auto now = std::chrono::system_clock::now();
+            auto t = std::chrono::system_clock::to_time_t(now);
+            char ts[64];
+            std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
+            fprintf(stderr, "[CONSENT] ts=%s voice=%s attestation=\"%s\" spoken_disclaimer=%s\n", ts,
+                    voice_name.c_str(), consent_attestation.c_str(), spoken_disclaimer ? "yes" : "no");
+        }
+        std::string response_format = body.value("response_format", std::string("wav"));
+        if (response_format != "wav" && response_format != "pcm" && response_format != "f32" &&
+            response_format != "mp3" && response_format != "opus") {
+            json_error(res, 400, "response_format must be one of 'wav', 'pcm', 'f32', 'mp3', or 'opus'",
+                       "unsupported_response_format", "response_format");
+            return;
+        }
+#ifndef CRISPASR_HAVE_LAME
+        if (response_format == "mp3") {
+            json_error(res, 400,
+                       "mp3 output requires libmp3lame; rebuild with -DCMAKE_PREFIX_PATH pointing at lame, "
+                       "or install libmp3lame-dev",
+                       "codec_not_available", "response_format");
+            return;
+        }
+#endif
+#ifndef CRISPASR_HAVE_OPUS
+        if (response_format == "opus") {
+            json_error(res, 400,
+                       "opus output requires libopus; rebuild with -DCMAKE_PREFIX_PATH pointing at opus, "
+                       "or install libopus-dev",
+                       "codec_not_available", "response_format");
+            return;
+        }
+#endif
 
         float speed = body.value("speed", 1.0f);
         if (!(speed >= 0.25f && speed <= 4.0f)) {
@@ -883,6 +1485,38 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         if (body.contains("frequency_penalty") && body["frequency_penalty"].is_number())
             rp.frequency_penalty = body["frequency_penalty"].get<float>();
 
+        // 75c-opt-2: native backend duration / sampling knobs.
+        // All optional; negative sentinel = "use backend default".
+        if (body.contains("top_p") && body["top_p"].is_number())
+            rp.tts_top_p = body["top_p"].get<float>();
+        if (body.contains("min_p") && body["min_p"].is_number())
+            rp.tts_min_p = body["min_p"].get<float>();
+        if (body.contains("top_k") && body["top_k"].is_number_integer())
+            rp.tts_top_k = body["top_k"].get<int>();
+        if (body.contains("repetition_penalty") && body["repetition_penalty"].is_number())
+            rp.tts_repetition_penalty = body["repetition_penalty"].get<float>();
+        if (body.contains("cfg_scale") && body["cfg_scale"].is_number())
+            rp.tts_cfg_scale = body["cfg_scale"].get<float>();
+        if (body.contains("num_steps") && body["num_steps"].is_number_integer())
+            rp.tts_num_steps = body["num_steps"].get<int>();
+        if (body.contains("noise_scale") && body["noise_scale"].is_number())
+            rp.tts_noise_scale = body["noise_scale"].get<float>();
+        if (body.contains("noise_w") && body["noise_w"].is_number())
+            rp.tts_noise_w = body["noise_w"].get<float>();
+        if (body.contains("exaggeration") && body["exaggeration"].is_number())
+            rp.tts_exaggeration = body["exaggeration"].get<float>();
+        if (body.contains("speaker_id") && body["speaker_id"].is_number_integer())
+            rp.tts_speaker_id = body["speaker_id"].get<int>();
+        if (body.contains("max_speech_tokens") && body["max_speech_tokens"].is_number_integer())
+            rp.tts_max_speech_tokens = body["max_speech_tokens"].get<int>();
+
+        // Wire speed into params so backends with native duration control
+        // (e.g. melotts length_scale, piper noise_w) can use it directly.
+        // The post-synth resampler below still applies as a fallback.
+        rp.tts_speed = speed;
+
+        bool stream = body.value("stream", false);
+
         // Long-form chunking (PLAN §75d / issue #66): split input on
         // sentence boundaries before dispatching to the backend so each
         // synth stays inside the talker's healthy training horizon.
@@ -895,6 +1529,98 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         auto t0 = std::chrono::steady_clock::now();
         const std::vector<std::string> sentences = crispasr_tts_plan_chunks_for_backend(text, backend->name());
 
+        // Backend-declared output rate. Most TTS backends emit 24 kHz;
+        // voxcpm2-tts emits 48 kHz. Hard-coding 24 kHz here is why
+        // voxcpm2 output played at half speed before this fix (#122).
+        const int sr_out = backend->tts_sample_rate();
+
+        // 75e: streaming mode — synthesize per-sentence and push each
+        // chunk to the client as raw PCM via chunked transfer encoding.
+        // The client receives int16 LE mono PCM at sr_out. This is the
+        // same binary format as response_format=pcm, but arrives
+        // incrementally. Speed resampling is still applied per-chunk.
+        if (stream) {
+            // Streaming only supports PCM formats (wav/pcm/f32).
+            // mp3/opus require full-file encoding — reject with 400.
+            if (response_format == "mp3" || response_format == "opus") {
+                json_error(res, 400,
+                           "streaming is not supported with response_format='" + response_format +
+                               "'; use 'pcm', 'wav', or 'f32', or set stream=false",
+                           "invalid_request_error", "response_format");
+                return;
+            }
+            // Pre-compute 200ms silence gap between chunks
+            const int silence_n = sr_out / 5;
+            std::vector<short> silence_s16(silence_n, 0);
+
+            // Shared state between the main thread (which synthesizes under
+            // model_mutex) and the chunked provider callback. We synthesize
+            // all chunks first into a queue, then the provider drains it.
+            // (httplib's provider callback runs synchronously in the same
+            // thread, but this structure is clearer.)
+            std::vector<std::string> pcm_chunks;
+            {
+                std::lock_guard<std::mutex> lock(model_mutex);
+                // Prepend disclaimer as first chunk for voice-clone streams
+                if (is_voice_clone) {
+                    const auto& disc = crispasr_tts_get_disclaimer(backend.get(), rp);
+                    if (!disc.empty()) {
+                        pcm_chunks.push_back(crispasr_make_pcm_int16_le(disc.data(), (int)disc.size()));
+                        pcm_chunks.push_back(
+                            std::string((const char*)silence_s16.data(), silence_s16.size() * sizeof(short)));
+                    }
+                }
+                for (size_t i = 0; i < sentences.size(); i++) {
+                    std::vector<float> chunk = backend->synthesize(sentences[i], rp);
+                    if (chunk.empty())
+                        continue;
+                    // Apply speed resampling per chunk
+                    if (speed != 1.0f) {
+                        const int in_n = (int)chunk.size();
+                        const int out_n = std::max(1, (int)((float)in_n / speed));
+                        std::vector<float> rs((size_t)out_n);
+                        for (int j = 0; j < out_n; j++) {
+                            const float s = (float)j * speed;
+                            const int s0 = (int)s;
+                            const int s1 = std::min(s0 + 1, in_n - 1);
+                            const float frac = s - (float)s0;
+                            rs[j] = chunk[s0] * (1.0f - frac) + chunk[s1] * frac;
+                        }
+                        chunk = std::move(rs);
+                    }
+                    // Embed watermark per-chunk (survives re-encoding)
+                    crispasr_wm_dispatch::embed(chunk.data(), (int)chunk.size(), sr_out);
+                    pcm_chunks.push_back(crispasr_make_pcm_int16_le(chunk.data(), (int)chunk.size()));
+                    // Add silence gap between sentences (not after last)
+                    if (i + 1 < sentences.size()) {
+                        pcm_chunks.push_back(
+                            std::string((const char*)silence_s16.data(), silence_s16.size() * sizeof(short)));
+                    }
+                }
+            }
+            auto t1_s = std::chrono::steady_clock::now();
+            const double el = std::chrono::duration<double>(t1_s - t0).count();
+            fprintf(stderr, "crispasr-server: streaming %zu PCM chunks in %.2fs\n", pcm_chunks.size(), el);
+
+            if (pcm_chunks.empty()) {
+                json_error(res, 500, "synthesis failed (backend returned empty audio)", "synthesis_failed");
+                return;
+            }
+
+            size_t chunk_idx = 0;
+            res.set_chunked_content_provider("audio/pcm", [pcm_chunks = std::move(pcm_chunks), chunk_idx](
+                                                              size_t /*offset*/, httplib::DataSink& sink) mutable {
+                if (chunk_idx >= pcm_chunks.size()) {
+                    sink.done();
+                    return true;
+                }
+                const auto& c = pcm_chunks[chunk_idx++];
+                sink.write(c.data(), c.size());
+                return true;
+            });
+            return;
+        }
+
         std::vector<std::vector<float>> chunks;
         chunks.reserve(sentences.size());
         {
@@ -905,15 +1631,22 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                     chunks.push_back(std::move(chunk));
             }
         }
-        // 200 ms silence at 24 kHz between chunks. Inaudible click
-        // suppression at boundaries; long enough that the listener
-        // perceives a natural sentence pause without dragging.
-        std::vector<float> pcm = crispasr_tts_concat_with_silence(chunks, 4800);
+        // 200 ms silence between chunks (scaled to the backend rate).
+        // Inaudible click suppression at boundaries; long enough that
+        // the listener perceives a natural sentence pause without dragging.
+        std::vector<float> pcm = crispasr_tts_concat_with_silence(chunks, sr_out / 5);
         auto t1 = std::chrono::steady_clock::now();
 
         if (pcm.empty()) {
             json_error(res, 500, "synthesis failed (backend returned empty audio)", "synthesis_failed");
             return;
+        }
+
+        // Prepend spoken AI-disclosure for voice-cloned requests.
+        // Skipped when "spoken_disclaimer": false; watermark + C2PA
+        // provenance remain regardless.
+        if (is_voice_clone && spoken_disclaimer) {
+            crispasr_tts_prepend_disclaimer(pcm, backend.get(), rp);
         }
 
         // Apply speed via linear-interpolation resampler. speed=1.0 is a
@@ -935,26 +1668,193 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             pcm = std::move(resampled);
         }
 
+        // Embed spread-spectrum watermark marking audio as AI-generated.
+        // Applied after speed resampling so the watermark is present in
+        // the final signal regardless of speed setting.
+        crispasr_wm_dispatch::embed(pcm.data(), (int)pcm.size(), sr_out);
+
         const double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
-        const double audio_s = (double)pcm.size() / 24000.0;
+        const double audio_s = (double)pcm.size() / (double)sr_out;
         fprintf(stderr,
                 "crispasr-server: synthesized %.1fs audio in %.2fs (RTF=%.2f) "
-                "voice='%s' speed=%.2f format=%s model='%s' chunks=%zu\n",
+                "voice='%s' speed=%.2f format=%s model='%s' chunks=%zu sr=%dHz\n",
                 audio_s, elapsed_s, elapsed_s > 0 ? elapsed_s / audio_s : 0.0,
                 voice_name.empty() ? "<startup>" : voice_name.c_str(), speed, response_format.c_str(),
-                requested_model.empty() ? "<unset>" : requested_model.c_str(), chunks.size());
+                requested_model.empty() ? "<unset>" : requested_model.c_str(), chunks.size(), sr_out);
 
         if (response_format == "f32") {
             std::string buf((const char*)pcm.data(), pcm.size() * sizeof(float));
             res.set_content(std::move(buf), "application/octet-stream");
         } else if (response_format == "pcm") {
-            // OpenAI's pcm: 24 kHz signed 16-bit LE mono raw bytes, no
-            // header. Content-Type is documented as audio/pcm; clients
-            // know the rate out-of-band from the spec.
+            // OpenAI's pcm: signed 16-bit LE mono raw bytes, no header.
+            // Spec is 24 kHz; we emit at the backend's native rate
+            // (voxcpm2 = 48 kHz) — clients must know the rate
+            // out-of-band. Use response_format=wav if the client needs
+            // a self-describing container.
             std::string raw = crispasr_make_pcm_int16_le(pcm.data(), (int)pcm.size());
             res.set_content(std::move(raw), "audio/pcm");
+#ifdef CRISPASR_HAVE_LAME
+        } else if (response_format == "mp3") {
+            std::string mp3 = crispasr_encode_mp3(pcm.data(), (int)pcm.size(), sr_out);
+            if (mp3.empty()) {
+                json_error(res, 500, "MP3 encoding failed", "encoding_failed");
+                return;
+            }
+            res.set_content(std::move(mp3), "audio/mpeg");
+#endif
+#ifdef CRISPASR_HAVE_OPUS
+        } else if (response_format == "opus") {
+            std::string opus = crispasr_encode_opus(pcm.data(), (int)pcm.size(), sr_out);
+            if (opus.empty()) {
+                json_error(res, 500, "Opus encoding failed", "encoding_failed");
+                return;
+            }
+            res.set_content(std::move(opus), "audio/opus");
+#endif
         } else {
-            std::string wav = crispasr_make_wav_int16(pcm.data(), (int)pcm.size(), 24000);
+            std::string wav = crispasr_make_wav_int16(pcm.data(), (int)pcm.size(), sr_out);
+            // C2PA Content Credentials signing (when c2pa-c is available
+            // and --c2pa-cert / --c2pa-key are configured)
+            crispasr_c2pa_sign_wav(wav, params.c2pa_cert, params.c2pa_key);
+            res.set_content(std::move(wav), "audio/wav");
+        }
+    });
+
+    // -----------------------------------------------------------------------
+    // POST /v1/audio/speech-to-speech — S2S (audio in → audio out)
+    //
+    // Content-Type: multipart/form-data
+    //   file:            <audio file>                    (required)
+    //   language:        "ja"|"en"|...                   (optional)
+    //   response_format: "wav"|"pcm"|"f32"               (optional, default "wav")
+    //
+    // Returns:
+    //   200 audio/wav — output audio at backend's TTS sample rate (24 kHz mono)
+    //   Header X-Transcript: <URL-encoded intermediate ASR transcript>
+    //   400 — backend lacks CAP_S2S, missing file
+    //   500 — S2S returned empty audio
+    //   503 — model still loading
+    //
+    // Supported backends: lfm2-audio, mini-omni2
+    // -----------------------------------------------------------------------
+    svr.Post("/v1/audio/speech-to-speech", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        if (!ready.load()) {
+            json_error(res, 503, "model is still loading");
+            return;
+        }
+        if (!(backend->capabilities() & CAP_S2S)) {
+            json_error(res, 400,
+                       "loaded backend '" + backend_name +
+                           "' does not support speech-to-speech (no CAP_S2S); "
+                           "load lfm2-audio or mini-omni2 via POST /load");
+            return;
+        }
+
+        if (!req.has_file("file")) {
+            json_error(res, 400, "missing 'file' field (multipart audio upload)", "missing_required_field", "file");
+            return;
+        }
+        const auto& audio_file = req.get_file_value("file");
+
+        // Decode input audio to 16 kHz mono PCM.
+        std::string tmp_path =
+            write_temp_audio(audio_file.content.data(), audio_file.content.size(), audio_file.filename);
+        if (tmp_path.empty()) {
+            json_error(res, 500, "failed to create temporary file for audio");
+            return;
+        }
+        std::vector<float> pcmf32;
+        std::vector<std::vector<float>> pcmf32s;
+        if (!read_audio_data(tmp_path, pcmf32, pcmf32s, false)) {
+            std::remove(tmp_path.c_str());
+            json_error(res, 400, "failed to decode audio (unsupported format or corrupt file)");
+            return;
+        }
+        std::remove(tmp_path.c_str());
+        if (pcmf32.empty()) {
+            json_error(res, 400, "audio file contains no samples");
+            return;
+        }
+
+        std::string response_format = "wav";
+        if (req.has_file("response_format"))
+            response_format = req.get_file_value("response_format").content;
+
+        whisper_params rp = params;
+        if (req.has_file("language"))
+            rp.language = req.get_file_value("language").content;
+
+        const int sr_out = backend->tts_sample_rate();
+
+        // Run S2S under model lock.
+        std::string transcript;
+        std::vector<float> pcm;
+        {
+            std::lock_guard<std::mutex> lock(model_mutex);
+            auto t0 = std::chrono::steady_clock::now();
+            pcm = backend->speech_to_speech(pcmf32.data(), (int)pcmf32.size(), &transcript, rp);
+            auto t1 = std::chrono::steady_clock::now();
+            double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
+            double in_dur_s = (double)pcmf32.size() / 16000.0;
+            double out_dur_s = pcm.empty() ? 0.0 : (double)pcm.size() / (double)sr_out;
+            fprintf(stderr, "crispasr-server: S2S %.1fs in → %.1fs out in %.2fs transcript='%s'\n", in_dur_s, out_dur_s,
+                    elapsed_s, transcript.empty() ? "<none>" : transcript.c_str());
+        }
+
+        if (pcm.empty()) {
+            json_error(res, 500, "speech-to-speech returned empty audio", "s2s_failed");
+            return;
+        }
+
+        // Watermark the output.
+        crispasr_wm_dispatch::embed(pcm.data(), (int)pcm.size(), sr_out);
+
+        // Return intermediate transcript as a header.
+        if (!transcript.empty()) {
+            // URL-encode for safe header transport.
+            std::string encoded;
+            for (char c : transcript) {
+                if (std::isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~' || c == ' ') {
+                    encoded += c;
+                } else {
+                    char hex[4];
+                    snprintf(hex, sizeof(hex), "%%%02X", (unsigned char)c);
+                    encoded += hex;
+                }
+            }
+            res.set_header("X-Transcript", encoded);
+        }
+
+        // Encode output audio.
+        if (response_format == "f32") {
+            std::string buf((const char*)pcm.data(), pcm.size() * sizeof(float));
+            res.set_content(std::move(buf), "application/octet-stream");
+        } else if (response_format == "pcm") {
+            std::string raw = crispasr_make_pcm_int16_le(pcm.data(), (int)pcm.size());
+            res.set_content(std::move(raw), "audio/pcm");
+#ifdef CRISPASR_HAVE_LAME
+        } else if (response_format == "mp3") {
+            std::string mp3 = crispasr_encode_mp3(pcm.data(), (int)pcm.size(), sr_out);
+            if (mp3.empty()) {
+                json_error(res, 500, "MP3 encoding failed", "encoding_failed");
+                return;
+            }
+            res.set_content(std::move(mp3), "audio/mpeg");
+#endif
+#ifdef CRISPASR_HAVE_OPUS
+        } else if (response_format == "opus") {
+            std::string opus = crispasr_encode_opus(pcm.data(), (int)pcm.size(), sr_out);
+            if (opus.empty()) {
+                json_error(res, 500, "Opus encoding failed", "encoding_failed");
+                return;
+            }
+            res.set_content(std::move(opus), "audio/opus");
+#endif
+        } else {
+            std::string wav = crispasr_make_wav_int16(pcm.data(), (int)pcm.size(), sr_out);
+            crispasr_c2pa_sign_wav(wav, params.c2pa_cert, params.c2pa_key);
             res.set_content(std::move(wav), "audio/wav");
         }
     });
@@ -998,6 +1898,123 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         }
         js << "]}";
         res.set_content(js.str(), "application/json");
+    });
+
+    // -----------------------------------------------------------------------
+    // POST /v1/voices — upload a voice file (multipart: "voice" file + optional "name" field)
+    // Returns 201 on success: {"name": "...", "format": "wav", "size_bytes": N}
+    // -----------------------------------------------------------------------
+    svr.Post("/v1/voices", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        if (params.tts_voice_dir.empty()) {
+            json_error(res, 400, "server has no --voice-dir configured; cannot store voice files");
+            return;
+        }
+        if (!req.has_file("voice")) {
+            json_error(res, 400, "missing multipart 'voice' file field");
+            return;
+        }
+        const auto& voice_file = req.get_file_value("voice");
+        if (voice_file.content.size() < 44) {
+            json_error(res, 400, "uploaded file is too small to be a valid audio file");
+            return;
+        }
+
+        // Derive voice name: from "name" form field, or from uploaded filename stem.
+        std::string voice_name;
+        if (req.has_file("name")) {
+            voice_name = req.get_file_value("name").content;
+        } else if (!voice_file.filename.empty()) {
+            voice_name = std::filesystem::path(voice_file.filename).stem().string();
+        }
+        if (voice_name.empty()) {
+            json_error(res, 400, "cannot derive voice name; provide a 'name' form field");
+            return;
+        }
+        // Validate: alphanumeric, dash, underscore only
+        for (char c : voice_name) {
+            if (!std::isalnum((unsigned char)c) && c != '-' && c != '_') {
+                json_error(res, 400, "voice name must match [a-zA-Z0-9_-]+");
+                return;
+            }
+        }
+
+        std::string dest = params.tts_voice_dir + "/" + voice_name + ".wav";
+        if (std::filesystem::exists(dest) && !req.has_param("force")) {
+            json_error(res, 409, "voice '" + voice_name + "' already exists; add ?force=true to overwrite");
+            return;
+        }
+
+        // Write the file
+        std::ofstream out(dest, std::ios::binary);
+        if (!out) {
+            json_error(res, 500, "failed to write voice file");
+            return;
+        }
+        out.write(voice_file.content.data(), (std::streamsize)voice_file.content.size());
+        out.close();
+
+        // If a "transcript" text field is provided, write the paired .txt
+        // (Qwen3-TTS ICL prefill format: <name>.wav + <name>.txt).
+        if (req.has_file("transcript")) {
+            const auto& txt = req.get_file_value("transcript");
+            std::string txt_path = params.tts_voice_dir + "/" + voice_name + ".txt";
+            std::ofstream txt_out(txt_path);
+            if (txt_out) {
+                txt_out.write(txt.content.data(), (std::streamsize)txt.content.size());
+            }
+        }
+
+        nlohmann::json resp;
+        resp["name"] = voice_name;
+        resp["format"] = "wav";
+        resp["size_bytes"] = voice_file.content.size();
+        res.status = 201;
+        res.set_content(resp.dump(), "application/json");
+        fprintf(stderr, "crispasr-server: uploaded voice '%s' (%zu bytes)\n", voice_name.c_str(),
+                voice_file.content.size());
+    });
+
+    // -----------------------------------------------------------------------
+    // DELETE /v1/voices/:name — remove a voice file from --voice-dir
+    // Returns 200: {"deleted": "<name>"}
+    // -----------------------------------------------------------------------
+    svr.Delete(R"(/v1/voices/([a-zA-Z0-9_-]+))", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
+        if (params.tts_voice_dir.empty()) {
+            json_error(res, 400, "server has no --voice-dir configured");
+            return;
+        }
+
+        const std::string voice_name = req.matches[1].str();
+        // Try .wav then .gguf
+        std::string wav_path = params.tts_voice_dir + "/" + voice_name + ".wav";
+        std::string gguf_path = params.tts_voice_dir + "/" + voice_name + ".gguf";
+        bool found = false;
+
+        if (std::filesystem::exists(wav_path)) {
+            std::remove(wav_path.c_str());
+            // Also remove paired .txt if present
+            std::string txt_path = params.tts_voice_dir + "/" + voice_name + ".txt";
+            std::remove(txt_path.c_str());
+            found = true;
+        }
+        if (std::filesystem::exists(gguf_path)) {
+            std::remove(gguf_path.c_str());
+            found = true;
+        }
+
+        if (!found) {
+            json_error(res, 404, "voice '" + voice_name + "' not found in --voice-dir");
+            return;
+        }
+
+        nlohmann::json resp;
+        resp["deleted"] = voice_name;
+        res.set_content(resp.dump(), "application/json");
+        fprintf(stderr, "crispasr-server: deleted voice '%s'\n", voice_name.c_str());
     });
 
     // -----------------------------------------------------------------------
@@ -1258,6 +2275,24 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         res.set_content("{\"error\": \"not found. Use POST /v1/audio/transcriptions\"}", "application/json");
     });
 
+    // When a route handler throws, cpp-httplib turns it into a bare 500 with an
+    // empty body — which the error handler above then mislabels as "not found".
+    // Surface the real reason instead: log it and return a structured 500 so an
+    // exception in e.g. transcription isn't silently disguised as a 404.
+    svr.set_exception_handler([&](const Request& req, Response& res, std::exception_ptr ep) {
+        std::string what = "unknown error";
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            what = e.what();
+        } catch (...) {
+        }
+        fprintf(stderr, "crispasr-server: %s %s → 500 (exception: %s)\n", req.method.c_str(), req.path.c_str(),
+                what.c_str());
+        res.status = 500;
+        json_error(res, 500, std::string("internal error: ") + what);
+    });
+
     // Start
     // -----------------------------------------------------------------------
     const bool tts = (backend->capabilities() & CAP_TTS) != 0;
@@ -1267,12 +2302,17 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     if (tts) {
         fprintf(stderr, "  POST /v1/audio/speech            — TTS (OpenAI-compatible)\n");
     }
+    if (backend->capabilities() & CAP_S2S) {
+        fprintf(stderr, "  POST /v1/audio/speech-to-speech  — S2S audio→audio\n");
+    }
     fprintf(stderr, "  POST /load                       — hot-swap model\n");
     fprintf(stderr, "  GET  /health                     — server status\n");
     fprintf(stderr, "  GET  /backends                   — list backends\n");
     fprintf(stderr, "  GET  /v1/models                  — model info\n");
     if (tts) {
         fprintf(stderr, "  GET  /v1/voices                  — list voices in --voice-dir\n");
+        fprintf(stderr, "  POST /v1/voices                  — upload voice file (multipart)\n");
+        fprintf(stderr, "  DELETE /v1/voices/:name          — delete voice file\n");
         if (params.tts_voice_dir.empty()) {
             fprintf(stderr, "crispasr-server: warning: --voice-dir not set; /v1/voices will return empty "
                             "and /v1/audio/speech will reject requests with a 'voice' field\n");
@@ -1281,10 +2321,32 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     if (!params.chat_model.empty()) {
         fprintf(stderr, "  POST /v1/chat/completions        — text-LLM chat (model '%s')\n", params.chat_model.c_str());
     }
-    fprintf(stderr, "\n");
     if (!api_keys.empty())
         fprintf(stderr, "crispasr-server: API key authentication enabled\n");
 
+    // Real-time WebSocket ASR streaming on a second port (--ws-port). Opt-in:
+    // -1 disables (default), 0 = main port + 1, N = port N. Reuses the streaming
+    // session API (crispasr_session_stream_*); clients send binary 16 kHz mono
+    // float32 PCM and receive JSON partial/final text events. Whisper-only today.
+    bool ws_started = false;
+    if (params.server_ws_port >= 0) {
+        const int ws_port = params.server_ws_port == 0 ? port + 1 : params.server_ws_port;
+        if (ws_stream_start(params.model.c_str(), ws_port, params.n_threads) == 0) {
+            ws_started = true;
+            fprintf(stderr, "  WS   ws://%s:%d                 — real-time streaming ASR (binary PCM in, JSON out)\n",
+                    host.c_str(), ws_port);
+        } else {
+            fprintf(stderr, "crispasr-server: warning: failed to start WebSocket streaming on port %d\n", ws_port);
+        }
+    }
+    fprintf(stderr, "\n");
+
     svr.listen(host, port);
+
+    // Clean up cached VAD context on shutdown (#132).
+    if (ws_started)
+        ws_stream_stop();
+    crispasr_vad_free_cache();
+
     return 0;
 }

@@ -5,6 +5,7 @@
 #include "kyutai_stt.h"
 #include "whisper_params.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -43,19 +44,63 @@ public:
         if (!ctx_)
             return out;
 
+        // PLAN #125 P6b: kyutai's batch path scales superlinearly with
+        // n_samples (~14 s/s on the 50 min file vs 1.36 s/s on JFK, per
+        // reports 05 + 11). KV grows O(N) per emitted token, attention
+        // turns memory-bound past L1, so total cost is O(N^2). Bound
+        // per-call N by chunking at 30 s = 480 000 samples; each chunk
+        // produces its own segment and the silence-tail flush from P6a
+        // applies per-chunk so chunk boundaries close cleanly. Linear
+        // wallclock + a predictable progress for callers.
+        constexpr int kChunkSamples = 30 * 16000;
+        if (n_samples > kChunkSamples) {
+            for (int start = 0; start < n_samples; start += kChunkSamples) {
+                const int this_n = std::min(kChunkSamples, n_samples - start);
+                const int64_t chunk_offset_cs = t_offset_cs + (int64_t)((double)start / 16000.0 * 100.0);
+                auto chunk_segs = transcribe_one(samples + start, this_n, chunk_offset_cs, params);
+                for (auto& s : chunk_segs)
+                    out.push_back(std::move(s));
+            }
+            return out;
+        }
+        return transcribe_one(samples, n_samples, t_offset_cs, params);
+    }
+
+    std::vector<crispasr_segment> transcribe_one(const float* samples, int n_samples, int64_t t_offset_cs,
+                                                 const whisper_params& params) {
+        std::vector<crispasr_segment> out;
+
         // PLAN #61c: use the _ex API to get per-token + word-level
         // timestamps. The kyutai LM emits one text token per Mimi frame
         // (12.5 Hz = 8 cs/frame) with the audio_delay correction baked in.
         // Best-of-N: when temperature > 0 and best_of > 1, run N seeded
         // decodes (process-global libc rand reseeded per run) and keep the
         // highest mean prob across the per-token probs in the result.
+
+        // PLAN #125 P6a: kyutai's causal LM needs a tail of audio to flush
+        // its final-token state. The batch wrapper passes raw samples and
+        // stops, so the model emits the partial token id for the last word
+        // (e.g. "c" for "country") but never receives the audio it needs
+        // to commit "ountry." + EOS. Append ~500 ms of zero-frame silence
+        // so the LM walks forward and finishes the word. Tokens emitted
+        // during the silence-tail keep their t_offset_cs arithmetic and
+        // simply land a few cs past the original input end — acceptable
+        // for word-timestamps. Pre-allocate once; reuse across best-of-N.
+        constexpr int kTailSilenceSamples = 8000; // 500 ms @ 16 kHz
+        std::vector<float> padded;
+        padded.reserve((size_t)n_samples + kTailSilenceSamples);
+        padded.assign(samples, samples + n_samples);
+        padded.resize((size_t)n_samples + kTailSilenceSamples, 0.0f);
+        const float* pad_ptr = padded.data();
+        const int pad_n = (int)padded.size();
+
         const int n_runs = (params.temperature > 0.0f && params.best_of > 1) ? params.best_of : 1;
         kyutai_stt_result_ex* r = nullptr;
         double best_score = -1.0;
         for (int run = 0; run < n_runs; run++) {
             if (n_runs > 1)
                 kyutai_stt_set_seed(ctx_, (unsigned int)(params.seed ^ (run * 0x9E3779B9u + 1u)));
-            kyutai_stt_result_ex* cand = kyutai_stt_transcribe_ex(ctx_, samples, n_samples, t_offset_cs);
+            kyutai_stt_result_ex* cand = kyutai_stt_transcribe_ex(ctx_, pad_ptr, pad_n, t_offset_cs);
             if (!cand)
                 continue;
             double sum = 0.0;

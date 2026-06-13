@@ -32,19 +32,15 @@ SAMPLE_DIR = f"{WORK}/samples"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(SAMPLE_DIR, exist_ok=True)
 
-# Load secrets
+# GH gist token (optional, for publishing results). HF auth is resolved
+# post-clone via the shared harness (kh.resolve_hf_token) so it gets the
+# 3-tier env → Kaggle Secret(retry) → mounted-dataset fallback.
 try:
     from kaggle_secrets import UserSecretsClient
-    secrets = UserSecretsClient()
-    HF_TOKEN = secrets.get_secret("HF_TOKEN")
-    GH_GIST_TOKEN = secrets.get_secret("GH_GIST_TOKEN") if "GH_GIST_TOKEN" in dir(secrets) else None
+    _secrets = UserSecretsClient()
+    GH_GIST_TOKEN = _secrets.get_secret("GH_GIST_TOKEN") if "GH_GIST_TOKEN" in dir(_secrets) else None
 except Exception:
-    HF_TOKEN = os.environ.get("HF_TOKEN", "")
     GH_GIST_TOKEN = os.environ.get("GH_GIST_TOKEN", "")
-
-os.environ["HF_TOKEN"] = HF_TOKEN
-os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 # Reference transcript for jfk.wav
 JFK_REF = "and so my fellow americans ask not what your country can do for you ask what you can do for your country"
@@ -69,6 +65,8 @@ BACKENDS = [
     ("glm-asr",           "GLM ASR Nano",             90, "Q4_K, 1.3B params"),
     ("kyutai-stt",        "Kyutai STT 1B",            90, "Q4_K, 1B params"),
     ("vibevoice",         "VibeVoice ASR",             90, "Q4_K, 4.5B params"),
+    ("sensevoice",        "SenseVoice Small",          60, "Q4_K, ~129MB, encoder-only multitask"),
+    ("paraformer",        "Paraformer-zh NAR",         60, "Q4_K, ~123MB, zh+en char-level"),
 ]
 
 # Slow / large backends (only test if BENCHMARK_SLOW=1)
@@ -77,10 +75,36 @@ SLOW_BACKENDS = [
     ("voxtral4b",         "Voxtral 4B Realtime",     300, "Q4_K, 4B params"),
     ("granite",           "Granite Speech 1B",       300, "Q4_K, 2.9B params"),
     ("gemma4-e2b",        "Gemma-4-E2B 2.3B",        300, "Q4_K, 2.3B params"),
+    ("granite-4.1",       "Granite Speech 4.1 2B",   300, "Q4_K, ~2.94GB, LLM-AR"),
+    ("mega-asr",          "Mega-ASR 1.7B",           120, "Q4_K, ~1.3GB, qwen3 backend + robustness LoRA"),
+    ("funasr",            "Fun-ASR Nano 2512",       180, "Q8_0 (~1.06GB); F16 hits CUDA F16xF32 !-loop, Q8_0 is GPU-safe"),
+    ("fun-asr-mlt-nano",  "Fun-ASR MLT Nano 2512",  240, "F16 (~1.98GB); multilingual multitask"),
+    ("granite-4.1-plus",  "Granite Speech 4.1 2B+",  300, "Q4_K, ~2.96GB, LLM-AR plus variant"),
+    ("granite-4.1-nar",   "Granite Speech 4.1 NAR",  300, "Q4_K, ~3.2GB, non-autoregressive"),
+    ("mimo-asr",          "MiMo-ASR",                420, "Q4_K ~4.2GB; PLAN #115 forces CPU (~297s/11s clip)"),
+]
+
+# TTS backends suitable for Kaggle time limits (small/fast models first,
+# then larger ones). Each entry downloads via -m auto, synthesises a phrase,
+# checks output WAV exists and has >1000 bytes. Models are cleaned up after
+# each backend to stay within Kaggle's ~20 GB scratch.
+TTS_BACKENDS = [
+    # (backend, display_name, timeout_seconds, notes)
+    ("piper",             "Piper LessAC Medium",      30, "F16, ~16MB, VITS en_US"),
+    ("kokoro",            "Kokoro 82M",               90, "Q8_0, needs espeak-ng + voice GGUF"),
+    ("speecht5",          "SpeechT5 TTS",             90, "F16, ~300MB, encoder-decoder + HiFi-GAN"),
+    ("fastpitch",         "FastPitch 60M",            30, "F16, ~60MB, non-AR parallel TTS"),
+    ("pocket-tts",        "Pocket TTS 100M",          90, "F16, ~381MB, continuous-latent AR"),
+    ("bark",              "Bark Small",              120, "Q8_0, ~500MB, 3-stage GPT-2"),
+    ("f5-tts",            "F5-TTS v1 Base",          120, "F16, ~953MB, DiT flow-matching"),
+    ("csm",               "CSM 1B",                  240, "Q4_K, ~1.1GB, conversational TTS"),
+    ("parler-tts",        "Parler TTS Mini v1.1",    180, "Q8_0, ~1GB, T5 + MusicGen decoder"),
+    ("dia",               "Dia 1.6B",                240, "Q8_0, ~1.6GB, byte-level + DAC 44.1 kHz"),
+    ("orpheus",           "Orpheus 3B-FT",           300, "Q8_0, ~3.5GB, Llama-3.2 + SNAC"),
 ]
 
 print(f"CrispASR Benchmark — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-print(f"Backends: {len(BACKENDS)} fast + {len(SLOW_BACKENDS)} slow")
+print(f"Backends: {len(BACKENDS)} fast + {len(SLOW_BACKENDS)} slow ASR, {len(TTS_BACKENDS)} TTS")
 
 # ─────────────────────────── cell 2 (code) ───────────────────────────
 # ── Install dependencies ───────────────────────────────────────────────────
@@ -144,6 +168,14 @@ else:
                    shell=True, check=True)
     print("✓ CrispASR cloned")
 
+# Shared Kaggle harness (lives in the cloned repo) — build streaming,
+# heartbeat+RSS, ccache/mold, CUDA arch auto-detect, 3-tier HF auth.
+sys.path.insert(0, os.path.join(CRISPASR_DIR, "tools", "kaggle"))
+import kaggle_harness as kh  # noqa: E402
+kh.init_progress(progress_path=f"{WORK}/progress.jsonl")
+kh.resolve_hf_token()  # env → Kaggle Secret(retry) → mounted dataset
+kh.step("clone.done")
+
 # Detect GPU — try CUDA first, fall back to CPU if cmake fails
 has_gpu = os.path.exists("/usr/local/cuda/bin/nvcc")
 # Incremental build: keep build dir if cmake config matches, only rebuild changed source.
@@ -151,10 +183,10 @@ has_gpu = os.path.exists("/usr/local/cuda/bin/nvcc")
 os.makedirs(BUILD_DIR, exist_ok=True)
 need_reconfigure = not os.path.isfile(f"{BUILD_DIR}/CMakeCache.txt")
 
-# Install ninja for faster builds (2-3x faster than make)
-subprocess.run("apt-get install -y ninja-build 2>/dev/null || pip install -q ninja",
-               shell=True, capture_output=True)
-has_ninja = shutil.which("ninja") is not None
+# Install ninja + ccache + mold via the harness (primes the persistent
+# ccache at /kaggle/working/.ccache so re-run builds are near-free).
+_tc = kh.install_build_toolchain()
+has_ninja = _tc["ninja"]
 generator = ["-G", "Ninja"] if has_ninja else []
 
 # Common cmake flags (match Docker/dev-build.sh patterns)
@@ -167,42 +199,55 @@ common_flags = [
 
 cmake_ok = not need_reconfigure  # skip configure if cache exists
 if has_gpu and need_reconfigure:
-    # CUDA build — use LIBRARY_PATH for stubs (same as Docker) + NO_VMM fallback
-    cuda_stubs = "/usr/local/cuda/lib64/stubs"
-    if os.path.isdir(cuda_stubs):
-        os.environ["LIBRARY_PATH"] = f"{cuda_stubs}:{os.environ.get('LIBRARY_PATH', '')}"
-
-    print("GPU: CUDA detected, attempting CUDA build...")
-    r = subprocess.run(
-        ["cmake", "-S", CRISPASR_DIR, "-B", BUILD_DIR] + generator + common_flags + [
-            "-DGGML_CUDA=ON", "-DGGML_CUDA_NO_VMM=ON",
-            "-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc",
-        ],
-        capture_output=True, text=True
-    )
+    # CUDA build. kh.cuda_build_flags auto-detects the GPU's compute
+    # capability (T4→75, P100→60, A100→80, L4→89) and pins it — without
+    # the pin, ggml builds every kernel for its full default arch list,
+    # which multiplies nvcc RAM+time and OOM'd the ~16 GB box ~19 kernels
+    # into ggml-cuda (2026-05-31). Plus ccache launchers + mold.
+    arch = kh.detect_cuda_arch()
+    kh.step("cuda.arch", arch=arch)
+    print(f"GPU: CUDA detected (sm_{arch}), attempting CUDA build...")
+    cuda_flags = kh.cuda_build_flags(arch) + kh.cache_and_link_flags()
+    with kh.build_heartbeat("cmake.configure.cuda"):
+        r = subprocess.run(
+            ["cmake", "-S", CRISPASR_DIR, "-B", BUILD_DIR] + generator + common_flags + cuda_flags,
+            capture_output=True, text=True
+        )
     if r.returncode == 0:
         cmake_ok = True
         print(f"✓ CUDA cmake configured ({'Ninja' if has_ninja else 'Make'})")
     else:
-        print(f"⚠ CUDA cmake failed, falling back to CPU build")
+        print("⚠ CUDA cmake failed, falling back to CPU build")
+        print((r.stdout or "")[-2000:]); print((r.stderr or "")[-2000:])
         shutil.rmtree(BUILD_DIR, ignore_errors=True)
         os.makedirs(BUILD_DIR, exist_ok=True)
         has_gpu = False
 
 if not cmake_ok and need_reconfigure:
     print("GPU: CPU-only build")
-    subprocess.run(
-        ["cmake", "-S", CRISPASR_DIR, "-B", BUILD_DIR] + generator + common_flags + [
-            "-DGGML_CUDA=OFF",
-        ],
-        check=True
-    )
+    with kh.build_heartbeat("cmake.configure.cpu"):
+        subprocess.run(
+            ["cmake", "-S", CRISPASR_DIR, "-B", BUILD_DIR] + generator + common_flags + [
+                "-DGGML_CUDA=OFF",
+            ] + kh.cache_and_link_flags(),
+            check=True
+        )
 elif cmake_ok and not need_reconfigure:
     print(f"✓ Using cached cmake config ({'GPU' if has_gpu else 'CPU'})")
 
-# Build only the main binary (not quantize, test tools, etc.)
-subprocess.run(f"cmake --build {BUILD_DIR} --target crispasr -j$(nproc)",
-               shell=True, check=True)
+# Build only the main binary (not quantize, test tools, etc.). Stream the
+# build through the harness (sh_with_progress + heartbeat) so ninja [X/N],
+# the current TU, and RSS are visible live — a silent subprocess.run here
+# is exactly why the first OOM was undiagnosable. CUDA nvcc is RAM-heavy,
+# so cap CUDA at -j2 (still parallel, fits memory); CPU keeps full -j.
+build_jobs = kh.safe_build_jobs(gpu=has_gpu)
+with kh.build_heartbeat("cmake.build"):
+    # Target is `crispasr-cli` — it has OUTPUT_NAME crispasr, so it produces
+    # bin/crispasr. Target `crispasr` builds ONLY the library (libcrispasr),
+    # leaving bin/crispasr absent — which failed the assert below on every
+    # prior run (examples/cli/CMakeLists.txt:12,232).
+    kh.sh_with_progress(f"stdbuf -oL -eL cmake --build {BUILD_DIR} "
+                        f"--target crispasr-cli -j{build_jobs}")
 
 assert os.path.isfile(CRISPASR), f"Build failed: {CRISPASR} not found"
 
@@ -223,7 +268,7 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # Pre-download shared models (whisper-tiny for LID, silero for VAD) — kept across tests
 for local_name, repo, hf_name in [
     ("ggml-tiny.bin", "ggerganov/crispasr", "ggml-tiny.bin"),
-    ("ggml-silero-v5.1.2.bin", "ggml-org/whisper-vad", "ggml-silero-v5.1.2.bin"),
+    ("ggml-silero-v6.2.0.bin", "ggml-org/whisper-vad", "ggml-silero-v6.2.0.bin"),
 ]:
     dst = os.path.join(CACHE_DIR, local_name)
     if not os.path.isfile(dst):
@@ -256,7 +301,23 @@ MODEL_REGISTRY = {
     "voxtral4b":         ("voxtral-mini-4b-realtime-q4_k.gguf","cstr/voxtral-mini-4b-realtime-GGUF","voxtral-mini-4b-realtime-q4_k.gguf"),
     "granite":           ("granite-speech-4.0-1b-q4_k.gguf","cstr/granite-speech-4.0-1b-GGUF",     "granite-speech-4.0-1b-q4_k.gguf"),
     "gemma4-e2b":        ("gemma4-e2b-it-q4_k.gguf",      "cstr/gemma4-e2b-it-GGUF",              "gemma4-e2b-it-q4_k.gguf"),
+    "sensevoice":        ("sensevoice-small-q4_k.gguf",  "cstr/sensevoice-small-GGUF",            "sensevoice-small-q4_k.gguf"),
+    "paraformer":        ("paraformer-zh-q4_k.gguf",     "cstr/paraformer-zh-GGUF",               "paraformer-zh-q4_k.gguf"),
+    "granite-4.1":       ("granite-speech-4.1-2b-q4_k.gguf","cstr/granite-speech-4.1-2b-GGUF",     "granite-speech-4.1-2b-q4_k.gguf"),
+    "mega-asr":          ("mega-asr-1.7b-q4_k.gguf",     "cstr/mega-asr-GGUF",                    "mega-asr-1.7b-q4_k.gguf"),
+    "funasr":            ("funasr-nano-2512-q8_0.gguf",  "cstr/funasr-nano-GGUF",                 "funasr-nano-2512-q8_0.gguf"),
+    "mimo-asr":          ("mimo-asr-q4_k.gguf",          "cstr/mimo-asr-GGUF",                    "mimo-asr-q4_k.gguf"),
 }
+
+# mimo-asr needs a companion tokenizer GGUF alongside the main model; the
+# C++ --auto-download path fetches it, but pre-pull it here so a flaky
+# companion download doesn't fail the whole backend mid-run.
+_mimo_tok = os.path.join(CACHE_DIR, "mimo-tokenizer-q4_k.gguf")
+if not os.path.isfile(_mimo_tok):
+    try:
+        hf_hub_download("cstr/mimo-tokenizer-GGUF", "mimo-tokenizer-q4_k.gguf", local_dir=CACHE_DIR)
+    except Exception:
+        pass
 
 # Also download moonshine tokenizer
 _tok_dst = os.path.join(CACHE_DIR, "tokenizer.bin")
@@ -466,6 +527,66 @@ if BENCHMARK_SLOW == "1":
 else:
     print(f"\n⏭ Skipping {len(SLOW_BACKENDS)} slow backends "
           f"(set BENCHMARK_SLOW=1 to include)")
+
+# TTS smoke benchmark (opt-in, separate from ASR)
+BENCHMARK_TTS = os.environ.get("BENCHMARK_TTS", "0")
+if BENCHMARK_TTS == "1":
+    # Install espeak-ng for kokoro (piper also benefits from it)
+    print("\nInstalling espeak-ng for TTS backends...")
+    subprocess.run("sudo apt-get update -qq && sudo apt-get install -y -qq libespeak-ng-dev espeak-ng",
+                   shell=True, capture_output=True)
+
+    tts_results = []
+    TTS_PHRASE = "The quick brown fox jumps over the lazy dog."
+
+    for backend, name, timeout, notes in TTS_BACKENDS:
+        print(f"\n{'='*60}")
+        print(f"  TTS: {name} (--backend {backend})")
+        print(f"{'='*60}")
+        outfile = f"/tmp/tts-bench-{backend}.wav"
+        cmd = [CRISPASR, "--backend", backend, "-m", "auto", "--auto-download",
+               "--tts-output", outfile, "--no-prints"]
+
+        # Per-backend phrase and voice overrides
+        phrase = TTS_PHRASE
+        if backend == "dia":
+            phrase = "[S1] The quick brown fox jumps over the lazy dog. This is a longer prompt for Dia which needs over one hundred characters to produce good output quality."
+        elif backend == "orpheus":
+            cmd += ["--voice", "tara"]
+
+        cmd += ["--tts", phrase]
+
+        t0 = time.time()
+        try:
+            proc = subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
+            wall = time.time() - t0
+            ok = proc.returncode == 0 and os.path.isfile(outfile) and os.path.getsize(outfile) > 1000
+            sz = os.path.getsize(outfile) if os.path.isfile(outfile) else 0
+            status = "PASS" if ok else "FAIL"
+            tts_results.append({"backend": backend, "name": name, "wall_s": round(wall, 1),
+                                "status": status, "wav_bytes": sz})
+            print(f"  {status} — {wall:.1f}s, {sz} bytes")
+            if not ok and proc.stderr:
+                print(f"  stderr: {proc.stderr[-300:]}")
+        except subprocess.TimeoutExpired:
+            tts_results.append({"backend": backend, "name": name, "wall_s": timeout,
+                                "status": "TIMEOUT", "wav_bytes": 0})
+            print(f"  TIMEOUT after {timeout}s")
+        if os.path.isfile(outfile):
+            os.remove(outfile)
+        _cleanup_cache(backend)
+
+    print(f"\n{'='*60}")
+    print("TTS RESULTS")
+    print(f"{'='*60}")
+    print(f"| Backend | Status | Wall (s) | WAV bytes |")
+    print(f"|---|---|---|---|")
+    for r in tts_results:
+        print(f"| {r['name']} | {r['status']} | {r['wall_s']} | {r['wav_bytes']} |")
+    print(f"\n{sum(1 for r in tts_results if r['status']=='PASS')}/{len(tts_results)} passed")
+else:
+    print(f"\n⏭ Skipping {len(TTS_BACKENDS)} TTS backends "
+          f"(set BENCHMARK_TTS=1 to include)")
 
 # ─────────────────────────── cell 7 (code) ───────────────────────────
 # ── Format results table ───────────────────────────────────────────────────

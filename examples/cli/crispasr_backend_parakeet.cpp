@@ -31,9 +31,23 @@ public:
         // (crispasr_run.cpp:`!has_native_lid`), so users wanting LID
         // get nothing. With the cap absent, `-dl` correctly routes
         // through the whisper-tiny pre-step.
+        //
+        // CAP_INTERNAL_CHUNKING intentionally NOT declared (2026-05-26,
+        // PLAN #114 follow-up). The backend's own
+        // `parakeet_transcribe_streamed` does handle long audio
+        // internally (chunked encode + concat + single TDT decode), but
+        // the empirical option matrix in PERFORMANCE.md shows that the
+        // dispatcher's chunk-30 + overlap-save + LCS-merge dedup path
+        // produces materially more content on long audio (v3+EN60:
+        // 520→755 chars +45 %; ja+JA60: 1674→1942 +16 %; v3+JA60:
+        // 605→660 +9 %). Without this flag the dispatcher's
+        // auto-chunk-at-30s fallback fires for audio > 30 s. Short audio
+        // (< 30 s) is unaffected — the dispatcher only auto-chunks past
+        // the threshold, so 11 s JFK still gets one backend call on the
+        // full audio.
         return CAP_TIMESTAMPS_NATIVE | CAP_WORD_TIMESTAMPS | CAP_TOKEN_CONFIDENCE | CAP_FLASH_ATTN |
-               CAP_PUNCTUATION_TOGGLE | CAP_TEMPERATURE | CAP_DIARIZE | CAP_PARALLEL_PROCESSORS | CAP_AUTO_DOWNLOAD |
-               CAP_UNBOUNDED_INPUT | CAP_INTERNAL_CHUNKING;
+               CAP_PUNCTUATION_TOGGLE | CAP_TEMPERATURE | CAP_BEAM_SEARCH | CAP_DIARIZE | CAP_PARALLEL_PROCESSORS |
+               CAP_AUTO_DOWNLOAD | CAP_UNBOUNDED_INPUT;
     }
 
     bool init(const whisper_params& p) override {
@@ -48,6 +62,9 @@ public:
             fprintf(stderr, "crispasr[parakeet]: failed to load model '%s'\n", p.model.c_str());
             return false;
         }
+        // Issue #89: JA-only models (vocab=3072) collapse past ~12 s on
+        // real audio. Auto-chunk at 10 s instead of the global 30 s default.
+        is_ja_model_ = (parakeet_n_vocab(ctx_) <= 4096);
         // CTC decode mode (hybrid TDT+CTC models).
         if (p.parakeet_decoder == "ctc") {
             if (parakeet_has_ctc(ctx_)) {
@@ -84,6 +101,26 @@ public:
         // who toggles --temperature back off doesn't keep the previous
         // sampling state from a prior file.
         parakeet_set_temperature(ctx_, params.temperature, params.seed);
+        parakeet_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
+
+        // MAES beam search (env: CRISPASR_PARAKEET_MAES=1, or --decode maes).
+        // Requires beam_size > 1. Configurable via env vars.
+        {
+            const char* maes_env = std::getenv("CRISPASR_PARAKEET_MAES");
+            bool use_maes = (maes_env && atoi(maes_env) > 0) || params.parakeet_decoder == "maes";
+            if (use_maes && params.beam_size > 1) {
+                int num_steps = 2;
+                float gamma = 2.3f;
+                int beta = 2;
+                if (const char* v = std::getenv("CRISPASR_MAES_NUM_STEPS"))
+                    num_steps = atoi(v);
+                if (const char* v = std::getenv("CRISPASR_MAES_GAMMA"))
+                    gamma = (float)atof(v);
+                if (const char* v = std::getenv("CRISPASR_MAES_BETA"))
+                    beta = atoi(v);
+                parakeet_set_maes(ctx_, true, num_steps, gamma, beta);
+            }
+        }
 
         // PLAN #98: CTC-WS hotword phrase boost
         if (!params.hotwords.empty()) {
@@ -94,23 +131,47 @@ public:
             parakeet_set_hotwords(ctx_, ptrs.data(), (int)ptrs.size(), params.hotwords_boost);
         }
 
-        // Issue #89 / PLAN #104: encoding path selection.
+        // Issue #89: encoding-path selection.
         //
-        // transcribe_ex (single-pass): best quality — bidirectional encoder
-        // sees full context.  99.5% coverage on the reporter's 60 s JA clip.
-        // Fails past ~60 s on some hardware (z-norm drift on Vulkan/AMD).
+        // parakeet_transcribe_ex (single-pass) routes the full audio through
+        // one bidirectional FastConformer encoder pass. The attention is
+        // numerically unstable past ~10-20 s in a way that depends on
+        // per-feature z-norm statistics: two codec-quantized copies of the
+        // same speech (≈0.3% RMS diff, 0.998 waveform corr) can flip the
+        // encoder output std by 10-15 % and drive the TDT decoder into
+        // emit-blank-forever past a few seconds. Repro: lenhone's clip in
+        // issue #89, comment 4529025103 (60 s file → 20 s of output).
         //
-        // transcribe_streamed (chunked encode): safe for any length — global
-        // z-norm + 8 s encoder chunks + single TDT decode.  ~93% coverage
-        // (encoder sees only 8 s context per chunk → slightly worse features).
+        // parakeet_transcribe_streamed encodes the (globally-z-normed) mel
+        // in overlapping 8 s windows and concatenates encoder outputs
+        // before a single TDT decode. The attention is local-bounded so
+        // codec-level perturbations don't amplify, and the decoder still
+        // sees one contiguous encoder sequence (no LSTM cold-start).
+        // On audio where single-pass works, streamed produces byte-
+        // identical or near-identical text. On audio where single-pass
+        // collapses, streamed still covers ~99 % of the clip.
         //
-        // Default: single-pass up to 60 s, streamed above.  Tuneable via env:
-        //   CRISPASR_PARAKEET_STREAM_THRESHOLD=0  → always streamed
-        //   CRISPASR_PARAKEET_STREAM_THRESHOLD=999 → always single-pass
-        //   CRISPASR_PARAKEET_STREAM_CHUNK=16      → 16 s encoder chunks
-        //   CRISPASR_PARAKEET_STREAM_OVERLAP=4     → 4 s encoder overlap
-        int stream_threshold_s = 60;
-        int stream_chunk_s = 8;
+        // We therefore always go through the streamed path. Single-pass
+        // is preserved as an opt-in escape hatch for callers who really
+        // want the bidirectional-over-everything behaviour (e.g. for
+        // bit-exact reproduction of upstream NeMo on test data) — set
+        // `CRISPASR_PARAKEET_STREAM_THRESHOLD=999` to bypass streaming
+        // for audio shorter than that.
+        //
+        // Env knobs:
+        //   CRISPASR_PARAKEET_STREAM_THRESHOLD : single-pass for audio ≤
+        //       this duration (seconds). Default 0 = always streamed.
+        //   CRISPASR_PARAKEET_STREAM_CHUNK     : encoder chunk size (s).
+        //       Default 0 = let the C library pick per-model: 8 s for the
+        //       JA-only model (vocab=3072), 30 s for the multilingual / v3
+        //       family (vocab=8192). Manual override here for the rare
+        //       case where neither heuristic fits the audio at hand.
+        //   CRISPASR_PARAKEET_STREAM_OVERLAP   : encoder overlap (s).
+        //       Default 2. Covers FastConformer's receptive field at the
+        //       chunk boundary; overlap frames from later chunks are
+        //       discarded before decode.
+        int stream_threshold_s = 0;
+        int stream_chunk_s = 0; // 0 = let the C library pick per-model
         int stream_overlap_s = 2;
         if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_THRESHOLD"))
             stream_threshold_s = std::max(0, atoi(e));
@@ -120,10 +181,11 @@ public:
             stream_overlap_s = std::max(0, atoi(e));
 
         parakeet_result* r;
-        if (stream_threshold_s > 0 && n_samples > stream_threshold_s * 16000) {
-            r = parakeet_transcribe_streamed(ctx_, samples, n_samples, t_offset_cs, stream_chunk_s, stream_overlap_s);
-        } else {
+        const bool use_single_pass = stream_threshold_s > 0 && n_samples <= stream_threshold_s * 16000;
+        if (use_single_pass) {
             r = parakeet_transcribe_ex(ctx_, samples, n_samples, t_offset_cs);
+        } else {
+            r = parakeet_transcribe_streamed(ctx_, samples, n_samples, t_offset_cs, stream_chunk_s, stream_overlap_s);
         }
         if (!r)
             return out;
@@ -171,6 +233,13 @@ public:
         return out;
     }
 
+    bool prefers_vad() const override {
+        // Issue #89: parakeet-ja's encoder degenerates on arbitrary chunks
+        // (repetition loops). VAD gives silence-bounded segments matching
+        // the ~10-15 s utterances the model was trained on.
+        return is_ja_model_;
+    }
+
     void shutdown() override {
         if (ctx_) {
             parakeet_free(ctx_);
@@ -180,6 +249,7 @@ public:
 
 private:
     parakeet_context* ctx_ = nullptr;
+    bool is_ja_model_ = false;
 };
 
 } // namespace

@@ -15,8 +15,11 @@ add_executable(${TARGET}
     cli.cpp
     crispasr_backend.cpp
     crispasr_backend_crispasr.cpp
+    crispasr_backend_nemotron.cpp
     crispasr_backend_parakeet.cpp
     crispasr_backend_canary.cpp
+    crispasr_backend_lfm2_audio.cpp
+    crispasr_backend_mini_omni2.cpp
     crispasr_backend_cohere.cpp
     crispasr_backend_granite.cpp
     crispasr_backend_granite_nle.cpp
@@ -26,12 +29,24 @@ add_executable(${TARGET}
     crispasr_backend_fastconformer_ctc.cpp
     crispasr_backend_wav2vec2.cpp
     crispasr_backend_vibevoice.cpp
+    crispasr_backend_kugelaudio.cpp
     crispasr_backend_qwen3_tts.cpp
     crispasr_backend_orpheus.cpp
     crispasr_backend_chatterbox.cpp
+    crispasr_backend_tada.cpp
     crispasr_backend_indextts.cpp
+    crispasr_backend_f5_tts.cpp
+    crispasr_backend_pocket_tts.cpp
+    crispasr_backend_csm.cpp
+    crispasr_backend_parler.cpp
+    crispasr_backend_fastpitch.cpp
+    crispasr_backend_bark.cpp
+    crispasr_backend_dia.cpp
     crispasr_backend_voxcpm2_tts.cpp
+    crispasr_backend_cosyvoice3.cpp
     crispasr_backend_kokoro.cpp
+    crispasr_backend_piper.cpp
+    crispasr_backend_melotts.cpp
     crispasr_backend_m2m100.cpp
     crispasr_backend_t5.cpp
     crispasr_backend_glm_asr.cpp
@@ -42,9 +57,12 @@ add_executable(${TARGET}
     crispasr_backend_gemma4_e2b.cpp
     crispasr_backend_omniasr.cpp
     crispasr_backend_mimo_asr.cpp
+    crispasr_backend_moss_audio.cpp
     crispasr_backend_funasr.cpp
     crispasr_backend_paraformer.cpp
     crispasr_backend_sensevoice.cpp
+    crispasr_backend_speecht5.cpp
+    crispasr_backend_zonos.cpp
     crispasr_aligner_cli.cpp
     crispasr_vad_cli.cpp
     crispasr_lid_cli.cpp
@@ -55,6 +73,9 @@ add_executable(${TARGET}
     crispasr_run.cpp
     crispasr_server.cpp
     crispasr_tts_chunking.cpp
+    # Real-time WebSocket ASR streaming, shared with the standalone server
+    # (examples/server). Wired into `crispasr --server` via --ws-port.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../server/ws_stream.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -150,7 +171,7 @@ add_executable(crispasr-diff
 )
 target_link_libraries(crispasr-diff PRIVATE
     common
-    crispasr
+    crispasr-lib
     parakeet
     canary
     cohere
@@ -163,15 +184,21 @@ target_link_libraries(crispasr-diff PRIVATE
     orpheus
     kokoro
     chatterbox
+    tada-tts
     indextts
     m2m100
     gemma4_e2b
     mimo_tokenizer
     mimo_asr
+    moss_audio
     voxcpm2_tts
     funasr
     paraformer
     sensevoice
+    cosyvoice3_tts
+    csm-tts
+    parler-tts
+    mini-omni2
     crispasr-diff-lib
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
@@ -184,13 +211,13 @@ install(TARGETS crispasr-diff RUNTIME BUNDLE DESTINATION bin)
 # peeking the GGUF's general.architecture key at load time. One binary
 # for any text-LID GGUF.
 #
-# Link order: text-lid-dispatch BEFORE crispasr because the dispatch
+# Link order: text-lid-dispatch BEFORE crispasr-lib because the dispatch
 # static library has unresolved references to crispasr_registry_lookup
 # / crispasr_cache::ensure_cached_file (in crispasr_model_registry.cpp
-# / crispasr_cache.cpp inside the main `crispasr` library), and MinGW's
+# / crispasr_cache.cpp inside the main `crispasr-lib` library), and MinGW's
 # GNU ld processes static libraries strictly left-to-right — listing
 # the consumer first lets ld pick up the missing definitions when it
-# subsequently scans `crispasr`. Without this, msys2 UCRT64 build.yml
+# subsequently scans `crispasr-lib`. Without this, msys2 UCRT64 build.yml
 # fails with `undefined reference to crispasr_registry_lookup` etc.
 # (Windows MSVC and Linux gcc are forgiving here; only MinGW UCRT64
 # enforces order strictly enough to surface the bug.)
@@ -203,7 +230,7 @@ install(TARGETS crispasr-diff RUNTIME BUNDLE DESTINATION bin)
 add_executable(crispasr-lid crispasr_lid_main.cpp)
 target_link_libraries(crispasr-lid PRIVATE
     text-lid-dispatch
-    crispasr
+    crispasr-lib
     ${CMAKE_THREAD_LIBS_INIT}
     $<$<BOOL:${WIN32}>:winhttp>
     $<$<BOOL:${WIN32}>:ws2_32>
@@ -219,7 +246,7 @@ install(TARGETS crispasr-lid RUNTIME BUNDLE DESTINATION bin)
 add_executable(mimo-tokenizer-smoke mimo_tokenizer_smoke.cpp)
 target_link_libraries(mimo-tokenizer-smoke PRIVATE
     common
-    crispasr
+    crispasr-lib
     mimo_tokenizer
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
@@ -234,7 +261,7 @@ include(DefaultTargetOptions)
 
 target_link_libraries(${TARGET} PRIVATE
     common
-    crispasr
+    crispasr-lib
     parakeet
     canary
     cohere
@@ -246,19 +273,29 @@ target_link_libraries(${TARGET} PRIVATE
     qwen3_tts
     orpheus
     chatterbox
+    tada-tts
     indextts
     kokoro
+    piper-tts
+    speecht5-tts
+    fastpitch-tts
+    bark-tts
+    dia-tts
+    pocket-tts
+    csm-tts
     voxcpm2_tts
     m2m100
     t5_translate
     canary_ctc
     wav2vec2-ggml
     vibevoice
+    kugelaudio
     silero-lid
     pyannote-seg
     funasr
     paraformer
     sensevoice
+    moss_audio
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
     $<$<BOOL:${WIN32}>:winhttp>
@@ -271,11 +308,60 @@ target_link_libraries(${TARGET} PRIVATE
     $<$<BOOL:${WIN32}>:crypt32>
     $<$<BOOL:${WIN32}>:bcrypt>
     $<$<BOOL:${WIN32}>:iphlpapi>
+    $<$<BOOL:${WIN32}>:shell32>
     $<$<BOOL:${CRISPASR_CURL}>:CURL::libcurl>
 )
 
 if (CRISPASR_CURL)
     target_compile_definitions(${TARGET} PRIVATE CRISPASR_USE_LIBCURL)
+endif()
+
+# Optional outetts backend (source files may not be present in all checkouts)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/crispasr_backend_outetts.cpp")
+    target_sources(${TARGET} PRIVATE crispasr_backend_outetts.cpp)
+    target_link_libraries(${TARGET} PRIVATE outetts)
+    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_OUTETTS=1)
+endif()
+
+# Optional parler-tts backend
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/crispasr_backend_parler.cpp")
+    target_link_libraries(${TARGET} PRIVATE parler-tts)
+endif()
+
+# Optional MP3 output (libmp3lame)
+find_library(LAME_LIBRARY NAMES mp3lame)
+find_path(LAME_INCLUDE_DIR lame/lame.h)
+if (LAME_LIBRARY AND LAME_INCLUDE_DIR)
+    target_link_libraries(${TARGET} PRIVATE ${LAME_LIBRARY})
+    target_include_directories(${TARGET} PRIVATE ${LAME_INCLUDE_DIR})
+    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_LAME=1)
+    message(STATUS "MP3 output enabled (libmp3lame)")
+else()
+    message(STATUS "MP3 output disabled (libmp3lame-dev not found)")
+endif()
+
+# Optional Opus output (libopus + libogg for OGG container)
+find_library(OPUS_LIBRARY NAMES opus)
+find_path(OPUS_INCLUDE_DIR opus/opus.h)
+if (OPUS_LIBRARY AND OPUS_INCLUDE_DIR)
+    target_link_libraries(${TARGET} PRIVATE ${OPUS_LIBRARY})
+    target_include_directories(${TARGET} PRIVATE ${OPUS_INCLUDE_DIR})
+    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_OPUS=1)
+    message(STATUS "Opus output enabled (libopus)")
+else()
+    message(STATUS "Opus output disabled (libopus-dev not found)")
+endif()
+
+# Optional C2PA Content Credentials signing (c2pa-c library)
+find_library(C2PA_LIBRARY NAMES c2pa)
+find_path(C2PA_INCLUDE_DIR NAMES c2pa.h c2pa/c2pa.h)
+if (C2PA_LIBRARY AND C2PA_INCLUDE_DIR)
+    target_link_libraries(${TARGET} PRIVATE ${C2PA_LIBRARY})
+    target_include_directories(${TARGET} PRIVATE ${C2PA_INCLUDE_DIR})
+    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_C2PA=1)
+    message(STATUS "C2PA signing enabled (c2pa-c)")
+else()
+    message(STATUS "C2PA signing disabled (c2pa-c not found; install from github.com/contentauth/c2pa-c)")
 endif()
 
 install(TARGETS ${TARGET} RUNTIME BUNDLE DESTINATION bin)
@@ -293,7 +379,7 @@ add_executable(crispasr-chat
 )
 target_include_directories(crispasr-chat PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(crispasr-chat PRIVATE
-    crispasr
+    crispasr-lib
     ${CMAKE_THREAD_LIBS_INIT}
 )
 include(DefaultTargetOptions)

@@ -17,7 +17,8 @@ struct Entry {
     const char* approx_size;
     const char* companion_file; // optional extra file (e.g. tokenizer.bin, primary voice). NULL if none.
     const char* companion_url;
-    const char* license; // NULL = permissive (MIT/Apache/etc.), non-NULL = printed to stderr on download
+    const char* companion_size; // size of the companion file; NULL = falls back to approx_size
+    const char* license;        // NULL = permissive (MIT/Apache/etc.), non-NULL = printed to stderr on download
 };
 
 // Extra companion files beyond the single inline `companion_file/url` slot.
@@ -45,6 +46,29 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF/resolve/main/parakeet-tdt-0.6b-v3-q4_k.gguf", "~467 MB", nullptr, nullptr},
     {"canary", "canary-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/canary-1b-v2-GGUF/resolve/main/canary-1b-v2-q4_k.gguf", "~600 MB", nullptr, nullptr},
+    // LiquidAI LFM2.5-Audio-1.5B: FastConformer + LFM2 hybrid
+    // conv+attention backbone. ASR (+ TTS/speech-to-speech planned).
+    // English base model — Q5_K recommended (Q4_K too aggressive for EN).
+    {"lfm2-audio", "lfm2-audio-1.5b-q5_k.gguf",
+     "https://huggingface.co/cstr/lfm2-audio-1.5b-GGUF/resolve/main/lfm2-audio-1.5b-q5_k.gguf",
+     "~1.6 GB", nullptr, nullptr, nullptr,
+     "LFM Open License v1.0 (commercial use OK under $10M revenue; see "
+     "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B)"},
+    // Japanese variant — Q4_K is safe for Japanese.
+    {"lfm2-audio", "lfm2-audio-1.5b-jp-q4_k.gguf",
+     "https://huggingface.co/cstr/lfm2-audio-1.5b-jp-GGUF/resolve/main/lfm2-audio-1.5b-jp-q4_k.gguf",
+     "~1.5 GB", nullptr, nullptr, nullptr,
+     "LFM Open License v1.0 (commercial use OK under $10M revenue; see "
+     "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP)"},
+    // gpt-omni/mini-omni2: Whisper-small + Qwen2-0.5B multimodal (ASR+TTS+S2S).
+    // Q4_K is safe — identical ASR transcript to F16 on JFK 11s.
+    // SNAC 24kHz codec companion for TTS/S2S output.
+    {"mini-omni2", "mini-omni2-q4_k.gguf",
+     "https://huggingface.co/cstr/mini-omni2-GGUF/resolve/main/mini-omni2-q4_k.gguf",
+     "~1.0 GB",
+     "snac-24khz.gguf",
+     "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf",
+     "~80 MB"},
     {"voxtral", "voxtral-mini-3b-2507-q4_k.gguf",
      "https://huggingface.co/cstr/voxtral-mini-3b-2507-GGUF/resolve/main/voxtral-mini-3b-2507-q4_k.gguf", "~2.5 GB", nullptr, nullptr},
     {"voxtral4b", "voxtral-mini-4b-realtime-q4_k.gguf",
@@ -77,9 +101,14 @@ constexpr Entry k_registry[] = {
     // Apache-2.0; weights are FunASR Model License v1.1 (Alibaba) —
     // commercial use OK with attribution, so the license field below
     // is set so the cache layer prints it to stderr on first download.
-    {"funasr", "funasr-nano-2512-f16.gguf",
-     "https://huggingface.co/cstr/funasr-nano-GGUF/resolve/main/funasr-nano-2512-f16.gguf",
-     "~1.98 GB", nullptr, nullptr,
+    {"funasr", "funasr-nano-2512-q8_0.gguf",
+     "https://huggingface.co/cstr/funasr-nano-GGUF/resolve/main/funasr-nano-2512-q8_0.gguf",
+     "~1.06 GB", nullptr, nullptr, nullptr,
+     // Default is Q8_0, not F16: the F16 weights hit the CUDA F16×F32 matmul
+     // saturation bug (issue #38 CUDA counterpart) and degenerate into a
+     // single-token "!-loop" on GPU. Q8_0 takes the MMQ/MMVQ path (per-block
+     // scales, F32-range activations) so it's correct on CUDA too, and it's
+     // ~half the download. Q8_0 is byte-identical to F16 on CPU/Metal.
      "FunASR Model License v1.1 (commercial use OK with attribution; see "
      "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512/blob/main/LICENSE)"},
     // Multilingual sibling — same architecture, 31 languages including
@@ -89,7 +118,7 @@ constexpr Entry k_registry[] = {
     // Persian, Danish, Hungarian, Macedonian, Russian.
     {"fun-asr-mlt-nano", "funasr-mlt-nano-2512-f16.gguf",
      "https://huggingface.co/cstr/funasr-mlt-nano-GGUF/resolve/main/funasr-mlt-nano-2512-f16.gguf",
-     "~1.98 GB", nullptr, nullptr,
+     "~1.98 GB", nullptr, nullptr, nullptr,
      "FunASR Model License v1.1 (commercial use OK with attribution; see "
      "https://huggingface.co/FunAudioLLM/Fun-ASR-MLT-Nano-2512/blob/main/LICENSE)"},
     // FunAudioLLM/SenseVoiceSmall: encoder-only multi-task ASR — same
@@ -102,7 +131,7 @@ constexpr Entry k_registry[] = {
     // (JSUT) clips on M1 Metal.
     {"sensevoice", "sensevoice-small-q4_k.gguf",
      "https://huggingface.co/cstr/sensevoice-small-GGUF/resolve/main/sensevoice-small-q4_k.gguf",
-     "~129 MB", nullptr, nullptr,
+     "~129 MB", nullptr, nullptr, nullptr,
      "FunASR Model License v1.1 (commercial use OK with attribution; see "
      "https://huggingface.co/FunAudioLLM/SenseVoiceSmall/blob/main/LICENSE)"},
     // F16 + Q8_0 lookups by canonical filename (auto-download resolver
@@ -110,33 +139,50 @@ constexpr Entry k_registry[] = {
     // -m auto:variant).
     {"sensevoice", "sensevoice-small-f16.gguf",
      "https://huggingface.co/cstr/sensevoice-small-GGUF/resolve/main/sensevoice-small-f16.gguf",
-     "~448 MB", nullptr, nullptr,
+     "~448 MB", nullptr, nullptr, nullptr,
      "FunASR Model License v1.1 (commercial use OK with attribution; see "
      "https://huggingface.co/FunAudioLLM/SenseVoiceSmall/blob/main/LICENSE)"},
     {"sensevoice", "sensevoice-small-q8_0.gguf",
      "https://huggingface.co/cstr/sensevoice-small-GGUF/resolve/main/sensevoice-small-q8_0.gguf",
-     "~240 MB", nullptr, nullptr,
+     "~240 MB", nullptr, nullptr, nullptr,
      "FunASR Model License v1.1 (commercial use OK with attribution; see "
      "https://huggingface.co/FunAudioLLM/SenseVoiceSmall/blob/main/LICENSE)"},
     // Paraformer-zh: NAR-ASR, 220M params, zh+en character-level.
     // Q4_K default — byte-identical transcript to F16, 3.4× smaller.
     {"paraformer", "paraformer-zh-q4_k.gguf",
      "https://huggingface.co/cstr/paraformer-zh-GGUF/resolve/main/paraformer-zh-q4_k.gguf",
-     "~123 MB", nullptr, nullptr,
+     "~123 MB", nullptr, nullptr, nullptr,
      "FunASR Model License (commercial use OK with attribution; see "
      "https://huggingface.co/funasr/paraformer-zh)"},
     {"paraformer", "paraformer-zh-f16.gguf",
      "https://huggingface.co/cstr/paraformer-zh-GGUF/resolve/main/paraformer-zh-f16.gguf",
-     "~421 MB", nullptr, nullptr,
+     "~421 MB", nullptr, nullptr, nullptr,
      "FunASR Model License (commercial use OK with attribution; see "
      "https://huggingface.co/funasr/paraformer-zh)"},
     {"paraformer", "paraformer-zh-q8_0.gguf",
      "https://huggingface.co/cstr/paraformer-zh-GGUF/resolve/main/paraformer-zh-q8_0.gguf",
-     "~227 MB", nullptr, nullptr,
+     "~227 MB", nullptr, nullptr, nullptr,
      "FunASR Model License (commercial use OK with attribution; see "
      "https://huggingface.co/funasr/paraformer-zh)"},
     {"cohere", "cohere-transcribe-q4_k.gguf",
      "https://huggingface.co/cstr/cohere-transcribe-03-2026-GGUF/resolve/main/cohere-transcribe-q4_k.gguf", "~550 MB", nullptr, nullptr},
+    // cohere-asr-ja — Japanese fine-tune of CohereLabs/cohere-transcribe-03-2026
+    // (efwkjn/cohere-asr-ja → CKHO GGUF conversion). Apache-2.0.
+    // Replaces v0.1 as the recommended JA variant per issue #127.
+    {"cohere", "cohere-asr-ja-q4_k.gguf",
+     "https://huggingface.co/CKHO/cohere-asr-ja-GGUF/resolve/main/cohere-asr-ja-q4_k.gguf",
+     "~1.5 GB", nullptr, nullptr},
+    {"cohere", "cohere-asr-ja-q8_0.gguf",
+     "https://huggingface.co/CKHO/cohere-asr-ja-GGUF/resolve/main/cohere-asr-ja-q8_0.gguf",
+     "~2.4 GB", nullptr, nullptr},
+    // cohere-asr-ja-v0.1 — older JA fine-tune (TransWithAI, issue #123).
+    // Kept for backwards compat; users with cached v0.1 GGUFs still work.
+    {"cohere", "cohere-asr-ja-v0.1-q4_k.gguf",
+     "https://huggingface.co/TransWithAI/cohere-transcribe-ja-v0.1-GGUF/resolve/main/cohere-asr-ja-v0.1-q4_k.gguf",
+     "~1.5 GB", nullptr, nullptr},
+    {"cohere", "cohere-asr-ja-v0.1-q8_0.gguf",
+     "https://huggingface.co/TransWithAI/cohere-transcribe-ja-v0.1-GGUF/resolve/main/cohere-asr-ja-v0.1-q8_0.gguf",
+     "~2.4 GB", nullptr, nullptr},
     {"wav2vec2", "wav2vec2-xlsr-en-q4_k.gguf",
      "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-english-GGUF/resolve/main/wav2vec2-xlsr-en-q4_k.gguf",
      "~212 MB", nullptr, nullptr},
@@ -180,9 +226,17 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/wav2vec2-xls-r-300m-cs-250-GGUF/resolve/main/wav2vec2-xls-r-300m-cs-250-q4_k.gguf",
      "~300 MB", nullptr, nullptr},
     {"mimo-asr", "mimo-asr-q4_k.gguf",
-     "https://huggingface.co/cstr/mimo-asr-GGUF/resolve/main/mimo-asr-q4_k.gguf", "~4.2 GB", nullptr, nullptr},
+     "https://huggingface.co/cstr/mimo-asr-GGUF/resolve/main/mimo-asr-q4_k.gguf", "~4.2 GB",
+     "mimo-tokenizer-q4_k.gguf",
+     "https://huggingface.co/cstr/mimo-tokenizer-GGUF/resolve/main/mimo-tokenizer-q4_k.gguf",
+     "~395 MB"},
+    {"moss-audio", "moss-audio-4b-instruct-q4_k.gguf",
+     "https://huggingface.co/cstr/MOSS-Audio-4B-Instruct-GGUF/resolve/main/moss-audio-4b-instruct-q4_k.gguf", "~3.8 GB",
+     nullptr, nullptr},
     {"omniasr", "omniasr-ctc-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/omniASR-CTC-1B-v2-GGUF/resolve/main/omniasr-ctc-1b-v2-q4_k.gguf", "~658 MB", nullptr, nullptr},
+    {"omniasr-300m", "omniasr-ctc-300m-v2-q4_k.gguf",
+     "https://huggingface.co/cstr/omniASR-CTC-300M-v2-GGUF/resolve/main/omniasr-ctc-300m-v2-q4_k.gguf", "~194 MB", nullptr, nullptr},
     {"omniasr-llm", "omniasr-llm-300m-v2-q4_k.gguf",
      "https://huggingface.co/cstr/omniasr-llm-300m-v2-GGUF/resolve/main/omniasr-llm-300m-v2-q4_k.gguf", "~1019 MB", nullptr, nullptr},
     {"omniasr-llm-1b", "omniasr-llm-1b-q4_k.gguf",
@@ -200,7 +254,11 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/vibevoice-realtime-0.5b-GGUF/resolve/main/vibevoice-realtime-0.5b-q4_k.gguf",
      "~636 MB",
      "vibevoice-voice-emma.gguf",
-     "https://huggingface.co/cstr/vibevoice-realtime-0.5b-GGUF/resolve/main/vibevoice-voice-emma.gguf"},
+     "https://huggingface.co/cstr/vibevoice-realtime-0.5b-GGUF/resolve/main/vibevoice-voice-emma.gguf",
+     "~3 MB"},
+    {"kugelaudio", "kugelaudio-0-open-f16.gguf",
+     "https://huggingface.co/cstr/kugelaudio-0-open-GGUF/resolve/main/kugelaudio-0-open-f16.gguf", "~14 GB", nullptr,
+     nullptr},
     {"firered-asr", "firered-asr2-aed-q4_k.gguf",
      "https://huggingface.co/cstr/firered-asr2-aed-GGUF/resolve/main/firered-asr2-aed-q4_k.gguf", "~918 MB", nullptr, nullptr},
     {"kyutai-stt", "kyutai-stt-1b-q4_k.gguf",
@@ -209,19 +267,20 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/glm-asr-nano-GGUF/resolve/main/glm-asr-nano-q4_k.gguf", "~1.2 GB", nullptr, nullptr},
     {"moonshine", "moonshine-tiny-q4_k.gguf",
      "https://huggingface.co/cstr/moonshine-tiny-GGUF/resolve/main/moonshine-tiny-q4_k.gguf", "~20 MB",
-     "tokenizer.bin", "https://huggingface.co/cstr/moonshine-tiny-GGUF/resolve/main/tokenizer.bin"},
+     "tokenizer.bin", "https://huggingface.co/cstr/moonshine-tiny-GGUF/resolve/main/tokenizer.bin",
+     "~2 MB"},
     // moonshine-de: fidoriel/moonshine-base-de fine-tune (61.5M, 6.9% WER
     // on CV22-de). Best quality German moonshine. CC-BY-NC-SA-4.0.
     {"moonshine-de", "moonshine-base-de-fidoriel-q4_k.gguf",
      "https://huggingface.co/cstr/moonshine-base-de-fidoriel-GGUF/resolve/main/moonshine-base-de-fidoriel-q4_k.gguf", "~39 MB",
      "tokenizer.bin", "https://huggingface.co/cstr/moonshine-base-de-fidoriel-GGUF/resolve/main/tokenizer.bin",
-     "CC-BY-NC-SA-4.0"},
+     "~2 MB", "CC-BY-NC-SA-4.0"},
     // moonshine-tiny-de: fidoriel/moonshine-tiny-de fine-tune (27M, 11.4%
     // WER on CV22-de). Smaller/faster alternative. CC-BY-NC-SA-4.0.
     {"moonshine-tiny-de", "moonshine-tiny-de-fidoriel-q4_k.gguf",
      "https://huggingface.co/cstr/moonshine-tiny-de-fidoriel-GGUF/resolve/main/moonshine-tiny-de-fidoriel-q4_k.gguf", "~17 MB",
      "tokenizer.bin", "https://huggingface.co/cstr/moonshine-tiny-de-fidoriel-GGUF/resolve/main/tokenizer.bin",
-     "CC-BY-NC-SA-4.0"},
+     "~2 MB", "CC-BY-NC-SA-4.0"},
     {"wav2vec2-de", "wav2vec2-large-xlsr-53-german-q4_k.gguf",
      "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-german-GGUF/resolve/main/wav2vec2-large-xlsr-53-german-q4_k.gguf",
      "~222 MB", nullptr, nullptr},
@@ -230,7 +289,8 @@ constexpr Entry k_registry[] = {
      "~222 MB", nullptr, nullptr},
     {"moonshine-streaming", "moonshine-streaming-tiny-q4_k.gguf",
      "https://huggingface.co/cstr/moonshine-streaming-tiny-GGUF/resolve/main/moonshine-streaming-tiny-q4_k.gguf", "~31 MB",
-     "tokenizer.bin", "https://huggingface.co/cstr/moonshine-streaming-tiny-GGUF/resolve/main/tokenizer.bin"},
+     "tokenizer.bin", "https://huggingface.co/cstr/moonshine-streaming-tiny-GGUF/resolve/main/tokenizer.bin",
+     "~2 MB"},
     {"fastconformer-ctc", "stt-en-fastconformer-ctc-large-q4_k.gguf",
      "https://huggingface.co/cstr/stt-en-fastconformer-ctc-large-GGUF/resolve/main/stt-en-fastconformer-ctc-large-q4_k.gguf",
      "~83 MB", nullptr, nullptr},
@@ -306,7 +366,18 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/qwen3-tts-0.6b-base-GGUF/resolve/main/qwen3-tts-12hz-0.6b-base-q8_0.gguf",
      "~986 MB",
      "qwen3-tts-tokenizer-12hz.gguf",
-     "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf"},
+     "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf",
+     "~60 MB"},
+    // gwen-tts-0.6B: Vietnamese-optimized Qwen3-TTS-0.6B-Base finetune
+    // (MIT, g-group-ai-lab). Same architecture as qwen3-tts-0.6B-Base,
+    // trained on ~1000h Vietnamese TikTok audio. Supports all 10 Qwen3-TTS
+    // languages but excels at Vietnamese. Uses the same 12 Hz tokenizer.
+    {"gwen-tts", "gwen-tts-0.6b-q8_0.gguf",
+     "https://huggingface.co/cstr/gwen-tts-0.6b-GGUF/resolve/main/gwen-tts-0.6b-q8_0.gguf",
+     "~968 MB",
+     "qwen3-tts-tokenizer-12hz.gguf",
+     "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf",
+     "~60 MB"},
     // Qwen3-TTS-CustomVoice: fixed-speaker fine-tune of qwen3-tts-Base
     // with 9 baked speakers (aiden, dylan, eric, ono_anna, ryan, serena,
     // sohee, uncle_fu, vivian). Runtime path: pick a speaker via
@@ -319,7 +390,8 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/qwen3-tts-0.6b-customvoice-GGUF/resolve/main/qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf",
      "~968 MB",
      "qwen3-tts-tokenizer-12hz.gguf",
-     "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf"},
+     "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf",
+     "~60 MB"},
     // Qwen3-TTS-Base 1.7B: same ICL voice-clone path as 0.6B-Base
     // (`--voice <wav> --ref-text "..."`), with talker hidden=2048,
     // ECAPA enc_dim=2048, and a small_to_mtp_projection bridge to the
@@ -329,7 +401,8 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/qwen3-tts-1.7b-base-GGUF/resolve/main/qwen3-tts-12hz-1.7b-base-q8_0.gguf",
      "~1.9 GB",
      "qwen3-tts-tokenizer-12hz.gguf",
-     "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf"},
+     "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf",
+     "~60 MB"},
     // Qwen3-TTS-CustomVoice 1.7B: same fixed-speaker pattern as 0.6B-CV
     // (9 baked speakers, `--voice <name>`, no ECAPA / no reference WAV)
     // but on the 1.7B talker. Runtime applies small_to_mtp_projection
@@ -341,7 +414,8 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/qwen3-tts-1.7b-customvoice-GGUF/resolve/main/qwen3-tts-12hz-1.7b-customvoice-q8_0.gguf",
      "~2.0 GB",
      "qwen3-tts-tokenizer-12hz.gguf",
-     "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf"},
+     "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf",
+     "~60 MB"},
     // Qwen3-TTS-VoiceDesign 1.7B: instruct-tuned variant that picks a
     // voice from a natural-language description ("--instruct \"young
     // female with British accent, energetic\"") — no reference WAV,
@@ -352,7 +426,8 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/qwen3-tts-1.7b-voicedesign-GGUF/resolve/main/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf",
      "~1.9 GB",
      "qwen3-tts-tokenizer-12hz.gguf",
-     "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf"},
+     "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf",
+     "~60 MB"},
     // Orpheus-3B (canopylabs/orpheus-3b-0.1-ft is gated; we convert
     // from the non-gated mirror unsloth/orpheus-3b-0.1-ft, llama3.2 —
     // "Built with Llama"). Talker = Llama-3.2-3B-Instruct + 7×4096
@@ -367,7 +442,15 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/orpheus-3b-base-GGUF/resolve/main/orpheus-3b-base-q8_0.gguf",
      "~3.5 GB",
      "snac-24khz.gguf",
-     "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf"},
+     "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf",
+     "~80 MB"},
+    // TADA-3B-ML (HumeAI/tada-3b-ml): Llama-3.2-3B + flow matching + TADA codec.
+    {"tada", "tada-tts-3b-ml-f16.gguf",
+     "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/tada-tts-3b-ml-f16.gguf",
+     "~6.6 GB",
+     "tada-codec-f16.gguf",
+     "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/tada-codec-f16.gguf",
+     "~1 GB"},
     // lex-au's German Orpheus-3B fine-tune. Already published as a Q8_0
     // GGUF on HF (`lex-au/Orpheus-3b-German-FT-Q8_0.gguf`, 3.52 GB) — the
     // repo name itself ends in `.gguf`, lex-au's convention. License
@@ -378,7 +461,8 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/lex-au/Orpheus-3b-German-FT-Q8_0.gguf/resolve/main/Orpheus-3b-German-FT-Q8_0.gguf",
      "~3.5 GB",
      "snac-24khz.gguf",
-     "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf"},
+     "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf",
+     "~80 MB"},
     // Kartoffel-Orpheus 3B German variants — drop-in checkpoint swaps on the
     // Orpheus runtime. The natural variant is fine-tuned on natural German
     // speech (~19 speakers); the synthetic variant adds emotion + outburst
@@ -390,12 +474,14 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/kartoffel-orpheus-3b-german-natural-GGUF/resolve/main/kartoffel-orpheus-de-natural-q8_0.gguf",
      "~3.5 GB",
      "snac-24khz.gguf",
-     "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf"},
+     "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf",
+     "~80 MB"},
     {"kartoffel-orpheus-de-synthetic", "kartoffel-orpheus-de-synthetic-q8_0.gguf",
      "https://huggingface.co/cstr/kartoffel-orpheus-3b-german-synthetic-GGUF/resolve/main/kartoffel-orpheus-de-synthetic-q8_0.gguf",
      "~3.5 GB",
      "snac-24khz.gguf",
-     "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf"},
+     "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf",
+     "~80 MB"},
     // Chatterbox family — ResembleAI MIT TTS. Two-GGUF runtime:
     //   primary  = T3 (text → speech tokens) — also carries baked conds
     //   companion = S3Gen (tokens → 24 kHz waveform via CFM + HiFTGenerator)
@@ -410,7 +496,8 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/chatterbox-GGUF/resolve/main/chatterbox-t3-q8_0.gguf",
      "~880 MB",
      "chatterbox-s3gen-q8_0.gguf",
-     "https://huggingface.co/cstr/chatterbox-GGUF/resolve/main/chatterbox-s3gen-q8_0.gguf"},
+     "https://huggingface.co/cstr/chatterbox-GGUF/resolve/main/chatterbox-s3gen-q8_0.gguf",
+     "~627 MB"},
     // Chatterbox-Turbo: distilled GPT-2 T3 (24L) + 2-step meanflow S3Gen.
     // Different architecture from base — runtime keys off
     // `chatterbox.t3.arch` ("kartoffelbox" branch handles GPT-2 T3 for
@@ -421,7 +508,8 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/chatterbox-turbo-GGUF/resolve/main/chatterbox-turbo-t3-q8_0.gguf",
      "~980 MB",
      "chatterbox-turbo-s3gen-q8_0.gguf",
-     "https://huggingface.co/cstr/chatterbox-turbo-GGUF/resolve/main/chatterbox-turbo-s3gen-q8_0.gguf"},
+     "https://huggingface.co/cstr/chatterbox-turbo-GGUF/resolve/main/chatterbox-turbo-s3gen-q8_0.gguf",
+     "~627 MB"},
     // Kartoffelbox-Turbo: SebastianBodza's German fine-tune of
     // chatterbox-turbo. Same GPT-2 T3 arch as Turbo; reuses the
     // chatterbox-turbo S3Gen verbatim (companion points at the Turbo
@@ -431,7 +519,8 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/kartoffelbox-turbo-GGUF/resolve/main/kartoffelbox-turbo-t3-q8_0.gguf",
      "~1.25 GB",
      "chatterbox-turbo-s3gen-f16.gguf",
-     "https://huggingface.co/cstr/chatterbox-turbo-GGUF/resolve/main/chatterbox-turbo-s3gen-f16.gguf"},
+     "https://huggingface.co/cstr/chatterbox-turbo-GGUF/resolve/main/chatterbox-turbo-s3gen-f16.gguf",
+     "~627 MB"},
     // Lahgtna-chatterbox-v1: oddadmix's Arabic T3 fine-tune of base
     // ResembleAI/chatterbox. Shares the base Llama T3 architecture
     // (default converter path, no `--variant`); reuses the base S3Gen
@@ -441,7 +530,30 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/lahgtna-chatterbox-v1-GGUF/resolve/main/chatterbox-t3-f16.gguf",
      "~1.4 GB",
      "chatterbox-s3gen-q8_0.gguf",
-     "https://huggingface.co/cstr/chatterbox-GGUF/resolve/main/chatterbox-s3gen-q8_0.gguf"},
+     "https://huggingface.co/cstr/chatterbox-GGUF/resolve/main/chatterbox-s3gen-q8_0.gguf",
+     "~627 MB"},
+    // Nari Labs Dia-1.6B (nari-labs/Dia-1.6B): byte-level text encoder (12L) +
+    // AR audio decoder (18L, GQA 16q/4kv, classifier-free guidance) emitting 9
+    // interleaved DAC codebooks under a delay pattern, decoded by a 44.1 kHz DAC
+    // codec companion. Surfaces as `--backend dia` with CAP_TTS + AUTO_DOWNLOAD +
+    // TEMPERATURE. Dialogue style with [S1]/[S2] speaker tags; use >100-char
+    // prompts — Dia is inconsistent on very short inputs. Ships F16 only for now
+    // (scale=1.0 attention is precision-sensitive; lower-bit quants need an
+    // ASR-roundtrip check before release). The DAC companion is quant-agnostic.
+    {"dia", "dia-1.6b-f16.gguf",
+     "https://huggingface.co/cstr/dia-1.6b-GGUF/resolve/main/dia-1.6b-f16.gguf",
+     "~3.0 GB",
+     "dac-44khz.gguf",
+     "https://huggingface.co/cstr/dia-1.6b-GGUF/resolve/main/dac-44khz.gguf",
+     "~80 MB"},
+    // Pocket TTS: Kyutai's 100M continuous-latent AR TTS (24 kHz, MIT/CC-BY-4.0).
+    // Generates continuous 32-dim float vectors at 12.5 Hz via one-step LSD,
+    // decoded by Mimi VAE to 24 kHz PCM. Single GGUF, no codec companion.
+    // Voice cloning via --voice ref.wav (requires the -f16 variant with Mimi encoder).
+    // The -novc variant lacks the encoder and produces near-silence without conditioning.
+    {"pocket-tts", "pocket-tts-english-f16.gguf",
+     "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-english-f16.gguf",
+     "~220 MB"},
     // IndexTTS-1.5: GPT-2 AR mel-code generator + BigVGAN vocoder.
     // Voice cloning via Conformer+Perceiver conditioning on reference audio.
     // Two-file setup: GPT (mel codes) + BigVGAN (vocoder). Q8_0 recommended
@@ -450,7 +562,25 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/indextts-1.5-GGUF/resolve/main/indextts-gpt-q8_0.gguf",
      "~870 MB",
      "indextts-bigvgan.gguf",
-     "https://huggingface.co/cstr/indextts-1.5-GGUF/resolve/main/indextts-bigvgan.gguf"},
+     "https://huggingface.co/cstr/indextts-1.5-GGUF/resolve/main/indextts-bigvgan.gguf",
+     "~112 MB"},
+    // OuteTTS 0.3 1B: OLMo-1B LLM + WavTokenizer single-codebook VQ-GAN.
+    // 24 kHz output, CC BY 4.0 license. Voice cloning via --voice <speaker.json>.
+    // Two-file setup: OLMo talker (Q8_0, ~1.3 GB) + WavTokenizer decoder (~130 MB).
+    // Also available: F16 (~2.4 GB), Q5_K (~820 MB). Q8_0 recommended.
+    {"outetts", "outetts-0.3-1b-q8_0.gguf",
+     "https://huggingface.co/cstr/outetts-0.3-1b-GGUF/resolve/main/outetts-0.3-1b-q8_0.gguf",
+     "~1270 MB",
+     "wavtokenizer-decoder-f16.gguf",
+     "https://huggingface.co/cstr/outetts-0.3-1b-GGUF/resolve/main/wavtokenizer-decoder-f16.gguf",
+     "~130 MB"},
+    // F5-TTS v1 Base: DiT-based flow-matching TTS with zero-shot voice
+    // cloning. Single GGUF containing DiT (330M) + Vocos vocoder (13M).
+    // Character-level tokenization (2545 vocab), 24 kHz output.
+    // Voice cloning via --voice <ref.wav> --ref-text "transcript".
+    {"f5-tts", "f5-tts-v1-base-f16.gguf",
+     "https://huggingface.co/cstr/f5-tts-GGUF/resolve/main/f5-tts-v1-base-f16.gguf",
+     "~953 MB", nullptr, nullptr},
     // CTC forced aligner — used by `-am auto` to attach word-level
     // timestamps (LLM-decode backends, or any backend when paired
     // with `--force-aligner` / `-fa`). Q4_K is the recommended quant
@@ -500,7 +630,61 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/kokoro-82m-GGUF/resolve/main/kokoro-82m-q8_0.gguf",
      "~135 MB",
      "kokoro-voice-af_heart.gguf",
-     "https://huggingface.co/cstr/kokoro-voices-GGUF/resolve/main/kokoro-voice-af_heart.gguf"},
+     "https://huggingface.co/cstr/kokoro-voices-GGUF/resolve/main/kokoro-voice-af_heart.gguf",
+     "~4 MB"},
+
+    // Piper — rhasspy/piper VITS TTS. 250+ community voices, 30+ languages.
+    // Default voice: en_US-lessac-medium (~16 MB F16).
+    {"piper", "piper-en_US-lessac-medium-f16.gguf",
+     "https://huggingface.co/cstr/piper-en_US-lessac-medium-GGUF/resolve/main/piper-en_US-lessac-medium-f16.gguf",
+     "~16 MB", nullptr, nullptr},
+
+    // Bark — suno/bark 3-stage hierarchical TTS (MIT). bark-small ~300M params,
+    // 24 kHz, 10 German speakers (v2/de_speaker_0..9). Single GGUF packs all
+    // 3 sub-models (semantic + coarse + fine GPT-2) + EnCodec decoder.
+    {"bark", "bark-small-q8_0.gguf",
+     "https://huggingface.co/cstr/bark-small-GGUF/resolve/main/bark-small-q8_0.gguf",
+     "~500 MB", nullptr, nullptr},
+
+    // CSM-1B — sesame/csm-1b conversational TTS (Apache 2.0). Llama-3.2 1B
+    // backbone + 100M depth decoder + Kyutai Mimi codec, all in one GGUF.
+    // 24 kHz. Default Q4_K (1.4 GB); F16 + Q8_0 on the same repo.
+    {"csm", "csm-1b-q4_k.gguf",
+     "https://huggingface.co/cstr/csm-1b-GGUF/resolve/main/csm-1b-q4_k.gguf",
+     "~1.4 GB", nullptr, nullptr},
+
+    // MeloTTS: VITS2 52M param TTS (myshell-ai/MeloTTS). 44.1 kHz mono.
+    // MIT license. Single GGUF with embedded CMU dictionary + neural G2P.
+    // V2: 4 English speakers (US/BR/India/AU), 112 symbols, 11 tones.
+    // V3: 1 speaker (EN-Newest), 219 symbols, 16 tones (newest checkpoint).
+    // Companion: bert-base-uncased Q4_K (52 MB) for BERT conditioning.
+    // Also available: F16 (227 MB), Q8_0 (97 MB) on the same HF repo.
+    {"melotts", "melotts-en-v2-f16.gguf",
+     "https://huggingface.co/cstr/melotts-en-v2-GGUF/resolve/main/melotts-en-v2-f16.gguf",
+     "~102+52 MB",
+     "bert-base-uncased-q4k.gguf",
+     "https://huggingface.co/cstr/melotts-en-v2-GGUF/resolve/main/bert-base-uncased-q4k.gguf",
+     "~52 MB"},
+    {"melotts-v3", "melotts-en-v3-f16.gguf",
+     "https://huggingface.co/cstr/melotts-en-v3-GGUF/resolve/main/melotts-en-v3-f16.gguf",
+     "~93+52 MB",
+     "bert-base-uncased.gguf",
+     "https://huggingface.co/cstr/melotts-en-v3-GGUF/resolve/main/bert-base-uncased.gguf",
+     "~420 MB"},
+
+    // SpeechT5 TTS: 80M param AR mel decoder + HiFi-GAN vocoder.
+    // MIT license (microsoft/speecht5_tts). Needs a 512-d x-vector for
+    // speaker conditioning; pass via --voice <xvector.bin> or set_voice().
+    {"speecht5", "speecht5-tts-f16.gguf",
+     "https://huggingface.co/cstr/speecht5-tts-GGUF/resolve/main/speecht5-tts-f16.gguf",
+     "~300 MB", nullptr, nullptr},
+
+    // Parler TTS Mini v1.1: prompt-conditioned TTS (~900M). T5 encoder +
+    // MusicGen decoder + DAC 44.1 kHz codec. Describe the voice in text
+    // via --instruct. Apache-2.0.
+    {"parler-tts", "parler-mini-v1.1-q8_0.gguf",
+     "https://huggingface.co/cstr/parler-tts-mini-v1.1-GGUF/resolve/main/parler-mini-v1.1-q8_0.gguf",
+     "~900 MB", nullptr, nullptr},
 
     // Text-LID — three families, one auto-routing dispatcher
     // (`src/text_lid_dispatch.cpp`). `lid-cld3` is the default for
@@ -544,6 +728,59 @@ constexpr Entry k_registry[] = {
     {"voxcpm2-tts", "voxcpm2-q4_k.gguf",
      "https://huggingface.co/cstr/voxcpm2-GGUF/resolve/main/voxcpm2-q4_k.gguf",
      "~1.6 GB", nullptr, nullptr},
+    // CosyVoice3 0.5B-2512: FunAudioLLM streaming multilingual TTS,
+    // Apache 2.0, 9 languages + 18 Chinese dialects, 24 kHz, zero-shot
+    // voice cloning via baked voices.gguf. Three-stage pipeline (LLM
+    // AR → flow Euler → HiFT vocoder). Default companion bundle:
+    // Q4_K LLM (384 MB) + Q8_0 flow (361 MB) + F16 HiFT (42 MB) +
+    // voices (57 KB) = ~745 MB. F16 reference also on the same repo.
+    {"cosyvoice3-tts", "cosyvoice3-llm-q4_k.gguf",
+     "https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF/resolve/main/cosyvoice3-llm-q4_k.gguf",
+     "~384 MB",
+     "cosyvoice3-flow-q8_0.gguf",
+     "https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF/resolve/main/cosyvoice3-flow-q8_0.gguf",
+     "~361 MB"},
+    // FastPitch: NVIDIA non-autoregressive parallel TTS (single speaker,
+    // English, 22 kHz). ~60M params (FastPitch + HiFi-GAN in one GGUF).
+    // Deterministic — no sampling, same input always produces same output.
+    {"fastpitch", "fastpitch-en-q8_0.gguf",
+     "https://huggingface.co/cstr/fastpitch-en-GGUF/resolve/main/fastpitch-en-q8_0.gguf",
+     "~120 MB", nullptr, nullptr},
+
+    // Truecaser — mayhewsw/pytorch-truecaser ports. BiLSTM is the
+    // recommended variant (97.9% F1 on German). Standalone .bin format
+    // (not GGUF). The `crispasr_truecase_*` C-ABI loads these directly.
+    // Published at cstr/truecaser-de on HuggingFace.
+    {"truecaser-lstm-de", "truecaser-lstm-de.bin",
+     "https://huggingface.co/cstr/truecaser-de/resolve/main/truecaser-lstm-de.bin",
+     "~3 MB", nullptr, nullptr},
+    {"truecaser-lstm-en", "truecaser-lstm-en.bin",
+     "https://huggingface.co/cstr/truecaser-de/resolve/main/truecaser-lstm-en.bin",
+     "~3 MB", nullptr, nullptr},
+    {"truecaser-lstm-es", "truecaser-lstm-es.bin",
+     "https://huggingface.co/cstr/truecaser-de/resolve/main/truecaser-lstm-es.bin",
+     "~3 MB", nullptr, nullptr},
+    {"truecaser-lstm-ru", "truecaser-lstm-ru.bin",
+     "https://huggingface.co/cstr/truecaser-de/resolve/main/truecaser-lstm-ru.bin",
+     "~4 MB", nullptr, nullptr},
+    {"truecaser-crf-de", "truecaser-crf-de.bin",
+     "https://huggingface.co/cstr/truecaser-de/resolve/main/truecaser-crf-de.bin",
+     "~8 MB", nullptr, nullptr},
+    {"truecaser-de", "truecaser-de.bin",
+     "https://huggingface.co/cstr/truecaser-de/resolve/main/truecaser-de.bin",
+     "~2 MB", nullptr, nullptr},
+    // Zonos v0.1 — Zyphra 500M-param transformer TTS with emotion/pitch/rate
+    // control, speaker cloning, 44.1 kHz via DAC codec. Apache 2.0.
+    // Selective Q4_K: heads.*/embeddings.*/prefix_conditioner.* kept at F16
+    // to prevent EOS-logit inflation; backbone projections quantized.
+    // Runtime includes a 3-retry guard for residual step-0 EOS failures.
+    // Companion: DAC 44.1 kHz F16 decoder from its own GGUF repo (MIT).
+    {"zonos", "zonos-v0.1-transformer-q8_0.gguf",
+     "https://huggingface.co/cstr/zonos-v0.1-transformer-GGUF/resolve/main/zonos-v0.1-transformer-q8_0.gguf",
+     "~1.6 GB",
+     "dac-44khz-f16.gguf",
+     "https://huggingface.co/cstr/dac-44khz-GGUF/resolve/main/dac-44khz-f16.gguf",
+     "~104 MB"},
 };
 
 // Multi-companion extras. When a backend needs >1 auxiliary file the
@@ -574,9 +811,26 @@ constexpr ExtraCompanion k_vibevoice_tts_extras[] = {
     {nullptr, nullptr},
 };
 
+// CosyVoice3 needs HiFT + voices in addition to flow (which rides as the
+// inline companion). The CLI auto-discovers them as siblings of the LLM
+// at load time; staging both here makes `-m auto --backend cosyvoice3-tts`
+// pull everything in one go.
+constexpr ExtraCompanion k_cosyvoice3_tts_extras[] = {
+    {"cosyvoice3-campplus-f16.gguf",
+     "https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF/resolve/main/cosyvoice3-campplus-f16.gguf"},
+    {"cosyvoice3-s3tok-f16.gguf",
+     "https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF/resolve/main/cosyvoice3-s3tok-f16.gguf"},
+    {"cosyvoice3-hift-f16.gguf",
+     "https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF/resolve/main/cosyvoice3-hift-f16.gguf"},
+    {"cosyvoice3-voices.gguf",
+     "https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF/resolve/main/cosyvoice3-voices.gguf"},
+    {nullptr, nullptr},
+};
+
 constexpr ExtraList k_extras[] = {
     {"kokoro", k_kokoro_extras},
     {"vibevoice-tts", k_vibevoice_tts_extras},
+    {"cosyvoice3-tts", k_cosyvoice3_tts_extras},
     {nullptr, nullptr},
 };
 // clang-format on
@@ -682,9 +936,11 @@ void fill(CrispasrRegistryEntry& out, const Entry& e, const std::string& preferr
     if (e.companion_file && e.companion_url) {
         out.companion_filename = apply_quant_to_filename(e.companion_file, preferred_quant);
         out.companion_url = replace_tail_filename(e.companion_url, e.companion_file, out.companion_filename);
+        out.companion_approx_size = e.companion_size ? e.companion_size : e.approx_size;
     } else {
         out.companion_filename.clear();
         out.companion_url.clear();
+        out.companion_approx_size.clear();
     }
     out.license = e.license ? e.license : "";
 }
@@ -710,14 +966,20 @@ void download_extras(const Entry& e, bool quiet, const std::string& cache_dir_ov
     }
 }
 
+static bool license_is_nc(const std::string& lic) {
+    return lic.find("NC") != std::string::npos || lic.find("NonCommercial") != std::string::npos;
+}
+
 void print_license_note(const CrispasrRegistryEntry& e, bool quiet) {
     if (!quiet && !e.license.empty()) {
-        // The license string is authoritative — it carries its own
-        // commercial/non-commercial language (e.g. "CC-BY-NC-SA-4.0"
-        // already says NC; FunASR Model License v1.1 says "commercial
-        // OK with attribution"). Don't append a misleading "(non-
-        // commercial)" suffix.
-        fprintf(stderr, "crispasr: note: %s is licensed %s\n", e.filename.c_str(), e.license.c_str());
+        if (license_is_nc(e.license)) {
+            fprintf(stderr,
+                    "crispasr: WARNING: %s is licensed %s — NON-COMMERCIAL USE ONLY.\n"
+                    "  By loading this model you confirm you will not use it for commercial purposes.\n",
+                    e.filename.c_str(), e.license.c_str());
+        } else {
+            fprintf(stderr, "crispasr: note: %s is licensed %s\n", e.filename.c_str(), e.license.c_str());
+        }
     }
 }
 
@@ -749,9 +1011,10 @@ bool crispasr_registry_lookup_by_filename(const std::string& filename, CrispasrR
             out.backend = row.backend;
             out.filename = base;
             out.url = replace_tail_filename(row.companion_url, row.companion_file, base);
-            out.approx_size = row.approx_size;
+            out.approx_size = row.companion_size ? row.companion_size : row.approx_size;
             out.companion_filename.clear();
             out.companion_url.clear();
+            out.companion_approx_size.clear();
             return true;
         }
     }

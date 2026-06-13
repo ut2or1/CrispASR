@@ -16,7 +16,9 @@
 
 #include "canary.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -36,8 +38,8 @@ public:
         // to ~60 s; for longer audio, parakeet_transcribe_streamed-style
         // chunking can be added later if needed).  Issue #89 follow-up.
         return CAP_TIMESTAMPS_NATIVE | CAP_TIMESTAMPS_CTC | CAP_WORD_TIMESTAMPS | CAP_TOKEN_CONFIDENCE | CAP_TRANSLATE |
-               CAP_SRC_TGT_LANGUAGE | CAP_PUNCTUATION_TOGGLE | CAP_FLASH_ATTN | CAP_TEMPERATURE | CAP_DIARIZE |
-               CAP_PARALLEL_PROCESSORS | CAP_AUTO_DOWNLOAD | CAP_UNBOUNDED_INPUT | CAP_INTERNAL_CHUNKING;
+               CAP_SRC_TGT_LANGUAGE | CAP_PUNCTUATION_TOGGLE | CAP_FLASH_ATTN | CAP_TEMPERATURE | CAP_BEAM_SEARCH |
+               CAP_DIARIZE | CAP_PARALLEL_PROCESSORS | CAP_AUTO_DOWNLOAD | CAP_UNBOUNDED_INPUT | CAP_INTERNAL_CHUNKING;
     }
 
     bool init(const whisper_params& p) override {
@@ -72,6 +74,7 @@ public:
 
         // Sticky decode-time sampling controls.
         canary_set_temperature(ctx_, params.temperature, params.seed);
+        canary_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
 
         // Resolve src/tgt language with the fallback chain:
         //   source_lang -> language
@@ -99,8 +102,59 @@ public:
             tgt = params.translate ? std::string("en") : src;
         }
 
+        // Issue #89 / #140: canary-1b-v2 is trained on 25 European
+        // languages (per the NVIDIA model card). The BPE vocab includes
+        // every ISO-639 `<|xx|>` token, but only the 25 below have
+        // training signal — anything else produces hallucinated output.
+        // clang-format off
+        static const char* kSupportedLangs[] = {
+            "en", "bg", "hr", "cs", "da", "nl", "et", "fi", "fr",
+            "de", "el", "hu", "it", "lv", "lt", "mt", "pl", "pt",
+            "ro", "sk", "sl", "es", "sv", "ru", "uk",
+        };
+        // clang-format on
+        auto is_supported = [&](const std::string& lang) {
+            for (const char* s : kSupportedLangs)
+                if (lang == s)
+                    return true;
+            return false;
+        };
+        if (!is_supported(src) || !is_supported(tgt)) {
+            fprintf(stderr,
+                    "canary: src='%s' tgt='%s' — not in canary-1b-v2's "
+                    "trained language set (25 European languages). "
+                    "For Japanese/Mandarin use --backend parakeet; for "
+                    "the broader multilingual set use --backend qwen3 "
+                    "or --backend voxtral.\n",
+                    src.c_str(), tgt.c_str());
+            return out;
+        }
+
+        // PLAN #114 P3 second half: route to canary_transcribe_streamed
+        // for all audio (matches the parakeet backend default). Single-pass
+        // over a long buffer lets the bidirectional Conformer attention
+        // amplify acoustic noise past the ~30 s training window. The
+        // streamed path (per-chunk AED decode with prompt re-injection
+        // + LCS-merge boundary dedup + splice-punctuation cleanup) is
+        // semantically equivalent to single-pass on short audio — JFK
+        // single-pass is "...for you, ask..." and JFK streamed is
+        // "...for you. Ask..." (LCS-dedup correctly converts the
+        // mid-sentence comma to a sentence boundary at the chunk
+        // splice). Set CANARY_STREAM_THRESHOLD_S=N to force single-pass
+        // for inputs ≤ N seconds.
+        int stream_threshold_s = 0;
+        if (const char* e = std::getenv("CANARY_STREAM_THRESHOLD_S")) {
+            stream_threshold_s = std::max(0, atoi(e));
+        }
+        const int stream_chunk_s = 8;
+        const int stream_overlap_s = 2;
+        const bool use_streamed = stream_threshold_s == 0 || n_samples > stream_threshold_s * 16000;
+
         canary_result* r =
-            canary_transcribe_ex(ctx_, samples, n_samples, src.c_str(), tgt.c_str(), params.punctuation, t_offset_cs);
+            use_streamed ? canary_transcribe_streamed(ctx_, samples, n_samples, src.c_str(), tgt.c_str(),
+                                                      params.punctuation, t_offset_cs, stream_chunk_s, stream_overlap_s)
+                         : canary_transcribe_ex(ctx_, samples, n_samples, src.c_str(), tgt.c_str(), params.punctuation,
+                                                t_offset_cs);
         if (!r)
             return out;
 

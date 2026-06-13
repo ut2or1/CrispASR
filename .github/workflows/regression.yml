@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Run driver smoke test
         run: python tests/regression/test_driver_smoke.py
 
@@ -72,7 +72,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Run no-model Python unit tests
         run: |
           python -m pytest tests/test_backend_config.py -v || \
@@ -89,7 +89,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - run: pip install huggingface_hub
       - run: python tests/regression/run_one.py --dry-run
 
@@ -138,23 +138,33 @@ jobs:
           # is hitting HF private-repo storage limit (403). Re-add once the
           # repo is made public or space is freed on the HF account.
           - granite-speech-4.1-2b
+          # Small ASR backends (<1 GB each, fit comfortably on GH free tier)
+          - wav2vec2-xlsr-en
+          - hubert-large
+          - data2vec-base
+          - fastconformer-ctc-large
+          - sensevoice-small
+          - paraformer-zh
           # TTS->ASR roundtrip entries (manifest.tts_backends). Each
           # synthesises a fixed phrase via the TTS backend, transcribes
           # it back with parakeet, and asserts WER under the manifest's
           # wer_max. Catches silent decode regressions the diff harness
           # can miss (e.g. the voxcpm2 BF16 noise bug).
           #
-          # Cheap tier (~600 MB - 1.8 GB download per slot, fits GitHub
-          # free-tier 14 GB runner scratch comfortably):
+          # Cheap tier (<1.5 GB per slot including parakeet):
           - kokoro-82m-en
           - qwen3-tts-0.6b-customvoice-eric
-          # Heavier TTS backends (orpheus 3B at 3.5 GB; vibevoice 7 GB;
-          # qwen3-tts-1.7b 2.4 GB; voxcpm2 ~3 GB) stay manual via
-          # `tools/test-all-backends.py --tts-roundtrip=full`. They
-          # need 4+ GB per slot once you add parakeet on top, and
-          # nightly traffic at that size adds up on free tier.
+          - speecht5-tts-en
+          - piper-lessac-en
+          - pocket-tts-en
+          - bark-small
+          - csm-1b
+          # Heavier TTS backends (orpheus 3B at 3.5 GB; dia 1.6 GB;
+          # parler 1 GB; f5-tts 1 GB; vibevoice 7 GB; voxcpm2 ~3 GB)
+          # stay manual or Kaggle-only. They need 2+ GB per slot once
+          # you add parakeet on top.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install build + runtime deps
         run: |
@@ -186,7 +196,7 @@ jobs:
               -DCRISPASR_BUILD_SERVER=OFF
           # CMake target `crispasr-cli` produces the `bin/crispasr`
           # binary (target name vs output name diverge — see
-          # examples/cli/CMakeLists.txt). Asking for target `crispasr`
+          # examples/cli/CMakeLists.txt). Asking for target `crispasr-lib`
           # would build just the library, leaving bin/crispasr absent.
           #
           # Also build crispasr-diff unconditionally — the binary is

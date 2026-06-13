@@ -13,6 +13,7 @@
 #include "gguf.h"
 
 #include "core/attention.h"
+#include "core/beam_decode.h"
 #include "core/bpe.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
@@ -28,8 +29,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <random>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include <vector>
 
 #ifndef M_PI
@@ -175,6 +178,7 @@ struct funasr_llm_block {
     ggml_tensor* attn_q_w = nullptr;
     ggml_tensor* attn_k_w = nullptr;
     ggml_tensor* attn_v_w = nullptr;
+    ggml_tensor* attn_qkv_w = nullptr; // fused Q+K+V for single matmul (§136)
     ggml_tensor* attn_output_w = nullptr;
     ggml_tensor* attn_q_norm_w = nullptr;
     ggml_tensor* attn_k_norm_w = nullptr;
@@ -235,6 +239,12 @@ struct funasr_context {
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
 
+    // Fused QKV weights (§136). Created at init to merge the 3 separate
+    // Q/K/V projections into one matmul so ggml_backend_sched can't split
+    // them across backends (the root cause of the CUDA !-loop).
+    ggml_context* fused_ctx = nullptr;
+    ggml_backend_buffer_t fused_buf = nullptr;
+
     std::vector<uint8_t> compute_meta;
 
     // KV cache for the LLM body — same layout as qwen3_asr.
@@ -243,6 +253,7 @@ struct funasr_context {
     ggml_tensor* kv_k = nullptr;
     ggml_tensor* kv_v = nullptr;
     int kv_max_ctx = 0;
+    int beam_size = 1;
 
     // Cached per-step LLM decode graph (PLAN funasr-perf #1). Built once
     // at first decode call (via funasr_ensure_step_graph) using
@@ -279,6 +290,10 @@ struct funasr_context {
     //     graphs (PLAN funasr-perf #1).
     bool enc_flash_attn = true;
     bool step_graph_cache = false;
+
+    // Language hint from -l / set_language. Empty = default ("语音转写：").
+    // Non-empty = "语音转写成{language}：" matching upstream get_prompt().
+    std::string language;
 
     // Stage-capture state — set by funasr_extract_stage to request a
     // specific intermediate tensor; consumed by the encoder graph builder
@@ -325,7 +340,7 @@ static void compute_encoder_pe(funasr_model& m, int max_T) {
 }
 
 static bool funasr_load_model(funasr_model& model, funasr_vocab& vocab, const char* path, ggml_backend_t backend,
-                              ggml_backend_t /*backend_cpu*/) {
+                              ggml_backend_t cpu_backend) {
     // Pass 1: hparams + vocab
     {
         gguf_context* gctx = core_gguf::open_metadata(path);
@@ -402,10 +417,28 @@ static bool funasr_load_model(funasr_model& model, funasr_vocab& vocab, const ch
         core_gguf::free_metadata(gctx);
     }
 
-    // Pass 2: tensor data
+    // Pass 2: tensor data.
+    // Issue #125 root cause: on GPUs without DP4A (P100 sm_60), quantized
+    // MUL_MAT falls through to cuBLAS F16 GEMM whose F16 accumulator
+    // overflows at the FFN down projection (swiglu values reach ~15K,
+    // dot-product partial sums over 3072 elements exceed F16 max 65504).
+    // Fixed in ggml-cuda.cu: block F16 cuBLAS path when src1 is F32.
+    //
+    // FUNASR_LLM_CPU=1 forces the old weight-split workaround (enc GPU,
+    // LLM CPU) for testing or as a safety net.
     core_gguf::WeightLoad wl;
-    if (!core_gguf::load_weights(path, backend, "funasr", wl))
-        return false;
+    const bool force_llm_cpu = []() {
+        const char* s = std::getenv("FUNASR_LLM_CPU");
+        return s && *s && *s != '0';
+    }();
+    if (!ggml_backend_is_cpu(backend) && cpu_backend && force_llm_cpu) {
+        auto is_gpu = [](const char* name, void*) -> bool { return std::strncmp(name, "funasr.", 7) == 0; };
+        if (!core_gguf::load_weights_split(path, backend, cpu_backend, is_gpu, nullptr, "funasr", wl))
+            return false;
+    } else {
+        if (!core_gguf::load_weights(path, backend, "funasr", wl))
+            return false;
+    }
     model.ctx = wl.ctx;
     model.buf = wl.buf;
     model.buf_cpu = wl.buf_cpu;
@@ -725,6 +758,65 @@ static std::vector<float> funasr_run_encoder_adaptor(funasr_context* ctx, const 
         return {};
     }
 
+    // ---- Per-stage tensor dump (FUNASR_DUMP_STAGES=1) ----
+    // Prints min/max/mean/L2/first-8 for key encoder stages so CPU-vs-CUDA
+    // divergence can be localised from Kaggle logs. Default OFF.
+    {
+        static int dump_flag = -1;
+        if (dump_flag < 0) {
+            const char* e = std::getenv("FUNASR_DUMP_STAGES");
+            dump_flag = (e && *e && *e != '0') ? 1 : 0;
+        }
+        if (dump_flag) {
+            // Stages to dump — every 10th encoder layer + boundaries + adaptor.
+            const char* names[] = {"encoder_layer_0",     "encoder_layer_9",       "encoder_layer_19",
+                                   "encoder_layer_29",    "encoder_layer_39",      "encoder_layer_49",
+                                   "encoder_layer_59",    "encoder_layer_69",      "encoder_main_out",
+                                   "encoder_output",      "audio_adaptor_layer_0", "audio_adaptor_layer_1",
+                                   "audio_adaptor_output"};
+            std::fprintf(stderr, "funasr_dump: ---- encoder/adaptor stage stats (T_lfr=%d) ----\n", T_lfr);
+            for (const char* nm : names) {
+                ggml_tensor* t = ggml_graph_get_tensor(gf, nm);
+                if (!t) {
+                    std::fprintf(stderr, "funasr_dump: %-28s [not found]\n", nm);
+                    continue;
+                }
+                const size_t n = ggml_nelements(t);
+                std::vector<float> buf(n, 0.0f);
+                ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+                float mn = buf[0], mx = buf[0], sm = 0.0f, sq = 0.0f;
+                int n_nan = 0, n_inf = 0;
+                for (size_t i = 0; i < n; i++) {
+                    float v = buf[i];
+                    if (std::isnan(v)) {
+                        n_nan++;
+                        continue;
+                    }
+                    if (std::isinf(v)) {
+                        n_inf++;
+                        continue;
+                    }
+                    if (v < mn)
+                        mn = v;
+                    if (v > mx)
+                        mx = v;
+                    sm += v;
+                    sq += v * v;
+                }
+                float mean = (n > 0) ? sm / (float)n : 0.0f;
+                float l2 = std::sqrt(sq);
+                std::fprintf(stderr,
+                             "funasr_dump: %-28s n=%-8zu min=%12.6f max=%12.6f mean=%12.6f L2=%12.4f nan=%d inf=%d "
+                             "first8=[",
+                             nm, n, mn, mx, mean, l2, n_nan, n_inf);
+                for (size_t i = 0; i < 8 && i < n; i++)
+                    std::fprintf(stderr, "%s%.6f", i ? "," : "", buf[i]);
+                std::fprintf(stderr, "]\n");
+            }
+            std::fprintf(stderr, "funasr_dump: ---- end ----\n");
+        }
+    }
+
     if (stage_out && stage_name && std::strcmp(stage_name, "mel_features") == 0) {
         stage_out->assign(lfr.begin(), lfr.begin() + (ptrdiff_t)D_lfr * T_lfr);
     } else if (stage_out && stage_name) {
@@ -980,17 +1072,34 @@ static ggml_cgraph* funasr_build_graph_llm_kv_impl(funasr_context* ctx, int n_pa
     ggml_tensor* const kv_indices = cached_step ? positions : nullptr;
     const int fixed_kv_len = cached_step ? ctx->kv_max_ctx : 0;
 
-    for (uint32_t il = 0; il < hp.llm_n_layers; il++) {
+    // FUNASR_LLM_LAYERS=N limits the number of LLM layers for debugging.
+    // Useful with FUNASR_NAN_CHECK=1 to isolate the failing layer faster.
+    uint32_t n_layers_eff = hp.llm_n_layers;
+    {
+        static int layers_override = -1;
+        if (layers_override < 0) {
+            const char* e = std::getenv("FUNASR_LLM_LAYERS");
+            layers_override = (e && *e) ? std::atoi(e) : 0;
+        }
+        if (layers_override > 0 && (uint32_t)layers_override < n_layers_eff) {
+            n_layers_eff = (uint32_t)layers_override;
+        }
+    }
+
+    for (uint32_t il = 0; il < n_layers_eff; il++) {
         const auto& b = m.llm.blocks[il];
         ggml_tensor* residual = cur;
 
         ggml_tensor* x = ggml_rms_norm(ctx0, cur, eps);
         x = ggml_mul(ctx0, x, b.attn_norm_w);
 
+        // Use fused QKV when available (§136 — prevents sched cross-backend
+        // split that causes all-NaN on CUDA). Falls back to separate Q/K/V
+        // when fusion wasn't possible (type mismatch, alloc failure).
         ggml_tensor* attn =
             core_attn::kv_self_attn(ctx0, gf, x, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_output_w, b.attn_q_norm_w,
                                     b.attn_k_norm_w, positions, causal_mask, ctx->kv_k, ctx->kv_v, (int)il, n_past, kvp,
-                                    /*qkv_w*/ nullptr, fixed_kv_len, kv_indices);
+                                    /*qkv_w*/ b.attn_qkv_w, fixed_kv_len, kv_indices);
         cur = ggml_add(ctx0, residual, attn);
 
         residual = cur;
@@ -998,10 +1107,41 @@ static ggml_cgraph* funasr_build_graph_llm_kv_impl(funasr_context* ctx, int n_pa
         x = ggml_mul(ctx0, x, b.ffn_norm_w);
         ggml_tensor* mlp = core_ffn::swiglu(ctx0, x, b.ffn_gate_w, b.ffn_up_w, b.ffn_down_w);
         cur = ggml_add(ctx0, residual, mlp);
+
+        // LLM layer snap — gated on FUNASR_DUMP_STAGES to avoid bloating
+        // the graph in production (28 extra dup nodes).
+        {
+            static int dump_flag = -1;
+            if (dump_flag < 0) {
+                const char* e = std::getenv("FUNASR_DUMP_STAGES");
+                dump_flag = (e && *e && *e != '0') ? 1 : 0;
+            }
+            if (dump_flag) {
+                char nm[32];
+                std::snprintf(nm, sizeof(nm), "llm_layer_%u", il);
+                ggml_tensor* s = ggml_dup(ctx0, cur);
+                ggml_set_name(s, nm);
+                ggml_build_forward_expand(gf, s);
+            }
+        }
     }
 
     cur = ggml_rms_norm(ctx0, cur, eps);
     cur = ggml_mul(ctx0, cur, m.llm.output_norm_w);
+
+    // Snap the pre-lm_head hidden state for the dump.
+    {
+        static int dump_flag = -1;
+        if (dump_flag < 0) {
+            const char* e = std::getenv("FUNASR_DUMP_STAGES");
+            dump_flag = (e && *e && *e != '0') ? 1 : 0;
+        }
+        if (dump_flag) {
+            ggml_tensor* s = ggml_dup(ctx0, cur);
+            ggml_set_name(s, "llm_pre_lmhead");
+            ggml_build_forward_expand(gf, s);
+        }
+    }
 
     // Last-token-only lm_head — decode loop only needs next-token logits.
     if (T > 1) {
@@ -1140,7 +1280,11 @@ static bool funasr_kv_init(funasr_context* ctx, int max_ctx) {
     ggml_set_name(ctx->kv_v, "kv_v");
     const size_t kbytes = ggml_nbytes(ctx->kv_k);
     const size_t vbytes = ggml_nbytes(ctx->kv_v);
-    ggml_backend_t kv_backend = core_attn::kv_backend_from_env(ctx->backend, ctx->backend_cpu, "funasr");
+    // When LLM weights are split to CPU (issue #125), KV cache must also
+    // be on CPU so the sched routes the entire LLM to CPU.
+    ggml_backend_t kv_backend = (ctx->model.buf_cpu)
+                                    ? ctx->backend_cpu
+                                    : core_attn::kv_backend_from_env(ctx->backend, ctx->backend_cpu, "funasr");
     ctx->kv_buf = ggml_backend_alloc_buffer(kv_backend, kbytes + vbytes);
     if (!ctx->kv_buf) {
         std::fprintf(stderr, "funasr: failed to allocate kv buffer\n");
@@ -1149,8 +1293,147 @@ static bool funasr_kv_init(funasr_context* ctx, int max_ctx) {
     char* base = (char*)ggml_backend_buffer_get_base(ctx->kv_buf);
     ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_k, base);
     ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_v, base + kbytes);
+    // Zero-fill the KV cache. On CUDA, ggml_backend_alloc_buffer does not
+    // zero memory (cudaMalloc). If the graph scheduler reads a KV slot
+    // before the corresponding ggml_cpy writes it (aliasing-based race in
+    // the same compute graph), uninitialized NaN/Inf values propagate
+    // through flash_attn and poison every downstream tensor. Zeroing is
+    // cheap (~1 MB for the funasr Qwen2-0.6B KV) and prevents this.
+    {
+        std::vector<uint8_t> zeros(std::max(kbytes, vbytes), 0);
+        ggml_backend_tensor_set(ctx->kv_k, zeros.data(), 0, kbytes);
+        ggml_backend_tensor_set(ctx->kv_v, zeros.data(), 0, vbytes);
+    }
     ctx->kv_max_ctx = max_ctx;
     return true;
+}
+
+// ===========================================================================
+// Per-node NaN/Inf checker — FUNASR_NAN_CHECK=1
+//
+// Uses the sched eval_callback to inspect every graph node right after it
+// runs. Prints the FIRST node whose output contains NaN or Inf, then
+// turns itself off so the run completes without flooding the log. The
+// callback forces per-node synchronization (slow) — debug-only.
+// ===========================================================================
+
+struct funasr_nan_check_state {
+    bool found = false;
+    int node_idx = 0;
+};
+
+static bool funasr_nan_check_cb(struct ggml_tensor* t, bool ask, void* user_data) {
+    auto* st = (funasr_nan_check_state*)user_data;
+    if (st->found)
+        return false; // already found the culprit, stop asking
+
+    if (ask) {
+        // We want the data for every non-view node that has a float type.
+        if (t->view_src != nullptr)
+            return false;
+        if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16)
+            return false;
+        return true; // yes, read this node back
+    }
+
+    // ask == false → data is ready, inspect it.
+    const size_t n = ggml_nelements(t);
+    if (n == 0) {
+        st->node_idx++;
+        return true;
+    }
+
+    std::vector<float> buf(n);
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+    } else {
+        // F16 — read raw then convert
+        std::vector<ggml_fp16_t> h(n);
+        ggml_backend_tensor_get(t, h.data(), 0, n * sizeof(ggml_fp16_t));
+        for (size_t i = 0; i < n; i++)
+            buf[i] = ggml_fp16_to_fp32(h[i]);
+    }
+
+    int n_nan = 0, n_inf = 0;
+    float mx = -1e30f, mn = 1e30f;
+    for (size_t i = 0; i < n; i++) {
+        float v = buf[i];
+        if (std::isnan(v)) {
+            n_nan++;
+            continue;
+        }
+        if (std::isinf(v)) {
+            n_inf++;
+            continue;
+        }
+        if (v > mx)
+            mx = v;
+        if (v < mn)
+            mn = v;
+    }
+
+    // Print every checked node (concise) so we can trace the full sequence.
+    std::fprintf(
+        stderr,
+        "funasr_nan_check: node#%-3d op=%-12s name=%-30s ne=[%lld,%lld,%lld,%lld] min=%.4g max=%.4g nan=%d inf=%d\n",
+        st->node_idx, ggml_op_name(t->op), t->name, (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2],
+        (long long)t->ne[3], (double)mn, (double)mx, n_nan, n_inf);
+
+    if (n_nan > 0 || n_inf > 0) {
+        std::fprintf(stderr, "funasr_nan_check: *** FIRST BAD NODE ABOVE ***\n");
+        // Dump source tensor stats by reading them back
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (!t->src[j])
+                continue;
+            auto* s = t->src[j];
+            size_t sn = ggml_nelements(s);
+            std::vector<float> sb(sn);
+            bool readable = (s->type == GGML_TYPE_F32 || s->type == GGML_TYPE_F16) && s->data;
+            if (readable) {
+                if (s->type == GGML_TYPE_F32) {
+                    ggml_backend_tensor_get(s, sb.data(), 0, sn * sizeof(float));
+                } else {
+                    std::vector<ggml_fp16_t> sh(sn);
+                    ggml_backend_tensor_get(s, sh.data(), 0, sn * sizeof(ggml_fp16_t));
+                    for (size_t i = 0; i < sn; i++)
+                        sb[i] = ggml_fp16_to_fp32(sh[i]);
+                }
+                int snan = 0, sinf = 0;
+                float smx = -1e30f, smn = 1e30f;
+                for (size_t i = 0; i < sn; i++) {
+                    float v = sb[i];
+                    if (std::isnan(v)) {
+                        snan++;
+                        continue;
+                    }
+                    if (std::isinf(v)) {
+                        sinf++;
+                        continue;
+                    }
+                    if (v > smx)
+                        smx = v;
+                    if (v < smn)
+                        smn = v;
+                }
+                std::fprintf(stderr,
+                             "  src[%d]: op=%-12s name=%-30s type=%-4s ne=[%lld,%lld,%lld,%lld] "
+                             "min=%.6g max=%.6g nan=%d inf=%d\n",
+                             j, ggml_op_name(s->op), s->name, ggml_type_name(s->type), (long long)s->ne[0],
+                             (long long)s->ne[1], (long long)s->ne[2], (long long)s->ne[3], (double)smn, (double)smx,
+                             snan, sinf);
+            } else {
+                std::fprintf(stderr,
+                             "  src[%d]: op=%-12s name=%-30s type=%-4s ne=[%lld,%lld,%lld,%lld] [not readable]\n", j,
+                             ggml_op_name(s->op), s->name, ggml_type_name(s->type), (long long)s->ne[0],
+                             (long long)s->ne[1], (long long)s->ne[2], (long long)s->ne[3]);
+            }
+        }
+        st->found = true;
+        return false; // stop processing further
+    }
+
+    st->node_idx++;
+    return true; // continue
 }
 
 // ===========================================================================
@@ -1245,10 +1528,116 @@ static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* 
         ggml_tensor* mask_in = ggml_graph_get_tensor(gf, "causal_mask");
         ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
+
+    // Install per-node NaN checker when FUNASR_NAN_CHECK=1 (prefill only).
+    funasr_nan_check_state nan_state;
+    {
+        static int nan_check_flag = -1;
+        if (nan_check_flag < 0) {
+            const char* e = std::getenv("FUNASR_NAN_CHECK");
+            nan_check_flag = (e && *e && *e != '0') ? 1 : 0;
+        }
+        if (nan_check_flag && n_tokens > 1) {
+            std::fprintf(stderr, "funasr: NaN checker enabled — per-node sync (slow)\n");
+            ggml_backend_sched_set_eval_callback(ctx->sched, funasr_nan_check_cb, &nan_state);
+        }
+    }
+
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "funasr: llm graph compute failed\n");
+        ggml_backend_sched_set_eval_callback(ctx->sched, nullptr, nullptr);
         return {};
     }
+
+    // Clear callback after compute.
+    ggml_backend_sched_set_eval_callback(ctx->sched, nullptr, nullptr);
+    if (nan_state.found) {
+        std::fprintf(stderr,
+                     "funasr: NaN/Inf detected at node #%d (see above). "
+                     "Continuing to produce dump for comparison.\n",
+                     nan_state.node_idx);
+    }
+
+    // ---- LLM layer dump (FUNASR_DUMP_STAGES=1, prefill only) ----
+    {
+        static int dump_flag = -1;
+        if (dump_flag < 0) {
+            const char* e = std::getenv("FUNASR_DUMP_STAGES");
+            dump_flag = (e && *e && *e != '0') ? 1 : 0;
+        }
+        if (dump_flag && n_tokens > 1) {
+            std::fprintf(stderr, "funasr_dump: ---- LLM layer stats (n_tokens=%d, n_past=%d, n_layers=%u) ----\n",
+                         n_tokens, n_past, ctx->model.hparams.llm_n_layers);
+            for (uint32_t li = 0; li < ctx->model.hparams.llm_n_layers; li++) {
+                char nmbuf[32];
+                std::snprintf(nmbuf, sizeof(nmbuf), "llm_layer_%u", li);
+                const char* nm = nmbuf;
+                ggml_tensor* t = ggml_graph_get_tensor(gf, nm);
+                if (!t) {
+                    std::fprintf(stderr, "funasr_dump: %-28s [not found]\n", nm);
+                    continue;
+                }
+                const size_t n = ggml_nelements(t);
+                std::vector<float> buf(n, 0.0f);
+                ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+                float mn = buf[0], mx = buf[0], sm = 0.0f;
+                int n_nan = 0, n_inf = 0;
+                for (size_t i = 0; i < n; i++) {
+                    float v = buf[i];
+                    if (std::isnan(v)) {
+                        n_nan++;
+                        continue;
+                    }
+                    if (std::isinf(v)) {
+                        n_inf++;
+                        continue;
+                    }
+                    if (v < mn)
+                        mn = v;
+                    if (v > mx)
+                        mx = v;
+                    sm += v;
+                }
+                float mean = (n > 0) ? sm / (float)n : 0.0f;
+                std::fprintf(stderr,
+                             "funasr_dump: %-28s n=%-8zu min=%12.6f max=%12.6f mean=%12.6f nan=%d inf=%d first8=[", nm,
+                             n, mn, mx, mean, n_nan, n_inf);
+                for (size_t i = 0; i < 8 && i < n; i++)
+                    std::fprintf(stderr, "%s%.6f", i ? "," : "", buf[i]);
+                std::fprintf(stderr, "]\n");
+            }
+            // Also dump the pre-lm_head hidden state.
+            {
+                const char* nm = "llm_pre_lmhead";
+                ggml_tensor* t = ggml_graph_get_tensor(gf, nm);
+                if (t) {
+                    const size_t n = ggml_nelements(t);
+                    std::vector<float> buf(n, 0.0f);
+                    ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+                    float mn = buf[0], mx = buf[0], sm = 0.0f;
+                    int n_nan = 0, n_inf = 0;
+                    for (size_t i = 0; i < n; i++) {
+                        float v = buf[i];
+                        if (std::isnan(v)) {
+                            n_nan++;
+                        } else if (std::isinf(v)) {
+                            n_inf++;
+                        } else {
+                            if (v < mn)
+                                mn = v;
+                            if (v > mx)
+                                mx = v;
+                            sm += v;
+                        }
+                    }
+                    std::fprintf(stderr, "funasr_dump: %-28s n=%-8zu min=%12.6f max=%12.6f mean=%12.6f nan=%d inf=%d\n",
+                                 nm, n, mn, mx, (n > 0) ? sm / (float)n : 0.0f, n_nan, n_inf);
+                }
+            }
+            std::fprintf(stderr, "funasr_dump: ---- end LLM ----\n");
+        }
+    }
+
     ggml_tensor* out = ggml_graph_get_tensor(gf, "logits");
     std::vector<float> result((size_t)vocab, 0.0f);
     ggml_backend_tensor_get(out, result.data(), 0, (size_t)vocab * sizeof(float));
@@ -1282,12 +1671,28 @@ static std::vector<float> funasr_embed_tokens(funasr_context* ctx, const std::ve
 // High-level pipeline: build prompt, splice audio, run AR decode → text.
 // ===========================================================================
 
-static const char* PROMPT_PREFIX = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
-                                   "\xE8\xAF\xAD\xE9\x9F\xB3\xE8\xBD\xAC\xE5\x86\x99\xEF\xBC\x9A"; // "语音转写："
+// Build the ChatML prompt prefix matching upstream get_prompt(language=...).
+// Default (empty language): "语音转写："
+// With language: "语音转写成{language}："
+static std::string funasr_build_prompt_prefix(const std::string& language) {
+    std::string prefix = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n";
+    // "语音转写" = speech transcription
+    prefix += "\xE8\xAF\xAD\xE9\x9F\xB3\xE8\xBD\xAC\xE5\x86\x99";
+    if (!language.empty()) {
+        // "成" = "to/into"
+        prefix += "\xE6\x88\x90";
+        prefix += language;
+    }
+    // "：" = Chinese colon
+    prefix += "\xEF\xBC\x9A";
+    return prefix;
+}
 static const char* PROMPT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n";
 
 static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm, int n_samples,
-                                          std::vector<float>* stage_out, const char* stage_name) {
+                                          std::vector<float>* stage_out, const char* stage_name,
+                                          std::vector<int32_t>* out_ids = nullptr,
+                                          std::vector<float>* out_probs = nullptr) {
     const auto& hp = ctx->model.hparams;
 
     int T_lfr = 0, D_lfr = 0;
@@ -1320,12 +1725,18 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
     std::vector<int32_t> suffix_ids;
     {
         funasr_bench_stage s("prompt_tokenize");
-        prefix_ids = funasr_bpe_encode(ctx->vocab, PROMPT_PREFIX);
+        std::string prompt_prefix = funasr_build_prompt_prefix(ctx->language);
+        prefix_ids = funasr_bpe_encode(ctx->vocab, prompt_prefix);
         suffix_ids = funasr_bpe_encode(ctx->vocab, PROMPT_SUFFIX);
     }
     const int fake_token_len = compute_fake_token_len(T_lfr, hp.use_low_frame_rate);
     const int fbank_beg = (int)prefix_ids.size();
     const int total_prompt = (int)prefix_ids.size() + fake_token_len + (int)suffix_ids.size();
+    if (std::getenv("CRISPASR_VERBOSE")) {
+        std::fprintf(
+            stderr, "funasr: T_lfr=%d use_low_frame_rate=%d fake_token_len=%d (prefix=%zu suffix=%zu prompt=%d)\n",
+            T_lfr, (int)hp.use_low_frame_rate, fake_token_len, prefix_ids.size(), suffix_ids.size(), total_prompt);
+    }
     std::vector<int32_t> ids((size_t)total_prompt, 0);
     std::copy(prefix_ids.begin(), prefix_ids.end(), ids.begin());
     std::copy(suffix_ids.begin(), suffix_ids.end(), ids.begin() + fbank_beg + fake_token_len);
@@ -1348,6 +1759,50 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
         }
     }
     const int d = (int)hp.llm_d_model;
+
+    // ---- Dump spliced embeddings (FUNASR_DUMP_STAGES=1) ----
+    {
+        static int dump_flag = -1;
+        if (dump_flag < 0) {
+            const char* e = std::getenv("FUNASR_DUMP_STAGES");
+            dump_flag = (e && *e && *e != '0') ? 1 : 0;
+        }
+        if (dump_flag) {
+            // Stats over the audio portion of the spliced embeddings.
+            const size_t audio_start = (size_t)fbank_beg * (size_t)d;
+            const size_t audio_len = (size_t)std::min(fake_token_len, T_lfr) * (size_t)d;
+            float mn = inputs_embeds[audio_start], mx = mn, sm = 0.0f, sq = 0.0f;
+            int n_nan = 0, n_inf = 0;
+            for (size_t i = 0; i < audio_len; i++) {
+                float v = inputs_embeds[audio_start + i];
+                if (std::isnan(v)) {
+                    n_nan++;
+                    continue;
+                }
+                if (std::isinf(v)) {
+                    n_inf++;
+                    continue;
+                }
+                if (v < mn)
+                    mn = v;
+                if (v > mx)
+                    mx = v;
+                sm += v;
+                sq += v * v;
+            }
+            float mean = audio_len > 0 ? sm / (float)audio_len : 0.0f;
+            float l2 = std::sqrt(sq);
+            std::fprintf(stderr,
+                         "funasr_dump: %-28s n=%-8zu min=%12.6f max=%12.6f mean=%12.6f L2=%12.4f nan=%d inf=%d "
+                         "first8=[",
+                         "spliced_audio_embeds", audio_len, mn, mx, mean, l2, n_nan, n_inf);
+            for (size_t i = 0; i < 8 && i < audio_len; i++)
+                std::fprintf(stderr, "%s%.6f", i ? "," : "", inputs_embeds[audio_start + i]);
+            std::fprintf(stderr, "]\n");
+
+            // Also dump the first prefill logits after they're computed.
+        }
+    }
 
     // KV cache sized for prompt + up to max_new_tokens.
     const int max_new_tokens = 512;
@@ -1372,6 +1827,41 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
     if (logits.empty())
         return "";
 
+    // ---- Dump prefill logits (FUNASR_DUMP_STAGES=1) ----
+    {
+        static int dump_flag = -1;
+        if (dump_flag < 0) {
+            const char* e = std::getenv("FUNASR_DUMP_STAGES");
+            dump_flag = (e && *e && *e != '0') ? 1 : 0;
+        }
+        if (dump_flag) {
+            float mn = logits[0], mx = mn, sm = 0.0f;
+            int n_nan = 0, n_inf = 0;
+            for (float v : logits) {
+                if (std::isnan(v)) {
+                    n_nan++;
+                    continue;
+                }
+                if (std::isinf(v)) {
+                    n_inf++;
+                    continue;
+                }
+                if (v < mn)
+                    mn = v;
+                if (v > mx)
+                    mx = v;
+                sm += v;
+            }
+            int top = 0;
+            for (int i = 1; i < (int)logits.size(); i++)
+                if (logits[i] > logits[top])
+                    top = i;
+            std::fprintf(stderr,
+                         "funasr_dump: %-28s n=%-8zu min=%12.6f max=%12.6f mean=%12.6f argmax=%-6d nan=%d inf=%d\n",
+                         "prefill_logits", logits.size(), mn, mx, sm / (float)logits.size(), top, n_nan, n_inf);
+        }
+    }
+
     auto argmax = [](const std::vector<float>& v) {
         int best = 0;
         float bv = v[0];
@@ -1383,20 +1873,102 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
         }
         return best;
     };
+    auto softmax_of = [](const std::vector<float>& v, int idx) -> float {
+        float mx = *std::max_element(v.begin(), v.end());
+        float sum = 0;
+        for (float x : v)
+            sum += std::exp(x - mx);
+        return std::exp(v[idx] - mx) / sum;
+    };
+    const float temperature = ctx->params.temperature;
+    auto pick_next = [&](std::vector<float>& v) -> int {
+        if (temperature > 0.0f) {
+            // Temperature sampling
+            float mx = *std::max_element(v.begin(), v.end());
+            std::vector<float> probs(v.size());
+            float sum = 0;
+            for (size_t i = 0; i < v.size(); i++) {
+                probs[i] = std::exp((v[i] - mx) / temperature);
+                sum += probs[i];
+            }
+            for (auto& p : probs)
+                p /= sum;
+            static thread_local std::mt19937 rng(std::random_device{}());
+            std::discrete_distribution<int> dist(probs.begin(), probs.end());
+            return dist(rng);
+        }
+        return argmax(v);
+    };
     std::vector<int32_t> generated;
-    int next_id = argmax(logits);
-    int n_past = total_prompt;
+    std::vector<float> generated_probs;
     auto decode_t0 = std::chrono::steady_clock::now();
-    for (int step = 0; step < max_new_tokens && next_id != (int)hp.eos_token_id; step++) {
-        generated.push_back(next_id);
-        std::vector<float> step_embed = funasr_embed_tokens(ctx, {next_id});
-        if (step_embed.empty())
-            break;
-        logits = funasr_run_llm_step(ctx, step_embed.data(), 1, n_past);
-        if (logits.empty())
-            break;
-        n_past += 1;
-        next_id = argmax(logits);
+
+    if (ctx->beam_size > 1) {
+        // Beam search via replay-from-prefix. Each beam step embeds
+        // the full suffix token-by-token and forwards through the LLM.
+        auto replay = [](funasr_context* c, const int32_t* toks, int n, int prompt_len) -> float* {
+            const int d = (int)c->model.hparams.llm_d_model;
+            // Embed all suffix tokens and concatenate
+            std::vector<float> embeds((size_t)n * d);
+            for (int i = 0; i < n; i++) {
+                auto e = funasr_embed_tokens(c, {toks[i]});
+                if (e.empty())
+                    return nullptr;
+                std::memcpy(embeds.data() + (size_t)i * d, e.data(), d * sizeof(float));
+            }
+            auto lg = funasr_run_llm_step(c, embeds.data(), n, prompt_len);
+            if (lg.empty())
+                return nullptr;
+            float* out = (float*)std::malloc(lg.size() * sizeof(float));
+            std::memcpy(out, lg.data(), lg.size() * sizeof(float));
+            return out;
+        };
+        core_beam_decode::Config bcfg;
+        bcfg.max_new_tokens = max_new_tokens;
+        bcfg.eos_id = (int)hp.eos_token_id;
+        bcfg.vocab_size = (int)hp.llm_vocab_size;
+        bcfg.beam_size = ctx->beam_size;
+        bcfg.prompt_len = total_prompt;
+        auto br = core_beam_decode::run_with_probs(ctx, logits.data(), replay, bcfg);
+        for (size_t i = 0; i < br.tokens.size(); i++) {
+            if (br.tokens[i] == (int32_t)hp.eos_token_id)
+                break;
+            generated.push_back(br.tokens[i]);
+            generated_probs.push_back(br.probs[i]);
+        }
+    } else {
+        int next_id = pick_next(logits);
+        float next_prob = softmax_of(logits, next_id);
+        int n_past = total_prompt;
+        int prev_id = -1;
+        int repeat_run = 0;
+        for (int step = 0; step < max_new_tokens && next_id != (int)hp.eos_token_id; step++) {
+            if (next_id == prev_id) {
+                if (++repeat_run >= 20) {
+                    std::fprintf(stderr,
+                                 "funasr: greedy decode degenerated (token %d repeated >%d times). "
+                                 "Aborting at step %d. This usually means the audio adaptor / encoder "
+                                 "produced unusable embeddings — re-run with CRISPASR_VERBOSE=1 to "
+                                 "inspect frames_spliced.\n",
+                                 next_id, repeat_run, step);
+                    break;
+                }
+            } else {
+                repeat_run = 0;
+                prev_id = next_id;
+            }
+            generated.push_back(next_id);
+            generated_probs.push_back(next_prob);
+            std::vector<float> step_embed = funasr_embed_tokens(ctx, {next_id});
+            if (step_embed.empty())
+                break;
+            logits = funasr_run_llm_step(ctx, step_embed.data(), 1, n_past);
+            if (logits.empty())
+                break;
+            n_past += 1;
+            next_id = pick_next(logits);
+            next_prob = softmax_of(logits, next_id);
+        }
     }
     if (funasr_bench_enabled()) {
         auto decode_t1 = std::chrono::steady_clock::now();
@@ -1406,6 +1978,12 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
                      n_steps, n_steps > 0 ? ms / n_steps : 0.0);
     }
     (void)d;
+
+    // Pass back raw token IDs and probabilities if requested.
+    if (out_ids)
+        *out_ids = generated;
+    if (out_probs)
+        *out_probs = generated_probs;
 
     // Detokenize, skipping any special tokens that survived.
     std::string out;
@@ -1429,6 +2007,7 @@ extern "C" funasr_context_params funasr_context_default_params(void) {
     p.n_threads = 4;
     p.verbosity = 1;
     p.use_gpu = true;
+    p.temperature = 0.0f;
     return p;
 }
 
@@ -1449,6 +2028,60 @@ extern "C" funasr_context* funasr_init_from_file(const char* path, funasr_contex
     if (!funasr_load_model(ctx->model, ctx->vocab, path, ctx->backend, ctx->backend_cpu)) {
         delete ctx;
         return nullptr;
+    }
+
+    // ---- Fuse Q/K/V into a single QKV weight per LLM layer (§136). ----
+    // The ggml_backend_sched with [CUDA,CPU] misroutes the 3 separate
+    // mul_mats across backends → Inf → NaN on CUDA (issue #125). A single
+    // fused matmul forces the sched to keep it on one backend.
+    {
+        auto& blocks = ctx->model.llm.blocks;
+        bool can_fuse = !blocks.empty() && blocks[0].attn_q_w && blocks[0].attn_k_w && blocks[0].attn_v_w;
+        if (can_fuse) {
+            const ggml_type t0 = blocks[0].attn_q_w->type;
+            for (auto& b : blocks) {
+                if (!b.attn_q_w || !b.attn_k_w || !b.attn_v_w || b.attn_q_w->type != t0 || b.attn_k_w->type != t0 ||
+                    b.attn_v_w->type != t0 || b.attn_q_w->ne[0] != b.attn_k_w->ne[0] ||
+                    b.attn_q_w->ne[0] != b.attn_v_w->ne[0]) {
+                    can_fuse = false;
+                    break;
+                }
+            }
+        }
+        if (can_fuse) {
+            const ggml_type t0 = blocks[0].attn_q_w->type;
+            int q_out = (int)blocks[0].attn_q_w->ne[1];
+            int k_out = (int)blocks[0].attn_k_w->ne[1];
+            int hidden = (int)blocks[0].attn_q_w->ne[0];
+            int qkv_out = q_out + 2 * k_out;
+            size_t fused_mem = ggml_tensor_overhead() * blocks.size() + 256;
+            ggml_init_params fgp = {fused_mem, nullptr, true};
+            ctx->fused_ctx = ggml_init(fgp);
+            if (ctx->fused_ctx) {
+                for (auto& b : blocks)
+                    b.attn_qkv_w = ggml_new_tensor_2d(ctx->fused_ctx, t0, hidden, qkv_out);
+                ctx->fused_buf = ggml_backend_alloc_ctx_tensors_from_buft(
+                    ctx->fused_ctx, ggml_backend_get_default_buffer_type(ctx->backend));
+                if (ctx->fused_buf) {
+                    for (auto& b : blocks) {
+                        size_t qb = ggml_nbytes(b.attn_q_w), kb = ggml_nbytes(b.attn_k_w);
+                        std::vector<uint8_t> tmp(qb + 2 * kb);
+                        ggml_backend_tensor_get(b.attn_q_w, tmp.data(), 0, qb);
+                        ggml_backend_tensor_get(b.attn_k_w, tmp.data() + qb, 0, kb);
+                        ggml_backend_tensor_get(b.attn_v_w, tmp.data() + qb + kb, 0, kb);
+                        ggml_backend_tensor_set(b.attn_qkv_w, tmp.data(), 0, tmp.size());
+                    }
+                    if (params.verbosity >= 1)
+                        std::fprintf(stderr, "funasr: fused QKV for %zu LLM layers (%d+%d+%d→%d, type=%s)\n",
+                                     blocks.size(), q_out, k_out, k_out, qkv_out, ggml_type_name(t0));
+                } else {
+                    ggml_free(ctx->fused_ctx);
+                    ctx->fused_ctx = nullptr;
+                    for (auto& b : blocks)
+                        b.attn_qkv_w = nullptr;
+                }
+            }
+        }
     }
 
     {
@@ -1492,6 +2125,18 @@ extern "C" funasr_context* funasr_init_from_file(const char* path, funasr_contex
     return ctx;
 }
 
+extern "C" void funasr_set_beam_size(funasr_context* ctx, int beam_size) {
+    if (!ctx)
+        return;
+    ctx->beam_size = beam_size > 1 ? beam_size : 1;
+}
+
+extern "C" void funasr_set_language(funasr_context* ctx, const char* lang) {
+    if (!ctx)
+        return;
+    ctx->language = (lang && *lang) ? lang : "";
+}
+
 extern "C" void funasr_free(funasr_context* ctx) {
     if (!ctx)
         return;
@@ -1505,6 +2150,10 @@ extern "C" void funasr_free(funasr_context* ctx) {
         ggml_backend_buffer_free(ctx->kv_buf);
     if (ctx->kv_ctx)
         ggml_free(ctx->kv_ctx);
+    if (ctx->fused_buf)
+        ggml_backend_buffer_free(ctx->fused_buf);
+    if (ctx->fused_ctx)
+        ggml_free(ctx->fused_ctx);
     if (ctx->model.buf)
         ggml_backend_buffer_free(ctx->model.buf);
     if (ctx->model.buf_cpu)
@@ -1562,4 +2211,46 @@ extern "C" float* funasr_extract_stage(funasr_context* ctx, const float* samples
     if (n_out)
         *n_out = (int)staged.size();
     return out;
+}
+
+extern "C" funasr_result* funasr_transcribe_with_probs(funasr_context* ctx, const float* samples, int n_samples) {
+    if (!ctx || !samples || n_samples <= 0)
+        return nullptr;
+    std::vector<int32_t> ids;
+    std::vector<float> probs;
+    std::string s = funasr_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr, &ids, &probs);
+
+    auto* r = (funasr_result*)std::malloc(sizeof(funasr_result));
+    if (!r)
+        return nullptr;
+    r->text = (char*)std::malloc(s.size() + 1);
+    if (r->text) {
+        std::memcpy(r->text, s.data(), s.size());
+        r->text[s.size()] = '\0';
+    }
+    r->n_tokens = (int)ids.size();
+    r->token_ids = (int32_t*)std::malloc(ids.size() * sizeof(int32_t));
+    r->token_probs = (float*)std::malloc(probs.size() * sizeof(float));
+    if (r->token_ids)
+        std::memcpy(r->token_ids, ids.data(), ids.size() * sizeof(int32_t));
+    if (r->token_probs)
+        std::memcpy(r->token_probs, probs.data(), probs.size() * sizeof(float));
+    return r;
+}
+
+extern "C" void funasr_result_free(funasr_result* r) {
+    if (!r)
+        return;
+    std::free(r->text);
+    std::free(r->token_ids);
+    std::free(r->token_probs);
+    std::free(r);
+}
+
+extern "C" const char* funasr_token_text(funasr_context* ctx, int id) {
+    if (!ctx || id < 0 || id >= (int)ctx->vocab.id_to_token.size())
+        return "";
+    static thread_local std::string buf;
+    buf = funasr_decode_token(ctx->vocab, id);
+    return buf.c_str();
 }

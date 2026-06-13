@@ -46,11 +46,11 @@ The default build produces every CLI target. Binaries land in
 | `crispasr-quantize` | Re-quantize any GGUF model — see [quantize.md](quantize.md) |
 | `crispasr-diff` | Per-stage cosine-similarity diff vs Python reference |
 
-To build only the main binary (faster CI builds), pass
-`--target crispasr`:
+To build only the library (faster CI builds), pass
+`--target crispasr-lib`:
 
 ```bash
-cmake --build build -j$(nproc) --target crispasr
+cmake --build build -j$(nproc) --target crispasr-lib
 ```
 
 ### CMake presets
@@ -172,7 +172,7 @@ crispasr --gpu-backend cpu -m model.gguf -f audio.wav        # benchmarking
 #   apt install libavformat-dev libavcodec-dev libavutil-dev libswresample-dev
 
 cmake -B build-ffmpeg -DCMAKE_BUILD_TYPE=Release -DCRISPASR_FFMPEG=ON
-cmake --build build-ffmpeg -j$(nproc) --target crispasr
+cmake --build build-ffmpeg -j$(nproc) --target crispasr-lib
 ```
 
 > **Upstream bug warning.** `.m4a` / `.mp4` / `.webm` containers
@@ -205,3 +205,52 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ls build/bin/crispasr-quantize
 ```
+
+## Android / Termux
+
+CrispASR builds natively under [Termux](https://termux.dev) on aarch64
+Android devices. Use a **static build** to avoid linker conflicts with
+system-installed `libggml.so` from the `whisper-cli` package (#137):
+
+```bash
+pkg install build-essential cmake git
+git clone https://github.com/CrispStrobe/CrispASR
+cd CrispASR
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=OFF \
+      -DCRISPASR_BUILD_TESTS=OFF
+cmake --build build -j$(nproc)
+```
+
+**Why static?** Termux's `whisper-cli` package installs an older
+`libggml.so` into `$PREFIX/lib`. The dynamic linker finds it before the
+locally built version, causing `cannot locate symbol` errors at runtime.
+Static linking (`-DBUILD_SHARED_LIBS=OFF`) embeds all ggml code directly
+into the binary, eliminating the conflict entirely.
+
+Strip debug symbols to reduce binary size:
+
+```bash
+strip build/bin/crispasr*
+```
+
+### Cross-compiling for Android (NDK)
+
+To cross-compile from a Linux or macOS host for Android deployment
+(e.g. embedding `libcrispasr.so` in an Android app), use the provided
+`build-android.sh` script. This requires the
+[Android NDK](https://developer.android.com/ndk) installed on the host:
+
+```bash
+export ANDROID_NDK_HOME=/path/to/android-ndk
+./build-android.sh                      # all ABIs (arm64-v8a, armeabi-v7a, x86_64)
+./build-android.sh --abi arm64-v8a      # single ABI
+./build-android.sh --vulkan             # with Vulkan GPU support
+```
+
+Output lands in `build-android/<ABI>/src/libcrispasr.so`.
+
+**This is not the same as building inside Termux.** The NDK
+cross-compiler produces binaries linked against Android's bionic libc,
+suitable for embedding in Android apps via JNI. Termux uses its own
+linker and packages — use the native Termux build above instead.

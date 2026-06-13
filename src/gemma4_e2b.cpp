@@ -12,6 +12,7 @@
 #include "core/bpe.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
+#include "core/beam_decode.h"
 #include "core/greedy_decode.h"
 #include "core/mel.h"
 
@@ -210,7 +211,9 @@ struct gemma4_e2b_context {
     int n_threads = 4;
     int verbosity = 1;
     float temperature = 0.0f;
+    int beam_size = 1; // 1 = greedy (default); >1 = beam search
 
+    std::string ask; // custom instruction (empty = use default)
     std::string model_path;
     std::vector<uint8_t> compute_meta; // scratch for graph building
 
@@ -1540,29 +1543,55 @@ static char* g4e_run_prompt(gemma4_e2b_context* ctx, const std::vector<int32_t>&
     int first_token = core_greedy_decode::argmax(prefill_logits, vocab);
     const float first_p =
         core_greedy_decode::softmax_of(prefill_logits, vocab, first_token, prefill_logits[first_token]);
-    free(prefill_logits);
 
     if (verbose)
         fprintf(stderr, "gemma4_e2b: prefill done, first_token=%d (%.1f ms)\n", first_token,
                 (ggml_time_us() - t_llm0) / 1000.0);
 
-    core_greedy_decode::Config cfg;
-    cfg.max_new_tokens = 256;
-    cfg.eos_id = ctx->end_of_turn_id >= 0 ? ctx->end_of_turn_id : ctx->eos_id;
-    cfg.vocab_size = vocab;
-    cfg.temperature = ctx->temperature;
-
+    const int eos = ctx->end_of_turn_id >= 0 ? ctx->end_of_turn_id : ctx->eos_id;
     const bool capture_probs = (out_token_ids && out_token_probs);
-    auto dec =
-        core_greedy_decode::run_with_probs(ctx, first_token, first_p, total, g4e_embed_tokens, g4e_run_llm_kv, cfg);
+
+    std::vector<int32_t> dec_tokens;
+    std::vector<float> dec_probs;
+    if (ctx->beam_size > 1) {
+        // Beam search via replay-from-prefix.
+        auto replay = [](gemma4_e2b_context* c, const int32_t* toks, int n, int prompt_len) -> float* {
+            float* emb = g4e_embed_tokens(c, toks, n);
+            if (!emb)
+                return nullptr;
+            float* lg = g4e_run_llm_kv(c, emb, n, prompt_len, nullptr, nullptr);
+            std::free(emb);
+            return lg;
+        };
+        core_beam_decode::Config bcfg;
+        bcfg.max_new_tokens = 256;
+        bcfg.eos_id = eos;
+        bcfg.vocab_size = vocab;
+        bcfg.beam_size = ctx->beam_size;
+        bcfg.prompt_len = total;
+        auto br = core_beam_decode::run_with_probs(ctx, prefill_logits, replay, bcfg);
+        dec_tokens = std::move(br.tokens);
+        dec_probs = std::move(br.probs);
+    } else {
+        core_greedy_decode::Config cfg;
+        cfg.max_new_tokens = 256;
+        cfg.eos_id = eos;
+        cfg.vocab_size = vocab;
+        cfg.temperature = ctx->temperature;
+        auto gr =
+            core_greedy_decode::run_with_probs(ctx, first_token, first_p, total, g4e_embed_tokens, g4e_run_llm_kv, cfg);
+        dec_tokens = std::move(gr.tokens);
+        dec_probs = std::move(gr.probs);
+    }
+    free(prefill_logits);
 
     if (verbose)
-        fprintf(stderr, "gemma4_e2b: decoded %d tokens (%.1f ms total)\n", (int)dec.tokens.size(),
+        fprintf(stderr, "gemma4_e2b: decoded %d tokens (%.1f ms total)\n", (int)dec_tokens.size(),
                 (ggml_time_us() - t_llm0) / 1000.0);
 
     std::string result;
-    for (size_t i = 0; i < dec.tokens.size(); i++) {
-        const int tid = dec.tokens[i];
+    for (size_t i = 0; i < dec_tokens.size(); i++) {
+        const int tid = dec_tokens[i];
         if (tid == ctx->bos_id || tid == ctx->eos_id)
             continue;
         if (tid == ctx->start_of_turn_id || tid == ctx->end_of_turn_id)
@@ -1582,7 +1611,7 @@ static char* g4e_run_prompt(gemma4_e2b_context* ctx, const std::vector<int32_t>&
         }
         if (capture_probs) {
             out_token_ids->push_back(tid);
-            out_token_probs->push_back(i < dec.probs.size() ? dec.probs[i] : 0.0f);
+            out_token_probs->push_back(i < dec_probs.size() ? dec_probs[i] : 0.0f);
         }
     }
 
@@ -2262,7 +2291,9 @@ static char* gemma4_e2b_transcribe_impl(struct gemma4_e2b_context* ctx, const fl
     std::string src = source_lang ? source_lang : "";
     std::string tgt = target_lang ? target_lang : "";
     std::string user_body;
-    if (translate) {
+    if (!ctx->ask.empty()) {
+        user_body = ctx->ask;
+    } else if (translate) {
         const std::string src_name = g4e_lang_name(src, true);
         const std::string tgt_name = g4e_lang_name(!tgt.empty() ? tgt : std::string("en"), false);
         user_body = "Transcribe the following speech segment in " + src_name + ", then translate it into " + tgt_name +
@@ -2624,4 +2655,15 @@ extern "C" void gemma4_e2b_set_n_threads(struct gemma4_e2b_context* ctx, int n_t
         if (ctx->backend_cpu)
             ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
     }
+}
+
+extern "C" void gemma4_e2b_set_beam_size(struct gemma4_e2b_context* ctx, int beam_size) {
+    if (!ctx)
+        return;
+    ctx->beam_size = beam_size > 1 ? beam_size : 1;
+}
+
+extern "C" void gemma4_e2b_set_ask(struct gemma4_e2b_context* ctx, const char* prompt) {
+    if (ctx)
+        ctx->ask = (prompt && prompt[0]) ? prompt : "";
 }

@@ -26,7 +26,55 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
+
+// ---- Silero VAD context cache (fixes #132) ----
+// Creating and destroying the ggml scheduler + backend on every request
+// fragments memory; after ~4 cycles the allocator hits a pathological
+// path and VAD time jumps from ~2 s to ~140 s. Caching the context
+// across calls avoids the repeated init/free cycle entirely.
+static std::mutex g_silero_cache_mtx;
+static whisper_vad_context* g_silero_cache_ctx = nullptr;
+static std::string g_silero_cache_path;
+
+// Return the cached Silero context (creating it on first use or when
+// the model path changed). Caller must NOT free the returned pointer.
+//
+// The caller MUST already hold g_silero_cache_mtx and keep holding it for
+// the whole duration it uses the returned context: the cached context owns
+// mutable per-request state (LSTM h/c buffer, scheduler, probs) that is
+// reset and rewritten on every detect, so two callers must not share it
+// concurrently. The server runs VAD slicing outside its model_mutex
+// (crispasr_server.cpp), so this mutex is the only thing serializing
+// concurrent requests against the single cached context (#132).
+static whisper_vad_context* silero_vad_get_cached_locked(const char* vad_model_path, int n_threads) {
+    if (g_silero_cache_ctx && g_silero_cache_path == vad_model_path) {
+        return g_silero_cache_ctx;
+    }
+    // Path changed or first call — (re)create.
+    if (g_silero_cache_ctx) {
+        whisper_vad_free(g_silero_cache_ctx);
+        g_silero_cache_ctx = nullptr;
+        g_silero_cache_path.clear();
+    }
+    whisper_vad_context_params vcp = whisper_vad_default_context_params();
+    vcp.n_threads = n_threads;
+    g_silero_cache_ctx = whisper_vad_init_from_file_with_params(vad_model_path, vcp);
+    if (g_silero_cache_ctx) {
+        g_silero_cache_path = vad_model_path;
+    }
+    return g_silero_cache_ctx;
+}
+
+void crispasr_vad_free_cache() {
+    std::lock_guard<std::mutex> lock(g_silero_cache_mtx);
+    if (g_silero_cache_ctx) {
+        whisper_vad_free(g_silero_cache_ctx);
+        g_silero_cache_ctx = nullptr;
+        g_silero_cache_path.clear();
+    }
+}
 
 // Check if a model path is a FireRedVAD model (by filename pattern)
 static bool is_firered_vad_model(const char* path) {
@@ -148,10 +196,16 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
     }
 #endif
     else {
-        // Default: Silero VAD via crispasr API
-        whisper_vad_context_params vcp = whisper_vad_default_context_params();
-        vcp.n_threads = opts.n_threads;
-        whisper_vad_context* vctx = whisper_vad_init_from_file_with_params(vad_model_path, vcp);
+        // Default: Silero VAD via crispasr API.
+        // Use a cached context to avoid the init/free cycle that causes
+        // memory fragmentation and the 70x regression (#132). The cache is
+        // shared mutable state, so hold g_silero_cache_mtx across the whole
+        // detect — the lookup alone is not enough, the context's LSTM/probs
+        // buffers are rewritten by whisper_vad_segments_from_samples and must
+        // not be touched concurrently (the server slices VAD outside its
+        // model_mutex, so concurrent requests would otherwise race here).
+        std::lock_guard<std::mutex> vad_lock(g_silero_cache_mtx);
+        whisper_vad_context* vctx = silero_vad_get_cached_locked(vad_model_path, opts.n_threads);
         if (!vctx) {
             fprintf(stderr, "crispasr: warning: failed to load VAD model '%s'\n", vad_model_path);
             return slices;
@@ -177,7 +231,7 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
         }
         if (vseg)
             whisper_vad_free_segments(vseg);
-        whisper_vad_free(vctx);
+        // Do NOT free vctx — it's owned by the cache.
     }
 
     // Post-merge: offline/file callers keep the historical short/close merge.

@@ -157,6 +157,7 @@ struct mimo_asr_context {
     // Backends + weights
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
+    bool gpu_embed_split = false; // PLAN #115: embed_w on CPU, matmul weights on GPU
     ggml_backend_sched_t sched = nullptr;
     ggml_context* ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
@@ -204,6 +205,8 @@ struct mimo_asr_context {
     int32_t id_eosp = 151652;     // <|eosp|>
     int32_t id_eot = 151653;      // <|eot|>
     int32_t id_eostm = 151654;    // <|eostm|>
+
+    std::string ask; // custom instruction (empty = use default)
 };
 
 static uint32_t mimo_kv_u32(gguf_context* ctx, const char* key, uint32_t def) {
@@ -321,17 +324,48 @@ extern "C" struct mimo_asr_context* mimo_asr_init_from_file(const char* path_mod
         return nullptr;
     }
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
-    if (!ctx->backend)
+    // PLAN #115: force the whole mimo-asr pipeline to CPU until option C
+    // lands. Two failure modes regress on M1 Metal otherwise:
+    //   - weights on GPU (PLAN #72 commit 89111260): prefill graph
+    //     silently emits no tokens, exit 0 with no .txt; segfault at
+    //     ~159 s on 5 min audio.
+    //   - weights on CPU + compute on GPU (the §56 working config):
+    //     `ggml_metal_buffer_get_id: error: tensor 'llm.embed.weight'
+    //     buffer is nil` — the Metal scheduler can't find weight
+    //     buffers for the embed lookup. The scheduler has tightened
+    //     cross-backend tensor resolution since §56, and mimo's graph
+    //     builder doesn't emit the per-tensor backend tagging the new
+    //     ggml needs.
+    // Both verified empirically on M1 Metal 2026-05-26 with current
+    // HEAD (95d74455 incl. the sched-restore hardening). Kaggle
+    // Linux x86_64 CPU build at HEAD verified working: JFK matches
+    // HISTORY §56 reference (prefill 15.8 s, decode 7.0 s over 26
+    // steps). Force-CPU is the cheapest path to correctness; the
+    // proper GPU graph fix is tracked as PLAN #115 option C and
+    // GPU default (PLAN #115 option B, validated on RTX 3090 + Kaggle P100).
+    // When use_gpu is true, weights are split: matmul weights on GPU, Q4_K
+    // embed tables on CPU (CUDA GET_ROWS doesn't support k-quants). Decode
+    // steps run via the prefill graph which handles cross-backend routing.
+    // Set CRISPASR_MIMO_FORCE_CPU=1 to override back to CPU-only.
+    const bool force_cpu = std::getenv("CRISPASR_MIMO_FORCE_CPU") != nullptr;
+    if (params.use_gpu && !force_cpu) {
+        ctx->backend = ggml_backend_init_best();
+        if (!ctx->backend) {
+            fprintf(stderr, "mimo_asr: GPU backend init failed; falling back to CPU\n");
+            ctx->backend = ctx->backend_cpu;
+        } else if (params.verbosity >= 1) {
+            fprintf(stderr, "mimo_asr: GPU backend active (embed split-load, decode via prefill graph)\n");
+        }
+    } else {
         ctx->backend = ctx->backend_cpu;
-
-    // PLAN #72: load weights onto the user-picked backend (GPU when
-    // use_gpu=true). Was hardcoded to backend_cpu under the old
-    // assumption that Q4_K CPU SIMD beat the Metal/CUDA path. Today's
-    // GPU Q4_K kernels are mature and dominate CPU on big-enough
-    // models — mimo_asr at 1.4B params is comfortably big enough.
+        if (force_cpu && params.verbosity >= 1) {
+            fprintf(stderr, "mimo_asr: CRISPASR_MIMO_FORCE_CPU=1 — forced CPU\n");
+        }
+    }
     // PLAN #69a: when CRISPASR_N_GPU_LAYERS is set and < total LLM
-    // layers, route model.layers.<il>.* with il >= N onto the CPU backend.
+    // layers, the split loader still works against ctx->backend_cpu —
+    // both halves of the split go to CPU buffers because the GPU half
+    // would hit the same prefill bug.
     core_gguf::WeightLoad wl;
     int n_gpu_layers_env = -1;
     if (const char* s = std::getenv("CRISPASR_N_GPU_LAYERS")) {
@@ -342,16 +376,34 @@ extern "C" struct mimo_asr_context* mimo_asr_init_from_file(const char* path_mod
                           n_gpu_layers_env < total_layers;
     if (do_split) {
         core_gguf::LayerSplitConfig cfg{"model.layers.", n_gpu_layers_env};
-        if (!core_gguf::load_weights_split(path_model, ctx->backend, ctx->backend_cpu,
+        if (!core_gguf::load_weights_split(path_model, ctx->backend_cpu, ctx->backend_cpu,
                                            core_gguf::is_gpu_tensor_with_prefix, &cfg, "mimo_asr", wl)) {
             fprintf(stderr, "mimo_asr: split load failed from '%s'\n", path_model);
             delete ctx;
             return nullptr;
         }
-        fprintf(stderr, "mimo_asr: layer offload: gpu=[0,%d), cpu=[%d,%d) (CRISPASR_N_GPU_LAYERS=%d)\n",
-                n_gpu_layers_env, n_gpu_layers_env, total_layers, n_gpu_layers_env);
+        fprintf(stderr, "mimo_asr: layer offload requested but pinned to CPU (PLAN #115 — GPU path broken)\n");
+    } else if (ctx->backend && ctx->backend != ctx->backend_cpu) {
+        // PLAN #115 option C: CUDA's get_rows cannot gather Q4_K (ggml-cuda
+        // GET_ROWS supports_op lists F16/F32/Q4_0/Q5_0/Q8_0 — NOT Q4_K), and
+        // mimo's `llm.embed.weight` + `audio.emb.*` are Q4_K. If those sit on
+        // the GPU, the sched routes their get_rows to the CPU backend, which
+        // dequantizes a GPU pointer → SIGSEGV (`dequantize_row_q4_K`, the P100
+        // crash). So keep exactly those get_rows'd embedding tables on CPU;
+        // every other (matmul) weight stays GPU-resident for the speedup. The
+        // small embed output is copied GPU-ward by the sched.
+        auto is_gpu_weight = [](const char* n, void*) -> bool {
+            return !(std::strstr(n, "embed") || std::strstr(n, "audio.emb"));
+        };
+        if (!core_gguf::load_weights_split(path_model, ctx->backend, ctx->backend_cpu, is_gpu_weight, nullptr,
+                                           "mimo_asr", wl)) {
+            fprintf(stderr, "mimo_asr: GPU split load failed from '%s'\n", path_model);
+            delete ctx;
+            return nullptr;
+        }
+        ctx->gpu_embed_split = true;
     } else {
-        if (!core_gguf::load_weights(path_model, ctx->backend, "mimo_asr", wl)) {
+        if (!core_gguf::load_weights(path_model, ctx->backend_cpu, "mimo_asr", wl)) {
             fprintf(stderr, "mimo_asr: failed to load weights from '%s'\n", path_model);
             delete ctx;
             return nullptr;
@@ -457,6 +509,11 @@ extern "C" struct mimo_asr_context* mimo_asr_init_from_file(const char* path_mod
         int n_be = 0;
         ggml_backend_t backends[2];
         backends[n_be++] = ctx->backend;
+        // ggml_backend_sched_new requires a CPU backend as the last (fallback)
+        // entry, so it must stay in the list even under force_gpu. The PLAN
+        // #115 decode segfault is a single CUDA-unsupported op that the sched
+        // offloads to CPU, where it reads a GPU-resident Q4_K weight — fixed
+        // by keeping that op's weight CPU-accessible, not by dropping CPU.
         if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
             backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
@@ -901,6 +958,8 @@ static ggml_cgraph* mimo_asr_build_step_graph(mimo_asr_context* ctx, int n_past,
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
     // Embed lookup straight from llm.embed_w (no audio fusion).
+    // This step graph is only used on the CPU path (gpu_embed_split routes
+    // decode steps through the prefill graph instead — see run_lm_step).
     ggml_tensor* text_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
     ggml_set_input(text_ids);
     ggml_set_name(text_ids, "text_input_ids");
@@ -1378,6 +1437,7 @@ static std::vector<int32_t> mimo_asr_concat_segments(int channels_plus_text,
 //   • The KV buffer is zero-cleared at mimo_asr_kv_init (already in
 //     place at line ~459) — required to avoid CUDA / partial-CPU
 //     noise from uninit'd KV pages (cf. qwen3-tts commit 7298dd5).
+static float* mimo_asr_run_lm(mimo_asr_context* ctx, const int32_t* input_ids_9xT, int T_total, int n_past);
 static float* mimo_asr_run_lm_step(mimo_asr_context* ctx, int32_t next_token, int n_past_groups) {
     const auto& hp = ctx->hp;
     const int vocab = (int)hp.llm_vocab;
@@ -1387,6 +1447,34 @@ static float* mimo_asr_run_lm_step(mimo_asr_context* ctx, int32_t next_token, in
         return nullptr;
     }
 
+    if (ctx->gpu_embed_split) {
+        // PLAN #115 option B (GPU path): reuse the prefill graph for
+        // decode steps. The prefill graph handles the cross-backend embed
+        // lookup correctly (scheduler routes get_rows to CPU, copies the
+        // result to GPU). Building a separate T=1 step graph with an F32
+        // embed input hits scheduler backend-assignment bugs on P100.
+        // The audio branch computes zero (speech_active_mask=0) — minor
+        // overhead for 1 token with gs=4, dwarfed by the 36L LM.
+        const int gs = (int)hp.audio_group_size;
+        const int channels = (int)hp.audio_channels;
+        const int T_seg = gs; // 1 text token × gs = gs frames
+        std::vector<int32_t> block((size_t)(channels + 1) * T_seg);
+        // Row 0: text token replicated via insert_between pattern
+        auto row0 = mimo_asr_insert_between({next_token}, gs, /*fill*/ -100);
+        std::memcpy(block.data(), row0.data(), (size_t)T_seg * sizeof(int32_t));
+        // Rows 1-8: zeroemb padding
+        for (int c = 0; c < channels; c++) {
+            int32_t pad = (int32_t)hp.speech_zeroemb_idx[c];
+            for (int t = 0; t < T_seg; t++)
+                block[(size_t)(1 + c) * T_seg + t] = pad;
+        }
+        // Invalidate the cached step graph (prefill graph uses compute_meta)
+        ctx->step_t1_gf = nullptr;
+        ctx->step_t1_fixed_kv_len = 0;
+        return mimo_asr_run_lm(ctx, block.data(), T_seg, n_past_groups);
+    }
+
+    // CPU path: use the fast cached T=1 step graph with in-graph get_rows.
     const int fixed_kv = ctx->kv_max_ctx;
     const bool can_skip = (ctx->step_t1_gf != nullptr && ctx->step_t1_fixed_kv_len == fixed_kv);
 
@@ -1394,11 +1482,6 @@ static float* mimo_asr_run_lm_step(mimo_asr_context* ctx, int32_t next_token, in
     if (can_skip) {
         gf = ctx->step_t1_gf;
     } else {
-        // n_past=0 here is intentional — only kv_indices (= lm_positions)
-        // controls the cache write slot when fixed_kv_len > 0, and Lk is
-        // already pinned to fixed_kv. The `n_past` parameter is unused
-        // by core_attn::kv_self_attn in that mode (the static-offset
-        // write path is suppressed by kv_indices != nullptr).
         gf = mimo_asr_build_step_graph(ctx, /*n_past*/ 0, /*fixed_kv_len*/ fixed_kv);
         if (!gf)
             return nullptr;
@@ -1426,8 +1509,6 @@ static float* mimo_asr_run_lm_step(mimo_asr_context* ctx, int32_t next_token, in
     if (!set_t("lm_positions", &pos, sizeof(pos)))
         return nullptr;
 
-    // Causal mask shape (fixed_kv, 1): visible up to and including
-    // position n_past_groups, -INF beyond.
     std::vector<ggml_fp16_t> mask((size_t)fixed_kv);
     const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f);
     const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
@@ -1466,7 +1547,7 @@ static float* mimo_asr_run_lm(mimo_asr_context* ctx, const int32_t* input_ids_9x
     // Production path: skip diag captures (~5% win + cleaner allocator,
     // PLAN #51 perf wave). Honour MIMO_ASR_DIAG=1 to keep the diag tensors
     // resident when debugging a transcribe-time regression directly.
-    const bool diag_env = std::getenv("MIMO_ASR_DIAG") != nullptr;
+    const bool diag_env = std::getenv("MIMO_ASR_DIAG") != nullptr || std::getenv("MIMO_ASR_DUMP_STAGES") != nullptr;
     ggml_cgraph* gf = mimo_asr_build_prefill_graph(ctx, Tg, n_past, /*diag_captures*/ diag_env);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
@@ -1522,6 +1603,50 @@ static float* mimo_asr_run_lm(mimo_asr_context* ctx, const int32_t* input_ids_9x
 
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
         return nullptr;
+
+    // Per-stage tensor stats dump (MIMO_ASR_DUMP_STAGES=1) — mirrors funasr's
+    // FUNASR_DUMP_STAGES so a CPU run and a GPU run (CRISPASR_MIMO_FORCE_GPU=1)
+    // can be compared stage-by-stage to localise where the PLAN #115 GPU
+    // prefill diverges (NaN / wrong / zero).
+    if (std::getenv("MIMO_ASR_DUMP_STAGES")) {
+        static const char* dump_stages[] = {
+            "prefill_audio_features", "prefill_text_embeds",       "prefill_inputs_embeds",
+            "prefill_last_hidden",    "prefill_text_logits_step0",
+        };
+        for (const char* sn : dump_stages) {
+            ggml_tensor* t = ggml_graph_get_tensor(gf, sn);
+            if (!t) {
+                std::fprintf(stderr, "mimo_dump: %-28s [not found]\n", sn);
+                continue;
+            }
+            const size_t n = ggml_nelements(t);
+            std::vector<float> buf(n);
+            ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+            double mn = 1e30, mx = -1e30, sum = 0.0, l2 = 0.0;
+            int n_nan = 0, n_inf = 0;
+            for (size_t i = 0; i < n; i++) {
+                const float v = buf[i];
+                if (std::isnan(v)) {
+                    n_nan++;
+                    continue;
+                }
+                if (std::isinf(v)) {
+                    n_inf++;
+                    continue;
+                }
+                mn = std::min(mn, (double)v);
+                mx = std::max(mx, (double)v);
+                sum += v;
+                l2 += (double)v * v;
+            }
+            const double mean = n ? sum / (double)n : 0.0;
+            std::fprintf(stderr,
+                         "mimo_dump: %-28s n=%-8zu min=%12.6f max=%12.6f mean=%12.6f L2=%12.4f nan=%d inf=%d "
+                         "first4=[%.4f %.4f %.4f %.4f]\n",
+                         sn, n, mn, mx, mean, std::sqrt(l2), n_nan, n_inf, n > 0 ? buf[0] : 0.f, n > 1 ? buf[1] : 0.f,
+                         n > 2 ? buf[2] : 0.f, n > 3 ? buf[3] : 0.f);
+        }
+    }
 
     ggml_tensor* logits_t = ggml_graph_get_tensor(gf, "prefill_text_logits_step0");
     if (!logits_t)
@@ -1589,7 +1714,7 @@ static char* mimo_asr_transcribe_impl(struct mimo_asr_context* ctx, const float*
     add_text("<|im_start|>user\n");
     segments.push_back(mimo_asr_build_audio_segment(ctx, codes, n_frames));
     free(codes);
-    add_text("Please transcribe this audio file"); // asr_en_templates[0]
+    add_text(!ctx->ask.empty() ? ctx->ask : std::string("Please transcribe this audio file"));
     add_text("<|im_end|>\n");
     add_text("<|im_start|>assistant\n");
     add_text("<think>\n\n</think>\n<english>");
@@ -1806,4 +1931,9 @@ extern "C" void mimo_asr_set_n_threads(struct mimo_asr_context* ctx, int n_threa
     ctx->n_threads = n_threads;
     if (ctx->backend_cpu)
         ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+}
+
+extern "C" void mimo_asr_set_ask(struct mimo_asr_context* ctx, const char* prompt) {
+    if (ctx)
+        ctx->ask = (prompt && prompt[0]) ? prompt : "";
 }

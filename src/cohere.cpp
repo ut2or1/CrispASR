@@ -112,15 +112,17 @@ static void cohere_log_tensor(const char* name, const struct ggml_tensor* t) {
 // ---------------------------------------------------------------------------
 
 struct cohere_perf {
-    int64_t t_features_us = 0;    // STFT + mel filterbank
-    int64_t t_enc_build_us = 0;   // encoder graph construction
-    int64_t t_enc_alloc_us = 0;   // encoder ggml_backend_sched_alloc_graph
-    int64_t t_enc_compute_us = 0; // encoder ggml_backend_sched_graph_compute
-    int64_t t_cross_kv_us = 0;    // copying cross-KV tensors from encoder output
-    int64_t t_dec_build_us = 0;   // decoder graph build (all steps summed)
-    int64_t t_dec_alloc_us = 0;   // decoder sched alloc (all steps summed)
-    int64_t t_dec_compute_us = 0; // decoder compute (all steps summed)
-    int64_t t_dec_logits_us = 0;  // decoder ggml_backend_tensor_get logits (all steps)
+    int64_t t_features_us = 0;     // STFT + mel filterbank
+    int64_t t_enc_build_us = 0;    // encoder graph construction
+    int64_t t_enc_alloc_us = 0;    // encoder ggml_backend_sched_alloc_graph
+    int64_t t_enc_compute_us = 0;  // encoder ggml_backend_sched_graph_compute
+    int64_t t_cross_kv_us = 0;     // copying cross-KV tensors from encoder output
+    int64_t t_crosskv_read_us = 0; // GPU->CPU readback of per-chunk cross-KV (#161 probe)
+    int64_t t_reserve_us = 0;      // one-time sched reserve of max-ctx decoder graph (#161 probe)
+    int64_t t_dec_build_us = 0;    // decoder graph build (all steps summed)
+    int64_t t_dec_alloc_us = 0;    // decoder sched alloc (all steps summed)
+    int64_t t_dec_compute_us = 0;  // decoder compute (all steps summed)
+    int64_t t_dec_logits_us = 0;   // decoder ggml_backend_tensor_get logits (all steps)
     int64_t t_dec_step_min_us = INT64_MAX;
     int64_t t_dec_step_max_us = 0;
     int n_dec_steps = 0;    // total autoregressive steps (prompt + generated)
@@ -179,6 +181,22 @@ static void cohere_perf_print(const cohere_perf& p, int n_samples, int sample_ra
                 p.t_dec_logits_us / 1e3 / p.n_dec_steps);
         fprintf(stderr, "cohere:  dec total        %7.1f ms\n",
                 (p.t_dec_build_us + p.t_dec_alloc_us + p.t_dec_compute_us + p.t_dec_logits_us) / 1e3);
+    }
+    // #161 probes: host-side work that lives in the gaps between the timed
+    // stages above (cross-KV GPU->CPU readback, one-time max-ctx sched
+    // reserve, and a UNACCOUNTED residual that catches any remaining gap —
+    // e.g. the beam-search KV snapshot that drove the #161 regression).
+    // Opt-in via COHERE_GAPS=1 (or COHERE_BENCH=1) to keep the default
+    // report compact.
+    if (std::getenv("COHERE_GAPS") || std::getenv("COHERE_BENCH")) {
+        const int64_t accounted = p.t_features_us + p.t_enc_build_us + p.t_enc_alloc_us + p.t_enc_compute_us +
+                                  p.t_cross_kv_us + p.t_crosskv_read_us + p.t_reserve_us + p.t_dec_build_us +
+                                  p.t_dec_alloc_us + p.t_dec_compute_us + p.t_dec_logits_us;
+        fprintf(stderr, "cohere: ----- untimed gaps (#161) -----\n");
+        fprintf(stderr, "cohere:  cross-kv readback%7.1f ms\n", p.t_crosskv_read_us / 1e3);
+        fprintf(stderr, "cohere:  sched reserve    %7.1f ms\n", p.t_reserve_us / 1e3);
+        fprintf(stderr, "cohere:  UNACCOUNTED     %7.1f ms   <- residual = total - all stages\n",
+                (p.t_total_us - accounted) / 1e3);
     }
     fprintf(stderr, "cohere: ----- memory -----\n");
     fprintf(stderr, "cohere:  model weights    %7.1f MiB\n", p.mem_model_buf / 1048576.0);
@@ -521,6 +539,9 @@ struct cohere_context {
     float frequency_penalty = 0.0f;
     int max_new_tokens = 0;
     uint64_t decode_seed = 0;
+
+    // §90 beam-search width. 1 = greedy (default).
+    int beam_size = 1;
 };
 
 static void cohere_log_tensor(const char* name, const struct ggml_tensor* t);
@@ -1036,6 +1057,7 @@ static ggml_tensor* ct_get_tensor_fmt(cohere_model& model, const char* fmt, int 
 // ---------------------------------------------------------------------------
 
 #include "core/attention.h"
+#include "core/beam_decode.h"
 #include "core/audio_chunking.h"
 #include "core/gguf_loader.h"
 
@@ -2285,6 +2307,7 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
             // Extract cross-KV from this chunk's encoder graph into CPU vectors.
             // K shape: [head_dim, T_enc_c, n_heads] (raw F32 from encoder graph)
             // V shape: [T_enc_c, head_dim, n_heads] (raw F32 from encoder graph)
+            const int64_t t_ckr0 = ggml_time_us();
             for (int il = 0; il < hp.dec_n_layers; il++) {
                 char ck_name[32], cv_name[32];
                 snprintf(ck_name, sizeof(ck_name), "ck_%d", il);
@@ -2300,6 +2323,7 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
                 ggml_backend_tensor_get(ck_src, partial_k[il].back().data(), 0, ggml_nbytes(ck_src));
                 ggml_backend_tensor_get(cv_src, partial_v[il].back().data(), 0, ggml_nbytes(cv_src));
             }
+            perf.t_crosskv_read_us += (ggml_time_us() - t_ckr0);
         } // end chunk loop
 
         if (do_chunked) {
@@ -2461,100 +2485,152 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     // the gallocr's size_max covers all future autoregressive steps, so
     // ggml_gallocr_needs_realloc returns false for every step and the plan is reused.
     {
+        const int64_t t_rsv0 = ggml_time_us();
         const int dummy_tok = 0;
         struct ggml_cgraph* gf_max = cohere_build_graph_decoder(ctx, &dummy_tok, 1, hp.dec_max_ctx - 1);
         ggml_backend_sched_reserve(ctx->ggml_alloc, gf_max);
+        perf.t_reserve_us += (ggml_time_us() - t_rsv0);
     }
 
-    // Greedy / temperature-sampled decode
     std::vector<int> generated;
     std::vector<float> gen_probs;
-    const bool sampling = ctx->decode_temperature > 0.0f;
-    std::mt19937_64 rng(ctx->decode_seed != 0 ? ctx->decode_seed : (uint64_t)std::random_device{}());
-    std::vector<int> token_counts(ctx->frequency_penalty > 0.0f ? (size_t)hp.vocab_size : 0);
-    std::vector<float> adjusted_logits;
 
-    for (int step = 0; step < max_gen; step++) {
+    // §90 beam search — run_with_probs_branched when beam_size > 1.
+    // Cross-attention KV (cross_kv_k/v) is shared across beams; only self-attention
+    // KV (kv_k/kv_v) is snapshotted per beam.
+    if (ctx->beam_size > 1) {
+        // GH #161: snapshot/restore self-attention KV on-device via a recycled
+        // buffer pool (no PCIe round-trip + sync per beam per step). The pool
+        // outlives every snapshot produced by the beam search below.
+        core_attn::kv_snapshot_pool kv_pool(ctx->kv_k, ctx->kv_v);
+
+        auto save_fn = [&kv_pool](cohere_context*) -> core_attn::kv_snapshot* { return kv_pool.save(); };
+
+        auto restore_fn = [&kv_pool](cohere_context*, core_attn::kv_snapshot* s) { kv_pool.restore(s); };
+
+        auto snap_free_fn = [&kv_pool](core_attn::kv_snapshot* s) { kv_pool.release(s); };
+
+        // Capture T_enc so step_fn can pass it to cohere_decode_step.
+        const int beam_T_enc = T_enc;
+        auto step_fn = [beam_T_enc](cohere_context* c, int32_t tok, int n_past) -> float* {
+            auto lg = cohere_decode_step(c, beam_T_enc, &tok, 1, n_past);
+            if (lg.empty())
+                return nullptr;
+            float* out = (float*)std::malloc(lg.size() * sizeof(float));
+            std::memcpy(out, lg.data(), lg.size() * sizeof(float));
+            return out;
+        };
+
         const int vocab = hp.vocab_size;
-        const float* last_logits = (step == 0) ? logits.data() + ((int)prompt.size() - 1) * vocab : logits.data();
-        const float* pick_logits = last_logits;
-        if (ctx->frequency_penalty > 0.0f && !token_counts.empty()) {
-            adjusted_logits.assign(last_logits, last_logits + vocab);
-            for (int v = 0; v < vocab; v++) {
-                if (token_counts[(size_t)v] > 0)
-                    adjusted_logits[(size_t)v] -= ctx->frequency_penalty * (float)token_counts[(size_t)v];
-            }
-            pick_logits = adjusted_logits.data();
+        // Use only the last-position logits from the prefill
+        const float* last_logits = logits.data() + ((int)prompt.size() - 1) * vocab;
+
+        core_beam_decode::Config bcfg;
+        bcfg.max_new_tokens = max_gen;
+        bcfg.eos_id = eos_id;
+        bcfg.vocab_size = vocab;
+        bcfg.beam_size = ctx->beam_size;
+        bcfg.prompt_len = (int)prompt.size();
+
+        auto br = core_beam_decode::run_with_probs_branched(ctx, last_logits, save_fn, restore_fn, snap_free_fn,
+                                                            step_fn, bcfg);
+
+        // Strip EOS if present at the end
+        for (int i = 0; i < (int)br.tokens.size(); i++) {
+            if (br.tokens[i] == eos_id)
+                break;
+            generated.push_back(br.tokens[i]);
+            gen_probs.push_back(br.probs[i]);
         }
+    } else {
+        // Greedy / temperature-sampled decode
+        const bool sampling = ctx->decode_temperature > 0.0f;
+        std::mt19937_64 rng(ctx->decode_seed != 0 ? ctx->decode_seed : (uint64_t)std::random_device{}());
+        std::vector<int> token_counts(ctx->frequency_penalty > 0.0f ? (size_t)hp.vocab_size : 0);
+        std::vector<float> adjusted_logits;
 
-        int next_tok = (int)(std::max_element(pick_logits, pick_logits + vocab) - pick_logits);
-
-        // Numerically-stable softmax probability of (initially) the
-        // argmax token. We compute the partition function once per
-        // step regardless of which path we take, because we need
-        // the per-token probability for the gen_probs vector either
-        // way.
-        float max_l = pick_logits[next_tok];
-        double sum_e = 0.0;
-        for (int v = 0; v < vocab; v++)
-            sum_e += std::exp((double)(pick_logits[v] - max_l));
-        float tok_p = (float)(1.0 / sum_e);
-
-        if (sampling) {
-            // Re-do the partition with logits/T instead of logits.
-            const float inv_t = 1.0f / ctx->decode_temperature;
-            float max_lt = pick_logits[0] * inv_t;
-            for (int v = 1; v < vocab; v++) {
-                const float s = pick_logits[v] * inv_t;
-                if (s > max_lt)
-                    max_lt = s;
-            }
-            std::vector<double> pr((size_t)vocab);
-            double sum_t = 0.0;
-            for (int v = 0; v < vocab; v++) {
-                const double e = std::exp((double)(pick_logits[v] * inv_t - max_lt));
-                pr[(size_t)v] = e;
-                sum_t += e;
-            }
-            if (sum_t > 0.0) {
-                std::uniform_real_distribution<double> unif(0.0, sum_t);
-                const double rr = unif(rng);
-                double acc = 0.0;
+        for (int step = 0; step < max_gen; step++) {
+            const int vocab = hp.vocab_size;
+            const float* last_logits = (step == 0) ? logits.data() + ((int)prompt.size() - 1) * vocab : logits.data();
+            const float* pick_logits = last_logits;
+            if (ctx->frequency_penalty > 0.0f && !token_counts.empty()) {
+                adjusted_logits.assign(last_logits, last_logits + vocab);
                 for (int v = 0; v < vocab; v++) {
-                    acc += pr[(size_t)v];
-                    if (rr <= acc) {
-                        next_tok = v;
-                        break;
+                    if (token_counts[(size_t)v] > 0)
+                        adjusted_logits[(size_t)v] -= ctx->frequency_penalty * (float)token_counts[(size_t)v];
+                }
+                pick_logits = adjusted_logits.data();
+            }
+
+            int next_tok = (int)(std::max_element(pick_logits, pick_logits + vocab) - pick_logits);
+
+            // Numerically-stable softmax probability of (initially) the
+            // argmax token. We compute the partition function once per
+            // step regardless of which path we take, because we need
+            // the per-token probability for the gen_probs vector either
+            // way.
+            float max_l = pick_logits[next_tok];
+            double sum_e = 0.0;
+            for (int v = 0; v < vocab; v++)
+                sum_e += std::exp((double)(pick_logits[v] - max_l));
+            float tok_p = (float)(1.0 / sum_e);
+
+            if (sampling) {
+                // Re-do the partition with logits/T instead of logits.
+                const float inv_t = 1.0f / ctx->decode_temperature;
+                float max_lt = pick_logits[0] * inv_t;
+                for (int v = 1; v < vocab; v++) {
+                    const float s = pick_logits[v] * inv_t;
+                    if (s > max_lt)
+                        max_lt = s;
+                }
+                std::vector<double> pr((size_t)vocab);
+                double sum_t = 0.0;
+                for (int v = 0; v < vocab; v++) {
+                    const double e = std::exp((double)(pick_logits[v] * inv_t - max_lt));
+                    pr[(size_t)v] = e;
+                    sum_t += e;
+                }
+                if (sum_t > 0.0) {
+                    std::uniform_real_distribution<double> unif(0.0, sum_t);
+                    const double rr = unif(rng);
+                    double acc = 0.0;
+                    for (int v = 0; v < vocab; v++) {
+                        acc += pr[(size_t)v];
+                        if (rr <= acc) {
+                            next_tok = v;
+                            break;
+                        }
                     }
+                    // Recompute the unsoftened probability of the
+                    // newly-picked token so the JSON-full output reflects
+                    // the model's actual confidence in it, not the
+                    // temperature-warped value.
+                    max_l = pick_logits[next_tok];
+                    sum_e = 0.0;
+                    for (int v = 0; v < vocab; v++) {
+                        sum_e += std::exp((double)(pick_logits[v] - max_l));
+                    }
+                    tok_p = (float)(1.0 / sum_e);
                 }
-                // Recompute the unsoftened probability of the
-                // newly-picked token so the JSON-full output reflects
-                // the model's actual confidence in it, not the
-                // temperature-warped value.
-                max_l = pick_logits[next_tok];
-                sum_e = 0.0;
-                for (int v = 0; v < vocab; v++) {
-                    sum_e += std::exp((double)(pick_logits[v] - max_l));
-                }
-                tok_p = (float)(1.0 / sum_e);
             }
+
+            COHERE_VLOG2(vb, "cohere: step %3d  tok=%5d  p=%.3f  %s\n", step, next_tok, tok_p,
+                         (next_tok >= 0 && next_tok < (int)voc.id_to_token.size()) ? voc.id_to_token[next_tok].c_str()
+                                                                                   : "?");
+            if (next_tok == eos_id || next_tok < 0)
+                break;
+
+            generated.push_back(next_tok);
+            gen_probs.push_back(tok_p);
+            if (next_tok >= 0 && next_tok < (int)token_counts.size())
+                token_counts[(size_t)next_tok]++;
+            offset++;
+
+            logits = cohere_decode_step(ctx, T_enc, &next_tok, 1, offset - 1);
+            perf.n_dec_steps++;
         }
-
-        COHERE_VLOG2(vb, "cohere: step %3d  tok=%5d  p=%.3f  %s\n", step, next_tok, tok_p,
-                     (next_tok >= 0 && next_tok < (int)voc.id_to_token.size()) ? voc.id_to_token[next_tok].c_str()
-                                                                               : "?");
-        if (next_tok == eos_id || next_tok < 0)
-            break;
-
-        generated.push_back(next_tok);
-        gen_probs.push_back(tok_p);
-        if (next_tok >= 0 && next_tok < (int)token_counts.size())
-            token_counts[(size_t)next_tok]++;
-        offset++;
-
-        logits = cohere_decode_step(ctx, T_enc, &next_tok, 1, offset - 1);
-        perf.n_dec_steps++;
-    }
+    } // end else (greedy path)
 
     // Snapshot memory
     perf.mem_model_buf = ctx->model.buf ? ggml_backend_buffer_get_size(ctx->model.buf) : 0;
@@ -2940,6 +3016,12 @@ void cohere_set_frequency_penalty(struct cohere_context* ctx, float frequency_pe
     if (!ctx)
         return;
     ctx->frequency_penalty = frequency_penalty > 0.0f ? frequency_penalty : 0.0f;
+}
+
+void cohere_set_beam_size(struct cohere_context* ctx, int n) {
+    if (!ctx)
+        return;
+    ctx->beam_size = n > 0 ? n : 1;
 }
 
 char* cohere_transcribe(struct cohere_context* ctx, const float* samples, int n_samples, const char* lang) {

@@ -47,10 +47,16 @@ DEFAULT_STAGES = [
     "hift_source_stft",
     "voc_conv_pre",
     "voc_ups_0",
+    "voc_si_0",
+    "voc_rb_input_0",
     "voc_rb_0",
     "voc_ups_1",
+    "voc_si_1",
+    "voc_rb_input_1",
     "voc_rb_1",
     "voc_ups_2",
+    "voc_si_2",
+    "voc_rb_input_2",
     "voc_rb_2",
     "voc_conv_post",
     "hift_pcm",
@@ -270,7 +276,11 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
 
                 si = hift.source_downs[i](s_stft)
                 si = hift.source_resblocks[i](si)
+                if f"voc_si_{i}" in stages:
+                    out[f"voc_si_{i}"] = si.detach().squeeze(0).permute(1, 0).contiguous().cpu().float().numpy()
                 x = x + si
+                if f"voc_rb_input_{i}" in stages:
+                    out[f"voc_rb_input_{i}"] = x.detach().squeeze(0).permute(1, 0).contiguous().cpu().float().numpy()
 
                 xs = None
                 for j in range(hift.num_kernels):

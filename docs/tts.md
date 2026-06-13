@@ -1,20 +1,38 @@
 # Text-to-Speech (TTS)
 
-CrispASR ships **seven open-weights TTS engines** behind the same
+CrispASR ships **fourteen open-weights TTS engines** behind the same
 `crispasr` binary, each with a distinct voice / quality / footprint
 trade-off:
 
 | Backend | Why pick it | Voice cloning | First-run download |
 |---|---|---|---|
-| **`kokoro`** | Smallest + fastest. 82 M-param StyleTTS2-derived model. Multilingual via espeak-ng + native German backbone. | No (preset voice packs) | Manual `wget` (no `-m auto`) |
+| **`melotts`** | Multilingual VITS2 (MeloTTS). 4 English speakers (US/BR/India/AU). 44.1 kHz output, ~102 MB GGUF. Neural G2P + CMU dict. BERT companion (Q4_K 52 MB) auto-downloads with `-m auto`; also via `--codec-model` or `MELOTTS_BERT` env. | No (per-speaker ID) | ~154 MB via `-m auto` |
+| **`piper`** | Tiniest footprint (30 MB). rhasspy/piper VITS; 250+ community voices across 30+ languages. Built-in G2P (CMUdict + LTS rules) for English — no espeak-ng needed. Optional espeak-ng for other langs (loaded via dlopen). 22 kHz output. Use `--g2p-dict` to select dictionary source. | No (per-voice GGUF) | Manual `wget` |
+| **`kokoro`** | Smallest + fastest. 82 M-param StyleTTS2-derived model. Multilingual via built-in G2P or espeak-ng (dlopen/popen fallback). | No (preset voice packs) | Manual `wget` (no `-m auto`) |
 | **`qwen3-tts`** | Highest fidelity / strongest cloning. Speech-LLM (talker + code predictor + 12 Hz codec). | Yes (WAV + ref-text or baked voice GGUF) | ~1.3 GB via `-m auto` |
 | **`vibevoice-tts`** | Lowest-latency streaming TTS, designed for realtime. | Preset voice packs | ~636 MB via `-m auto` |
 | **`vibevoice-1.5b`** | Base VibeVoice TTS model with WAV cloning. | Yes (`VIBEVOICE_VOICE_AUDIO=<wav>` or `--voice <wav>`) | ~1.6 GB via `-m auto` |
 | **`orpheus`** | Llama-3.2-3B talker + SNAC 24 kHz codec. 8 baked English speakers; expressive output. Greedy loops — pass `--temperature 0.6`. | Preset names via `--voice tara/leah/...` | ~3.5 GB via `-m auto` (talker Q8 + 26 MB SNAC) |
 | **`chatterbox`** | T3 AR + S3Gen flow-matching + HiFTGenerator. Built-in voice baked into the T3 GGUF; clones via a baked voice GGUF (see workflow below). EN/AR/DE variants share runtime. | Yes (`--voice <voice.gguf>`, baked from a WAV with `models/bake-chatterbox-voice-from-wav.py`) | ~880 MB via `-m auto` (T3 Q8 + S3Gen Q8) |
+| **`outetts`** | OuteTTS-0.3-1B: OLMo-1B LLM + WavTokenizer single-codebook VQ-GAN. Lightweight (1B params), CC BY 4.0 license. 24 kHz output. | Yes (`--voice <speaker.json>`, created with `tools/reference_backends/outetts_create_speaker.py`) | ~2.5 GB via `-m auto` (talker F16 + WavTokenizer decoder) |
+| **`f5-tts`** | F5-TTS v1 Base: 22-layer DiT flow-matching TTS + Vocos iSTFT vocoder. MIT license. High-quality zero-shot voice cloning from 3-15s reference audio. 24 kHz output, character-level tokenization. | Yes (`--voice <ref.wav> --ref-text "transcript"`) | ~953 MB via `-m auto` (single F16 GGUF, DiT + Vocos) |
 | **`indextts`** | IndexTTS-1.5: GPT-2 AR (24L/1280d) mel-code generator + BigVGAN vocoder. Designed for Chinese+English. Zero-shot voice cloning from any reference WAV. | Yes (`--voice <ref.wav>`) | ~2.4 GB via `-m auto` (GPT F16 + BigVGAN F16) |
+| **`cosyvoice3-tts`** | Fun-CosyVoice3-0.5B-2512: Qwen2-0.5B AR speech-token LM + DiT-CFM (10-step Euler) + HiFT (NSF + iSTFT) @ 24 kHz. 9 languages + 18 Chinese dialects. Ships an 8-voice baked bank (`zero_shot` + `fleurs-{en,de,zh,ja,fr,es,ko}`). | Yes — baked-bank name via `--voice <name>`, **or** native arbitrary-WAV cloning via `--voice <ref.wav> --ref-text "..."` (ports speech_tokenizer_v3 + CAMPPlus + matcha mel to ggml; speech tokens byte-exact vs ONNX). | ~1.2 GB via `-m auto` (Q4_K LLM + Q8_0 flow + HiFT + s3tok + campplus + voices) |
+| **`csm`** | Sesame CSM-1B: Llama-3.2 1B backbone (first-codebook AR) + 100M depth decoder (codebooks 1–31) + Kyutai Mimi codec (32-codebook RVQ → SEANet) @ 24 kHz. Single GGUF. Apache-2.0. | No (single built-in voice) | ~1.4 GB via `-m auto` (single Q4_K GGUF) |
+| **`dia`** | Nari Labs Dia 1.6B: byte-level text encoder (12L) + AR audio decoder (18L GQA) + 9-codebook DAC codec @ 44.1 kHz. CFG-guided, dialogue-style with `[S1]`/`[S2]` speaker tags. Apache-2.0. | No (dialogue via speaker tags) | ~1.6 GB via `-m auto` |
+| **`zonos-tts`** | Zyphra Zonos-v0.1-transformer: 26-layer GQA AR transformer → 9-codebook DAC @ 44.1 kHz. Rich conditioning: speaker embedding + text + emotion + FWHM pitch/tempo. CFG guided. Voice cloning from any reference WAV (pass via `ZONOS_SPEAKER_EMB_PATH` or `--voice <ref.wav>`). Apache-2.0. | Yes (`--voice <ref.wav>`) | ~1.6 GB Q8_0 (default) or ~931 MB selective-Q4_K (heads/embeddings kept F16, auto-retry guard) or ~3.0 GB F16, via `-m auto` + 104 MB DAC codec. |
+| **`bark`** | Suno Bark: 3-stage GPT-2 (text→semantic→coarse→fine) + EnCodec 24 kHz decoder. All sub-models packed into one GGUF. Supports speaker conditioning via `.npz` prompts. MIT license. | Yes (`--voice <speaker.npz>`) | ~423 MB via `-m auto` (selective Q4_K) |
+| **`speecht5`** | Microsoft SpeechT5 80M: char-level encoder (12L) + AR mel decoder (6L) + 5-conv postnet + HiFi-GAN @ 16 kHz. MIT. Speaker via 512-d x-vector. | Yes (`--voice <xvector.bin>`, raw float32) | ~300 MB via `-m auto` (F16 GGUF) |
+| **`fastpitch`** | NVIDIA FastPitch 60M: non-autoregressive parallel TTS — 6L FFTransformer encoder + duration/pitch predictors + length regulator + 6L FFTransformer decoder + HiFi-GAN @ 22 kHz. Deterministic (no sampling). CC-BY-4.0. | No (single speaker) | ~230 MB via `-m auto` (Q8_0 GGUF) |
+| **`parler-tts`** | Parler TTS Mini v1.1 (~900M): T5 encoder + MusicGen decoder + DAC 44.1 kHz. Apache-2.0. Prompt-conditioned: describe the voice in natural language via `--instruct`. | No (prompt-conditioned) | ~900 MB via `-m auto` (Q8_0 GGUF) |
+| **`voxcpm2-tts`** | VoxCPM2: 2B Qwen2 backbone + flow matching + BigVGAN @ 48 kHz (decimated to 24 kHz). Zero-shot voice cloning via `--voice <ref.wav>`. | Yes | ~2.4 GB via `-m auto` |
+| **`pocket-tts`** | Kyutai Pocket TTS 100M: continuous-latent AR @ 12.5 Hz + one-step LSD flow head + Mimi VAE decoder → 24 kHz. MIT / CC-BY-4.0. Voice cloning via `--voice ref.wav`. | Yes (`--voice`) | ~220 MB via `-m auto` (F16 GGUF) |
+| **`kugelaudio`** | KugelAudio-0-Open: 7B Qwen2.5 backbone + 4-layer DiT diffusion head (20-step SDE-DPMSolver++) + acoustic VAE decoder → 24 kHz. 23 languages. MIT. | Pre-encoded voices (`--voice voice.gguf`) | ~5.3 GB Q4_K / ~16 GB F16 via `-m auto` |
+| **`tada`** | HumeAI TADA-3B-ML: Llama-3.2-3B backbone + per-token flow-matching diffusion head + TADA codec → 24 kHz. 1:1 text-to-acoustic alignment (no expansion). Voice cloning via reference audio prompt. Requires `--codec-model` for companion codec GGUF. | Yes (`--voice <ref.wav>`) | ~2.2 GB talker Q4_K + ~1 GB codec GGUF |
+| **`lfm2-audio`** | LiquidAI LFM2.5-Audio 1.5B: FastConformer encoder + LFM2 hybrid conv+attention backbone + 6L depthformer (8-codebook Mimi) + ISTFT detokenizer → 24 kHz. Interleaved text+audio generation. Also does ASR and speech-to-speech. LFM Open License v1.0 ($10M revenue cap). | No | ~1.5 GB Q4_K (JP) / ~1.6 GB Q5_K (EN) + ~157 MB detokenizer companion |
+| **`mini-omni2`** | gpt-omni/mini-omni2: Whisper-small encoder + Qwen2-0.5B LLM with 8-stream architecture + SNAC 24 kHz decoder → 24 kHz. Also does ASR and speech-to-speech. MIT license. Requires `--codec-model snac-24khz.gguf` companion. | No | ~1.0 GB Q4_K + ~80 MB SNAC companion |
 
-All seven write 24 kHz mono WAV via `--tts-output`.
+All backends write mono WAV via `--tts-output` (22 kHz for piper/fastpitch, 16 kHz for speecht5, 24 kHz for most others, 44.1 kHz for melotts/dia/parler-tts/zonos-tts, 48 kHz for voxcpm2-tts).
 
 ### Reproducible / diverse generation (`--seed`)
 
@@ -39,7 +57,7 @@ each run can produce a different prosody or phrasing.
 ```
 
 The seed is wired through the sampling-capable TTS backends:
-qwen3-tts, chatterbox, vibevoice, orpheus, indextts, and voxcpm2. It
+qwen3-tts, chatterbox, vibevoice, orpheus, indextts, f5-tts, voxcpm2, and parler-tts. It
 also works for ASR backends with temperature sampling (parakeet,
 canary, cohere, qwen3-asr, voxtral4b, granite, glm-asr, kyutai-stt,
 moonshine). The server API accepts `"seed"` in the `/v1/audio/speech`
@@ -61,6 +79,56 @@ any `crispasr --server` instance whose loaded backend declares
 `speed`, and `instructions` pass through to the backend's
 `whisper_params`. Long-form input is auto-chunked on sentence
 boundaries.
+
+## G2P Phonemization (`--g2p-dict`)
+
+TTS backends that use IPA phonemes (piper, kokoro) need a
+grapheme-to-phoneme (G2P) engine to convert text to IPA. CrispASR
+ships pre-generated IPA pronunciation dictionaries for 4 languages —
+**no espeak-ng required**:
+
+| Language | IPA dict (primary) | Fallback | Match rate |
+|----------|--------------------|----------|------------|
+| English | 126K words, 3 MB | CMUdict + ARPAbet→IPA + LTS rules | 99.5% |
+| German | 667K words, 23 MB | OLaPh + LTS rules (Auslautverhärtung, compound splitting) | 100% |
+| French | 257K words, 6.6 MB | OLaPh + LTS rules (nasals, silent finals, s-voicing) | — |
+| Spanish | 600K words, 18 MB | OLaPh + LTS rules (seseo, lenition, yeísmo) | — |
+
+Dictionaries are auto-downloaded from
+[cstr/g2p-dicts](https://huggingface.co/datasets/cstr/g2p-dicts)
+on first use and cached at `~/.cache/crispasr/`.
+
+The `--g2p-dict` flag selects the dictionary source:
+
+```bash
+# Default: pre-generated IPA dicts (piper-compatible, auto-download)
+crispasr --backend piper -m auto --tts "Hello world"
+
+# Use CMUdict + ARPAbet→IPA conversion instead (76% piper match)
+crispasr --backend piper -m auto --g2p-dict cmudict --tts "Hello world"
+
+# Use OLaPh MIT dicts (British IPA conventions)
+crispasr --backend piper -m auto --g2p-dict olaph --tts "Hello world"
+
+# Use your own dictionary file
+crispasr --backend piper -m auto --g2p-dict /path/to/my/dict.txt --tts "Hello world"
+```
+
+The phonemization cascade tries in order:
+1. Pre-generated IPA dict (99.5% piper-compatible) — auto-download
+2. CMUdict + ARPAbet→IPA conversion (EN) / OLaPh dict (DE/FR/ES)
+3. LTS letter-to-sound rules — always available, zero dependencies
+4. espeak-ng via dlopen (loaded at runtime if installed)
+5. espeak-ng via popen (subprocess fallback)
+
+Override per-language dict paths with env vars:
+`CRISPASR_CMUDICT_PATH`, `CRISPASR_DE_DICT_PATH`,
+`CRISPASR_FR_DICT_PATH`, `CRISPASR_ES_DICT_PATH`.
+
+Dictionary sources at [cstr/g2p-dicts](https://huggingface.co/datasets/cstr/g2p-dicts):
+- **Pre-generated IPA** (primary): piper-compatible phonetic transcriptions for EN/DE/FR/ES
+- **CMUdict** (BSD): [cmusphinx/cmudict](https://github.com/cmusphinx/cmudict), English ARPAbet
+- **OLaPh** (MIT): [iisys-hof/olaph](https://github.com/iisys-hof/olaph), 13 languages
 
 ## Kokoro — multilingual, smallest
 
@@ -205,7 +273,7 @@ defaults reproduce the validated, end-to-end-tested code path.
 | `QWEN3_TTS_PROF` | unset | Per-op profiler (more granular than `BENCH`). |
 | `QWEN3_TTS_CP_BACKEND` | unset | Pin the code predictor to a chosen backend. `cpu`, `cpu-f16`, `cpu-f32` keep its weights on the CPU backend — useful when isolating bugs to the talker vs. code-predictor or when comparing CPU and Metal end-to-end. |
 | `QWEN3_TTS_DUMP_DIR` | unset | Write per-frame intermediate tensors into the named directory. Bulky; intended for diff-harness work (`tools/dump_reference.py --backend qwen3-tts`). |
-| `QWEN3_TTS_CODEC_GPU` | unset | Route the codec decode through the main GPU scheduler instead of the CPU-only `codec_sched`. The codec is pinned to CPU by default to dodge the M1 Metal hang; on CUDA / Vulkan / etc. the hang does not apply and CPU codec is dramatically slower. On Jetson Orin AGX, codec on CPU is ~50× slower than CUDA. Distinct from `QWEN3_TTS_CODEC_FORCE_METAL`, which also moves the codec to the main GPU sched but additionally enables a per-op `ggml_backend_synchronize` trace callback for reproducing the Metal hang — useful for debugging, not for production. |
+| `QWEN3_TTS_CODEC_GPU` | unset | Route the codec decode through the main GPU scheduler instead of the CPU-only `codec_sched`. **Now safe on all backends** — `GGML_OP_CONV_TRANSPOSE_1D` is forced to CPU fallback across CUDA/Metal/Vulkan/SYCL/CANN (#155), so the rest of the codec runs on GPU while only the transpose conv falls back to CPU. On Jetson Orin AGX, codec on CPU is ~50× slower than CUDA; with this fix, `CODEC_GPU=1` gives ~50% TTS speedup without driver crashes. Distinct from `QWEN3_TTS_CODEC_FORCE_METAL`, which also enables a per-op trace callback for debugging. |
 | `QWEN3_TTS_SKIP_REF_DECODE` | **on** (set `=0` to opt out) | Skip the codec decode of the reference audio in `qwen3_tts_synthesize`. The default-on path emits `codec_decode_codes(gen)` directly; the opt-out path concatenates `ref_codes + gen_codes`, decodes both, then trims the ref portion. With a 26 s reference (~334 codec frames at 12 Hz), the ref half adds ~16 s of constant codec compute regardless of how much new audio is generated (Jetson Orin AGX, issue #64). End-to-end RTF on Orin drops from ~7-9 → ~1.5; the win compounds N× under `/v1/audio/speech` long-form chunking. Bit-identity verified 2026-05-05 on Apple Silicon Metal, qwen3-tts-customvoice 0.6B Q8_0: max\|diff\| = 0, cosine similarity = 1.0 — equivalence holds because the codec is a straight-line forward pass with no rolling state. Set `QWEN3_TTS_SKIP_REF_DECODE=0` only for A/B verification or if a future codec graph variant grows rolling state. |
 
 ## VibeVoice — realtime streaming TTS
@@ -497,6 +565,37 @@ missing up_layer.conv, missing xscale-after-up_embed, attention
 output head layout). encoder_out is now bit-exact to the Python
 reference.
 
+## Parler TTS — prompt-conditioned voice description
+
+Parler TTS Mini v1.1 is a prompt-conditioned TTS model (~900M params):
+T5 encoder processes a natural-language voice description, MusicGen-style
+decoder generates audio codes, DAC codec decodes to 44.1 kHz PCM.
+Apache-2.0 license. No reference audio or voice packs needed --- describe
+the voice you want in text via `--instruct`.
+
+```bash
+# Auto-download (~900 MB Q8_0 GGUF on first run):
+./build/bin/crispasr --backend parler-tts -m auto \
+    --instruct "A female speaker with a warm voice in a quiet room." \
+    --tts "Hello, this is a test of Parler TTS." \
+    --tts-output output.wav --seed 42
+
+# Explicit model path:
+./build/bin/crispasr --backend parler-tts \
+    -m parler-mini-v1.1-q8_0.gguf \
+    --instruct "A young male speaker with an energetic tone." \
+    --tts "Welcome to CrispASR text-to-speech." \
+    --tts-output welcome.wav
+```
+
+The `--instruct` flag sets the voice description. If omitted, a default
+description ("A female speaker with a warm, clear voice in a quiet room.")
+is used. Output is 44.1 kHz mono PCM. Temperature (default 1.0) and seed
+are supported for reproducible / diverse generation.
+
+**Model file:**
+[`cstr/parler-tts-mini-v1.1-GGUF`](https://huggingface.co/cstr/parler-tts-mini-v1.1-GGUF)
+
 ## TTS GGUF downloads
 
 [`cstr/vibevoice-realtime-0.5b-GGUF`](https://huggingface.co/cstr/vibevoice-realtime-0.5b-GGUF) ·
@@ -513,7 +612,36 @@ reference.
 [`cstr/chatterbox-turbo-GGUF`](https://huggingface.co/cstr/chatterbox-turbo-GGUF) ·
 [`cstr/kartoffelbox-turbo-GGUF`](https://huggingface.co/cstr/kartoffelbox-turbo-GGUF) ·
 [`cstr/lahgtna-chatterbox-v1-GGUF`](https://huggingface.co/cstr/lahgtna-chatterbox-v1-GGUF) ·
-[`cstr/indextts-1.5-GGUF`](https://huggingface.co/cstr/indextts-1.5-GGUF)
+[`cstr/indextts-1.5-GGUF`](https://huggingface.co/cstr/indextts-1.5-GGUF) ·
+[`cstr/parler-tts-mini-v1.1-GGUF`](https://huggingface.co/cstr/parler-tts-mini-v1.1-GGUF)
+
+## F5-TTS — DiT flow-matching voice cloning
+
+F5-TTS v1 Base is a DiT-based flow-matching TTS model with zero-shot
+voice cloning from 3-15s of reference audio. MIT license. Architecture:
+ConvNeXtV2 text encoder → 22-layer Diffusion Transformer with AdaLN-Zero
+→ 32-step Euler ODE solver with CFG → Vocos iSTFT vocoder. Single GGUF
+(~1.3 GB) containing both DiT and Vocos weights.
+
+```bash
+# Basic synthesis with voice cloning
+./build/bin/crispasr --backend f5-tts -m auto \
+    --voice samples/jfk.wav \
+    --ref-text "Ask not what your country can do for you" \
+    --tts "Hello, how are you today?" \
+    --tts-output hello.wav --seed 42
+
+# Without voice cloning (requires ref audio for now)
+# F5-TTS always needs a reference audio + transcript pair.
+```
+
+The `--ref-text` flag provides the transcript of the reference audio.
+This is required for F5-TTS (unlike indextts which conditions on audio
+only). The model uses character-level tokenization (2545 vocab, pinyin
+for Chinese). Output is 24 kHz mono PCM.
+
+**Model file:**
+[`cstr/f5-tts-GGUF`](https://huggingface.co/cstr/f5-tts-GGUF)
 
 ## IndexTTS — Chinese/English voice cloning
 
@@ -637,3 +765,113 @@ sources unless you also vet the env var.
 When the hook fires you'll see no extra log line by default; pass
 `-v` to confirm the post-hook tokenization (`indextts: text "..." ->
 N tokens`).
+
+---
+
+## AI-generated audio provenance & watermarking
+
+All TTS output is automatically marked as AI-generated through multiple
+complementary layers. This is non-optional and cannot be bypassed.
+
+### Spread-spectrum watermark (built-in, always active)
+
+A frequency-domain watermark embedded in the PCM signal after synthesis.
+Survives re-encoding, volume normalization, and moderate compression.
+
+```bash
+# Detect watermark in any audio file (C API)
+crispasr_watermark_detect(pcm, n_samples)  # returns confidence 0..1
+```
+
+### AudioSeal neural watermark (optional upgrade)
+
+Meta's AudioSeal (MIT) provides stronger robustness via a learned
+SEANet encoder-decoder. 100% cosine parity with the PyTorch reference.
+
+```bash
+# Convert model (requires pip install audioseal gguf)
+python3 models/convert-audioseal-to-gguf.py -o audioseal.gguf
+
+# Use with TTS
+crispasr --tts "hello" -m kokoro.gguf --watermark-model audioseal.gguf
+
+# Debug: AUDIOSEAL_DEBUG=1 for shape traces, AUDIOSEAL_DUMP_STAGES=1 for binary dumps
+```
+
+### File metadata (always active)
+
+- **WAV**: `LIST`/`INFO` chunk with `ISFT="CrispASR (AI-generated audio)"` and `ICMT` notice
+- **MP3**: ID3v2 `TXXX` frames: `AI_GENERATED=true`, `GENERATOR=CrispASR`
+
+### C2PA Content Credentials (optional, compile-time)
+
+Signed provenance manifests with `digitalSourceType=trainedAlgorithmicMedia`.
+Requires `c2pa-c` library and a self-signed certificate:
+
+```bash
+# Generate certificate
+./scripts/generate-c2pa-cert.sh
+
+# Use with TTS
+crispasr --tts "hello" --c2pa-cert crispasr-c2pa.crt --c2pa-key crispasr-c2pa.key
+```
+
+### Voice cloning consent gate
+
+Voice cloning (`.wav` reference files) requires explicit consent:
+
+```bash
+# CLI: --i-have-rights flag required
+crispasr --tts "hello" --voice speaker.wav --i-have-rights
+
+# Server: consent_attestation field required in JSON body
+curl -X POST http://localhost:8080/v1/audio/speech \
+  -d '{"input":"hello","voice":"speaker.wav","consent_attestation":"I have consent"}'
+```
+
+All consent attestations are logged with ISO 8601 timestamps.
+
+### Post-embed watermark verification (automatic)
+
+After writing a watermarked WAV in TTS mode, CrispASR automatically
+reads back the in-memory PCM and runs watermark detection on it. If
+the detected confidence is below 0.6, a warning is emitted to stderr.
+This catches cases where the watermark was degraded during synthesis
+or encoding — no extra flags needed.
+
+### `--detect-watermark PATH` — standalone watermark detection
+
+Reads a WAV file, runs watermark detection (spread-spectrum by default,
+or AudioSeal if `--watermark-model` is given), prints the confidence
+score and a human-readable verdict, then exits.
+
+| Confidence | Verdict |
+|---|---|
+| > 0.65 | `AI-GENERATED WATERMARK DETECTED` |
+| 0.4 – 0.65 | `UNCERTAIN` |
+| < 0.4 | `No watermark detected` |
+
+```bash
+# Detect watermark using the built-in spread-spectrum detector
+crispasr --detect-watermark output.wav
+
+# Detect with AudioSeal neural watermark model
+crispasr --detect-watermark output.wav --watermark-model audioseal.gguf
+```
+
+### Spoken disclaimer (voice clones only)
+
+Voice-cloned output is automatically prefixed with "This audio was
+generated by artificial intelligence" using a neutral default voice
+(not the cloned voice), with a 300ms silence gap before the cloned audio.
+
+The spoken disclaimer can be disabled per-request while keeping all
+machine-readable provenance (watermark + C2PA) intact:
+
+- **CLI**: `--no-spoken-disclaimer`
+- **Server**: `"spoken_disclaimer": false` in the request body
+
+When the spoken disclaimer is suppressed, the caller assumes
+responsibility for providing appropriate AI-disclosure to end users
+(e.g. a visual label in the UI). The spread-spectrum watermark and
+C2PA metadata are always embedded regardless of this setting.

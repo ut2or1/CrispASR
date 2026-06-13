@@ -221,6 +221,12 @@ REGISTRY: tuple[Backend, ...] = (
             timeout_s=600, approx_size_mb=4500,
             capabilities=("transcribe", "json-output", "temperature",
                           "word-timestamps", "tts-roundtrip")),
+    # vibevoice-1.5b: base VibeVoice TTS model with WAV cloning. Larger
+    # than the ASR-optimised vibevoice; produces higher-fidelity TTS.
+    Backend("vibevoice-1.5b", "VibeVoice 1.5B TTS", "vibevoice-1.5b-tts-q4_k.gguf",
+            "cstr/vibevoice-1.5b-GGUF", "vibevoice-1.5b-tts-q4_k.gguf",
+            timeout_s=600, approx_size_mb=1600,
+            capabilities=("tts-roundtrip", "temperature", "voice-cloning")),
     Backend("voxtral",    "Voxtral Mini 3B",     "voxtral-mini-3b-2507-q4_k.gguf",
             "cstr/voxtral-mini-3b-2507-GGUF", "voxtral-mini-3b-2507-q4_k.gguf",
             timeout_s=300, approx_size_mb=1900,
@@ -247,6 +253,40 @@ REGISTRY: tuple[Backend, ...] = (
             timeout_s=600, approx_size_mb=4200,
             capabilities=("transcribe", "json-output", "temperature",
                           "word-timestamps")),
+
+    # mega-asr: Qwen3-1.7B variant with robustness LoRA. Same qwen3-asr
+    # runtime; ships as a separate GGUF with the LoRA baked in.
+    Backend("mega-asr",  "Mega-ASR 1.7B",           "mega-asr-1.7b-q4_k.gguf",
+            "cstr/mega-asr-GGUF", "mega-asr-1.7b-q4_k.gguf",
+            timeout_s=300, approx_size_mb=1300,
+            capabilities=("transcribe", "json-output", "beam",
+                          "temperature", "word-timestamps", "punctuation")),
+
+    # FunASR LLM-decoder family (70-block SANM encoder + 2-block adaptor
+    # + Qwen3-0.6B AR decode). Same runtime path; mlt-nano is the
+    # multilingual fine-tune. Both were ported 2026-05-20 (HISTORY) but
+    # never landed in this registry, so the !-loop regression in v0.6.10
+    # shipped silent (issue #125 reports 01/07/08/09).
+    Backend("funasr",     "FunASR Nano 2512",        "funasr-nano-2512-f16.gguf",
+            "cstr/funasr-nano-GGUF", "funasr-nano-2512-f16.gguf",
+            timeout_s=120, approx_size_mb=1980,
+            capabilities=("transcribe", "json-output")),
+    Backend("fun-asr-mlt-nano", "FunASR MLT-Nano 2512",
+            "funasr-mlt-nano-2512-f16.gguf",
+            "cstr/funasr-mlt-nano-GGUF", "funasr-mlt-nano-2512-f16.gguf",
+            timeout_s=120, approx_size_mb=1980,
+            capabilities=("transcribe", "json-output")),
+    # SenseVoice + paraformer-zh share the SANM block helper with funasr
+    # but ship as encoder-only / NAR backends. Missing from the registry
+    # in parallel with funasr; same coverage gap.
+    Backend("sensevoice", "SenseVoice Small (CTC)", "sensevoice-small-q4_k.gguf",
+            "cstr/sensevoice-small-GGUF", "sensevoice-small-q4_k.gguf",
+            timeout_s=60, approx_size_mb=470,
+            capabilities=("transcribe", "json-output", "lid")),
+    Backend("paraformer", "Paraformer-zh (NAR)",     "paraformer-zh-q4_k.gguf",
+            "cstr/paraformer-zh-GGUF", "paraformer-zh-q4_k.gguf",
+            timeout_s=60, approx_size_mb=130,
+            capabilities=("transcribe", "json-output")),
 
     # granite-4.1-plus: 2B speech-LLM with translate + src/tgt language.
     # Same runtime path as granite-4.1; -plus adds bigger LM head + extra
@@ -379,6 +419,105 @@ REGISTRY: tuple[Backend, ...] = (
             "cstr/lahgtna-chatterbox-v1-GGUF", "chatterbox-t3-f16.gguf",
             timeout_s=600, approx_size_mb=1400,
             capabilities=("tts-roundtrip", "temperature", "voice-cloning")),
+    # indextts: IndexTTS-1.5 GPT-2 AR mel-code generator + BigVGAN vocoder.
+    # Voice cloning via Conformer+Perceiver on reference audio. Two GGUFs.
+    Backend("indextts",  "IndexTTS 1.5 (TTS)",  "indextts-gpt-q8_0.gguf",
+            "cstr/indextts-1.5-GGUF", "indextts-gpt-q8_0.gguf",
+            timeout_s=600, approx_size_mb=870,
+            capabilities=("tts-roundtrip", "temperature", "voice-cloning"),
+            extra_files=(("indextts-bigvgan.gguf",
+                          "cstr/indextts-1.5-GGUF",
+                          "indextts-bigvgan.gguf"),)),
+    # voxcpm2-tts: VoxCPM2 diffusion AR TTS, 30 languages, 48 kHz.
+    Backend("voxcpm2-tts", "VoxCPM2 TTS",       "voxcpm2-q4_k.gguf",
+            "cstr/voxcpm2-GGUF", "voxcpm2-q4_k.gguf",
+            timeout_s=600, approx_size_mb=1600,
+            capabilities=("tts-roundtrip", "temperature")),
+    # cosyvoice3-tts: CosyVoice3 0.5B streaming multilingual TTS. Three-
+    # stage pipeline (LLM AR -> flow Euler -> HiFT vocoder). Multiple
+    # GGUFs: LLM + flow + HiFT + campplus + s3tok + voices.
+    Backend("cosyvoice3-tts", "CosyVoice3 0.5B (TTS)", "cosyvoice3-llm-q4_k.gguf",
+            "cstr/cosyvoice3-0.5b-2512-GGUF", "cosyvoice3-llm-q4_k.gguf",
+            timeout_s=600, approx_size_mb=1200,
+            capabilities=("tts-roundtrip", "temperature"),
+            extra_files=(("cosyvoice3-flow-q8_0.gguf",
+                          "cstr/cosyvoice3-0.5b-2512-GGUF",
+                          "cosyvoice3-flow-q8_0.gguf"),
+                         ("cosyvoice3-hift-f16.gguf",
+                          "cstr/cosyvoice3-0.5b-2512-GGUF",
+                          "cosyvoice3-hift-f16.gguf"),
+                         ("cosyvoice3-campplus-f16.gguf",
+                          "cstr/cosyvoice3-0.5b-2512-GGUF",
+                          "cosyvoice3-campplus-f16.gguf"),
+                         ("cosyvoice3-s3tok-f16.gguf",
+                          "cstr/cosyvoice3-0.5b-2512-GGUF",
+                          "cosyvoice3-s3tok-f16.gguf"),
+                         ("cosyvoice3-voices.gguf",
+                          "cstr/cosyvoice3-0.5b-2512-GGUF",
+                          "cosyvoice3-voices.gguf"),)),
+    # f5-tts: DiT-based flow-matching TTS with zero-shot voice cloning.
+    # Single GGUF containing DiT + Vocos vocoder. Character-level tokenizer.
+    Backend("f5-tts",    "F5-TTS v1 Base (TTS)", "f5-tts-v1-base-f16.gguf",
+            "cstr/f5-tts-GGUF", "f5-tts-v1-base-f16.gguf",
+            timeout_s=600, approx_size_mb=953,
+            capabilities=("tts-roundtrip", "temperature")),
+    # outetts: OuteTTS 0.3 1B — OLMo-1B LLM + WavTokenizer VQ-GAN. Two
+    # GGUFs: talker + WavTokenizer decoder.
+    Backend("outetts",   "OuteTTS 0.3 1B (TTS)", "outetts-0.3-1b-q8_0.gguf",
+            "cstr/outetts-0.3-1b-GGUF", "outetts-0.3-1b-q8_0.gguf",
+            timeout_s=600, approx_size_mb=2500,
+            capabilities=("tts-roundtrip", "temperature"),
+            extra_files=(("wavtokenizer-decoder-f16.gguf",
+                          "cstr/outetts-0.3-1b-GGUF",
+                          "wavtokenizer-decoder-f16.gguf"),)),
+    # csm: Sesame CSM-1B conversational TTS. Llama-3.2 1B backbone + depth
+    # decoder + Mimi codec, all in one GGUF.
+    Backend("csm",       "CSM-1B (TTS)",         "csm-1b-q4_k.gguf",
+            "cstr/csm-1b-GGUF", "csm-1b-q4_k.gguf",
+            timeout_s=600, approx_size_mb=1400,
+            capabilities=("tts-roundtrip", "temperature")),
+    # dia: Nari Labs Dia-1.6B. Byte-level text encoder + AR audio decoder
+    # emitting 9 interleaved DAC codebooks. DAC 44.1 kHz codec companion.
+    Backend("dia",       "Dia 1.6B (TTS)",       "dia-1.6b-f16.gguf",
+            "cstr/dia-1.6b-GGUF", "dia-1.6b-f16.gguf",
+            timeout_s=600, approx_size_mb=3000,
+            capabilities=("tts-roundtrip", "temperature"),
+            extra_files=(("dac-44khz.gguf",
+                          "cstr/dia-1.6b-GGUF",
+                          "dac-44khz.gguf"),)),
+    # speecht5: SpeechT5 TTS — 80M param AR mel decoder + HiFi-GAN vocoder.
+    # Deterministic (no sampling). Needs 512-d x-vector for speaker
+    # conditioning via --voice <xvector.bin>.
+    Backend("speecht5",  "SpeechT5 TTS",         "speecht5-tts-f16.gguf",
+            "cstr/speecht5-tts-GGUF", "speecht5-tts-f16.gguf",
+            timeout_s=120, approx_size_mb=300,
+            capabilities=("tts-roundtrip",)),
+    # piper: Piper VITS TTS. Deterministic, ~30 MB. No auto-download yet
+    # (community voices on rhasspy/piper, not HuggingFace GGUF).
+    Backend("piper",     "Piper VITS (TTS)",     "piper-en_US-lessac-medium-f16.gguf",
+            "cstr/piper-en_US-lessac-medium-GGUF", "piper-en_US-lessac-medium-f16.gguf",
+            timeout_s=120, approx_size_mb=30,
+            capabilities=("tts-roundtrip",)),
+    # pocket-tts: Kyutai Pocket TTS 100M. Continuous-latent AR TTS at 12.5 Hz,
+    # decoded by Mimi VAE to 24 kHz PCM. Single GGUF, no codec companion.
+    Backend("pocket-tts", "Pocket TTS (TTS)",    "pocket-tts-english-novc-f16.gguf",
+            "cstr/pocket-tts-GGUF", "pocket-tts-english-novc-f16.gguf",
+            timeout_s=300, approx_size_mb=200,
+            capabilities=("tts-roundtrip", "temperature")),
+    # bark: Suno Bark small — 3-stage hierarchical TTS (semantic + coarse +
+    # fine GPT-2) + EnCodec decoder. Single GGUF.
+    Backend("bark",      "Bark Small (TTS)",     "bark-small-q8_0.gguf",
+            "cstr/bark-small-GGUF", "bark-small-q8_0.gguf",
+            timeout_s=600, approx_size_mb=500,
+            capabilities=("tts-roundtrip", "temperature")),
+    # parler-tts: Parler TTS Mini v1.1 — T5 encoder + DAC-based AR decoder.
+    # 44.1 kHz output. Voice described via natural-language --instruct.
+    Backend("parler-tts", "Parler TTS Mini v1.1 (TTS)", "parler-mini-v1.1-q8_0.gguf",
+            "cstr/parler-tts-mini-v1.1-GGUF", "parler-mini-v1.1-q8_0.gguf",
+            timeout_s=600, approx_size_mb=1000,
+            capabilities=("tts-roundtrip", "temperature")),
+    # zonos: Zyphra Zonos v0.1 — GGUF repo not yet uploaded to HF.
+    # TODO: add entry once cstr/zonos-v0.1-transformer-GGUF is created.
     # M2M-100 multilingual text-to-text translation (facebook/m2m100_418M).
     # NOT an ASR or TTS backend — input is text, not audio. The test
     # script's test_translate runs `--translate -tl de samples/jfk.wav`
@@ -1047,8 +1186,10 @@ def test_word_timestamps(b: Backend, tier: str, ctx: dict) -> TestOutcome:
 # silero VAD model can live in a few places; the test runner probes them.
 def _find_silero(models_dir: Path) -> Path | None:
     for cand in (
+        models_dir / "ggml-silero-v6.2.0.bin",
+        Path.home() / ".cache" / "crispasr" / "ggml-silero-v6.2.0.bin",
+        models_dir / "for-tests-silero-v6.2.0-ggml.bin",
         models_dir / "ggml-silero-v5.1.2.bin",
-        models_dir / "silero-v5.1.2.bin",
         Path.home() / ".cache" / "crispasr" / "ggml-silero-v5.1.2.bin",
     ):
         if cand.is_file():
@@ -1076,7 +1217,7 @@ def test_vad(b: Backend, tier: str, ctx: dict) -> TestOutcome:
         return TestOutcome(b.name, "vad", tier, "SKIP",
                            "silero VAD model not found in --models or "
                            "~/.cache/crispasr/ — download "
-                           "ggml-silero-v5.1.2.bin from ggml-org/whisper-vad")
+                           "ggml-silero-v6.2.0.bin from ggml-org/whisper-vad")
     if tier == "full":
         try:
             audio = make_multi_segment_probe(audio, n_repeats=4, silence_ms=800)

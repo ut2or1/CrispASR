@@ -112,7 +112,7 @@ Duplicated scaffolding is bundled in a single static library,
 | `core/bpe.h` | GPT-2 byte-level BPE encode + decode | granite_speech, granite_nle, voxtral, qwen3, glm-asr |
 | `core/greedy_decode.h` | Autoregressive greedy decode loop with EOS handling | qwen3, voxtral, voxtral4b, granite, glm-asr |
 | `core/sanm.h` | FunASR SANM encoder block (MHA + FSMN depthwise conv) | funasr, sensevoice, paraformer |
-| `core/asr_context_bias.h` | Aho-Corasick CTC-WS phrase-boost trie for `--hotwords` (#98) | parakeet (CTC + TDT); extensible to any CTC/TDT backend |
+| `core/asr_context_bias.h` | Aho-Corasick CTC-WS phrase-boost trie for `--hotwords` (#98). Per-beam state in TDT/RNNT beam search | parakeet (CTC + TDT greedy + TDT beam); extensible to any CTC/TDT backend |
 
 `core_mel::Params` spans both algorithm clusters: the NeMo family
 (`ln` + per-mel z-score + `(T, n_mels)` layout) and the HF/Whisper
@@ -185,6 +185,7 @@ regression test against `samples/jfk.wav`:
 | qwen3-tts | Qwen3 talker + 12 Hz codec + code-predictor | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu |
 | orpheus | Llama-3.2 talker + SNAC RVQ codec | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu |
 | chatterbox | T3 (Llama / GPT-2) + S3Gen (Conformer + UNet1D CFM + HiFTGen) | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu, fft |
+| zonos-tts | 26L GQA transformer + 9-codebook DAC @ 44.1 kHz; CFG; voice cloning from WAV | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, gated_mlp |
 | m2m100 | facebook/m2m100 12L+12L transformer (text-to-text translation; WMT21 4.7B variant via `--backend m2m100-wmt21`) | ✔ | — | ✔ (cross-attn) | CUDA / Metal | gguf_loader, kv_self_attn |
 | madlad / t5 | T5 encoder-decoder (MADLAD-400 12L+12L, gated-GELU, RMSNorm, bucketed rel-pos bias). Tokens match Python SP bit-by-bit; translation outputs match the HF reference. | ✔ | — | ✔ (cross-attn) | CUDA / Metal | gguf_loader, ffn |
 
@@ -200,7 +201,10 @@ regression test against `samples/jfk.wav`:
   injected into LLM embedding space, KV-cached autoregressive
   decoding.
 - **Transducer** (parakeet): LSTM predictor + joint network,
-  frame-synchronous TDT decoding.
+  frame-synchronous TDT decoding. Supports greedy (default),
+  label-looping beam search (`-bs N`), and MAES (Modified Adaptive
+  Expansion Search — `CRISPASR_PARAKEET_MAES=1 -bs N`), with per-beam
+  LSTM state snapshots and per-beam hotword trie tracking.
 - **Codec + LM** (kyutai-stt): neural audio codec (RVQ) →
   token-based LM.
 - **TTS — codec / vocoder pipeline**:
@@ -361,13 +365,68 @@ Variants:
 Conformer rel-pos parity gap closed in §80 — encoder_out now bit-exact
 to Python reference.
 
+### zonos-tts
+
+Zyphra Zonos-v0.1-transformer: 26-layer GQA transformer (d=2048,
+n_heads=16, n_kv=4, head_dim=128) conditioned on speaker embedding +
+phoneme tokens → 9-codebook DAC codes @ 86 Hz → 44.1 kHz PCM via the
+DAC decoder GGUF.
+
+**Conditioning prefix**: speaker embedding (512-d float32 from a reference
+WAV, encoded externally or via `--voice <ref.wav>`) is projected through
+an MLP and prepended as prefix tokens before the phonemised text. CFG
+(classifier-free guidance) runs a conditioned path and an unconditioned
+path in parallel, blending with `cfg_scale=2.0`: `uncond + 2*(cond − uncond)`.
+
+**Backbone**: standard pre-norm transformer with RMSNorm,
+GatedMLP (`fc2(y * silu(gate))`, first chunk = y, second = gate),
+and consecutive-pair RoPE (`GGML_ROPE_TYPE_NORMAL`) matching
+x_transformers' `apply_rotary_emb` (reshape to (…, d/2, 2), rotate
+paired elements). GQA with 4 KV heads shared across 16 query heads.
+
+**AR decode**: 9-codebook delay pattern (codebook k shifted by k+1
+positions). Each step samples one token per codebook via min-p=0.1 +
+temperature=1.0 + repetition penalty (factor=3.0, window=2). EOS is
+only predicted on codebook 0; other codebooks have EOS masked to −∞.
+
+**Quantisation**: selective quantization is required. Uniform Q4_K
+inflates the EOS logit at AR step 0 by ~0.9 units (−1.125 → +0.21),
+making P(EOS) > 60 % and causing synthesis to fail on every seed.
+The `crispasr-quantize` tool keeps `heads.*`, `embeddings.*`, and
+`prefix_conditioner.*` at F16 while quantizing the 210 backbone
+projections — reducing the model to 931 MB (vs 872 MB for full-Q4_K).
+A 3-retry guard in the runtime handles residual step-0 failures
+(~25 % of seeds, 100 % resolved within 2 retries). Default via
+`-m auto` is **Q8_0** (1.6 GB); Q4_K (931 MB) is safe with the
+above caveats; F16 (3.0 GB) is the reference.
+
+**DAC codec**: the companion `dac-44khz-f16.gguf` (104 MB) is a purely
+convolutional architecture — all weight tensors have kernel-size ≤ 16 as
+ne[0], making block quantization impossible. F16 is the only usable quant.
+
+**Voice cloning**: pass `--voice <ref.wav>` at the CLI or set
+`ZONOS_SPEAKER_EMB_PATH=/path/to/jfk_speaker_emb.bin` (raw float32,
+512 floats). The runtime calls `zonos_tts_set_voice(ctx, path)` which
+decodes the WAV via `src/core/audio_resample` and runs the VoiceEncoder
+MLP to produce the speaker embedding.
+
+GGUFs: [`cstr/zonos-v0.1-transformer-GGUF`](https://huggingface.co/cstr/zonos-v0.1-transformer-GGUF)
+(AR transformer) + [`cstr/dac-44khz-GGUF`](https://huggingface.co/cstr/dac-44khz-GGUF)
+(DAC decoder, auto-discovered as a sibling or via `--codec-model`).
+
 ### omniasr (CTC + LLM + Unlimited)
 
 wav2vec2-style CNN frontend (7 layers, stride 5+2×6=320) + 24–48L
 transformer encoder + either CTC head or 12L LLaMA decoder (SwiGLU,
 RoPE, d=4096, 8 heads).
 
-**CTC variant**: greedy argmax with CTC blank collapse.
+**CTC variant** (`omniasr`, `omniasr-300m`): greedy argmax with CTC blank
+collapse (blank = token 0 for both v1/fairseq2 and v2/HF formats). Only
+v2 (HF transformers) GGUFs work — the v1 fairseq2 `.pt` format produces
+empty output because fairseq2's model loader applies weight transforms
+we cannot replicate. The 300M model's positional encoding degrades beyond
+~7 s; the runtime auto-chunks long audio into 5 s segments. The 1B model
+handles all lengths.
 
 **LLM variant** (`omniasr-llm-300m-v2`): Encoder projection (1024→4096)
 + language conditioning (1694 FLORES-200 codes) + autoregressive decode.
@@ -389,9 +448,38 @@ timestamps, diarization, hotwords) and TTS (DPM-Solver++ flow matching).
 ### mimo-asr
 
 6L input_local_transformer (1024d) + 36L Qwen2 LM (4096d, 32Q/8KV);
-8-channel RVQ codes from separate MiMo-Audio-Tokenizer GGUF
-(`--codec-model`). Mandarin (Wu/Cantonese/Hokkien/Sichuanese dialects)
-+ English + code-switching.
+8-channel RVQ codes from separate MiMo-Audio-Tokenizer GGUF. Mandarin
+(Wu/Cantonese/Hokkien/Sichuanese dialects) + English + code-switching.
+
+**Tokenizer is a separate file.** `--auto-download` fetches both the LM
+(`cstr/mimo-asr-GGUF`) and the tokenizer (`cstr/mimo-tokenizer-GGUF`)
+into `~/.cache/crispasr/`; the runtime auto-discovers
+`mimo-tokenizer-q4_k.gguf` next to the LM. Override with `--codec-model
+PATH/mimo-tokenizer-q4_k.gguf` if you keep the tokenizer elsewhere.
+
+### moss-audio
+
+32-layer Whisper-style audio encoder (1280d, 20 heads, 128-mel,
+sliding-window attention w=100) with **DeepStack** 3-tap cross-layer
+injection + 36-layer Qwen3 LM (2560d, 32Q/8KV, SwiGLU, RoPE θ=1M).
+Apache-2.0. First audio-understanding backend — supports transcription,
+audio QA, scene description, and time-aware ASR via prompt.
+
+**DeepStack architecture:** the encoder captures intermediate outputs at
+layers 8, 16, and 24. Each tap is projected through an independent
+GatedMLP (1280→8192→2560) into the LM embedding space. These projections
+are injected as residual adds at LM blocks 0, 1, and 2, preserving
+multi-resolution audio features (low-level prosody/transients alongside
+high-level semantics) through the LM's early layers.
+
+**Audio front-end:** 128-bin log-mel → 3×Conv2d (stride 2 each, 8×
+downsample total) → stem_proj Linear(7680, 1280) → sinusoidal position
+embeddings → 32 encoder blocks. Slaney mel filterbank normalization.
+Encoder output padded to 3000 frames (Whisper 30s convention).
+
+**Prompt format:** Qwen3 chat template with time-marker tokens inserted
+at fixed intervals between audio frame embeddings. Supports custom prompts
+via `--prompt` / `set_ask()` for audio understanding tasks beyond ASR.
 
 ### qwen3-tts
 
@@ -399,6 +487,146 @@ Qwen3 talker LM + 12 Hz RVQ speech tokenizer. Three variants:
 - `qwen3-tts-0.6b-base` — 0.6B talker, baked voice pack or WAV + `--ref-text`
 - `qwen3-tts-1.7b-base` — 1.7B talker, higher quality
 - `qwen3-tts-1.7b-voicedesign` — natural-language voice description via `--instruct`
+
+### csm
+
+Sesame CSM-1B (`sesame/csm-1b`, Apache-2.0), one GGUF, 24 kHz. Three
+stages run per the original two-transformer + codec design:
+
+- **Backbone** — Llama-3.2 1B (16L, 2048d, 32 heads / 8 KV, SwiGLU,
+  RMSNorm, RoPE θ=500k). Text is Llama-3.2 BPE; each frame sums 32 audio
+  codebook embeddings + 1 text embedding (masked per role). Autoregressive
+  over frames; its head samples codebook 0.
+- **Depth decoder** — Llama-3.2 100M (4L, 1024d), KV cache reset per frame.
+  Given the backbone hidden state + codebook-0 embedding (projected
+  2048→1024), it fills codebooks 1–31 with position-specific heads.
+- **Mimi codec** — Kyutai Mimi: 32-codebook RVQ dequant → depthwise
+  upsample → 8L transformer → SEANet decoder → 24 kHz PCM. The RVQ
+  codebooks are `embed_sum / cluster_usage.clamp(min=1e-5)` — the converter
+  must apply that normalization (a wrong `max(cu,1.0)` clamp left ~96 % of
+  codes un-normalized and produced buzzing; §135). EOS when all 32
+  codebooks of a frame are 0.
+
+GGUF built from the HF-transformers checkpoint (rotate_half layout → NEOX
+rope). Diff via `crispasr-diff csm` (backbone per-layer + depth + RVQ vs
+the manual PyTorch reference).
+
+### dia
+
+Nari Labs Dia 1.6B (`nari-labs/Dia-1.6B`, Apache-2.0, ~1.6B params),
+single GGUF, 44.1 kHz mono. Dialogue TTS with inline `[S1]`/`[S2]`
+speaker tags. Architecture:
+
+- **Text encoder** — 12L Llama-style transformer (byte-level tokenizer,
+  1024-d, SwiGLU, RMSNorm, RoPE). Input is raw UTF-8 bytes + special tokens.
+- **AR decoder** — 18L transformer with cross-attention (2048-d, GQA
+  16q/4kv). Generates 9-codebook DAC tokens using a delay pattern
+  `[0, 8, 9, 10, 11, 12, 13, 14, 15]` — channel k is delayed by
+  `delay[k]` steps; after EOS on channel 0, generation continues for
+  max\_delay (15) more steps to flush.
+- **DAC codec** — 9-codebook RVQ → 44.1 kHz PCM. Shared with the Zonos
+  port (#130); a separate DAC GGUF (`--codec-model`) or embedded weights
+  both work.
+
+Classifier-Free Guidance (CFG) runs batch=2 (conditional + unconditional);
+`logits = uncond + cfg_scale * (cond - uncond)`, default `cfg_scale=3.0`.
+Sampling: temperature (default 1.2), top-p (0.95), top-k (45), seedable.
+
+### speecht5
+
+Microsoft SpeechT5 (`microsoft/speecht5_tts`, MIT, ~80M params), single
+GGUF (~300 MB F16), 16 kHz mono. Architecture:
+
+- **Text encoder** — Embedding(81, 768) + ScaledPositionalEncoding +
+  LayerNorm + 12L transformer with SpeechT5RelativePositionalEncoding
+  (embedding-based, max_rel=160). Post-LN, GELU FFN.
+- **Speech decoder** — AR over continuous mel frames (no codebook tokens).
+  Prenet: 2× Linear(80→256)+ReLU + Linear(256→768) + ScaledPosEnc +
+  speaker projection Linear(1280→768)+ReLU (512-d x-vector concatenated).
+  6L decoder (self-attn KV-cached + cross-attn + FFN, post-LN).
+  feat_out Linear(768→160) → reshape (reduction_factor=2, 80 mel bins).
+  prob_out Linear(768→2) → sigmoid → stop token.
+- **Postnet** — 5-layer Conv1d(k=5) + BatchNorm + Tanh stack, residual
+  add to feat_out mel.
+- **HiFi-GAN vocoder** — `microsoft/speecht5_hifigan`, 4× upsample
+  (rates [4,4,4,4]) with MRF resblocks (kernels [3,7,11],
+  dilations [[1,3,5]×3]) → 16 kHz PCM. Weight-norm fused at conversion.
+
+Speaker conditioning requires a 512-d x-vector (e.g. from
+`Matthijs/cmu-arctic-xvectors`), passed as raw float32 `.bin` via
+`--voice`. The prenet uses "consistent dropout" at inference in the
+original; the C++ port omits it (deterministic).
+
+### fastpitch
+
+NVIDIA FastPitch (`nvidia/tts_en_fastpitch`, CC-BY-4.0, ~60M params),
+single GGUF (~230 MB including HiFi-GAN vocoder), 22 kHz mono.
+**Non-autoregressive** — the entire mel spectrogram is generated in a
+single parallel forward pass (no AR loop, no sampling, no KV cache).
+
+- **Text encoder** — Embedding(115, 384) + sinusoidal PE (cat [sin, cos])
+  + 6L FFTransformer (1-head, d_head=64, d_inner=1536, Conv1d(k=3) FFN,
+  post-LN). Bidirectional (no causal mask).
+- **Duration predictor** — 2-layer Conv1d(k=3, 256 filters) + LayerNorm
+  + ReLU → Linear(256→1). Output: log-durations per token, converted via
+  `round(exp(x) - 1)`.
+- **Pitch predictor** — same architecture as duration predictor. Output:
+  normalized pitch per token.
+- **Length regulator** — repeat_interleave encoder features by rounded
+  durations. Pitch expanded similarly, then embedded via Conv1d(1→384, k=3)
+  and added to the expanded features.
+- **Mel decoder** — 6L FFTransformer (same architecture as encoder), then
+  Linear(384→80) → mel spectrogram.
+- **HiFi-GAN vocoder** — `nvidia/tts_hifigan`, conv_pre(80→512) + 4×
+  upsample (rates [8,8,2,2], kernels [16,16,4,4]) with MRF resblocks
+  (kernels [3,7,11], dilations [[1,3,5]×3]) + conv_post → 22 kHz PCM.
+  Weight-norm fused at conversion.
+
+Deterministic output — same input always produces the same audio.
+Tokenizer: ARPABET vocabulary (115 tokens: space + 24 consonants +
+45 stressed vowels + 26 lowercase chars + apostrophe + 15 punct +
+pad/blank/oov). Currently character-level; G2P not yet implemented.
+
+### pocket-tts
+
+Kyutai Pocket TTS (100M, MIT / CC-BY-4.0). Continuous-latent AR TTS —
+architecturally unique: no codebook, no RVQ, no softmax.
+
+Pipeline: SentencePiece (4000 vocab) → 4001×1024 embedding LUT →
+6-layer causal transformer (1024D, 16H, RoPE, pre-norm LN, GELU FFN)
+→ consistency head (SimpleMLPAdaLN: 6 ResBlocks + FinalLayer, 512D,
+AdaLN conditioning from timestep embeddings + backbone output) →
+one-step Lagrangian Self Distillation (LSD) decode → continuous 32-dim
+float vectors at 12.5 Hz → Mimi VAE decoder (depthwise ConvTranspose1d
+upsample ×16 + 2L causal transformer with RoPE and LayerScale +
+SEANet CNN decoder with causal convolutions, ratios [6,5,4]) → 24 kHz
+mono PCM. Voice cloning: ref audio → Mimi VAE encoder → linear project
+→ prepend to transformer KV cache. Model:
+`kyutai/pocket-tts-without-voice-cloning` (no encoder weights) or
+`kyutai/pocket-tts` (full, with encoder for voice cloning).
+
+### parler-tts
+
+Prompt-conditioned TTS from
+[parler-tts/parler-tts-mini-v1.1](https://huggingface.co/parler-tts/parler-tts-mini-v1.1)
+(Apache 2.0, ~900M params), single GGUF (~1.8 GB F16), 44.1 kHz mono.
+
+| Component | Architecture | Details |
+|---|---|---|
+| T5 encoder | flan-t5-large encoder | d=1024, 16 heads, 24 layers, gated-GELU FFN, RMSNorm, relative position bias |
+| MusicGen decoder | Causal transformer | d=1024, 16 heads, 24 layers, 9 codebooks, sinusoidal PE, LayerNorm, delay pattern |
+| DAC codec | Descript Audio Codec 44 kHz | 9 codebooks × 1024, Snake activations, 4 upsample blocks (8×8×4×2 = 512×) |
+
+Voice characteristics are controlled via `--instruct` (natural language
+description). Temperature=1.0 required (greedy produces degenerate output;
+the model is trained with stochastic sampling). `--seed` wired for
+reproducibility (note: C++ `std::mt19937` differs from PyTorch RNG).
+
+Tokenizer: LLaMA-2 sentencepiece BPE (90714 tokens). The GGUF stores the
+original sentencepiece scores and a `parler.tokenizer.is_bpe=true` flag so
+the runtime auto-selects `core_spm::tokenize_bpe` (iterative best-merge)
+instead of the Viterbi unigram path. Quantized GGUFs preserve DAC codec
+weights at F16 (audio codecs are precision-sensitive).
 
 ### m2m100 / wmt21
 
@@ -460,3 +688,179 @@ T5 encoder-decoder (12L+12L, d=2048, gated-GELU FFN, RMSNorm, bucketed
 relative-position bias) + SentencePiece (256K vocab). Target language
 specified as `<2xx>` input prefix. Tokens match Python SentencePiece
 bit-by-bit; output matches HF reference.
+
+### melotts
+
+[myshell-ai/MeloTTS](https://github.com/myshell-ai/MeloTTS) VITS2
+architecture (~52M params, MIT). Text encoder (6-layer relative-position
+transformer with speaker conditioning at layer 2) → dual duration predictor
+(SDP spline flows + deterministic DP, blended via sdp_ratio) →
+TransformerCouplingBlock flow (4 blocks × 3 transformer layers) → HiFi-GAN
+vocoder (5 upsample stages) @ 44.1 kHz. Built-in English G2P via embedded
+CMU dictionary (129k entries) + rule-based LTS fallback for OOV words.
+4 English speakers (US, BR, India, AU).
+
+Optional BERT conditioning: loads a companion bert-base-uncased GGUF (238 MB)
+via `melotts_load_bert()`. Runs 10-layer BERT forward pass → hidden_states[-3]
+→ word2ph expansion → `ja_bert_proj` (768→192) → added to text encoder
+embeddings. Improves contextual phoneme disambiguation (4/6 → 4/6 ASR
+roundtrip but fixes previously-broken sentences like "I enjoy reading").
+
+### piper
+
+[rhasspy/piper](https://github.com/rhasspy/piper) VITS architecture (~60M
+params, Apache-2.0). Text encoder (TextConv + Transformer) → flow-based
+decoder → HiFi-GAN vocoder @ 22 kHz. Uses espeak-ng for phonemization.
+Single speaker per model. Lightweight, fast inference.
+
+### indextts
+
+IndexTTS-1.5: GPT-2 AR (24L, 1280-d) mel-code generator + BigVGAN
+vocoder. Designed for Chinese + English. Zero-shot voice cloning from
+any reference WAV. Two GGUFs: GPT AR model + BigVGAN vocoder.
+
+### outetts
+
+OuteTTS: OLMo-0.5B LM backbone AR codec-token generator +
+WavTokenizer codec (CC BY 4.0). Generates speech tokens
+autoregressively, decoded to PCM by the WavTokenizer.
+
+### voxcpm2-tts
+
+VoxCPM2: Qwen2-2B backbone + flow matching + BigVGAN @ 48 kHz. Two-stage:
+AR text-to-semantic-tokens via the Qwen2 LM, then flow matching
+continuous diffusion + BigVGAN vocoder. Zero-shot voice cloning from
+reference WAV. Output is 48 kHz, decimated to 24 kHz for the standard
+CrispASR TTS pipeline.
+
+### cosyvoice3-tts
+
+CosyVoice3 0.5B (FunAudioLLM, Apache-2.0): three-stage pipeline — Qwen2-0.5B
+AR speech-token LM → DiT-based conditional flow matching (10-step Euler ODE) →
+HiFT vocoder (NSF + iSTFT) @ 24 kHz. Supports 9 languages + 18 Chinese
+dialects. Zero-shot voice cloning via baked voice packs. Three separate GGUFs:
+LLM, flow, HiFT.
+
+### kugelaudio
+
+KugelAudio-0-Open (MIT, 23 languages): hybrid AR + diffusion TTS based on
+VibeVoice. Qwen2.5-7B language model (28L, 3584d, GQA 28/4) generates
+constrained tokens; on `speech_diffusion` token, a 4-layer DiT prediction
+head (AdaLN + SwiGLU, v-prediction) runs 20-step SDE-DPMSolver++ with
+cosine beta schedule to produce 64-dim acoustic latents. An acoustic VAE
+decoder (6-stage ConvNeXt with depthwise conv mixer, transposed-conv
+upsample ratios [8,5,5,4,2,2] = 3200×) converts latents to 24 kHz mono
+PCM. Pre-encoded voice embeddings (acoustic connector: FC1→RMSNorm→FC2)
+inject speaker identity into the LM input sequence.
+
+### pocket-tts
+
+Kyutai Pocket TTS: Llama-1B backbone (causal LM) generating Mimi RVQ codec
+tokens + Mimi decoder (SEANet with causal convolutions) @ 24 kHz.
+Streaming-capable architecture. Uses raw tensor operations on CPU (no ggml
+graph), KV-cached AR decode for the Llama backbone, per-frame Mimi decoding.
+
+### f5-tts
+
+F5-TTS: DiT (Diffusion Transformer) for flow-matching text-to-speech.
+Converts text + reference audio to mel spectrograms via ODE-based diffusion
+(typically 32 Euler steps), then vocodes with a shared vocoder. Zero-shot
+voice cloning.
+
+### lfm2-audio
+
+LiquidAI LFM2.5-Audio (LFM Open v1.0, 1.5B): end-to-end multimodal
+ASR + TTS + speech-to-speech in a single model.
+
+**ASR path:** 16 kHz mono PCM → 128-mel NeMo-style spectrogram (slaney
+filterbank, ln + per-feature-z normalization) → 17L FastConformer encoder
+(512-dim, 8 heads, rel-pos attention, dw-striding 8× subsampling) → audio
+adapter MLP (LayerNorm → Linear(512→2048) → GELU → Linear(2048→2048)) →
+16L LFM2 hybrid backbone (2048-dim, 10 ShortConv + 6 GQA attention layers,
+SwiGLU FFN, RoPE θ=1M, QK layernorm) → greedy text decode via tied
+embed_tokens weight.
+
+The LFM2 backbone interleaves two layer types:
+- **ShortConv** (10 of 16 layers): depthwise causal conv1d (kernel=3) with
+  gated in/out projections. `BCx = in_proj(h)`, `Bx = B * x`, conv(Bx),
+  `y = C * conv_out`, `out = out_proj(y)`. Conv state cache stores last
+  K-1=2 Bx columns per layer for incremental decode.
+- **GQA attention** (6 of 16 layers): 32 query heads, 8 KV heads, head_dim=64.
+  Per-head QK RMSNorm before RoPE. Flash attention with explicit causal mask.
+  Standard F16 KV cache for incremental decode.
+
+Layer types follow the pattern `ccaccaccacacacac` (c=conv, a=attn).
+
+**TTS path:** text tokenized via GPT-2 BPE → interleaved generation
+(6 text tokens + 9 audio frames alternating) → depthformer (6L transformer,
+1024-dim, fused QKV, 8-codebook Mimi code generation) → ISTFT detokenizer
+(separate 8L LFM2 512-dim + Linear(512→1282) + ISTFT → 24 kHz PCM).
+The detokenizer loads from a companion `*-detokenizer.gguf`.
+
+**Speech-to-speech:** combines the ASR conformer encoder (audio input) with
+interleaved generation (text + audio output). System prompt:
+"Respond with interleaved text and audio."
+
+GGUF: single file for the main model (encoder + backbone + depthformer + Mimi
+codec + audio embedding) + companion detokenizer. Quantization: Q5_K
+recommended for EN, Q4_K for JP. crispasr-quantize keeps encoder, adapter,
+embeddings, and Mimi codec at F16; only backbone + depthformer layers quantized.
+
+Variants: English (`LiquidAI/LFM2.5-Audio-1.5B`) and Japanese
+(`LiquidAI/LFM2.5-Audio-1.5B-JP`).
+
+### bark
+
+Suno Bark (MIT, ~400M): three-stage GPT-2 pipeline — text → semantic tokens
+(12L, 1024-d) → coarse acoustic tokens (12L, 1024-d) → fine acoustic tokens
+(12L, 1024-d) → EnCodec decoder @ 24 kHz. All sub-models packed into one
+GGUF with selective Q4_K quantization. Speaker conditioning via `.npz`
+voice prompts.
+
+### tada
+
+HumeAI TADA-3B-ML (`HumeAI/tada-3b-ml`). Two GGUFs: backbone talker + codec.
+
+- **Backbone**: Llama-3.2-3B (28L, 3072-d, 24 heads, 8 KV heads, RoPE, SwiGLU,
+  RMSNorm). Token embeddings extended with `acoustic_proj`, `mask`, `time_start`,
+  and `time_end` step-embedding tensors for per-token conditioning.
+- **FM head**: 4-layer SwiGLU + AdaLN transformer with sinusoidal time embedding.
+  Uses an Euler ODE solver (flow-matching) to diffuse a noise vector into a
+  per-token acoustic vector conditioned on the backbone hidden state.
+- **Codec**: 6-layer local-attention transformer + DAC-style upsampler → 24 kHz
+  mono PCM.
+- **Special**: 1:1 text-to-acoustic alignment — every text token maps to exactly
+  one acoustic vector (no duration predictor, no length regulator). BPE tokenizer
+  (tiktoken GPT-2 byte-level vocab).
+- **Voice cloning**: reference audio is encoded via the codec and prepended as a
+  prompt to the backbone KV cache.
+
+Models: `HumeAI/tada-3b-ml` (backbone Q4_K ~2.2 GB) + companion codec GGUF
+(~1 GB). Pass `--codec-model <codec.gguf>`.
+
+### mini-omni2
+
+gpt-omni/mini-omni2 (`gpt-omni/mini-omni2`). Multimodal speech model
+supporting ASR, TTS, and speech-to-speech.
+
+- **Audio encoder**: Whisper-small (80 mel, 12 layers, 768-d, 12 heads,
+  sinusoidal positional embedding, LayerNorm with bias, GELU FFN).
+- **Adapter**: whisperMLP (SwiGLU gate: `fc_1(768,4864)`, `fc_2(768,4864)`
+  → `silu(fc_1) * fc_2` → `proj(4864,896)`). No bias (config.bias=false).
+- **LLM**: Qwen2-0.5B (896-d, 24 layers, 14 heads, 2 KV heads, GQA 7:1,
+  RoPE theta=1M, SwiGLU, RMSNorm eps=1e-6, QKV bias, no O/FFN bias).
+- **8-stream architecture**: 7 audio streams (SNAC codebooks, layershifted)
+  + 1 text stream, all embedded and averaged. Audio features replace pad
+  positions in streams 0-6 only (not text stream 7).
+- **Modes**: ASR uses `_asr` token (151940) for pure transcription. S2S
+  uses `_answer_a/_answer_t` for conversational audio response. TTS uses
+  text-only input with `_answer_a/_answer_t`.
+- **Audio output**: 7-stream SNAC tokens deinterleaved to 3 codebooks
+  (c0: stream 0, c1: streams 1+4, c2: streams 2+3+5+6) → SNAC 24kHz
+  decoder (separate GGUF, `hubertsiuzdak/snac_24khz`).
+- **Vocab**: text 152000 + 7x audio 4160 = 181120 padded. Tied word
+  embeddings (lm_head = token_embd).
+
+Models: single GGUF (F16 ~1.6 GB) converted from `lit_model.pth` + `small.pt`.
+For TTS/S2S, also needs SNAC codec GGUF (`--codec-model snac-24khz.gguf`).
+

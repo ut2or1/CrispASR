@@ -33,6 +33,8 @@
 #define M_PI 3.14159265358979323846
 #endif
 #include "core/attention.h"
+#include "core/beam_decode.h"
+#include "core/crispasr_lcs.h"
 #include "core/fastconformer.h"
 
 #ifndef M_PI
@@ -41,6 +43,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <set>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -148,6 +151,18 @@ struct canary_model {
 struct canary_vocab {
     std::vector<std::string> id_to_token;
     std::unordered_map<std::string, int> token_to_id;
+    // PLAN #114 P3 polish — case-insensitive LCS support.
+    // `id_to_canonical_lc[i]` is the smallest token id whose
+    // lowercase-ASCII text matches token `i`. Used by
+    // canary_transcribe_streamed when looking for boundary-overlap
+    // matches across chunks where the AED re-emits the same audio with
+    // different capitalization (e.g. "world's say for" in chunk 1 vs
+    // "World's Save for" in chunk 2 — different raw ids but the LCS
+    // should still match them). Populated once at vocab load; ASCII-only
+    // (UTF-8 case folding would need libicu and DE/FR/ES chunk-boundary
+    // capitalization is rare enough that ASCII is sufficient for the
+    // present polish).
+    std::vector<int32_t> id_to_canonical_lc;
 };
 
 struct canary_context {
@@ -191,6 +206,9 @@ struct canary_context {
     // softmax sampling. Set via canary_set_temperature().
     float decode_temperature = 0.0f;
     uint64_t decode_seed = 0;
+
+    // §90 beam-search width. 1 = greedy (default).
+    int beam_size = 1;
 };
 
 // ===========================================================================
@@ -245,6 +263,29 @@ static bool canary_load_model(canary_model& model, canary_vocab& vocab, const ch
             vocab.id_to_token = std::move(tokens);
             for (int i = 0; i < (int)vocab.id_to_token.size(); i++) {
                 vocab.token_to_id[vocab.id_to_token[i]] = i;
+            }
+            // PLAN #114 P3 polish — build the case-insensitive canonical
+            // mapping. ASCII lowercase only; non-ASCII bytes (UTF-8) pass
+            // through unchanged, so DE-umlaut tokens still match their
+            // own variants but not cross-case. Sufficient for the
+            // observed EN FLEURS chunk-boundary capitalization artifacts.
+            const int n_vocab = (int)vocab.id_to_token.size();
+            vocab.id_to_canonical_lc.assign((size_t)n_vocab, 0);
+            std::unordered_map<std::string, int> first_id_for_lc;
+            first_id_for_lc.reserve((size_t)n_vocab);
+            for (int i = 0; i < n_vocab; i++) {
+                std::string lc = vocab.id_to_token[i];
+                for (char& c : lc) {
+                    if (c >= 'A' && c <= 'Z')
+                        c = (char)(c + ('a' - 'A'));
+                }
+                auto it = first_id_for_lc.find(lc);
+                if (it == first_id_for_lc.end()) {
+                    first_id_for_lc.emplace(std::move(lc), i);
+                    vocab.id_to_canonical_lc[(size_t)i] = i;
+                } else {
+                    vocab.id_to_canonical_lc[(size_t)i] = it->second;
+                }
             }
         }
 
@@ -1312,6 +1353,12 @@ extern "C" void canary_set_temperature(struct canary_context* ctx, float tempera
     ctx->decode_seed = seed;
 }
 
+extern "C" void canary_set_beam_size(struct canary_context* ctx, int n) {
+    if (!ctx)
+        return;
+    ctx->beam_size = n > 0 ? n : 1;
+}
+
 extern "C" int canary_n_vocab(struct canary_context* ctx) {
     return (int)ctx->model.hparams.vocab_size;
 }
@@ -1379,6 +1426,13 @@ extern "C" int canary_test_encoder(struct canary_context* ctx, int T_mel) {
     return T_enc;
 }
 
+// PLAN #114 P3 second half — post-encode pipeline shared by
+// canary_transcribe_ex (single-pass) and canary_transcribe_streamed
+// (parakeet-style chunked-encode + concat for long audio).
+static canary_result* canary_finish_from_encoder(canary_context* ctx, const float* enc_data, int T_enc,
+                                                 const char* source_lang, const char* target_lang, bool punctuation,
+                                                 int64_t t_offset_cs);
+
 extern "C" struct canary_result* canary_transcribe_ex(struct canary_context* ctx, const float* samples, int n_samples,
                                                       const char* source_lang, const char* target_lang,
                                                       bool punctuation, int64_t t_offset_cs) {
@@ -1397,8 +1451,248 @@ extern "C" struct canary_result* canary_transcribe_ex(struct canary_context* ctx
     if (enc.empty())
         return nullptr;
 
+    return canary_finish_from_encoder(ctx, enc.data(), T_enc, source_lang, target_lang, punctuation, t_offset_cs);
+}
+
+// PLAN #114 P3 second half — parakeet-pattern long-audio port. Computes
+// mel for the FULL audio (so PerFeatureZ uses global statistics; this is
+// the NeMo convention and matches what canary_transcribe_ex does on short
+// audio), then encodes in overlapping mel chunks and concatenates the
+// encoder outputs with `overlap_enc` trimming. Runs the existing AED
+// decode + cross-attention K/V over the concat. Works for the 4 trained
+// languages (en/de/fr/es) — the whitelist in
+// crispasr_backend_canary.cpp::transcribe() refuses other langs before
+// either code path.
+extern "C" struct canary_result* canary_transcribe_streamed(struct canary_context* ctx, const float* samples,
+                                                            int n_samples, const char* source_lang,
+                                                            const char* target_lang, bool punctuation,
+                                                            int64_t t_offset_cs, int chunk_seconds,
+                                                            int overlap_seconds) {
+    if (!ctx || !samples || n_samples <= 0 || !source_lang || !target_lang)
+        return nullptr;
+    if (chunk_seconds <= 0)
+        chunk_seconds = 8;
+    if (overlap_seconds < 0)
+        overlap_seconds = 2;
+    if (overlap_seconds >= chunk_seconds)
+        overlap_seconds = chunk_seconds / 4;
+
+    const auto& hp = ctx->model.hparams;
+    const int n_mels = (int)hp.n_mels;
+    const int hop = (int)hp.hop_length;
+    const int SR = (int)hp.sample_rate;
+
+    // ---- Pass 1: mel for the full audio (global PerFeatureZ) ----
+    int T_mel = 0;
+    auto mel_full = canary_compute_mel_impl(ctx, samples, n_samples, T_mel);
+    if (mel_full.empty() || T_mel <= 0)
+        return nullptr;
+
+    // ---- Pass 2: per-chunk encode + per-chunk AED decode (NeMo
+    // FrameBatchMultiTaskAED analogon). Each chunk re-injects the
+    // <lang> / <task> / <pnc> prompt prefix, so the AED decoder
+    // doesn't treat the chunk boundary as <eos>. Per-chunk results
+    // are concatenated text-wise; token/word timestamps land in the
+    // global time window via per-chunk t_offset arithmetic.
+    const int chunk_mel_frames = chunk_seconds * SR / hop;
+    const int overlap_mel_frames = overlap_seconds * SR / hop;
+    const int shift_mel_frames = chunk_mel_frames - overlap_mel_frames;
+
+    std::string full_text;
+    std::vector<canary_token_data> all_tokens;
+    std::vector<canary_word_data> all_words;
+    int chunks_processed = 0;
+
+    // LCS dedup window: bound how far into the previous chunk we look for
+    // boundary duplication. Conservative — overlap_seconds at ~3 tok/s
+    // (canary's average emission rate on en/de/fr/es) gives ~6 tokens for
+    // a 2 s overlap; cap at 30 to leave headroom for slower regimes.
+    const int delay_tokens = std::min(30, std::max(8, overlap_seconds * 5));
+
+    for (int mel_offset = 0; mel_offset < T_mel; mel_offset += shift_mel_frames) {
+        const int chunk_end = std::min(T_mel, mel_offset + chunk_mel_frames);
+        const int chunk_T = chunk_end - mel_offset;
+        if (chunk_T <= 0)
+            break;
+        int T_enc = 0;
+        auto enc = canary_encode_mel(ctx, mel_full.data() + (size_t)mel_offset * n_mels, n_mels, chunk_T, &T_enc);
+        if (enc.empty() || T_enc <= 0)
+            continue;
+
+        const int64_t chunk_t_offset_cs = t_offset_cs + (int64_t)mel_offset * hop * 100 / SR;
+        canary_result* part = canary_finish_from_encoder(ctx, enc.data(), T_enc, source_lang, target_lang, punctuation,
+                                                         chunk_t_offset_cs);
+        if (!part)
+            continue;
+
+        // PLAN #114 P3 polish: boundary-overlap dedup via LCS-merge across
+        // adjacent chunks. NeMo's `streaming_utils.longest_common_subsequence_merge`
+        // (the same primitive `core/crispasr_lcs::lcs_dedup_prefix_count`
+        // wraps) finds the LCS between the tail of accumulated tokens and
+        // the head of the current chunk's tokens. If the LCS length >=
+        // kMinMergeSubsequenceLen (default 3), the matched prefix of the
+        // current chunk is dropped before accumulation.
+        int n_skip = 0;
+        if (chunks_processed > 0 && part->n_tokens > 0 && !all_tokens.empty()) {
+            const int tail_size = std::min(delay_tokens, (int)all_tokens.size());
+            // PLAN #114 P3 polish — case-insensitive LCS. The AED can
+            // re-emit the same audio with different capitalization at
+            // chunk boundaries (e.g. "world's say for" in chunk 1 vs
+            // "World's Save for" in chunk 2 — different raw ids but
+            // semantically duplicate). Look up each id via
+            // vocab.id_to_canonical_lc[id] (smallest id whose
+            // lowercase-ASCII text matches) before running LCS. Indices
+            // line up with the raw token vectors, so the returned
+            // slice_count is still the right number of leading raw
+            // tokens to drop.
+            auto canon = [&](int32_t id) -> int32_t {
+                if (id < 0 || id >= (int32_t)ctx->vocab.id_to_canonical_lc.size())
+                    return id;
+                return ctx->vocab.id_to_canonical_lc[(size_t)id];
+            };
+            std::vector<int32_t> prev_tail;
+            prev_tail.reserve((size_t)tail_size);
+            for (int i = (int)all_tokens.size() - tail_size; i < (int)all_tokens.size(); i++)
+                prev_tail.push_back(canon(all_tokens[(size_t)i].id));
+            std::vector<int32_t> curr_ids;
+            curr_ids.reserve((size_t)part->n_tokens);
+            for (int i = 0; i < part->n_tokens; i++)
+                curr_ids.push_back(canon(part->tokens[i].id));
+            n_skip = crispasr_lcs::lcs_dedup_prefix_count(prev_tail, curr_ids);
+        }
+
+        // PLAN #114 P3 polish — word-snap heuristic. The LCS operates on
+        // token ids and may drop a prefix that ends mid-word, because
+        // BPE-split points inside a duplicated word region don't always
+        // align between chunks (chunk 1 emits `[▁Geschirrt, uches]` for
+        // "Geschirrtuches"; chunk 2 emits `[▁tuch, ▁umfassen, ...]` for
+        // the same audio segment — only `▁umfassen` matches the LCS, so
+        // we drop 1 token and leave `▁tuch` as a stray word-fragment in
+        // the output). Extend the drop forward until the next token
+        // whose text starts with a space (sentencepiece convention:
+        // `▁X` decodes to ` X`, so a leading space marks a word start).
+        // Trades a few extra tokens for a clean prefix; bounded by
+        // n_tokens so we don't drop the whole chunk on a pathological
+        // mid-word run.
+        if (n_skip > 0 && n_skip < part->n_tokens) {
+            while (n_skip < part->n_tokens) {
+                const char* t = part->tokens[n_skip].text;
+                if (!t || !t[0])
+                    break;
+                if (t[0] == ' ')
+                    break;
+                n_skip++;
+            }
+        }
+
+        // Rebuild text for this chunk from surviving tokens (so the
+        // dedupe matches the token vector exactly; trusting part->text
+        // would leak the dropped prefix as a string).
+        std::string part_text;
+        for (int i = n_skip; i < part->n_tokens; i++)
+            part_text += part->tokens[i].text;
+        if (!part_text.empty() && part_text[0] == ' ')
+            part_text.erase(0, 1);
+
+        if (!part_text.empty()) {
+            // PLAN #114 P3 polish — splice-punctuation cleanup. After LCS
+            // dedup the chunk boundary can land between a mid-sentence
+            // punctuation in the previous chunk (`,` `;` `:`) and a
+            // sentence-end punctuation in the surviving prefix of the new
+            // chunk (`.` `?` `!`), producing e.g. "for you, . Ask...".
+            // The chunk-1 comma was the model's best guess for the
+            // continuation point; chunk-2 produced a period because the
+            // LCS-dropped middle ended that sentence. Collapse the
+            // mid-sentence punctuation in favour of the sentence-end
+            // punctuation that survived LCS.
+            bool attach_directly = false;
+            if (!full_text.empty()) {
+                const char last_punct = full_text.back();
+                size_t first_nws = 0;
+                while (first_nws < part_text.size() && (part_text[first_nws] == ' ' || part_text[first_nws] == '\t'))
+                    first_nws++;
+                if (first_nws < part_text.size()) {
+                    const char first_punct = part_text[first_nws];
+                    if ((last_punct == ',' || last_punct == ';' || last_punct == ':') &&
+                        (first_punct == '.' || first_punct == '?' || first_punct == '!')) {
+                        full_text.pop_back();
+                        while (!full_text.empty() && full_text.back() == ' ')
+                            full_text.pop_back();
+                        // Strip leading whitespace from part_text so the
+                        // surviving punctuation attaches directly:
+                        //   "for you" + ". Ask..."  →  "for you. Ask..."
+                        // (instead of "for you . Ask..." with a stray
+                        // space before the period).
+                        part_text.erase(0, first_nws);
+                        attach_directly = true;
+                    }
+                }
+            }
+            if (!attach_directly && !full_text.empty() && full_text.back() != ' ' && part_text[0] != ' ')
+                full_text += ' ';
+            full_text += part_text;
+        }
+        for (int i = n_skip; i < part->n_tokens; i++)
+            all_tokens.push_back(part->tokens[i]);
+
+        // Words: drop leading ones whose t1 is at or before the last
+        // surviving token's t0 (best-effort — words and tokens don't have
+        // a strict 1:1 mapping but adjacent boundary-overlap words should
+        // share timing with the dropped tokens).
+        if (n_skip > 0 && part->n_tokens > 0) {
+            const int64_t cutoff_t0 =
+                (n_skip < part->n_tokens) ? part->tokens[(size_t)n_skip].t0 : part->tokens[(size_t)n_skip - 1].t1;
+            for (int i = 0; i < part->n_words; i++) {
+                if (part->words[i].t1 <= cutoff_t0)
+                    continue;
+                all_words.push_back(part->words[i]);
+            }
+        } else {
+            for (int i = 0; i < part->n_words; i++)
+                all_words.push_back(part->words[i]);
+        }
+
+        canary_result_free(part);
+        chunks_processed++;
+    }
+
+    if (chunks_processed == 0 && all_tokens.empty() && full_text.empty())
+        return nullptr;
+
+    canary_result* r = (canary_result*)calloc(1, sizeof(canary_result));
+    if (!r)
+        return nullptr;
+    r->text = strdup(full_text.c_str());
+    if (!r->text) {
+        canary_result_free(r);
+        return nullptr;
+    }
+    r->n_tokens = (int)all_tokens.size();
+    r->tokens = (canary_token_data*)calloc(r->n_tokens > 0 ? (size_t)r->n_tokens : 1, sizeof(canary_token_data));
+    if (!r->tokens) {
+        canary_result_free(r);
+        return nullptr;
+    }
+    for (int i = 0; i < r->n_tokens; i++)
+        r->tokens[i] = all_tokens[(size_t)i];
+
+    r->n_words = (int)all_words.size();
+    r->words = (canary_word_data*)calloc(r->n_words > 0 ? (size_t)r->n_words : 1, sizeof(canary_word_data));
+    if (!r->words) {
+        canary_result_free(r);
+        return nullptr;
+    }
+    for (int i = 0; i < r->n_words; i++)
+        r->words[i] = all_words[(size_t)i];
+
+    return r;
+}
+
+static canary_result* canary_finish_from_encoder(canary_context* ctx, const float* enc_data, int T_enc,
+                                                 const char* source_lang, const char* target_lang, bool punctuation,
+                                                 int64_t t_offset_cs) {
     // 3. Pre-compute cross-attention K/V
-    canary_build_cross_kv(ctx, enc.data(), T_enc);
+    canary_build_cross_kv(ctx, enc_data, T_enc);
 
     // 4. Build prompt
     std::vector<int> prompt = canary_build_prompt(ctx, source_lang, target_lang, punctuation);
@@ -1436,6 +1730,85 @@ extern "C" struct canary_result* canary_transcribe_ex(struct canary_context* ctx
     if (logits.empty())
         return nullptr;
     offset = (int)prompt.size();
+
+    // §90 beam search — run_with_probs_branched when beam_size > 1.
+    // Cross-attention KV (cross_k/v) is shared across beams; only self-attention
+    // KV (kv_k/kv_v) is snapshotted per beam.
+    if (ctx->beam_size > 1) {
+        // GH #161: snapshot/restore self-attention KV on-device via a recycled
+        // buffer pool (no PCIe round-trip + sync per beam per step).
+        core_attn::kv_snapshot_pool kv_pool(ctx->kv_k, ctx->kv_v);
+
+        auto save_fn = [&kv_pool](canary_context*) -> core_attn::kv_snapshot* { return kv_pool.save(); };
+
+        auto restore_fn = [&kv_pool](canary_context*, core_attn::kv_snapshot* s) { kv_pool.restore(s); };
+
+        auto snap_free_fn = [&kv_pool](core_attn::kv_snapshot* s) { kv_pool.release(s); };
+
+        auto step_fn = [](canary_context* c, int32_t tok, int n_past) -> float* {
+            auto lg = canary_decode_step(c, &tok, 1, n_past);
+            if (lg.empty())
+                return nullptr;
+            float* out = (float*)std::malloc(lg.size() * sizeof(float));
+            std::memcpy(out, lg.data(), lg.size() * sizeof(float));
+            return out;
+        };
+
+        const int vocab = (int)logits.size();
+        core_beam_decode::Config bcfg;
+        bcfg.max_new_tokens = max_steps;
+        bcfg.eos_id = eos;
+        bcfg.vocab_size = vocab;
+        bcfg.beam_size = ctx->beam_size;
+        bcfg.prompt_len = (int)prompt.size();
+
+        auto br = core_beam_decode::run_with_probs_branched(ctx, logits.data(), save_fn, restore_fn, snap_free_fn,
+                                                            step_fn, bcfg);
+
+        // Build result from beam output (skip EOS if present at the end)
+        int n_beam = (int)br.tokens.size();
+        if (n_beam > 0 && br.tokens.back() == eos)
+            n_beam--;
+
+        auto* r = (canary_result*)calloc(1, sizeof(canary_result));
+        if (!r)
+            return nullptr;
+
+        r->n_tokens = n_beam;
+        r->tokens = (canary_token_data*)calloc((size_t)n_beam, sizeof(canary_token_data));
+        std::string full_text;
+        for (int i = 0; i < n_beam; i++) {
+            r->tokens[i].id = br.tokens[i];
+            r->tokens[i].p = br.probs[i];
+            r->tokens[i].t0 = 0;
+            r->tokens[i].t1 = 0;
+            const char* txt = canary_token_to_str(ctx, br.tokens[i]);
+            if (txt) {
+                std::string vis = spiece_to_text(txt);
+                snprintf(r->tokens[i].text, sizeof(r->tokens[i].text), "%s", vis.c_str());
+                full_text += vis;
+            }
+        }
+        r->text = strdup(full_text.c_str());
+        r->n_words = 0;
+        r->words = nullptr;
+        return r;
+    }
+
+    // PLAN #114 P3 polish — degenerate-loop guard. The AED has no
+    // repetition penalty; on out-of-distribution audio (or a chunk
+    // boundary where the encoder embeddings collapse) the decoder can
+    // lock on a short cycle and emit ~100+ copies before <eos>. Funasr
+    // (PLAN #125 P1) had a single-id repeat (`!`); canary's BPE often
+    // emits a two-token cycle like `▁yeah` + `,` alternating, so the
+    // funasr-style consecutive-id guard misses it. Detect by
+    // small-vocabulary window: if the last kWindow generated tokens
+    // contain ≤ kMaxDistinct distinct ids, the decoder is in a loop.
+    // Window/threshold picked so normal speech (~25-30 unique ids per
+    // 40-token window) stays well above the trigger and degenerate
+    // 1/2/3-cycles all fire.
+    constexpr int kWindow = 40;
+    constexpr int kMaxDistinct = 3;
 
     for (int step = 0; step < max_steps && offset < max_ctx - 1; step++) {
         // Argmax (default) or temperature sample
@@ -1478,6 +1851,28 @@ extern "C" struct canary_result* canary_transcribe_ex(struct canary_context* ctx
         }
         if (best == eos)
             break;
+
+        // Degenerate-loop guard: count distinct ids in the last
+        // kWindow generated tokens (including this one). Cheap O(W)
+        // per step on a fixed-size window — for kWindow=40 that's
+        // ~40 comparisons per step, negligible next to the decoder
+        // forward.
+        if ((int)generated.size() >= (int)prompt.size() + kWindow) {
+            const int start = (int)generated.size() - kWindow + 1;
+            std::set<int> distinct;
+            for (int i = start; i < (int)generated.size(); i++)
+                distinct.insert(generated[(size_t)i]);
+            distinct.insert(best);
+            if ((int)distinct.size() <= kMaxDistinct) {
+                if (ctx->params.verbosity >= 1) {
+                    fprintf(stderr,
+                            "canary: greedy decode degenerated (%d distinct ids in last %d tokens). "
+                            "Aborting at step %d.\n",
+                            (int)distinct.size(), kWindow, step);
+                }
+                break;
+            }
+        }
 
         // Softmax probability of the picked token. Numerically stable:
         // subtract the max log-prob before exponentiating.
