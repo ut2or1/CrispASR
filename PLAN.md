@@ -59,7 +59,7 @@ test-all-backends.py passes 18/18 transcribe + 51/54 feature tests (3 stream ski
 | **DONE** | [#42 VibeVoice-ASR 7B](#42-vibevoice-asr-7b) | High | **DONE.** GGUFs at `cstr/VibeVoice-7B-GGUF` (Q3_K 4.7 GB – F16 17.4 GB). ASR+TTS working. Layer offload validated on M1 Metal (ASR 28L, TTS 20L). |
 | **DONE** | [#43 Fun-ASR-Nano](#43-fun-asr-nano) | Medium | **DONE 2026-05-20.** Full LLM-decoder runtime shipped; GGUFs at `cstr/funasr-{nano,mlt-nano}-GGUF`; byte-identical diffs; ~9× RT on M1 Metal. CTC two-pass rescore is a separate low-pri follow-up. |
 | **DONE** | [#80 nano-cohere-transcribe-inspired tweaks](#80-nano-cohere-transcribe-inspired-perf--chunking-tweaks) | Small | 80a parked; **80b DONE**; **80c DONE**; **80d DONE** 2026-05-23 (audit: no fixes needed — all backends use energy chunker); 80e low-priority warmup deferred |
-| **HIGH** | [#81 Nemotron-Speech-Streaming-EN-0.6B](#81-nemotron-speech-streaming-en-06b--first-cache-aware-streaming-native-asr) | M-L | **IN PROGRESS.** Scaffold on main (`6ce67fd2` + `b2cf3106`) + worktree `feat/nemotron-streaming` (7 commits). Converter, runtime, CLI, registry all done. Pre-encode validated cos=1.0 vs Python. Kaggle diff harness v8 → ref GGUF at `cstr/nemotron-3.5-asr-streaming-GGUF`. **Root cause of 0 tokens: streaming-ONLY model** (`chunked_limited` attention). Batch bidirectional attention → blank wins at all frames. Fixes landed: siglu non-swapped, mel normalize=NA, causal pre-encode (pad(2,2)+trim). **Next: cache-aware chunked encoder** (K/V cache 56 frames + conv state 8 frames per layer). |
+| **HIGH** | [#81 Nemotron-Speech-Streaming-EN-0.6B](#81-nemotron-speech-streaming-en-06b--first-cache-aware-streaming-native-asr) | M-L | **IN PROGRESS.** Full scaffold on main: converter, runtime, CLI, registry, Kaggle diff harness (ref GGUF at `cstr/nemotron-3.5-asr-streaming-GGUF`), F16 GGUF uploaded. Fixes landed: siglu, mel normalize=NA, causal pre-encode, causal DW conv, prompt kernel, lang mapping, exact-size graphs, chunked encoder. **Still 0 tokens** — remaining issue: cache stores block OUTPUT but NeMo caches POST-FFN1 (before attention). Re-processing cached frames through FFN1 corrupts them. **Fix: split block into stages** — FFN1 on new frames only, Q from new / K,V from concat(cached_post_ffn1, new), conv with separate cache, FFN2+LN on new only. |
 | **DONE** | [#86 Per-backend flash-attention wiring](#86-per-backend-flash-attention-wiring-crisperweaver-driven) | — | All backends now route through core helpers (`core_attn`, `core_sanm`, `core_conformer`) that unconditionally use `ggml_flash_attn_ext`. Only t5_translate excluded (T5 rel-pos bias incompatible). |
 | **LOW** | [#87 `gpu_backend` runtime selector](#87-gpu_backend-runtime-selector-multi-backend-ggml-build) | ~1 week | Needs ggml-side multi-backend dispatch to land first. CrisperWeaver UI placeholder ready when the C-side is. |
 | **LOW** | [#95 IndexTTS Chinese TN binary alternative](#95-indextts-15-chinese-tn--binary-alternative-to-the-python-wetext-hook) | survey only | Python `INDEXTTS_TEXT_NORMALIZER` hook shipped 2026-05-19. Hand-roll (#95a) is the right next step *when* a user reports a digit/date prompt that breaks; OpenFST vendoring (#95b) only after #95a grows past ~5 cases. |
@@ -94,16 +94,6 @@ test-all-backends.py passes 18/18 transcribe + 51/54 feature tests (3 stream ski
 **Follow-ups from the 2026-06-12 A1000 session (RTX A1000 4 GB, Windows/CUDA) — we want both:**
 - **firered AED decoder — batch the beam (perf). DONE.** Prior round (`e9d492a2`): OpenMP + vectorized `cpu_dot` → 1443→365 ms/token (3.95×). **This round (`88ad4b9d`):** restructured the beam loop to batch all active beams through each weight matrix in a single `cpu_matmul_bt(X, W, out, n_active, K, N)` call instead of `beam_size` separate M=1 calls. Each of 128 weight matrices per step (8 per layer × 16 layers + logit projection) is read once regardless of beam count. Self-attention and cross-attention scoring remain per-beam (different KV histories). **JFK 11s Q4_K beam=3 VPS CPU (4 threads): 4922→1099 ms/token (4.48×), 137.8→30.8s decode, transcript byte-identical.** Cumulative from baseline: **1443→1099 ms/token (OpenMP+batching combined).** Remaining potential: route beam path through Q4_K `ggml_vecmat` instead of F32 `cpu_matmul_bt` (4× less bandwidth), but would need a batched ggml graph to avoid the 129 per-step graph-alloc overhead that makes greedy's `ggml_vecmat` path actually slower (28.5ms/call vs 12.8ms for raw F32 matmul).
 - **#89 parakeet-ja auto-chunk window — DONE (`f950bd1e`).** Auto-enables VAD for JA models (vocab ≤ 4096) on audio > 30 s when user didn't set `--vad` or `--chunk-seconds`. 10 s chunks still produced repetition loops; VAD gives silence-bounded segments matching training distribution. Kaggle-validated on `reazon_baseball_14s` ×3 (42 s): default (auto-VAD) recovers 3/3 岡本, identical to explicit `--vad` (442 chars); old 30 s chunking gets 1/3 (596 chars of garbage). `CrispasrBackend::prefers_vad()` virtual, overridden in `ParakeetBackend`.
-
----
-
-## §165 Server fails to launch on Vulkan build (GitHub #165) — OPEN tail
-
-`--no-warmup` opt-out + guarded warmup + two server-robustness fixes shipped
-2026-06-13 (see HISTORY). **Open:** reporter to confirm `--no-warmup` unblocks
-them on the AMD Radeon 780M Vulkan build (could not reproduce on M1/MoltenVK). If
-a specific parakeet warmup op crashes their RADV/proprietary driver, a minimal
-Vulkan repro + upstream report would be the proper fix.
 
 ---
 
@@ -5641,35 +5631,37 @@ The f16 variant passed `A_TYPE=float16_t` without enabling the required
 
 Fix: enable the extension + cast kernel element to float in `fma()`.
 
-### Part 2 — VOXCPM2_USE_GRAPH TSLM NaN on CUDA — IN PROGRESS
+### Part 2 — VOXCPM2_USE_GRAPH NaN + SIGABRT — DONE
 
-**Root cause (confirmed 2026-06-13, 8+ Kaggle P100 runs):** The TSLM
-step graph produces valid hidden_out on its first AR call (pos 4) but
-**NaN on every subsequent call** (pos 5+). The stop predictor not firing
-was a symptom — the hidden state itself is garbage from step 1 onwards.
+**NaN root cause (confirmed 2026-06-13):** RALM has `rope_theta=0`.
+`ggml_rope_ext` computes `powf(0, -2/d) = inf`, cascading NaN through
+RALM → mu → CFM → LocEnc → enc_lm → TSLM input from pos=5 onwards.
+**Fix:** skip RoPE when `rope_theta <= 0` in `core/attention.h`
+(`6679f485`).
 
-The NaN originates in the bucketed TSLM step graph's KV cache path.
-The first AR step writes K/V at position 4 via `ggml_set_rows` (index-
-scatter). The second step reads positions 0-5 via `ggml_cont` +
-`ggml_flash_attn_ext`. Something about reading the just-written
-position 4 data back through the attention path produces NaN on CUDA.
+**SIGABRT root cause (confirmed 2026-06-13):** Two issues:
+1. **Accumulated graph topology changes** (FSQ removal, PREC_F32, RALM
+   replay, ggml_cont fallback) between `3683ad0a` and `657e851e`
+   caused `ggml_graph_get_tensor` to return NULL for input tensors,
+   triggering `GGML_ASSERT(tensor)` in `ggml_backend_tensor_set`
+   (ggml-backend.cpp:325). Reproduced on P100 CUDA + Arc B580 Vulkan.
+   **Fix:** reverted to `3683ad0a` base + RoPE skip + FA_CPU
+   (`6679f485`).
+2. **FSQ `fsq_half` 1-element tensor broadcast** — the in-graph FSQ
+   rounding (`floor(x + 0.5)`) used `ggml_add([512,1], [1])`.
+   Broadcasting across ne[0] SIGABRTs on CUDA/Vulkan backends.
+   **Fix:** shape `fsq_half` to `th->ne[0]` so the add is element-wise.
+3. **All `ggml_graph_get_tensor` calls were unguarded** — 13 call sites
+   across tslm_step_graph, ralm_step_graph, locenc/locdit_forward_graph,
+   and vae_decode_graph passed results directly to tensor_set/get without
+   null-checking. Any future graph change would SIGABRT again.
+   **Fix:** null-guard every call; graceful fallback to CPU or zero-fill.
 
-**Mitigations on main (7 commits):**
-- Prefill replay through graph KV (`7449f793`)
-- In-graph stop predictor (stop_proj → SiLU → stop_head → softmax,
-  no FSQ — ggml_round produces NaN on CUDA) (`a6aef4cf`, `2062180c`)
-- NaN guard on graph_stop_score (`4cd7de23`)
-- Direct ggml_graph_node scan for tensor lookup (`f94e84c2`)
-- Verbosity-gated debug logging (`6bd49dda`)
-
-**Next steps:**
-1. Test with `ggml_cpy` (static-offset KV write) instead of
-   `ggml_set_rows` (index-scatter) — this is what the dynamic (non-
-   bucketed) graph path uses. If the dynamic path doesn't NaN, the
-   bucket reuse + set_rows combination is the culprit.
-2. Test with explicit F32 cache (`CRISPASR_KV_QUANT=f32`).
-3. If set_rows is confirmed broken, force the dynamic graph path as
-   a workaround (disables bucket caching, costs ~10% more per step).
+**Status: DONE.** Validated on Kaggle T4 (2026-06-13): all 3 configs pass
+(nograph, graph_default, graph_fa_cpu). Stop predictor fires correctly on
+all paths (step 6-7, scores 0.86-0.99). graph_default 5× faster than
+nograph (4.1s vs 20.6s). FA_CPU only needed on P100 (sm_60) where F16
+flash_attn overflows. Awaiting HubSana Vulkan re-test on Arc B580.
 
 ### Part 3 — VAE decode crash on Vulkan — DONE
 
@@ -5680,3 +5672,28 @@ Root cause: `vae_decode_graph` mixed CPU-resident bias/alpha tensors
 Fix (`7449f793`): `vae_wn_init_ggml` now creates GPU copies of all bias
 and alpha tensors; `Bias()`/`Alpha()` lambdas prefer the GPU copy.
 Confirmed working on P100 CUDA (5 Kaggle runs, exit 0, audio produced).
+
+### Handover notes (2026-06-13 session, ~18 hours)
+
+**What works:** converter (681 tensors), F16 GGUF on HF, pre-encode (cos=1.0),
+mel, CLI wiring, model registry, Kaggle diff harness. Fixes: siglu, mel
+normalize=NA, causal pre-encode, causal DW conv, prompt kernel, lang mapping,
+exact-size graphs, chunked encoder with per-layer cache.
+
+**What doesn't work:** RNNT decoder emits 0 tokens in ALL configurations
+tested (batch bidirectional, batch + window mask, chunked with full-block
+re-processing, chunked with staged streaming block).
+
+**Root cause analysis:**
+1. Batch bidirectional: model is streaming-only, full attention → out-of-distribution
+2. Window mask: banded mask alone insufficient (all-blank even in Python ref)
+3. Chunked + full-block: re-processing cached frames corrupts LayerNorm statistics
+4. Chunked + staged block: crashes (ggml optimizes away cache output tensor);
+   also missing rel-pos bias for asymmetric Q/K attention
+
+**Recommended next step:** Write a Python-only chunked encoder that matches
+NeMo's exact `cache_last_channel` + `cache_last_time` flow (using the
+`tools/kaggle/nemotron-diff/nemotron_diff.py` framework). Validate that the
+Python chunked encoder produces tokens on JFK. Then port that exact logic
+to C++, matching each intermediate tensor. The Kaggle diff harness and ref
+GGUF are ready for this.

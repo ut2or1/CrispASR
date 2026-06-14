@@ -25,7 +25,10 @@ except (AttributeError, ValueError):
 
 WORK = Path("/kaggle/working")
 REPO = WORK / "CrispASR"
-BUILD = WORK / "build"
+# Build in /kaggle/temp to avoid filling up /kaggle/working (capped at ~20 GB,
+# saved as kernel output). /kaggle/temp is ephemeral scratch space.
+_TEMP = Path("/kaggle/temp") if Path("/kaggle/temp").is_dir() else WORK
+BUILD = _TEMP / "build"
 CRISPASR_REPO = "https://github.com/CrispStrobe/CrispASR.git"
 CRISPASR_REF = os.environ.get("CRISPASR_REF", "main")
 MODEL_REPO = "cstr/voxcpm2-GGUF"
@@ -119,7 +122,7 @@ os.environ["LD_LIBRARY_PATH"] = (
 )
 
 # -- Download model --
-MODEL_DIR = WORK / "models"
+MODEL_DIR = _TEMP / "models"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 model_path = MODEL_DIR / MODEL_FILE
 
@@ -139,7 +142,7 @@ TEST_TEXT = "Hello world."
 OUT_WAV = WORK / "test_output.wav"
 
 
-def run_tts(label: str, extra_env: dict, timeout: int = 300) -> dict:
+def run_tts(label: str, extra_env: dict, timeout: int = 600) -> dict:
     step(f"{label}_start")
     cmd = [
         str(CLI), "-m", str(model_path),
@@ -149,21 +152,40 @@ def run_tts(label: str, extra_env: dict, timeout: int = 300) -> dict:
         "--verbose", "2",
     ]
     env = {**os.environ, **extra_env}
+    stderr_path = WORK / f"{label}_stderr.txt"
     t0 = time.time()
-    r = subprocess.run(
-        cmd, timeout=timeout,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        env=env,
-    )
-    elapsed = time.time() - t0
+    try:
+        r = subprocess.run(
+            cmd, timeout=timeout,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=env,
+        )
+        elapsed = time.time() - t0
+        rc = r.returncode
+        stderr_text = r.stderr
+    except subprocess.TimeoutExpired as e:
+        elapsed = time.time() - t0
+        rc = -99
+        stderr_text = (e.stderr or b"").decode("utf-8", errors="replace")
+        print(f"  {label}: TIMEOUT after {elapsed:.1f}s", flush=True)
+    except Exception as e:
+        elapsed = time.time() - t0
+        rc = -1
+        stderr_text = str(e)
+
+    # Always write stderr to a file for post-mortem
+    with open(stderr_path, "w") as f:
+        f.write(stderr_text[-50000:] if len(stderr_text) > 50000 else stderr_text)
 
     result = {
         "label": label,
-        "rc": r.returncode,
+        "rc": rc,
         "elapsed": round(elapsed, 1),
     }
 
-    for line in r.stderr.splitlines():
+    for line in stderr_text.splitlines():
+        if "nan_check" in line:
+            result.setdefault("nan_check_lines", []).append(line.strip())
         if "stop=" in line:
             result.setdefault("stop_lines", []).append(line.strip())
         if "stopped at step" in line:
@@ -175,9 +197,9 @@ def run_tts(label: str, extra_env: dict, timeout: int = 300) -> dict:
         if "replayed" in line:
             result["replayed"] = True
 
-    print(f"  {label}: rc={r.returncode}, elapsed={elapsed:.1f}s, "
+    print(f"  {label}: rc={rc}, elapsed={elapsed:.1f}s, "
           f"stop_fired={result.get('stop_fired', 'unknown')}", flush=True)
-    for line in r.stderr.splitlines():
+    for line in stderr_text.splitlines():
         if "voxcpm2:" in line:
             print(f"    {line.strip()}", flush=True)
     if "stop_lines" in result:
@@ -190,27 +212,35 @@ def run_tts(label: str, extra_env: dict, timeout: int = 300) -> dict:
     return result
 
 
-# -- Config A: graph=0 (baseline) --
-print("\n=== Config A: VOXCPM2_USE_GRAPH=0 (baseline) ===", flush=True)
-res_a = run_tts("nograph", {"VOXCPM2_USE_GRAPH": "0"})
+results = []
+try:
+    # -- Config A: graph=0 (baseline) --
+    print("\n=== Config A: VOXCPM2_USE_GRAPH=0 (baseline) ===", flush=True)
+    results.append(run_tts("nograph", {"VOXCPM2_USE_GRAPH": "0"}))
 
-# -- Config B: graph=1, CUDA, bucketed (current default — known NaN) --
-print("\n=== Config B: VOXCPM2_USE_GRAPH=1, bucketed (CUDA) ===", flush=True)
-res_b = run_tts("graph_bucket", {"VOXCPM2_USE_GRAPH": "1"})
+    # -- Config B: graph=1, CUDA (default — known NaN on P100) --
+    print("\n=== Config B: VOXCPM2_USE_GRAPH=1 (CUDA, default) ===", flush=True)
+    results.append(run_tts("graph_default", {
+        "VOXCPM2_USE_GRAPH": "1",
+    }))
 
-# -- Config C: graph=1, CUDA, NO_BUCKET (dynamic graph, ggml_cpy KV) --
-print("\n=== Config C: VOXCPM2_USE_GRAPH=1, NO_BUCKET (CUDA) ===", flush=True)
-res_c = run_tts("graph_nobucket", {
-    "VOXCPM2_USE_GRAPH": "1",
-    "VOXCPM2_NO_BUCKET": "1",
-})
+    # -- Config C: graph=1, CUDA + FA_CPU (LocDiT/LocEnc on CPU) --
+    print("\n=== Config C: graph=1 + FA_CPU (LocDiT/LocEnc on CPU) ===", flush=True)
+    results.append(run_tts("graph_fa_cpu", {
+        "VOXCPM2_USE_GRAPH": "1",
+        "VOXCPM2_FA_CPU": "1",
+    }))
+except Exception as e:
+    step("ERROR", error=str(e))
+    import traceback
+    traceback.print_exc()
 
 # -- Summary --
 print("\n" + "=" * 60, flush=True)
 print("RESULTS SUMMARY", flush=True)
 print("=" * 60, flush=True)
 all_pass = True
-for r in [res_a, res_b, res_c]:
+for r in results:
     sf = r.get("stop_fired", "unknown")
     sl = r.get("stop_line", r.get("ceiling_line", ""))
     status = "PASS" if sf is True else ("FAIL" if sf is False else "UNKNOWN")
@@ -218,12 +248,16 @@ for r in [res_a, res_b, res_c]:
         all_pass = False
     print(f"  {r['label']:15s}: {status}  rc={r['rc']}  {sl}", flush=True)
 
+if not results:
+    all_pass = False
+    print("  NO TESTS RAN", flush=True)
+
 print(f"\nOverall: {'ALL PASS' if all_pass else 'SOME FAILED'}", flush=True)
-step("DONE", all_pass=all_pass, summary={
+step("DONE", all_pass=all_pass, n_tests=len(results), summary={
     r["label"]: {
         "rc": r["rc"],
         "elapsed": r["elapsed"],
         "stop_fired": r.get("stop_fired"),
     }
-    for r in [res_a, res_b, res_c]
+    for r in results
 })

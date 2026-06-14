@@ -1127,9 +1127,22 @@ static std::vector<float> ralm_step_graph(voxcpm2_context* ctx, const float* hid
         return std::vector<float>(d, 0.0f);
     }
 
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "ralm_hidden_in"), hidden_in, 0, (size_t)d * sizeof(float));
-    int32_t pos_i = pos;
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "ralm_positions"), &pos_i, 0, sizeof(int32_t));
+    ggml_tensor* t_hidden_in = ggml_graph_get_tensor(gf, "ralm_hidden_in");
+    if (!t_hidden_in) {
+        fprintf(stderr, "voxcpm2: ralm_step graph missing ralm_hidden_in tensor\n");
+        return std::vector<float>(d, 0.0f);
+    }
+    ggml_backend_tensor_set(t_hidden_in, hidden_in, 0, (size_t)d * sizeof(float));
+
+    // positions is optional — when rope_theta=0 (RALM has no positional
+    // encoding) and the KV cache is F32, nothing in the graph consumes it,
+    // so ggml_graph_get_tensor won't find it. That's fine: set it only if
+    // present (#164).
+    ggml_tensor* t_positions = ggml_graph_get_tensor(gf, "ralm_positions");
+    if (t_positions) {
+        int32_t pos_i = pos;
+        ggml_backend_tensor_set(t_positions, &pos_i, 0, sizeof(int32_t));
+    }
 
     if (ggml_backend_is_cpu(ctx->backend)) {
         ggml_backend_cpu_set_n_threads(ctx->backend, g_cpu_n_threads);
@@ -1140,8 +1153,12 @@ static std::vector<float> ralm_step_graph(voxcpm2_context* ctx, const float* hid
     }
 
     ggml_tensor* out = ggml_graph_get_tensor(gf, "ralm_hidden_out");
-    std::vector<float> result(d);
-    ggml_backend_tensor_get(out, result.data(), 0, (size_t)d * sizeof(float));
+    std::vector<float> result(d, 0.0f);
+    if (out) {
+        ggml_backend_tensor_get(out, result.data(), 0, (size_t)d * sizeof(float));
+    } else {
+        fprintf(stderr, "voxcpm2: ralm_step graph missing ralm_hidden_out tensor\n");
+    }
     return result;
 }
 
@@ -1267,11 +1284,6 @@ static ggml_cgraph* build_tslm_step_graph(voxcpm2_context* ctx, int n_past, int 
     // hidden state. Without FSQ, the stop predictor sees out-of-distribution
     // inputs and never fires on Vulkan (#164). We implement round(x) as
     // floor(x + 0.5) to avoid ggml_round, which produces NaN on CUDA.
-    // The stop predictor weights were trained on FSQ'd inputs, so feeding raw
-    // hidden state is out-of-distribution and fails on Vulkan (#164).
-    // FSQ: round(tanh(in_proj(hidden)) * 9) / 9 → out_proj.
-    // We implement round(x) as floor(x + 0.5) to avoid ggml_round, which
-    // produces NaN on some CUDA backends.
     if (W.stop_proj_w && W.stop_proj_b && W.stop_head_w && W.fsq_in_proj_w && W.fsq_out_proj_w) {
         // FSQ path
         ggml_tensor* fsq_in = ggml_mul_mat(ctx0, W.fsq_in_proj_w, cur);
@@ -1280,8 +1292,10 @@ static ggml_cgraph* build_tslm_step_graph(voxcpm2_context* ctx, int n_past, int 
         }
         ggml_tensor* th = ggml_tanh(ctx0, fsq_in);
         th = ggml_scale(ctx0, th, 9.0f);
-        // round(x) = floor(x + 0.5) — avoids ggml_round NaN on CUDA
-        ggml_tensor* half_const = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
+        // round(x) = floor(x + 0.5) — avoids ggml_round NaN on CUDA.
+        // Shape must match th's ne[0] to avoid broadcast add; a 1-element
+        // tensor SIGABRTs on CUDA/Vulkan backends (#164).
+        ggml_tensor* half_const = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, th->ne[0]);
         ggml_set_name(half_const, "fsq_half");
         ggml_set_input(half_const);
         th = ggml_add(ctx0, th, half_const);
@@ -1433,27 +1447,41 @@ static std::vector<float> tslm_step_graph(voxcpm2_context* ctx, const float* hid
         return std::vector<float>(d, 0.0f);
     }
 
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "hidden_in"), hidden_in, 0, (size_t)d * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), &pos_i, 0, sizeof(int32_t));
+    ggml_tensor* t_hidden_in = ggml_graph_get_tensor(gf, "hidden_in");
+    ggml_tensor* t_positions = ggml_graph_get_tensor(gf, "positions");
+    if (!t_hidden_in || !t_positions) {
+        fprintf(stderr, "voxcpm2: tslm_step graph missing input tensors (hidden_in=%p positions=%p)\n",
+                (void*)t_hidden_in, (void*)t_positions);
+        return std::vector<float>(d, 0.0f);
+    }
+    ggml_backend_tensor_set(t_hidden_in, hidden_in, 0, (size_t)d * sizeof(float));
+    ggml_backend_tensor_set(t_positions, &pos_i, 0, sizeof(int32_t));
     if (bucketed) {
         // Mask: shape (Lk, 1). 0 for k <= pos (visible written slots);
         // -inf for k > pos (unwritten tail). F16 to match the helper's
         // declared mask type.
+        ggml_tensor* t_mask = ggml_graph_get_tensor(gf, "causal_mask");
+        if (!t_mask) {
+            fprintf(stderr, "voxcpm2: tslm_step graph missing causal_mask tensor\n");
+            return std::vector<float>(d, 0.0f);
+        }
         std::vector<ggml_fp16_t> mask((size_t)Lk);
         const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f);
         const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
         for (int k = 0; k < Lk; k++) {
             mask[k] = (k <= pos) ? z : ninf;
         }
-        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
-                                mask.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(t_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
 
-    // FSQ half-constant for floor(x + 0.5) rounding (#164)
+    // FSQ half-constant for floor(x + 0.5) rounding (#164).
+    // Tensor is shaped to match th's ne[0] (FSQ intermediate dim) — a
+    // 1-element broadcast caused SIGABRT on CUDA/Vulkan backends.
     ggml_tensor* fsq_half_t = ggml_graph_get_tensor(gf, "fsq_half");
     if (fsq_half_t) {
-        const float half_val = 0.5f;
-        ggml_backend_tensor_set(fsq_half_t, &half_val, 0, sizeof(float));
+        const int64_t n = ggml_nelements(fsq_half_t);
+        std::vector<float> half_buf((size_t)n, 0.5f);
+        ggml_backend_tensor_set(fsq_half_t, half_buf.data(), 0, (size_t)n * sizeof(float));
     }
 
     if (ggml_backend_is_cpu(ctx->backend)) {
@@ -1462,6 +1490,43 @@ static std::vector<float> tslm_step_graph(voxcpm2_context* ctx, const float* hid
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "voxcpm2: tslm_step graph compute failed\n");
         return std::vector<float>(d, 0.0f);
+    }
+
+    // Per-node NaN checker (#164 diagnosis). Walks every graph node after
+    // compute and reports the first op that produced NaN/Inf. Gated on
+    // VOXCPM2_NAN_CHECK=1 (expensive — reads every tensor back to CPU).
+    static const bool nan_check = vox_env_bool("VOXCPM2_NAN_CHECK");
+    if (nan_check) {
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+            ggml_tensor* nd = ggml_graph_node(gf, i);
+            size_t n = ggml_nelements(nd);
+            if (n == 0 || nd->type != GGML_TYPE_F32)
+                continue;
+            std::vector<float> buf(n);
+            ggml_backend_tensor_get(nd, buf.data(), 0, n * sizeof(float));
+            int nans = 0, infs = 0;
+            float mn = buf[0], mx = buf[0];
+            for (size_t j = 0; j < n; j++) {
+                if (std::isnan(buf[j]))
+                    nans++;
+                else if (std::isinf(buf[j]))
+                    infs++;
+                else {
+                    if (buf[j] < mn)
+                        mn = buf[j];
+                    if (buf[j] > mx)
+                        mx = buf[j];
+                }
+            }
+            if (nans > 0 || infs > 0) {
+                fprintf(stderr,
+                        "voxcpm2[nan_check] pos=%d node#%d %-12s ne=[%lld,%lld,%lld] "
+                        "nan=%d inf=%d min=%.4g max=%.4g name=%s\n",
+                        pos, i, ggml_op_name(nd->op), (long long)nd->ne[0], (long long)nd->ne[1], (long long)nd->ne[2],
+                        nans, infs, mn, mx, nd->name);
+                break; // stop at first bad node
+            }
+        }
     }
 
     // Output tensor pointers. Scan graph nodes directly — ggml_graph_get_tensor
@@ -2000,10 +2065,14 @@ static std::vector<float> locenc_forward_graph(voxcpm2_context* ctx, const float
         return locenc_forward(ctx, patch, ctx->backend_cpu);
     }
 
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "patch_in"), patch_buf.data(), 0,
-                            patch_buf.size() * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), positions.data(), 0,
-                            positions.size() * sizeof(int32_t));
+    ggml_tensor* t_patch = ggml_graph_get_tensor(gf, "patch_in");
+    ggml_tensor* t_pos = ggml_graph_get_tensor(gf, "positions");
+    if (!t_patch || !t_pos) {
+        fprintf(stderr, "voxcpm2: locenc graph missing input tensors\n");
+        return locenc_forward(ctx, patch, ctx->backend_cpu);
+    }
+    ggml_backend_tensor_set(t_patch, patch_buf.data(), 0, patch_buf.size() * sizeof(float));
+    ggml_backend_tensor_set(t_pos, positions.data(), 0, positions.size() * sizeof(int32_t));
 
     if (ggml_backend_is_cpu(ctx->backend)) {
         ggml_backend_cpu_set_n_threads(ctx->backend, g_cpu_n_threads);
@@ -2014,6 +2083,10 @@ static std::vector<float> locenc_forward_graph(voxcpm2_context* ctx, const float
     }
 
     ggml_tensor* out = ggml_graph_get_tensor(gf, "cls_out");
+    if (!out) {
+        fprintf(stderr, "voxcpm2: locenc graph missing cls_out tensor\n");
+        return locenc_forward(ctx, patch, ctx->backend_cpu);
+    }
     std::vector<float> result(d);
     ggml_backend_tensor_get(out, result.data(), 0, (size_t)d * sizeof(float));
     return result;
@@ -2513,13 +2586,22 @@ static std::vector<float> locdit_forward_graph(voxcpm2_context* ctx, const float
         return std::vector<float>(feat_dim * P, 0.0f);
     }
 
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x_in"), x_buf.data(), 0, x_buf.size() * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "cond_in"), cond_buf.data(), 0, cond_buf.size() * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mu_in"), mu_buf.data(), 0, mu_buf.size() * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_sin"), t_sin.data(), 0, t_sin.size() * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "dt_sin"), dt_sin.data(), 0, dt_sin.size() * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), positions.data(), 0,
-                            positions.size() * sizeof(int32_t));
+    ggml_tensor* t_x = ggml_graph_get_tensor(gf, "x_in");
+    ggml_tensor* t_cond = ggml_graph_get_tensor(gf, "cond_in");
+    ggml_tensor* t_mu = ggml_graph_get_tensor(gf, "mu_in");
+    ggml_tensor* t_tsin = ggml_graph_get_tensor(gf, "t_sin");
+    ggml_tensor* t_dsin = ggml_graph_get_tensor(gf, "dt_sin");
+    ggml_tensor* t_pos = ggml_graph_get_tensor(gf, "positions");
+    if (!t_x || !t_cond || !t_mu || !t_tsin || !t_dsin || !t_pos) {
+        fprintf(stderr, "voxcpm2: locdit graph missing input tensors\n");
+        return std::vector<float>(feat_dim * P, 0.0f);
+    }
+    ggml_backend_tensor_set(t_x, x_buf.data(), 0, x_buf.size() * sizeof(float));
+    ggml_backend_tensor_set(t_cond, cond_buf.data(), 0, cond_buf.size() * sizeof(float));
+    ggml_backend_tensor_set(t_mu, mu_buf.data(), 0, mu_buf.size() * sizeof(float));
+    ggml_backend_tensor_set(t_tsin, t_sin.data(), 0, t_sin.size() * sizeof(float));
+    ggml_backend_tensor_set(t_dsin, dt_sin.data(), 0, dt_sin.size() * sizeof(float));
+    ggml_backend_tensor_set(t_pos, positions.data(), 0, positions.size() * sizeof(int32_t));
 
     if (ggml_backend_is_cpu(ctx->backend)) {
         ggml_backend_cpu_set_n_threads(ctx->backend, g_cpu_n_threads);
@@ -2530,8 +2612,12 @@ static std::vector<float> locdit_forward_graph(voxcpm2_context* ctx, const float
     }
 
     ggml_tensor* vel = ggml_graph_get_tensor(gf, "vel");
-    std::vector<float> out((size_t)feat_dim * P);
-    ggml_backend_tensor_get(vel, out.data(), 0, out.size() * sizeof(float));
+    std::vector<float> out((size_t)feat_dim * P, 0.0f);
+    if (vel) {
+        ggml_backend_tensor_get(vel, out.data(), 0, out.size() * sizeof(float));
+    } else {
+        fprintf(stderr, "voxcpm2: locdit graph missing vel tensor\n");
+    }
     return out;
 }
 
@@ -2566,9 +2652,13 @@ static std::vector<float> cfm_euler_solve(voxcpm2_context* ctx, const float* mu,
     // ~30 per-matmul tiny graphs. Same algebra; one graph build/alloc
     // per locdit call instead of one per matmul.
     const bool use_graph = vox_env_bool_default_on("VOXCPM2_USE_GRAPH");
+    // VOXCPM2_FA_CPU=1 forces LocDiT/LocEnc to CPU — required on P100
+    // where flash_attn_ext F16 accumulator overflows on mu-conditioned
+    // attention from the second AR step onwards (#164).
+    static const bool fa_cpu = vox_env_bool("VOXCPM2_FA_CPU");
     auto locdit_call = [&](const float* x_tc, const float* mu_in, float t_cur, const float* cond_in,
                            float dt_in) -> std::vector<float> {
-        if (use_graph) {
+        if (use_graph && !fa_cpu) {
             return locdit_forward_graph(ctx, x_tc, mu_in, t_cur, cond_in, dt_in);
         }
         return locdit_forward(ctx, x_tc, mu_in, t_cur, cond_in, dt_in, cpu_be);
@@ -3764,8 +3854,13 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
         return vae_decode(ctx, patches, ctx->backend_cpu);
     }
 
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "latents"), latents_host.data(), 0,
-                            latents_host.size() * sizeof(float));
+    ggml_tensor* t_latents = ggml_graph_get_tensor(gf, "latents");
+    if (!t_latents) {
+        fprintf(stderr, "voxcpm2: vae_decode_graph missing latents tensor; falling back to CPU\n");
+        ggml_free(ctx0);
+        return vae_decode(ctx, patches, ctx->backend_cpu);
+    }
+    ggml_backend_tensor_set(t_latents, latents_host.data(), 0, latents_host.size() * sizeof(float));
 
     if (ggml_backend_is_cpu(ctx->backend)) {
         ggml_backend_cpu_set_n_threads(ctx->backend, g_cpu_n_threads);
@@ -5348,8 +5443,9 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
 
         // 1c. LocEnc on predicted patch
         tb = bench ? vox_now_ms() : 0;
-        std::vector<float> enc_out =
-            use_graph_tslm ? locenc_forward_graph(ctx, patch_tf.data()) : locenc_forward(ctx, patch_tf.data(), cpu_be);
+        static const bool fa_cpu_le = vox_env_bool("VOXCPM2_FA_CPU");
+        std::vector<float> enc_out = (use_graph_tslm && !fa_cpu_le) ? locenc_forward_graph(ctx, patch_tf.data())
+                                                                    : locenc_forward(ctx, patch_tf.data(), cpu_be);
         if (bench)
             sum_locenc += vox_now_ms() - tb;
 
