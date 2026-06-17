@@ -103,7 +103,9 @@ public:
 
     const char* name() const override { return "moss-audio"; }
 
-    uint32_t capabilities() const override { return CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_PUNCTUATION_NATIVE; }
+    uint32_t capabilities() const override {
+        return CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_PUNCTUATION_NATIVE | CAP_BEAM_SEARCH;
+    }
 
     bool init(const whisper_params& p) override {
         auto cp = moss_audio_context_default_params();
@@ -124,6 +126,8 @@ public:
                                              const whisper_params& params) override {
         if (!ctx_)
             return {};
+
+        moss_audio_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
 
         // Use the prompt from params if set, otherwise default to transcription
         const char* prompt = "Transcribe this audio.";

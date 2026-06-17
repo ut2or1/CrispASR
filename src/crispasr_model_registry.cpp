@@ -42,6 +42,9 @@ struct ExtraList {
 constexpr Entry k_registry[] = {
     {"whisper", "ggml-base.bin",
      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin", "~147 MB", nullptr, nullptr},
+    {"nemotron", "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
+     "https://huggingface.co/cstr/nemotron-3.5-asr-streaming-0.6b-GGUF/resolve/main/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
+     "~458 MB", nullptr, nullptr},
     {"parakeet", "parakeet-tdt-0.6b-v3-q4_k.gguf",
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF/resolve/main/parakeet-tdt-0.6b-v3-q4_k.gguf", "~467 MB", nullptr, nullptr},
     {"canary", "canary-1b-v2-q4_k.gguf",
@@ -54,9 +57,9 @@ constexpr Entry k_registry[] = {
      "~1.6 GB", nullptr, nullptr, nullptr,
      "LFM Open License v1.0 (commercial use OK under $10M revenue; see "
      "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B)"},
-    // Japanese variant — Q4_K is safe for Japanese.
-    {"lfm2-audio", "lfm2-audio-1.5b-jp-q4_k.gguf",
-     "https://huggingface.co/cstr/lfm2-audio-1.5b-jp-GGUF/resolve/main/lfm2-audio-1.5b-jp-q4_k.gguf",
+    // Japanese variant — Q5_K minimum (Q4_K produces 0 tokens on hybrid backbone).
+    {"lfm2-audio", "lfm2-audio-1.5b-jp-q5_k.gguf",
+     "https://huggingface.co/cstr/lfm2-audio-1.5b-jp-GGUF/resolve/main/lfm2-audio-1.5b-jp-q5_k.gguf",
      "~1.5 GB", nullptr, nullptr, nullptr,
      "LFM Open License v1.0 (commercial use OK under $10M revenue; see "
      "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP)"},
@@ -638,6 +641,16 @@ constexpr Entry k_registry[] = {
     {"piper", "piper-en_US-lessac-medium-f16.gguf",
      "https://huggingface.co/cstr/piper-en_US-lessac-medium-GGUF/resolve/main/piper-en_US-lessac-medium-f16.gguf",
      "~16 MB", nullptr, nullptr},
+    // German voices from the consolidated piper-voices-GGUF repo
+    {"piper", "piper-de_DE-thorsten-medium-f16.gguf",
+     "https://huggingface.co/cstr/piper-voices-GGUF/resolve/main/piper-de_DE-thorsten-medium-f16.gguf",
+     "~30 MB", nullptr, nullptr},
+    {"piper", "piper-de_DE-thorsten-high-f16.gguf",
+     "https://huggingface.co/cstr/piper-voices-GGUF/resolve/main/piper-de_DE-thorsten-high-f16.gguf",
+     "~60 MB", nullptr, nullptr},
+    {"piper", "piper-de_DE-kerstin-low-f16.gguf",
+     "https://huggingface.co/cstr/piper-voices-GGUF/resolve/main/piper-de_DE-kerstin-low-f16.gguf",
+     "~12 MB", nullptr, nullptr},
 
     // Bark — suno/bark 3-stage hierarchical TTS (MIT). bark-small ~300M params,
     // 24 kHz, 10 German speakers (v2/de_speaker_0..9). Single GGUF packs all

@@ -137,10 +137,8 @@ add_library(crispasr-lib
             # and by the C-ABI `crispasr_align_words_abi`. Both canary-ctc
             # and qwen3-forced-aligner paths route through one call.
             crispasr_aligner.cpp
-            # Built-in G2P phonemizers (EN/DE/FR/ES). LTS rules + optional
-            # IPA dict auto-download. Used by kokoro TTS for espeak-free
-            # phonemization.
-            phonemizer.cpp
+            # Built-in G2P phonemizers (EN/DE/FR/ES) live in the kokoro
+            # target (phonemizer.cpp) — only kokoro calls them.
             # HF download + filesystem cache (shared with CLI). Consumed
             # by the library's VAD / LID / diarize auto-download paths
             # and by the CLI's `-m auto` resolver.
@@ -1077,9 +1075,8 @@ endif()
 # ---------------------------------------------------------------------------
 # kokoro — hexgrad/Kokoro-82M + yl4579/StyleTTS2-LJSpeech (iSTFTNet TTS)
 # ---------------------------------------------------------------------------
-# phonemizer.cpp is in crispasr-lib (line ~143); don't duplicate it here
-# or the all-in-one link (Linux/Android shared .so) gets duplicate symbols.
-add_library(kokoro STATIC kokoro.h kokoro.cpp phonemizer.h)
+# phonemizer.cpp lives here — only kokoro calls phonemize_builtin_*.
+add_library(kokoro STATIC kokoro.h kokoro.cpp phonemizer.cpp phonemizer.h)
 set_target_properties(kokoro PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(kokoro PUBLIC .)
 target_compile_features   (kokoro PUBLIC cxx_std_17)
@@ -1375,18 +1372,24 @@ target_compile_features   (firered-lid PUBLIC cxx_std_17)
 target_link_libraries     (firered-lid PUBLIC firered-asr crispasr-core ggml ggml-base ggml-cpu)
 
 # ---------------------------------------------------------------------------
-# lid-fasttext — fastText supervised LID (GlotLID-V3 + Facebook LID-176).
-# Text-only — runs on transcripts, not audio. Tiny F32/F16 forward
-# (manual gather + matmul + softmax), no ggml graph for the F32/F16 path;
-# quants will need a small ggml graph for the matmul.
 # ---------------------------------------------------------------------------
-add_library(lid-fasttext STATIC lid_fasttext.h lid_fasttext.cpp)
-set_target_properties(lid-fasttext PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(lid-fasttext PUBLIC .)
-target_compile_features   (lid-fasttext PUBLIC cxx_std_17)
-target_link_libraries     (lid-fasttext PUBLIC crispasr-core ggml ggml-base ggml-cpu)
-if(NOT MSVC)
-    target_compile_options(lid-fasttext PRIVATE -O3)
+# crisp_lid — shared text LID library (fastText + CLD3).
+# Prefer shared library from crisp_lid/; fall back to local copies.
+# ---------------------------------------------------------------------------
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../crisp_lid/CMakeLists.txt" AND NOT TARGET crisp_lid)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../crisp_lid
+                     ${CMAKE_BINARY_DIR}/crisp_lid)
+    message(STATUS "crispasr: using shared crisp_lid library")
+else()
+    # Local fallback: lid-fasttext
+    add_library(lid-fasttext STATIC lid_fasttext.h lid_fasttext.cpp)
+    set_target_properties(lid-fasttext PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(lid-fasttext PUBLIC .)
+    target_compile_features   (lid-fasttext PUBLIC cxx_std_17)
+    target_link_libraries     (lid-fasttext PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+    if(NOT MSVC)
+        target_compile_options(lid-fasttext PRIVATE -O3)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -1447,93 +1450,101 @@ if(NOT MSVC)
     target_compile_options(silero-lid PRIVATE -O3)
 endif()
 
-# ---------------------------------------------------------------------------
-# lid-cld3 — Google CLD3 (Apache-2.0) text-LID, 109 ISO 639-1 labels
-# Sibling backend to lid-fasttext; the auto-routing dispatcher in
-# src/text_lid_dispatch.cpp picks between them by reading the GGUF's
-# general.architecture key. Pure manual F32 forward, no ggml graph.
-# ---------------------------------------------------------------------------
-add_library(lid-cld3 STATIC lid_cld3.h lid_cld3.cpp)
-set_target_properties(lid-cld3 PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(lid-cld3 PUBLIC .)
-target_compile_features   (lid-cld3 PUBLIC cxx_std_17)
-target_link_libraries     (lid-cld3 PUBLIC crispasr-core ggml ggml-base ggml-cpu)
-if(NOT MSVC)
-    target_compile_options(lid-cld3 PRIVATE -O3)
+# lid-cld3 — local fallback (only built if shared crisp_lid not available)
+if(NOT TARGET crisp_lid)
+    add_library(lid-cld3 STATIC lid_cld3.h lid_cld3.cpp)
+    set_target_properties(lid-cld3 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(lid-cld3 PUBLIC .)
+    target_compile_features   (lid-cld3 PUBLIC cxx_std_17)
+    target_link_libraries     (lid-cld3 PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+    if(NOT MSVC)
+        target_compile_options(lid-cld3 PRIVATE -O3)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
 # text-lid-dispatch — backend-agnostic façade over lid-fasttext + lid-cld3.
 # Peeks general.architecture and dispatches; one C ABI for any text-LID GGUF.
 # ---------------------------------------------------------------------------
-add_library(text-lid-dispatch STATIC text_lid_dispatch.h text_lid_dispatch.cpp)
-set_target_properties(text-lid-dispatch PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(text-lid-dispatch PUBLIC .)
-target_compile_features   (text-lid-dispatch PUBLIC cxx_std_17)
-target_link_libraries     (text-lid-dispatch PUBLIC crispasr-core lid-fasttext lid-cld3)
-# `text_lid_resolve_path()` calls into crispasr_cache::ensure_cached_file
-# and crispasr_registry_lookup — both compiled into the crispasr-lib shared
-# library, not separate targets. The symbols resolve when the consumer
-# (crispasr-lid, libcrispasr) links text-lid-dispatch + crispasr-lib together.
-if(NOT MSVC)
-    target_compile_options(text-lid-dispatch PRIVATE -O3)
+if(NOT TARGET crisp_lid)
+    add_library(text-lid-dispatch STATIC text_lid_dispatch.h text_lid_dispatch.cpp)
+    set_target_properties(text-lid-dispatch PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(text-lid-dispatch PUBLIC .)
+    target_compile_features   (text-lid-dispatch PUBLIC cxx_std_17)
+    target_compile_definitions(text-lid-dispatch PRIVATE CRISPASR_BUILD)
+    target_link_libraries     (text-lid-dispatch PUBLIC crispasr-core lid-fasttext lid-cld3)
+    if(NOT MSVC)
+        target_compile_options(text-lid-dispatch PRIVATE -O3)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
-# fireredpunc — FireRedPunc BERT-based punctuation restoration
+# crisp_punc — shared punctuation library (FireRedPunc + PCS).
+# Prefer the shared library from crisp_punc/; fall back to local copies.
 # ---------------------------------------------------------------------------
-add_library(fireredpunc STATIC fireredpunc.h fireredpunc.cpp)
-set_target_properties(fireredpunc PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(fireredpunc PUBLIC .)
-target_compile_features   (fireredpunc PUBLIC cxx_std_17)
-target_link_libraries     (fireredpunc PUBLIC crispasr-core ggml ggml-base ggml-cpu)
-if(NOT MSVC)
-    target_compile_options(fireredpunc PRIVATE -O3)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../crisp_punc/CMakeLists.txt" AND NOT TARGET crisp_punc)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../crisp_punc
+                     ${CMAKE_BINARY_DIR}/crisp_punc)
+    message(STATUS "crispasr: using shared crisp_punc library")
+else()
+    # Local fallback: fireredpunc
+    add_library(fireredpunc STATIC fireredpunc.h fireredpunc.cpp)
+    set_target_properties(fireredpunc PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fireredpunc PUBLIC .)
+    target_compile_features   (fireredpunc PUBLIC cxx_std_17)
+    target_link_libraries     (fireredpunc PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+    if(NOT MSVC)
+        target_compile_options(fireredpunc PRIVATE -O3)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
-# truecaser — statistical truecaser from word-frequency data
+# crisp_truecase — shared truecaser library (stat + CRF + BiLSTM).
+# Prefer shared library from crisp_truecase/; fall back to local copies.
 # ---------------------------------------------------------------------------
-add_library(truecaser STATIC truecaser.h truecaser.cpp)
-set_target_properties(truecaser PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(truecaser PUBLIC .)
-target_compile_features   (truecaser PUBLIC cxx_std_17)
-if(NOT MSVC)
-    target_compile_options(truecaser PRIVATE -O3)
-endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../crisp_truecase/CMakeLists.txt" AND NOT TARGET crisp_truecase)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../crisp_truecase
+                     ${CMAKE_BINARY_DIR}/crisp_truecase)
+    message(STATUS "crispasr: using shared crisp_truecase library")
+else()
+    add_library(truecaser STATIC truecaser.h truecaser.cpp)
+    set_target_properties(truecaser PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(truecaser PUBLIC .)
+    target_compile_features   (truecaser PUBLIC cxx_std_17)
+    if(NOT MSVC)
+        target_compile_options(truecaser PRIVATE -O3)
+    endif()
 
-# ---------------------------------------------------------------------------
-# truecaser_crf — CRF-based truecaser with context features
-# ---------------------------------------------------------------------------
-add_library(truecaser_crf STATIC truecaser_crf.h truecaser_crf.cpp)
-set_target_properties(truecaser_crf PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(truecaser_crf PUBLIC .)
-target_compile_features   (truecaser_crf PUBLIC cxx_std_17)
-if(NOT MSVC)
-    target_compile_options(truecaser_crf PRIVATE -O3)
-endif()
+    add_library(truecaser_crf STATIC truecaser_crf.h truecaser_crf.cpp)
+    set_target_properties(truecaser_crf PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(truecaser_crf PUBLIC .)
+    target_compile_features   (truecaser_crf PUBLIC cxx_std_17)
+    if(NOT MSVC)
+        target_compile_options(truecaser_crf PRIVATE -O3)
+    endif()
 
-# ---------------------------------------------------------------------------
-# truecaser_lstm — BiLSTM character-level truecaser (mayhewsw/pytorch-truecaser)
-# ---------------------------------------------------------------------------
-add_library(truecaser_lstm STATIC truecaser_lstm.h truecaser_lstm.cpp)
-set_target_properties(truecaser_lstm PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(truecaser_lstm PUBLIC .)
-target_compile_features   (truecaser_lstm PUBLIC cxx_std_17)
-if(NOT MSVC)
-    target_compile_options(truecaser_lstm PRIVATE -O3)
+    add_library(truecaser_lstm STATIC truecaser_lstm.h truecaser_lstm.cpp)
+    set_target_properties(truecaser_lstm PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(truecaser_lstm PUBLIC .)
+    target_compile_features   (truecaser_lstm PUBLIC cxx_std_17)
+    if(NOT MSVC)
+        target_compile_options(truecaser_lstm PRIVATE -O3)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
 # pcs — Punctuation + Capitalization + Segmentation (1-800-BAD-CODE XLM-R)
 # ---------------------------------------------------------------------------
-add_library(pcs STATIC pcs.h pcs.cpp)
-set_target_properties(pcs PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(pcs PUBLIC .)
-target_compile_features   (pcs PUBLIC cxx_std_17)
-target_link_libraries     (pcs PUBLIC crispasr-core ggml ggml-base ggml-cpu)
-if(NOT MSVC)
-    target_compile_options(pcs PRIVATE -O3)
+if(NOT TARGET crisp_punc)
+    # Only build local pcs if shared crisp_punc wasn't loaded
+    add_library(pcs STATIC pcs.h pcs.cpp)
+    set_target_properties(pcs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(pcs PUBLIC .)
+    target_compile_features   (pcs PUBLIC cxx_std_17)
+    target_link_libraries     (pcs PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+    if(NOT MSVC)
+        target_compile_options(pcs PRIVATE -O3)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -1624,7 +1635,9 @@ endif()
 if (TARGET firered-lid)
     target_link_libraries(crispasr-lib PUBLIC firered-lid)
 endif()
-if (TARGET lid-fasttext)
+if (TARGET crisp_lid)
+    target_link_libraries(crispasr-lib PUBLIC crisp_lid)
+elseif (TARGET lid-fasttext)
     target_link_libraries(crispasr-lib PUBLIC lid-fasttext)
 endif()
 if (TARGET omniasr)
@@ -1771,19 +1784,25 @@ endif()
 if (TARGET sensevoice)
     target_link_libraries(crispasr-lib PUBLIC sensevoice)
 endif()
-if (TARGET fireredpunc)
+if (TARGET crisp_punc)
+    target_link_libraries(crispasr-lib PUBLIC crisp_punc)
+elseif (TARGET fireredpunc)
     target_link_libraries(crispasr-lib PUBLIC fireredpunc)
 endif()
-if (TARGET truecaser)
+if (TARGET truecaser AND NOT TARGET crisp_truecase)
     target_link_libraries(crispasr-lib PUBLIC truecaser)
 endif()
-if (TARGET truecaser_crf)
-    target_link_libraries(crispasr-lib PUBLIC truecaser_crf)
+if (TARGET crisp_truecase)
+    target_link_libraries(crispasr-lib PUBLIC crisp_truecase)
+else()
+    if (TARGET truecaser_crf)
+        target_link_libraries(crispasr-lib PUBLIC truecaser_crf)
+    endif()
+    if (TARGET truecaser_lstm)
+        target_link_libraries(crispasr-lib PUBLIC truecaser_lstm)
+    endif()
 endif()
-if (TARGET truecaser_lstm)
-    target_link_libraries(crispasr-lib PUBLIC truecaser_lstm)
-endif()
-if (TARGET pcs)
+if (TARGET pcs AND NOT TARGET crisp_punc)
     target_link_libraries(crispasr-lib PUBLIC pcs)
 endif()
 # Pyannote segmentation is not a backend; it's consumed by
@@ -1798,12 +1817,12 @@ if (TARGET silero-lid)
 endif()
 # CLD3 text-LID — sibling of lid-fasttext, routed via the auto-routing
 # text-LID dispatcher in src/text_lid_dispatch.cpp.
-if (TARGET lid-cld3)
+if (TARGET lid-cld3 AND NOT TARGET crisp_lid)
     target_link_libraries(crispasr-lib PUBLIC lid-cld3)
 endif()
 # Text-LID dispatcher — selects between fastText and CLD3 by GGUF arch.
 # crispasr-lib (the main library) and crispasr-lid both go through this.
-if (TARGET text-lid-dispatch)
+if (TARGET text-lid-dispatch AND NOT TARGET crisp_lid)
     target_link_libraries(crispasr-lib PUBLIC text-lid-dispatch)
 endif()
 

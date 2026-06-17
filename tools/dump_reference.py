@@ -258,6 +258,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # model_dir = LiquidAI/LFM2.5-Audio-1.5B-JP HF id or local snapshot.
     # Prompt from LFM2_PROMPT env var (default "Perform ASR in japanese.").
     "lfm2-audio": "reference_backends.lfm2_audio",
+    # Nemotron-3.5-ASR-Streaming: Cache-Aware FastConformer + RNN-T.
+    # model_dir = nvidia/nemotron-3.5-asr-streaming-0.6b HF id or local .nemo.
+    # Captures mel, pre-encode, and full encoder output for diff regression.
+    "nemotron":   "reference_backends.nemotron",
     # gpt-omni/mini-omni2: Whisper-small encoder + SwiGLU adapter +
     # Qwen2-0.5B LLM. Custom litgpt framework (not HF). model_dir = cloned
     # repo with lit_model.pth + small.pt + model_config.yaml. Needs the

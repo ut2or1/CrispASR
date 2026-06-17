@@ -51,7 +51,7 @@ test-all-backends.py passes 18/18 transcribe + 51/54 feature tests (3 stream ski
 | **MEDIUM** | [#52 Qwen3-TTS](#52-qwen3-tts) — perf pass | Medium | talker + code_predictor + codec + ECAPA + codec_encoder all done; step-4 perf pass open (~137 ms/frame → real-time). **O15 broken on CUDA and default-OFF** (`61c42bfb`) — main perf lever disabled. **2026-06-13 Kaggle P100:** dedicated-sched fix (`baef21aa`) didn't help — O15=ON still rc=-6 SIGABRT at 6.0s. Crash is on the *first* code_pred call (not cached reuse), so root cause is `ggml_set_rows`-based KV scatter or the fixed-Lk causal mask on CUDA, not sched sharing. Baseline O15=OFF: 27.4 ms/frame, WAV OK. |
 | **HIGH** | [#57 Commercial-friendly TTS expansion](#57-commercial-friendly-tts-backend-expansion) | Phased | Phases 1-3 DONE; Turbo WORKING; F0 wired in; native voice cloning shipped → HISTORY §82; **#83 production fix LANDED 2026-05-24 → HISTORY 2026-05-24 + LEARNINGS Round 9** — S3Gen UNet weight residency split (`s3.fd.*` on CPU, encoder/vocoder GPU): M1 Metal cos_min 0.940→**0.999980** in diff harness, intelligible audio at all T; comparable wall-time to pure CPU on M1. Q8_0×F32 bit-match Metal kernel committed (commit `752baecf`, upstream-PR-quality, drafted as PR 09). 3 upstream PR drafts in `tools/upstream-prs/09-11` covering Metal Q8_0 kernel + ggml-alloc drift bug report + scheduler NaN-at-large-T bug report. Linux CPU smoke validated on VPS. **R9 follow-up #4 2026-05-24**: two bugs found. **Bug A** (ggml sched dangling src pointers across `alloc_graph` calls): **FIXED** with a per-call mutation log in `ggml/src/ggml-backend.cpp` that restores `node->src[j]` originals at end of compute. Repro is the chatterbox CFG cond+uncond pair on the same gf; characterized and upstream-PR drafted at `tools/upstream-prs/10`. **Bug B** (`unet_input` divergence under sched-copy): **STILL OPEN — current code only WORKS AROUND it** by pinning `unet_input` to Metal in `cfm_euler_solve::run_denoiser`. With Bug A patched, the sched CPU→GPU copy delivers correct bytes to the kernel (verified by inline `tensor_get` before im2col dispatch) yet downstream compute still diverges (smoke rms ~16). Pinning `time_emb` is actively harmful (rms ~209), so the workaround is narrow. Without a real fix, any future user of `ggml_backend_sched` with a similar topology will hit this. Handover prompt for the follow-up at `handover-prompts/issue83-r9-followup-5-unet-input-routing.md`. **R9 follow-up #5 2026-05-24**: **Bug B FIXED via `parallel=true` in `ggml_backend_sched_new`**. After eliminating ~10 candidate hypotheses (cache barriers, blit copies, concurrency, fusion, optimize, n_cb variants, private-storage buffers, im2col edge case, rc-as-mul_mat) and proving the divergence is between host's and GPU's view of the same shared-storage Metal buffer on the uncond pass, the root cause is sched's between-submission synchronisation. With `parallel=false` (the chatterbox default until this fix) sched uses `[cmd_buf_last waitUntilCompleted]`, which doesn't invalidate the GPU's L1/L2 cached view of a shared-storage `MTLBuffer` that the CPU just memcpy'd between submissions. With `parallel=true` sched uses `ggml_backend_event_record` / `event_wait` → on Metal that's `MTLSharedEvent` `encodeSignalEvent` / `encodeWaitForEvent`, which carry proper GPU cache invalidation. Switched `chatterbox_s3gen_init_from_file` to `parallel=true`. Removed the unet_input pin workaround and the `CRISPASR_NO_INPUT_PIN` env override. Verification: GPU residency smoke `rms 16.x → 5.143`, CPU residency smoke `rms 5.139` unchanged (no regression), diff harness `s3gen_mel cos_min = 0.999976` (matches prior workaround baseline). LEARNINGS R9 #5 closes with new lessons 7' and 8 ("Check sched's `parallel` flag for Metal cache-coherency-shaped bugs"). End-to-end status: smoke rms `13.938 → 5.143`, diff `s3gen_mel cos_min 0.940 → 0.999976`, 2-mark trigger `NaN → 5.291`. Production CPU-residency path unchanged. Also open: Kartoffelbox_Turbo DE |
 | **MEDIUM** | [#51c MiMo-V2.5-ASR F16 step decode](#51c-f16-step-decode) | Small | F16 step-decode validation blocked behind ≥32 GB box (see PLAN #51c); base runtime + Q4_K shipped → HISTORY §56 |
-| **LOW** | [#56 Kokoro multilingual phonemizer](#56-kokoro-multilingual-phonemizer-espeak-ng) | Small | espeak-ng + DE backbone shipped; HF GGUFs published 2026-05-01; auto-download wired; Mandarin tone strip done; CJK quality warnings added; diff-harness phonemizer-step **DONE** (`ee9af935`). Only JA kanji g2p (needs MeCab/KaKaSi) remains. |
+| **DONE** | [#56 Kokoro multilingual phonemizer](#56-kokoro-multilingual-phonemizer-espeak-ng) | Small | espeak-ng + DE backbone shipped; Mandarin tone strip done; JA kanji g2p DONE (`1e7755e5`) — MeCab via dlopen (BSD-3-Clause, MIT-clean). |
 | **MOSTLY DONE** | [#58 MOSS-Audio-4B-Instruct](#58-moss-audio-4b-instruct) | Large | Runtime working, diff-validated cos ≥ 0.999, GGUFs published. Polish (tests, docs, HISTORY) shipped 2026-06-12. **2026-06-13 Kaggle P100: CUDA PASS** — ASR rc=0 (4.1s), QA mode rc=0 (4.9s) on JFK. Sweep v1 UTF-8 harness bug fixed `aa60ba99`. Remaining: flash-attn for encoder, transcript extraction fix in sweep harness (log lines parsed instead of actual transcript). |
 | **DONE** | [#59 Cross-binding C-ABI parity](#59-cross-binding-c-abi-parity) | Medium | **DONE 2026-06-04.** All 7 bindings at 100% C-ABI parity (149/149 symbols, `0b64a6d7` + `4835a241`). Go/Python/Rust fully wrapped; Java/Ruby/Dart/JS have C-ABI declarations + partial-to-full idiomatic wrappers. JS/WASM build live since 2026-06-10 (`c29f6653`). |
 | **DONE** | [#104 Stateful TDT frame-streaming](#104-stateful-frame-streaming-tdt-decode-for-parakeet-long-form-issue-89) | M-L | **DONE 2026-05-23.** Global z-norm + chunked encode + single decode → 99.5 % (was 59.7 %). Extended to canary (96.8 %) and fastconformer-ctc (98.5 %) via `CAP_INTERNAL_CHUNKING`. See HISTORY 2026-05-21. |
@@ -59,7 +59,7 @@ test-all-backends.py passes 18/18 transcribe + 51/54 feature tests (3 stream ski
 | **DONE** | [#42 VibeVoice-ASR 7B](#42-vibevoice-asr-7b) | High | **DONE.** GGUFs at `cstr/VibeVoice-7B-GGUF` (Q3_K 4.7 GB – F16 17.4 GB). ASR+TTS working. Layer offload validated on M1 Metal (ASR 28L, TTS 20L). |
 | **DONE** | [#43 Fun-ASR-Nano](#43-fun-asr-nano) | Medium | **DONE 2026-05-20.** Full LLM-decoder runtime shipped; GGUFs at `cstr/funasr-{nano,mlt-nano}-GGUF`; byte-identical diffs; ~9× RT on M1 Metal. CTC two-pass rescore is a separate low-pri follow-up. |
 | **DONE** | [#80 nano-cohere-transcribe-inspired tweaks](#80-nano-cohere-transcribe-inspired-perf--chunking-tweaks) | Small | 80a parked; **80b DONE**; **80c DONE**; **80d DONE** 2026-05-23 (audit: no fixes needed — all backends use energy chunker); 80e low-priority warmup deferred |
-| **HIGH** | [#81 Nemotron-Speech-Streaming-EN-0.6B](#81-nemotron-speech-streaming-en-06b--first-cache-aware-streaming-native-asr) | M-L | **IN PROGRESS.** Full scaffold on main: converter, runtime, CLI, registry, Kaggle diff harness (ref GGUF at `cstr/nemotron-3.5-asr-streaming-GGUF`), F16 GGUF uploaded. Fixes landed: siglu, mel normalize=NA, causal pre-encode, causal DW conv, prompt kernel, lang mapping, exact-size graphs, chunked encoder. **Still 0 tokens** — remaining issue: cache stores block OUTPUT but NeMo caches POST-FFN1 (before attention). Re-processing cached frames through FFN1 corrupts them. **Fix: split block into stages** — FFN1 on new frames only, Q from new / K,V from concat(cached_post_ffn1, new), conv with separate cache, FFN2+LN on new only. |
+| **DONE** | [#81 Nemotron-Speech-Streaming-EN-0.6B](#81-nemotron-speech-streaming-en-06b--first-cache-aware-streaming-native-asr) | M-L | **DONE 2026-06-15.** All 4 streaming presets working. Conv cache fix, asymmetric rel-pos, sched migration, C ABI + bindings, 3 live tests, HF READMEs. → HISTORY 2026-06-15. |
 | **DONE** | [#86 Per-backend flash-attention wiring](#86-per-backend-flash-attention-wiring-crisperweaver-driven) | — | All backends now route through core helpers (`core_attn`, `core_sanm`, `core_conformer`) that unconditionally use `ggml_flash_attn_ext`. Only t5_translate excluded (T5 rel-pos bias incompatible). |
 | **LOW** | [#87 `gpu_backend` runtime selector](#87-gpu_backend-runtime-selector-multi-backend-ggml-build) | ~1 week | Needs ggml-side multi-backend dispatch to land first. CrisperWeaver UI placeholder ready when the C-side is. |
 | **LOW** | [#95 IndexTTS Chinese TN binary alternative](#95-indextts-15-chinese-tn--binary-alternative-to-the-python-wetext-hook) | survey only | Python `INDEXTTS_TEXT_NORMALIZER` hook shipped 2026-05-19. Hand-roll (#95a) is the right next step *when* a user reports a digit/date prompt that breaks; OpenFST vendoring (#95b) only after #95a grows past ~5 cases. |
@@ -278,7 +278,30 @@ unchanged — `parakeet-tdt_ctc-*.gguf` matches "parakeet" with the
 
 **Still open:**
 - **`nvidia/parakeet_realtime_eou_120m-v1`** — streaming + end-of-utterance head. Needs cache-aware FastConformer streaming (cf. PLAN #81 Nemotron), plus an EOU head. Not a converter-only job.
-- **`nvidia/parakeet-unified-en-0.6b`** — recent "unified" variant; needs a model-card / architecture read before scoping.
+- **`nvidia/parakeet-unified-en-0.6b`** — **surveyed 2026-06-15 via Kaggle kernel.**
+  Target class: `EncDecRNNTBPEModel` (same as other parakeets). Encoder:
+  `ConformerEncoder` with new `att_chunk_context_size` param (dynamic chunked
+  convolutions for unified offline+streaming). Kaggle NeMo 2.7.3 lacks this
+  param — needs `nemo_toolkit>=2.8` or later. Alternatively: extract weights
+  directly from the .nemo zip (torch checkpoint format) + read config from the
+  Hydra config embedded in `save_restore_connector`. The existing
+  `convert-parakeet-to-gguf.py` should work once the model loads — same
+  `EncDecRNNTBPEModel` class, same weight naming. The C++ runtime needs
+  `att_chunk_context_size` support in `core/fastconformer.h` (dynamic conv
+  kernel selection per chunk, similar to nemotron's streaming conv cache).
+  **2026-06-16 v4 kernel — direct zip extraction WORKS.** Custom
+  `NeMo2Unpickler` reads `data.pkl` + storage files from the NeMo 2.x zip
+  without instantiating the NeMo model (bypasses `att_chunk_context_size`).
+  989 tensors extracted with actual data. Hparams: d_model=1024, n_layers=24,
+  vocab=1025, pred=640, joint=640 — **same architecture as standard parakeet**.
+  **v5 kernel — GGUF conversion succeeded (1181 MB F16).** Synthetic NeMo 1.x
+  tar (config + tokenizer from parakeet-rnnt + weights) fed to existing
+  converter. CrispASR test SIGABRT: runtime assumes 4x subsampling but
+  parakeet-unified uses 8x (3 strided convs vs 2). **Fix needed:**
+  `parakeet_build_pre_encode` in `src/parakeet.cpp` (or
+  `core/fastconformer.h`) must handle `subsampling_factor=8` — 3 Conv2d
+  layers with strides [1,2] instead of 2. Tensor shapes are already in
+  the GGUF; the graph builder just needs the extra conv layer.
 
 ### Won't do
 
@@ -1296,8 +1319,18 @@ so existing builds don't regress.
 3. **Japanese kanji.** espeak-ng falls back to English pronunciation
    for kanji (e.g. 日本語 → "Chinese letter"), inserting `(en)…(ja)`
    voice-switch markers that aren't IPA. For full Japanese support,
-   pre-process input with a Japanese frontend (`pyopenjtalk` /
-   `mecab` + `kakasi`) to convert kanji → kana before espeak.
+   pre-process input with a Japanese frontend to convert kanji → kana
+   before espeak. **MIT-clean approach (2026-06-16 survey):**
+   - MeCab (BSD-3-Clause) + unidic-lite (MIT) for morphological
+     analysis → kanji reading extraction
+   - NO kakasi/pykakasi (GPL-3.0 — viral license, incompatible)
+   - Feed kana output to existing espeak-ng `ja` voice for IPA
+   - Implementation: either libmecab C API via dlopen (like espeak)
+     or a pre-built kanji→kana lookup dictionary shipped as a flat
+     file (avoids runtime MeCab dependency). The dict approach is
+     simpler but less accurate on rare/compound words.
+   - fugashi (MIT) is a Python MeCab wrapper; cutlet (MIT) does
+     kanji→romaji. Either can generate the offline dict.
 4. ~~**Diff harness reference backend.**~~ **DONE — phonemizer-step
    diff (May 2026).** The model-side reference dumper at
    `tools/reference_backends/kokoro.py` already covered the 16 model
@@ -2793,12 +2826,12 @@ so this is a small extension to the harness itself.
    the cache tensor layout (per-layer `[Dh, 70, n_heads]` for SA K
    and V, `[8, d_model]` for DW conv state) and check it survives
    the converter round-trip.
-2. **Rel-pos shift on `[cache | new]`.** The existing
+2. **Rel-pos shift on `[cache | new]`.** ~~The existing
    `core_conformer::rel_shift` operates on a square `(2T-1, T)`
-   tensor; with cached frames the table is `(2(L+R+1)-1, R+1)` —
-   different layout, different shift indexing. Either extend
-   `rel_shift` with a left-context offset or build a streaming-
-   specific variant.
+   tensor~~ **SOLVED 2026-06-15.** The asymmetric rel_shift uses the
+   same stride-trick formula as the symmetric case:
+   `view_3d(BD_raw, T_full, T_new, H, s1-s0, s2, (T_new-1)*s0)`.
+   Implemented in `nemotron_build_block_streaming`.
 3. **Decoder state across chunks.** RNN-T predictor is autoregressive
    over emitted tokens, not over time; its LSTM state carries
    forward across chunks naturally. Confirm with the Python ref
@@ -2842,6 +2875,123 @@ where blank wins at every frame. The next step is implementing the
 cache-aware chunked encoder: per-layer K/V cache (56 frames left context)
 + conv state (8 frames) + attention masking to limit context window.
 Kaggle diff harness (v8) uploaded ref GGUF to `cstr/nemotron-3.5-asr-streaming-GGUF`.
+
+**2026-06-14 progress:** Fixed tensor name mismatches, prompt_id mapping,
+mel frame count, pre-encode causal padding. Confirmed via Kaggle NeMo
+ground truth that encoder output range [-0.91, 0.51] matches exactly
+and NeMo's decoder produces correct text. Per-frame values diverged
+due to the conformer conv module bug.
+
+**2026-06-15 — WORKING.** Root cause found and fixed: **GLU gate/value
+swap** in the conformer conv module. `ggml_siglu` does
+`sigmoid(first) * second` but NeMo's `glu` does `first * sigmoid(second)`.
+Fix: `ggml_siglu` → `ggml_siglu_swapped`. One-line change.
+
+Output: "And so my fellow Americans ask not what your country can do for
+you. Ask what you can do for your country." — matches NeMo exactly.
+
+Additional fixes along the way:
+- Tensor names: conv.bn→conv.ln, prompt_kernel.linear1→prompt_kernel.0
+- Prompt_id: NeMo uses en-US=0 (not alphabetical index 7)
+- Mel: drop_last_frame=false (NeMo keeps all frames)
+- Pre-encode: ggml_pad_ext for true causal padding, F32 weights in converter
+- Chunked_limited attention mask (chunk-based, not banded)
+
+**Cleanup done (2026-06-15):**
+- Debug prints removed, Q4_K dequant support added to tensor_to_f32
+- F16 and Q4_K both produce correct text (Q4_K ~2x faster: 14s vs 24s)
+- Fixed GGUFs uploaded to HF, broken ref GGUF deleted
+- Streaming block GLU also fixed (ggml_siglu → ggml_siglu_swapped)
+- Bidirectional+mask path is now the default (no NEMOTRON_BATCH needed)
+- Worktree cleaned up, HF README updated with Q4_K recommendation
+- German tested (works on DE audio; EN audio with DE prompt gives
+  expected degradation)
+
+**2026-06-15 streaming + sched:**
+- Sched migration done (gallocr → ggml_backend_sched) — see §168
+- Streaming encoder architecture complete: `nemotron_build_block_streaming`
+  with cache_last_channel, asymmetric rel-pos bias (stride-trick rel_shift),
+  Q-from-new / KV-from-context, causal conv padding
+- `CRISPASR_NEMOTRON_STREAMING=1` + `CRISPASR_NEMOTRON_CONTEXT_PRESET=N`
+  env vars for A/B testing (0=R3/chunk4, 3=R13/chunk14)
+- Quality problem: streaming output diverges from full-sequence by frame 10;
+  preset 3 gives recognizable text, preset 0 gives blank. See §168 for
+  root cause analysis.
+- 3 live integration tests added (init, JFK, F16/Q4_K parity)
+
+**2026-06-15 — STREAMING FIXED (`7f4feff9`).** Root cause: conv module
+zero-padded K-1=8 frames instead of prepending cached pre-DW-conv signal.
+NeMo's `CausalConv1D.update_cache` does `torch.cat([cache, x])`.
+All 4 presets now produce correct text:
+- Preset 0 (R=3, 160ms): "And so, my fellow Americans..."
+- Preset 3 (R=13, 1120ms): "And so, my fellow Americans..."
+- F16 preset 0: "And so my fellow Americans..."
+
+**Remaining:** WER benchmarking on standard test sets, GPU perf testing,
+consider making streaming the default path.
+
+---
+
+## 168. GPU scheduler migration — gallocr-only backends
+
+**Status:** partially done (4/7 migrated, streaming encoder incomplete).
+
+### Completed (2026-06-15, commits `f3a57d7c`, `d393b506`, `8f481aa2`)
+
+Four backends migrated from `ggml_gallocr` to `ggml_backend_sched`:
+- **nemotron** — encoder, chunked encoder, pre-encode graph
+- **paraformer** — encoder, decoder
+- **dia_tts** — encoder, cross-attn, decoder loop, DAC decode
+- **outetts_wavtok** — decode graph
+
+All verified: identical output on CPU, ASR roundtrip for TTS, 435 unit tests pass.
+
+### Second batch (2026-06-15, commit `f748b94d`)
+
+Two more backends migrated:
+- **audioseal** — generator encode + detect graphs
+- **lfm2_audio** — encoder, backbone, adapter graphs; F16 verified
+
+**lfm2 Q4_K finding:** the published `lfm2-audio-1.5b-q4_k.gguf` was quantized
+with an older quantizer that Q4_K'd `lfm.embed_tokens` (should be F16). Even
+after re-quantizing with correct rules (embed_tokens F16), Q4_K still produces
+0 tokens — the hybrid conv+attention backbone is too precision-sensitive. **Q5_K
+works** and gives identical output to F16. Need to re-publish GGUFs on HF with
+Q5_K as minimum quant.
+
+### Remaining gallocr backends
+
+| Backend | gallocr | init_best | Status |
+|---------|:-------:|:---------:|--------|
+| `voxcpm2_tts` | 27 | ✅ | persistent gallocr with reserve — complex migration |
+
+### Nemotron streaming encoder — QUALITY PROBLEM
+
+The streaming (chunked) encoder path is architecturally complete:
+- `nemotron_build_block_streaming`: FFN1 new-only, Q-new/KV-context,
+  causal conv, FFN2+LN new-only, cache_last_channel
+- Asymmetric rel-pos bias via stride-trick rel_shift (same formula as
+  symmetric, offset = T_new-1 instead of T-1)
+- Gated by `CRISPASR_NEMOTRON_STREAMING=1`
+
+**FIXED (2026-06-15, `7f4feff9`).** Root cause was hypothesis #3: the conv
+module zero-padded the left by K-1=8 on every chunk instead of prepending
+the cached pre-DW-conv signal from the previous chunk. NeMo's
+`CausalConv1D.update_cache` does `torch.cat([cache, new_x], dim=-1)` — our
+code was using `ggml_conv_2d_dw_direct(..., pad_left=K-1)` which fills zeros.
+
+Fix: added `conv_cache_in` / `conv_cache_out` to the streaming block. Each
+layer stores the last K-1 frames of the post-GLU signal and prepends them
+on the next chunk. All 4 context presets now produce correct text.
+
+### Env vars added
+
+| Var | Effect |
+|-----|--------|
+| `CRISPASR_NEMOTRON_STREAMING=1` | Enable streaming chunked encoder |
+| `CRISPASR_NEMOTRON_CONTEXT_PRESET=N` | Attention context preset (0-3) |
+| `CRISPASR_NEMOTRON_NO_WINDOW_MASK=1` | Disable banded attention mask |
+| `CRISPASR_NEMOTRON_DEBUG=1` | Encoder/decoder debug prints |
 
 ---
 
@@ -3095,8 +3245,15 @@ parity-pass audit doesn't have to re-discover them.
 
 ## 92. All-backend regression suite (nightly CI)
 
-**Status:** seed shipped (`parakeet-tdt-0.6b-ja` end-to-end);
-expand by adding manifest entries + uploading reference dumps.
+**Status:** 32 ASR + 21 TTS regression entries, 0 PLACEHOLDERs.
+CI workflow at `.github/workflows/regression.yml` runs nightly + on PR
+(smoke-only). Matrix: 22 ASR + 7 TTS = 29 backends on GH free tier.
+**First nightly run (2026-06-16):** smoke+preflight+14 backends PASS.
+6 failures diagnosed and fixed: 4 decode-drift backends got WER
+tolerance (`transcript_tolerance`), 1 bad revision SHA corrected,
+1 HF rate limit (transient). Re-triggered; expecting full green.
+Next: flip `skip_diff` on backends where ref archives exist, promote
+to release gating.
 
 **Why:** the ggml-assertion-hardening regression in 0.6.x cycle
 demonstrated that we silently inherit upstream behaviour changes —
@@ -4986,41 +5143,35 @@ factored out. Standard `core_beam_decode::run_with_probs` replay.
 adapter frames at the correct offsets during suffix replay, matching
 the streaming pre_hook's behavior. No local model to benchmark.
 
-### Still open
+### Done — shipped 2026-06-15 (§167 batch)
 
-**mimo-asr** (MEDIUM, ~50 LOC — once the runtime is stable)
-- Qwen2 LLM decode after audio RVQ tokenizer. Same `core_beam_decode`
-  replay pattern. Currently semi-scaffold (PLAN #115); beam search
-  should land after the baseline is solid.
+**nemotron** — DONE (`641c701e`). RNNT beam search ported from
+parakeet's `parakeet_rnnt_beam_decode`. Also MAES (`ec6507d2`).
+Benchmarked: beam=4 2.16× decode time, identical text. MAES removes
+spurious `<en-US>` tags and improves punctuation.
 
-### Hard — architecture complications
+**moss-audio** — DONE (`5c437124`). Full `core_beam_decode::run_with_probs`
+replay wired. 4B model needs Kaggle for A/B testing.
 
-**voxtral4b** (~200 LOC)
-- Same LLM as voxtral but uses a streaming prompt path with
-  `delay_tokens=6` baked into adaptive RMSNorm. Not integrated
-  with `crispasr_llm_pipeline.h`. Would need refactoring the
-  direct decode loop to support beam replay, coordinating the
-  delay_tokens across beams.
-- Lower priority: voxtral (3B) already covers the family.
+**granite-nle** — DONE (`fe94e976`). CTC beam via
+`core_ctc::prefix_beam_search` with gamma in the BPE-CTC decode step.
+Compile-verified; no local model.
 
-**funasr** (~200 LOC)
-- ChatML prompt prefix is embedded in the monolithic
-  `funasr_transcribe_with_probs()` C ABI. Beam search requires
-  decomposing into sub-steps (prefill, embed, decode) to expose
-  a replay_fn. Significant refactoring.
+**mimo-asr** — API STUB (`5c437124`). `set_beam_size` setter + field;
+actual beam decode blocked on PLAN #115 runtime stability. 9-stream
+architecture needs KV snapshot/restore.
+
+**lfm2-audio** — API STUB (`9511dd5b`). Hybrid Mamba+attention needs
+both KV and conv state save/restore. Deferred to Kaggle session.
 
 ### Not applicable
 
 | Backend | Reason |
 |---|---|
-| wav2vec2, hubert, data2vec | CTC-only, no autoregressive component |
+| wav2vec2, hubert, data2vec | CTC beam via `core_ctc` (already has gamma) |
 | fastconformer-ctc | CTC-only |
-| sensevoice | Encoder-only CTC multi-task |
+| sensevoice | CTC beam via `core_ctc` (already wired: `sensevoice_set_beam_size`) |
 | paraformer | Non-autoregressive (CIF-based) |
-| granite-4.1-nar | Non-autoregressive |
-
-CTC beam search with an external language model is a different
-feature (LM shallow fusion) and out of scope for this item.
 
 ### Priority (remaining)
 
@@ -5032,11 +5183,15 @@ feature (LM shallow fusion) and out of scope for this item.
 6. ~~**moonshine-streaming**~~ — **DONE**
 7. ~~**funasr**~~ — **DONE** (was easier than expected)
 8. ~~**voxtral4b**~~ — **DONE** (adapter injection in replay lambda)
-9. **mimo-asr** — after PLAN #115 baseline is stable
+9. ~~**nemotron**~~ — **DONE** (RNNT beam + MAES, §167a/b)
+10. ~~**moss-audio**~~ — **DONE** (replay, §167g)
+11. ~~**granite-nle**~~ — **DONE** (CTC beam + gamma, §167e)
+12. **mimo-asr** — API stub, blocked on PLAN #115
+13. **lfm2-audio** — API stub, needs KV+conv save/restore
 
-**Score: 18 of 24 backends now support beam search** (was 10 at
-session start). Only mimo-asr remains feasible but blocked; the
-other 5 without beam are CTC-only or NAR (not applicable).
+**Score: 21 of 24 ASR backends now support beam search** (was 18 at
+§139 close). mimo-asr and lfm2-audio have API stubs, blocked on
+runtime issues. paraformer is NAR (not applicable).
 
 ## §140 GPU / ggml_backend_sched for CPU-only TTS backends — MOSTLY DONE
 
@@ -5657,11 +5812,40 @@ RALM → mu → CFM → LocEnc → enc_lm → TSLM input from pos=5 onwards.
    null-checking. Any future graph change would SIGABRT again.
    **Fix:** null-guard every call; graceful fallback to CPU or zero-fill.
 
-**Status: DONE.** Validated on Kaggle T4 (2026-06-13): all 3 configs pass
-(nograph, graph_default, graph_fa_cpu). Stop predictor fires correctly on
-all paths (step 6-7, scores 0.86-0.99). graph_default 5× faster than
-nograph (4.1s vs 20.6s). FA_CPU only needed on P100 (sm_60) where F16
-flash_attn overflows. Awaiting HubSana Vulkan re-test on Arc B580.
+**RALM noise fix (2026-06-14):** HubSana retested on Arc B580 Vulkan
+(`452aa2fd`): SIGABRT gone, stop fires, but audio was pure noise. Root
+cause: RALM `rope_theta=0` + RoPE skip meant the `positions` input
+tensor was never consumed by any graph node, so
+`ggml_graph_get_tensor("ralm_positions")` returned NULL. The null-guard
+treated this as fatal and returned all-zero RALM hidden states → noise.
+**Fix:** `602308fc` — positions is optional in `ralm_step_graph`.
+
+**Status: DONE.** Validated on Kaggle T4 (2026-06-14) + HubSana Arc B580
+Vulkan (2026-06-14, `602308fc` CONFIRMED WORKING). All configs pass:
+stop fires correctly (step 7 short, step 54-391 voice-clone), audio is
+clean, ~180 ms/step on Vulkan (13-15× speedup vs graph=0's ~2700 ms/step).
+FA_CPU not needed on Intel Vulkan. Reporter's workflow: 81 h → 5 h.
+
+### Part 4 — VAE decode Vulkan work-group overflow on long sequences (NEW)
+
+**Reporter:** HubSana, Arc B580 Vulkan, long narration (443 positions,
+390 AR steps → ~60s audio). Graph path + stop predictor work perfectly;
+crash is purely in the VAE decode dispatch:
+```
+ggml-vulkan.cpp:6691: GGML_ASSERT(wg0 <= maxComputeWorkGroupCount[0] && ...)
+```
+The VAE decode work-group count scales with decoded sample count. At
+390 steps × 1024 samples/step ≈ 400K samples, one dispatch axis exceeds
+the Vulkan `maxComputeWorkGroupCount` limit (65535 on standard GPUs).
+CUDA has higher grid limits and is unaffected.
+
+**Fix needed:** tile/chunk the VAE decode dispatch when sample count
+would exceed device work-group limits. Or split the AR output into
+VAE sub-windows (overlap-add). Not blocking (reporter chunks long
+narration), but a guard prevents abort on long single utterances.
+
+**Priority:** LOW — workaround exists (chunk input text). Only affects
+Vulkan + sequences >~50s.
 
 ### Part 3 — VAE decode crash on Vulkan — DONE
 
@@ -5697,3 +5881,151 @@ NeMo's exact `cache_last_channel` + `cache_last_time` flow (using the
 Python chunked encoder produces tokens on JFK. Then port that exact logic
 to C++, matching each intermediate tensor. The Kaggle diff harness and ref
 GGUF are ready for this.
+
+## §167 — Beam search, MAES, and KV caching expansion
+
+Cross-cutting feature push to bring beam search, MAES (Modified Adaptive
+Expansion Search), and KV caching to backends that lack them. Builds on
+§139 (beam search round 1, all LLM backends done) and §165 (beam_size
+defaults).
+
+Branch: `feat/beam-maes-cache`
+
+### Survey results (2026-06-15)
+
+**Beam search gaps:**
+
+| Backend | Architecture | Gap | Effort |
+|---|---|---|---|
+| nemotron | RNNT (FastConformer enc + LSTM pred) | Stub only — `set_beam_size` + field exist but `nemotron_rnnt_decode` is greedy | LOW — copy `parakeet_rnnt_beam_decode` pattern |
+| sensevoice | CTC (encoder-only) | Greedy CTC; `core_ctc::prefix_beam_search` available | LOW — wire existing infra |
+| granite-nle | CTC (encoder-only) | Greedy CTC; same `core_ctc` | LOW |
+| mimo-asr | LLM (Qwen2 + RVQ) | No beam wired; `kv_self_attn` present | MEDIUM — `core_beam_decode` replay |
+| moss-audio | LLM (InternLM2 + audio) | No beam wired; `kv_self_attn` present | MEDIUM — `core_beam_decode` replay |
+| lfm2-audio | Hybrid Mamba+attention | No beam; needs KV + conv state save/restore | HIGH |
+
+**MAES gaps:**
+
+| Backend | Current | Gap |
+|---|---|---|
+| nemotron | greedy RNNT | No MAES; direct port from `parakeet_rnnt_maes_decode` |
+| sensevoice | greedy CTC | `core_ctc::prefix_beam_search` gamma parameter unused |
+| granite-nle | greedy CTC | Same |
+| wav2vec2 | Has gamma | Already done (reference) |
+| parakeet | Has full MAES | Already done (reference) |
+
+**KV caching gaps:**
+
+| Backend | Current | Gap |
+|---|---|---|
+| firered-asr | Hand-rolled per-step AED, no persistent KV | Migrate to `core_attn::kv_self_attn` |
+
+### Phase 1 — VPS (small models, ≤1.2 GB)
+
+**§167a: Nemotron RNNT beam search**
+- Model: `nemotron-3.5-asr-streaming-0.6b-q4_k.gguf` (458 MB)
+- Implement `nemotron_rnnt_beam_decode` from `parakeet_rnnt_beam_decode`
+- Wire `ctx->decode_beam_size` in transcribe path
+- A/B: greedy vs beam_size=4 on jfk.wav — WER, wall time, RSS
+
+**§167b: Nemotron RNNT MAES**
+- Depends on §167a
+- Implement `nemotron_rnnt_maes_decode` from `parakeet_rnnt_maes_decode`
+- Add `nemotron_set_maes()` + C API surface
+- A/B: beam=4 vs MAES(beam=4, steps=2, gamma=2.3)
+
+**§167c: Firered AED decoder KV cache**
+- Model: `firered-asr2-aed-q4_k.gguf` (919 MB)
+- Migrate decoder attention to `core_attn::kv_self_attn`
+- Regression gate: identical text output
+- A/B: current vs KV-cached — wall time improvement
+
+### Phase 2 — VPS or Kaggle (medium models, need model files)
+
+**§167d: Sensevoice CTC beam + gamma**
+- Model: needs GGUF on disk (not currently available)
+- Wire `sensevoice_set_beam_size` → `core_ctc::prefix_beam_search(gamma)`
+- A/B: greedy vs beam=8 + gamma=2.3
+
+**§167e: Granite-NLE CTC beam + gamma**
+- Model: needs GGUF on disk
+- Wire beam into `granite_nle` CTC decode
+- A/B: greedy vs beam=8 + gamma=2.3
+
+### Phase 3 — Kaggle (large models, GPU needed)
+
+**§167f: MIMO-ASR beam** — `core_beam_decode::run_with_probs` replay
+**§167g: Moss-Audio beam** — `core_beam_decode::run_with_probs` replay (4B, GPU)
+**§167h: LFM2-Audio beam** — `core_beam_decode::run_with_probs_branched` + conv state
+
+### Benchmark results (2026-06-15)
+
+**§167a Nemotron beam** on jfk.wav (Q4_K, CPU, 4 threads, median of 3):
+
+| | Greedy (beam=1) | Beam (beam=4) |
+|---|---|---|
+| Decode time | 8.8s | 19.0s (2.16×) |
+| Text | `...ask not...for you. <en-US> Ask what...` | identical |
+| RSS | 679 MB | 679 MB |
+
+**§167b Nemotron MAES** on jfk.wav:
+
+| | Beam=4 | MAES(4,2,2.3) |
+|---|---|---|
+| Text | `...for you. <en-US> Ask what...country. <en-US>` | `...for you, ask what...country.` |
+| Quality | Spurious `<en-US>` tags, missing commas | Proper punctuation, no tags |
+| Overhead | baseline | +15% decode time |
+
+**§167c Firered KV cache**: Already implemented (sa_k/sa_v per beam).
+**§167d Sensevoice CTC beam**: Already implemented (core_ctc).
+**§167e–h**: Compile-verified; no local models for A/B testing.
+
+## §169 — Qwen3-ASR ChatML language prompt (non-English script output)
+
+**Status:** OPEN
+
+**Problem:** Qwen3-ASR supports 30 languages including Arabic, but our
+implementation (`src/qwen3_asr.cpp`) skips the ChatML prompt and builds
+the token sequence as bare `<|audio_start|>...<|audio_end|>` without a
+system/user message. The original HF model uses:
+
+```
+<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+Transcribe the following audio in Arabic.
+<|audio_start|><|audio_pad|>×N<|audio_end|><|im_end|>
+<|im_start|>assistant
+```
+
+Without this, the model auto-detects language but may romanize
+non-Latin scripts (observed: Arabic AA0010.wav → `istagel` instead of
+native Arabic `استغل`; AA001.wav → `مرحبًا` works, so auto-detect is
+partial).
+
+**Impact:** All 30 Qwen3-ASR languages work in auto-detect mode for
+clean audio, but explicit language selection (`-l ar`) has no effect
+and ambiguous cases get romanized.
+
+**Fix:**
+1. Build the full ChatML prompt in `qwen3_asr_transcribe_with_probs`
+   when `-l LANG` is set (map ISO 639-1 → English name → prompt text)
+2. Fall back to bare audio-only prompt when no language specified
+   (current behaviour, preserves auto-detect)
+3. Wire `--language` / `-l` through the CLI adapter's transcribe call
+
+**Files:** `src/qwen3_asr.cpp` (~50 LOC), `examples/cli/crispasr_backend.cpp`
+
+**Effort:** MEDIUM — the ChatML token IDs (`<|im_start|>` etc.) need
+to be resolved from the GGUF vocab. The word-level timestamp alignment
+loop (lines 2074-2091) also needs adjustment since the prompt prefix
+shifts positions.
+
+**Test:** Arabic audio from `atishay23/Arabic_Audio` (AA001.wav →
+should output `مرحبًا` in native script with `-l ar`).
+
+**2026-06-16: GGUFs uploaded to `cstr/parakeet-unified-en-0.6b-GGUF`**
+(F16 1181 MB + Q4_K). v8: n_mels=128 fix → test_rc=0 (no crash) but
+transcript garbage. Tokenizer verified correct (same as parakeet-rnnt).
+Root cause: synthetic config mismatch vs actual training config. Need
+to diff C++ mel output against NeMo Python reference to find divergence.

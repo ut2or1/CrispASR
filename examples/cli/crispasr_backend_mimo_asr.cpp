@@ -61,7 +61,7 @@ public:
         //                         into cp.temperature → decode cfg
         //   CAP_DIARIZE           framework post-step on segment list
         return CAP_AUTO_DOWNLOAD | CAP_TOKEN_CONFIDENCE | CAP_TIMESTAMPS_CTC | CAP_FLASH_ATTN | CAP_TEMPERATURE |
-               CAP_DIARIZE;
+               CAP_DIARIZE | CAP_BEAM_SEARCH;
     }
 
     bool init(const whisper_params& params) override {
@@ -100,10 +100,10 @@ public:
 
     std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
                                              const whisper_params& params) override {
-        (void)params;
         std::vector<crispasr_segment> out;
         if (!ctx_)
             return out;
+        mimo_asr_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
         char* text = mimo_asr_transcribe(ctx_, samples, n_samples);
         if (text) {
             crispasr_segment seg;

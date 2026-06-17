@@ -435,6 +435,26 @@ catch_discover_tests(test-paraformer
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test - nemotron — live integration tests for nemotron ASR
+add_executable(test-nemotron
+    test_nemotron_live.cpp
+)
+target_include_directories(test-nemotron PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-nemotron PRIVATE
+    Catch2::Catch2WithMain
+    nemotron
+)
+catch_discover_tests(test-nemotron
+    TEST_SPEC "[nemotron]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── test - lfm2-audio — live integration tests for LFM2-Audio ASR + TTS
 add_executable(test-lfm2-audio
     test_lfm2_audio_live.cpp

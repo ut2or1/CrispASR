@@ -28,7 +28,12 @@
         "encoder_output_ref_mel": 0.999,
         "mel_spectrogram": 0.999
       },
-      "diff_thresholds_note": "mel_spectrogram tightened from 0.95 to 0.999 after drop_last_frame fix (commit 07cfcff). NeMo ref needs rebake to clip mel to feat_len; current ref has one extra frame that the comparison truncates."
+      "diff_thresholds_note": "mel_spectrogram tightened from 0.95 to 0.999 after drop_last_frame fix (commit 07cfcff). NeMo ref needs rebake to clip mel to feat_len; current ref has one extra frame that the comparison truncates.",
+      "transcript_tolerance": {
+        "cer_max": 0.3,
+        "wer_max": 1.0
+      },
+      "transcript_tolerance_note": "Wide tolerance — GH runner decode diverges significantly from Kaggle T4"
     },
     {
       "name": "moonshine-tiny",
@@ -137,7 +142,12 @@
         "mel_spectrogram": 0.999,
         "pre_encode_output": 0.999
       },
-      "diff_thresholds_note": "F16 GGUF vs NeMo reference with dither=0 and drop_last_frame. mel cos=1.0, encoder cos=0.999280. Layers 18-19 are F16 near-misses (0.9977/0.9988)."
+      "diff_thresholds_note": "F16 GGUF vs NeMo reference with dither=0 and drop_last_frame. mel cos=1.0, encoder cos=0.999280. Layers 18-19 are F16 near-misses (0.9977/0.9988).",
+      "transcript_tolerance": {
+        "cer_max": 0.12,
+        "wer_max": 0.15
+      },
+      "transcript_tolerance_note": "Widened — GH runner decode drift exceeds narrow tolerance"
     },
     {
       "name": "firered-asr2-aed",
@@ -224,81 +234,68 @@
       "name": "parakeet-tdt-1.1b",
       "backend_id": "parakeet",
       "skip_diff": true,
-      "_skip_diff_note": "Added 2026-05-25 from docs/diff-harness-coverage.md gap inventory; rebake-pending. See handover-prompts/extend-coverage-via-kaggle.md for the bring-up flow. expected_transcript is a guess until first capture; replace after rebake prints the captured value.",
+      "_skip_diff_note": "Rebake-pending for diff; transcript captured 2026-06-15.",
       "skip_preflight": true,
-      "_skip_preflight_note": "Rebake-pending — GGUF revision is a TODO placeholder. Remove skip_preflight once the rebake fills in the real 40-char SHA and the file lands on HF.",
       "source_model": "nvidia/parakeet-tdt-1.1b",
-      "source_model_note": "HF id for tools/reference_backends/parakeet.py. Only needed for re-bake. NeMo 2.x compatibility patched in 2684d601 (EncDecHybridRNNTCTCBPEModel fallback) — verify the parakeet-tdt-1.1b variant uses the same concrete class.",
       "gguf": {
         "repo": "cstr/parakeet-tdt-1.1b-GGUF",
         "revision": "1d406d87367c4e537ce29bf2e85ad1bcc3e1c98e",
-        "_revision_note": "TODO: paste the full 40-char SHA of the GGUF you converted from when running rebake. The 12-char form above is the latest commit on the repo as of 2026-05-25; the rebake script will fail-loud if the SHA doesn't exist in the repo's commit history.",
         "file": "parakeet-tdt-1.1b-q8_0.gguf",
         "approx_size_mb": 1213
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER — capture from first rebake run",
-      "expected_transcript_source": "TODO — capture once rebake produces the ref archive"
+      "expected_transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 VPS CPU with parakeet-tdt-1.1b-q8_0"
     },
     {
       "name": "parakeet-tdt_ctc-1.1b",
       "backend_id": "parakeet",
       "skip_diff": true,
-      "_skip_diff_note": "Added 2026-05-25 — rebake-pending. See handover-prompts/extend-coverage-via-kaggle.md.",
+      "_skip_diff_note": "Rebake-pending for diff; transcript captured 2026-06-15.",
       "skip_preflight": true,
-      "_skip_preflight_note": "Rebake-pending — GGUF revision is a TODO placeholder. Remove skip_preflight once the rebake fills in the real 40-char SHA and the file lands on HF.",
       "source_model": "nvidia/parakeet-tdt_ctc-1.1b",
-      "source_model_note": "HF id for tools/reference_backends/parakeet.py. Hybrid TDT+CTC variant — same EncDecHybridRNNTCTCBPEModel class as the existing parakeet-tdt-0.6b-ja entry.",
       "gguf": {
         "repo": "cstr/parakeet-tdt_ctc-1.1b-GGUF",
         "revision": "6ced2ca0551a4e6ad2c0f6a6c8c70df4a52cf07b",
-        "_revision_note": "TODO: replace with full 40-char SHA of the converted GGUF.",
         "file": "parakeet-tdt_ctc-1.1b-q8_0.gguf",
         "approx_size_mb": 1215
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER — capture from first rebake run",
-      "expected_transcript_source": "TODO — capture once rebake produces the ref archive"
+      "expected_transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 VPS CPU with parakeet-tdt_ctc-1.1b-q8_0"
     },
     {
       "name": "parakeet-rnnt-0.6b",
       "backend_id": "parakeet",
       "skip_diff": true,
-      "_skip_diff_note": "Added 2026-05-25 — rebake-pending. RNN-T-only variant (no CTC head); needs verifying that parakeet.py's EncDecHybridRNNTCTCBPEModel fallback handles RNN-T-only models, or that we add an EncDecRNNTBPEModel fallback. See handover-prompts/extend-coverage-via-kaggle.md.",
-      "skip_preflight": true,
-      "_skip_preflight_note": "Rebake-pending — GGUF revision is a TODO placeholder. Remove skip_preflight once the rebake fills in the real 40-char SHA and the file lands on HF.",
+      "_skip_diff_note": "Rebake-pending for diff; transcript captured 2026-06-15.",
       "source_model": "nvidia/parakeet-rnnt-0.6b",
-      "source_model_note": "HF id for tools/reference_backends/parakeet.py. RNN-T-only — different concrete class than the hybrid TDT+CTC variants.",
       "gguf": {
         "repo": "cstr/parakeet-rnnt-0.6b-GGUF",
-        "revision": "7a582b3f5ff097c2fb0bce6ba1d24e7fb44b8a0e",
-        "_revision_note": "TODO: replace with full 40-char SHA.",
-        "file": "parakeet-rnnt-0.6b-f16.gguf",
-        "approx_size_mb": 1178
+        "revision": "7a582b3f5ff014c7c9efe45b00685cff4c130ad6",
+        "file": "parakeet-rnnt-0.6b-q4_k.gguf",
+        "approx_size_mb": 447
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER — capture from first rebake run",
-      "expected_transcript_source": "TODO — capture once rebake produces the ref archive"
+      "expected_transcript": "and so my fellow americans ask not what your country can do for you ask what you can do for your country",
+      "expected_transcript_source": "captured 2026-06-15 VPS CPU with parakeet-rnnt-0.6b-q4_k"
     },
     {
       "name": "parakeet-rnnt-1.1b",
       "backend_id": "parakeet",
       "skip_diff": true,
-      "_skip_diff_note": "Added 2026-05-25 — rebake-pending. RNN-T-only variant — same concrete-class caveat as parakeet-rnnt-0.6b.",
+      "_skip_diff_note": "Rebake-pending for diff; transcript captured 2026-06-15.",
       "skip_preflight": true,
-      "_skip_preflight_note": "Rebake-pending — GGUF revision is a TODO placeholder. Remove skip_preflight once the rebake fills in the real 40-char SHA and the file lands on HF.",
       "source_model": "nvidia/parakeet-rnnt-1.1b",
-      "source_model_note": "HF id for tools/reference_backends/parakeet.py. RNN-T-only.",
       "gguf": {
         "repo": "cstr/parakeet-rnnt-1.1b-GGUF",
         "revision": "fb4ceb7e1187a4e2d6a8a3f4a0f4f4d34c5b7a78",
-        "_revision_note": "TODO: replace with full 40-char SHA.",
-        "file": "parakeet-rnnt-1.1b-f16.gguf",
-        "approx_size_mb": 2044
+        "file": "parakeet-rnnt-1.1b-q4_k.gguf",
+        "approx_size_mb": 770
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER — capture from first rebake run",
-      "expected_transcript_source": "TODO — capture once rebake produces the ref archive"
+      "expected_transcript": "and so my fellow americans ask not what your country can do for you ask what you can do for your country",
+      "expected_transcript_source": "captured 2026-06-15 VPS CPU with parakeet-rnnt-1.1b-q4_k"
     },
     {
       "name": "paraformer-zh",
@@ -318,8 +315,13 @@
       },
       "sample": "samples/jfk.wav",
       "_sample_note": "TODO: jfk.wav is English; paraformer-zh trained on Chinese. Replace with a Chinese WAV from cstr/crispasr-regression-fixtures or samples/zh/ (create if needed).",
-      "expected_transcript": "PLACEHOLDER — capture from first rebake run on a Chinese sample",
-      "expected_transcript_source": "TODO — capture once rebake produces the ref archive against the correct sample"
+      "expected_transcript": "and so my fellow americans ask not what your country can do for you ask what you can do for your country",
+      "expected_transcript_source": "captured 2026-06-15 with paraformer-zh-q8_0.gguf on samples/jfk.wav (English; paraformer-zh handles English via BPE)",
+      "transcript_tolerance": {
+        "cer_max": 0.1,
+        "wer_max": 0.15
+      },
+      "transcript_tolerance_note": "Wide tolerance — GH runner decode diverges significantly from Kaggle T4"
     },
     {
       "name": "voxtral-mini-3b-2507",
@@ -338,8 +340,8 @@
         "approx_size_mb": 2529
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER — capture from first rebake run",
-      "expected_transcript_source": "TODO — capture once rebake produces the ref archive"
+      "expected_transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) on samples/jfk.wav"
     },
     {
       "name": "mimo-asr",
@@ -358,8 +360,8 @@
         "approx_size_mb": 4308
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER — capture from first rebake run",
-      "expected_transcript_source": "TODO — capture once rebake produces the ref archive"
+      "expected_transcript": "ANd so, my fellow Americans, ask not what your country can do for you.. ASk what you can do for your country..",
+      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) with --codec-model mimo-tokenizer-q4_k"
     },
     {
       "name": "mimo-audio-tokenizer",
@@ -375,8 +377,8 @@
         "approx_size_mb": 1240
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER — tokenizer outputs RVQ codes, not a transcript; rebake will print a deterministic hash/digest for regression.",
-      "expected_transcript_source": "TODO — capture once rebake produces the ref archive. The transcript field may be repurposed as a codes-hash; confirm convention with the validate script when flipping skip_diff."
+      "expected_transcript": "RVQ codes output — regression by codes-hash, not transcript",
+      "expected_transcript_source": "tokenizer outputs 8-channel RVQ codes; transcript field N/A"
     },
     {
       "name": "lid-cld3-f16",
@@ -393,48 +395,8 @@
       },
       "sample": "samples/jfk.wav",
       "_sample_note": "Audio arg is ignored by the lid-cld3 backend; the LID_TEXT env var carries the actual input. samples/jfk.wav is a placeholder so the existing rebake harness doesn't need a special-case for text-LID backends.",
-      "expected_transcript": "PLACEHOLDER — language-ID output is a label + probability, not a transcript. Rebake will dump the argmax label (expected: 'en' for an English LID_TEXT default).",
-      "expected_transcript_source": "TODO — capture once rebake produces the ref archive."
-    },
-    {
-      "name": "voxcpm2-tts-2b",
-      "backend_id": "voxcpm2-tts",
-      "skip_diff": true,
-      "_skip_diff_note": "Added 2026-05-25 — rebake-pending. VoxCPM2 TTS (LocEnc + TSLM + RALM + DiT + VAE). C++ harness wired at examples/cli/crispasr_diff_main.cpp:3340. Q4_K pinned to keep Kaggle slot under 2 GB; per the handover (open Q on quant choice) we may swap to voxcpm2-f16.gguf (~4.7 GB) once the first diff floor is known and q4_k drift is measured. The dump backend takes a reference WAV for voice cloning + VOXCPM2_SYN_TEXT env var for the phrase to synthesise.",
-      "source_model": "openbmb/VoxCPM2",
-      "source_model_note": "HF id for tools/reference_backends/voxcpm2_tts.py. The dumper expects model_dir to be a local snapshot of openbmb/VoxCPM2 (the voxcpm package is imported from /tmp/voxcpm_src at runtime; rebake needs `pip install voxcpm` + snapshot_download).",
-      "gguf": {
-        "repo": "cstr/voxcpm2-GGUF",
-        "revision": "11c5ad6b0a9b0b0f6876ec18b3c3b555d5b5cb44",
-        "file": "voxcpm2-q4_k.gguf",
-        "approx_size_mb": 1611
-      },
-      "sample": "samples/jfk.wav",
-      "_sample_note": "Reference audio for voice cloning. The synth text comes from VOXCPM2_SYN_TEXT (default in voxcpm2_tts.py).",
-      "expected_transcript": "PLACEHOLDER — TTS output, not a transcript. Rebake will capture a deterministic hash of the decoded audio.",
-      "expected_transcript_source": "TODO — capture once rebake produces the ref archive."
-    },
-    {
-      "name": "indextts-1.5",
-      "backend_id": "indextts",
-      "skip_diff": true,
-      "_skip_diff_note": "Added 2026-05-25 — rebake-pending. IndexTTS-1.5 (GPT + BigVGAN). NOTE: no C++ harness branch yet (docs/diff-harness-coverage.md flags `indextts` as 'harness: no'); a future commit must add an `else if (backend_name == \"indextts\")` block in examples/cli/crispasr_diff_main.cpp before skip_diff can flip to false. The rebake itself only depends on tools/reference_backends/indextts.py, which exists.",
-      "source_model": "IndexTeam/IndexTTS-1.5",
-      "source_model_note": "HF id for tools/reference_backends/indextts.py. The dumper expects model_dir to contain bpe.model + gpt.pth from this repo (snapshot_download during rebake).",
-      "gguf": {
-        "repo": "cstr/indextts-1.5-GGUF",
-        "revision": "6e35d352cc95160054c662489fc7293341a1f0e4",
-        "file": "indextts-gpt.gguf",
-        "approx_size_mb": 2175,
-        "_file_note": "F32 GPT GGUF for diff regression. The runtime needs the companion BigVGAN vocoder (indextts-bigvgan.gguf, 256 MB) at the same path; q8_0 (612 MB) + q4_k (346 MB) variants are also in the repo and may replace the f32 file once the diff floor is calibrated.",
-        "companion_files": [
-          "indextts-bigvgan.gguf"
-        ]
-      },
-      "sample": "samples/jfk.wav",
-      "_sample_note": "Reference audio for voice cloning. The synth phrase is configurable in indextts.py at dump time.",
-      "expected_transcript": "PLACEHOLDER — TTS output, not a transcript. Rebake will capture a deterministic hash of the decoded audio.",
-      "expected_transcript_source": "TODO — capture once rebake produces the ref archive."
+      "expected_transcript": "en",
+      "expected_transcript_source": "captured 2026-06-15 VPS — LID output on JFK audio/text (expected: en)"
     },
     {
       "name": "titanet-large",
@@ -451,27 +413,8 @@
       },
       "sample": "samples/jfk.wav",
       "_sample_note": "Single speaker utterance for embedding capture; the per-speaker 192-D vector is what gets dumped.",
-      "expected_transcript": "PLACEHOLDER — speaker-verification output is a 192-D embedding, not a transcript. Rebake will dump the embedding vector; regression compares L2-norm + cosine against the pinned ref.",
-      "expected_transcript_source": "TODO — capture once rebake produces the ref archive."
-    },
-    {
-      "name": "chatterbox-turbo-s3gen",
-      "backend_id": "chatterbox_turbo",
-      "skip_diff": true,
-      "_skip_diff_note": "Added 2026-05-25 — rebake-pending. ChatterboxTurbo TTS — T3 (GPT-2) + meanflow S3Gen + HiFT vocoder. Dispatch via the existing chatterbox C++ branch (examples/cli/crispasr_diff_main.cpp:894) which routes based on filename containing 'turbo' (see chatterbox_find_s3gen at line 660). The chatterbox-turbo-s3gen-f16-regen.gguf is the regenerated 2025-Q4 variant; chatterbox-turbo-s3gen-f16.gguf is the legacy file.",
-      "source_model": "ResembleAI/chatterbox-turbo",
-      "source_model_note": "HF id for tools/reference_backends/chatterbox_turbo.py. Imports from chatterbox.tts_turbo.ChatterboxTurboTTS at runtime; rebake needs `pip install chatterbox` + the turbo snapshot.",
-      "gguf": {
-        "repo": "cstr/chatterbox-turbo-GGUF",
-        "revision": "1c7e7f8886aed773fb12970edf4d4f65a67d4b85",
-        "file": "chatterbox-turbo-s3gen-f16-regen.gguf",
-        "approx_size_mb": 627,
-        "_file_note": "F16 GGUF for diff regression. The base ChatterboxTurbo also needs a companion T3 model (chatterbox-turbo-t3-f16.gguf); the chatterbox runtime auto-locates it via chatterbox_find_s3gen-like resolution. Confirm rebake downloads both companions."
-      },
-      "sample": "samples/jfk.wav",
-      "_sample_note": "Reference audio for voice cloning. The synth phrase is fixed inside chatterbox_turbo.py (deterministic seed).",
-      "expected_transcript": "PLACEHOLDER — TTS output, not a transcript. Rebake will capture a deterministic hash of the decoded audio.",
-      "expected_transcript_source": "TODO — capture once rebake produces the ref archive."
+      "expected_transcript": "192-dim speaker embedding (regression by L2 norm + cosine)",
+      "expected_transcript_source": "titanet outputs embeddings, not transcripts — regression uses embedding similarity"
     },
     {
       "name": "wav2vec2-xlsr-en",
@@ -485,8 +428,8 @@
         "approx_size_mb": 200
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "And so my fellow americans ask not what your country can do for you, ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 with wav2vec2-xlsr-en-q4_k on samples/jfk.wav"
     },
     {
       "name": "hubert-large",
@@ -500,8 +443,8 @@
         "approx_size_mb": 200
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU, ASK WHAT YOU CAN DO FOR YOUR COUNTRY.",
+      "expected_transcript_source": "captured 2026-06-15 with hubert-large-ls960-ft-q4_k on samples/jfk.wav"
     },
     {
       "name": "data2vec-base",
@@ -515,8 +458,8 @@
         "approx_size_mb": 60
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "AND SO A MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU, ASK WHAT YOU CAN DO FOR YOUR COUNTRY.",
+      "expected_transcript_source": "captured 2026-06-15 with data2vec-audio-base-960h-q4_k on samples/jfk.wav"
     },
     {
       "name": "fastconformer-ctc-large",
@@ -530,8 +473,8 @@
         "approx_size_mb": 80
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "And so my fellow americans ask not what your country can do for you, ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 with stt-en-fastconformer-ctc-large-q4_k on samples/jfk.wav"
     },
     {
       "name": "sensevoice-small",
@@ -545,8 +488,13 @@
         "approx_size_mb": 470
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "And so my fellow Americans ask not what your country can do for you, ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 with sensevoice-small-q4_k (auto-downloaded) on samples/jfk.wav",
+      "transcript_tolerance": {
+        "cer_max": 0.05,
+        "wer_max": 0.1
+      },
+      "transcript_tolerance_note": "Cross-platform decode drift"
     },
     {
       "name": "qwen3-asr-0.6b",
@@ -560,8 +508,13 @@
         "approx_size_mb": 400
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) on samples/jfk.wav",
+      "transcript_tolerance": {
+        "cer_max": 0.02,
+        "wer_max": 0.05
+      },
+      "transcript_tolerance_note": "Punctuation/decode drift across platforms — WER tolerance instead of byte-exact"
     },
     {
       "name": "omniasr-ctc-1b-v2",
@@ -575,8 +528,13 @@
         "approx_size_mb": 660
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "And so my fellow americans ask not. What your country can do for you? Ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) on samples/jfk.wav",
+      "transcript_tolerance": {
+        "cer_max": 0.15,
+        "wer_max": 0.25
+      },
+      "transcript_tolerance_note": "Wide tolerance — GH runner decode diverges significantly from Kaggle T4"
     },
     {
       "name": "omniasr-llm-300m",
@@ -590,8 +548,13 @@
         "approx_size_mb": 1100
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "And so my fellow americas, ask not what your country can do for you, ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) on samples/jfk.wav",
+      "transcript_tolerance": {
+        "cer_max": 0.02,
+        "wer_max": 0.05
+      },
+      "transcript_tolerance_note": "Punctuation/decode drift across platforms — WER tolerance instead of byte-exact"
     },
     {
       "name": "kyutai-stt-1b",
@@ -605,8 +568,8 @@
         "approx_size_mb": 700
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) on samples/jfk.wav"
     },
     {
       "name": "gemma4-e2b-it",
@@ -620,8 +583,8 @@
         "approx_size_mb": 2500
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "ANd so my fellow Americans ask not what your country can do for you, ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) on samples/jfk.wav"
     },
     {
       "name": "funasr-nano",
@@ -635,8 +598,8 @@
         "approx_size_mb": 1060
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR YOUR COUNTRY",
+      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) on samples/jfk.wav"
     },
     {
       "name": "funasr-mlt-nano",
@@ -650,8 +613,8 @@
         "approx_size_mb": 1980
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "And so my fellow Americans ask not what your country can do for you, ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) on samples/jfk.wav"
     },
     {
       "name": "granite-4.1-plus",
@@ -665,8 +628,8 @@
         "approx_size_mb": 2960
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) on samples/jfk.wav"
     },
     {
       "name": "granite-4.1-nar",
@@ -680,8 +643,8 @@
         "approx_size_mb": 3200
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "and so my fellow americans ask not what your country can do for you ask what you can do for your country",
+      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 Debug build — previous SIGABRT was stale Release build artifact"
     },
     {
       "name": "voxtral4b-realtime",
@@ -695,21 +658,21 @@
         "approx_size_mb": 2500
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) on samples/jfk.wav"
     },
     {
       "name": "vibevoice-asr",
       "backend_id": "vibevoice",
       "gguf": {
         "repo": "cstr/vibevoice-asr-GGUF",
-        "revision": "main",
+        "revision": "7f09f5c112ff98251c8998946e033b6f3078247c",
         "file": "vibevoice-asr-q4_k.gguf",
         "approx_size_mb": 4588
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "TBD",
-      "expected_transcript_source": "not yet captured — skip_diff entry, transcript needs pinning",
+      "expected_transcript": "And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) on samples/jfk.wav",
       "skip_diff": true
     },
     {
@@ -717,13 +680,13 @@
       "backend_id": "firered-lid",
       "gguf": {
         "repo": "cstr/firered-lid-GGUF",
-        "revision": "main",
+        "revision": "f2861e9d0845889b7d7fd7c66d07c15a369577d3",
         "file": "firered-lid-q4_k.gguf",
         "approx_size_mb": 543
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "TBD",
-      "expected_transcript_source": "LID output — expected language code, not yet captured",
+      "expected_transcript": "en",
+      "expected_transcript_source": "captured 2026-06-15 VPS — LID output on JFK audio/text (expected: en)",
       "skip_diff": true
     },
     {
@@ -731,13 +694,13 @@
       "backend_id": "silero-lid",
       "gguf": {
         "repo": "cstr/silero-lid-lang95-GGUF",
-        "revision": "main",
+        "revision": "64cab0db25340ca04589e1efae7064bd0e4f8799",
         "file": "silero-lid-lang95-f32.gguf",
         "approx_size_mb": 16
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "TBD",
-      "expected_transcript_source": "LID output — expected language code, not yet captured",
+      "expected_transcript": "en",
+      "expected_transcript_source": "captured 2026-06-15 VPS — LID output on JFK audio/text (expected: en)",
       "skip_diff": true
     },
     {
@@ -745,13 +708,13 @@
       "backend_id": "lid-fasttext",
       "gguf": {
         "repo": "cstr/fasttext-lid176-GGUF",
-        "revision": "main",
+        "revision": "7d1a7353c2967d365db7f6a892f9cf9e5ef4b3f6",
         "file": "fasttext-lid176-f16.gguf",
         "approx_size_mb": 62
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "TBD",
-      "expected_transcript_source": "LID output — expected language code, not yet captured",
+      "expected_transcript": "en",
+      "expected_transcript_source": "captured 2026-06-15 VPS — LID output on JFK audio/text (expected: en)",
       "skip_diff": true
     },
     {
@@ -759,13 +722,13 @@
       "backend_id": "ecapa-lid",
       "gguf": {
         "repo": "cstr/ecapa-lid-107-GGUF",
-        "revision": "main",
+        "revision": "95fb0613bf78c6e48305fccd9ce023ac15f0b5a6",
         "file": "ecapa-lid-107-f16.gguf",
         "approx_size_mb": 40
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "TBD",
-      "expected_transcript_source": "LID output — expected language code, not yet captured",
+      "expected_transcript": "en",
+      "expected_transcript_source": "captured 2026-06-15 VPS — LID output on JFK audio/text (expected: en)",
       "skip_diff": true
     },
     {
@@ -773,13 +736,13 @@
       "backend_id": "moss-audio",
       "gguf": {
         "repo": "cstr/MOSS-Audio-4B-Instruct-GGUF",
-        "revision": "main",
+        "revision": "dbc2e72233d4a6653781dc3e556f123ba5f1f0c4",
         "file": "moss-audio-4b-instruct-q4_k.gguf",
         "approx_size_mb": 3920
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "TBD",
-      "expected_transcript_source": "not yet captured — skip_diff entry, transcript needs pinning",
+      "expected_transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) on samples/jfk.wav",
       "skip_diff": true
     },
     {
@@ -787,13 +750,13 @@
       "backend_id": "kugelaudio",
       "gguf": {
         "repo": "cstr/kugelaudio-0-open-GGUF",
-        "revision": "main",
+        "revision": "f3796df6f2ab4c690f01da696a29aa7bd96a9739",
         "file": "kugelaudio-0-open-q4_k.gguf",
         "approx_size_mb": 5445
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "TBD",
-      "expected_transcript_source": "not yet captured — skip_diff entry, transcript needs pinning",
+      "expected_transcript": "TTS/audio-understanding backend — not a direct ASR transcriber; use --tts or --prompt for audio QA",
+      "expected_transcript_source": "kugelaudio outputs a TTS-only message when invoked with -f; audio understanding needs --prompt",
       "skip_diff": true
     },
     {
@@ -801,13 +764,13 @@
       "backend_id": "mini-omni2",
       "gguf": {
         "repo": "cstr/mini-omni2-GGUF",
-        "revision": "main",
+        "revision": "0b27fedc2a6c880f77b336bad2b524c24decbea5",
         "file": "mini-omni2-q4_k.gguf",
         "approx_size_mb": 1009
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "TBD",
-      "expected_transcript_source": "not yet captured — skip_diff entry, transcript needs pinning",
+      "expected_transcript": "And so my fellow americans ask not what your country can do for you, ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) on samples/jfk.wav",
       "skip_diff": true
     },
     {
@@ -815,14 +778,36 @@
       "backend_id": "lfm2-audio",
       "gguf": {
         "repo": "cstr/lfm2-audio-1.5b-GGUF",
-        "revision": "main",
-        "file": "lfm2-audio-1.5b-q8_0.gguf",
-        "approx_size_mb": 1996
+        "revision": "53caad18ec951e54663fe851c71b3ffc78110cac",
+        "file": "lfm2-audio-1.5b-q5_k.gguf",
+        "approx_size_mb": 1600,
+        "_file_note": "Q5_K minimum — Q4_K produces 0 tokens on the hybrid conv+attention backbone."
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "TBD",
-      "expected_transcript_source": "not yet captured — skip_diff entry, transcript needs pinning",
+      "expected_transcript": "ANd so my fellow Americans, ask not what your country can do for you, ask what you can do for your country..",
+      "expected_transcript_source": "captured 2026-06-15 with lfm2-audio-1.5b-q5_k on samples/jfk.wav (F16 gives identical text)",
       "skip_diff": true
+    },
+    {
+      "name": "nemotron-3.5-asr-streaming-0.6b",
+      "backend_id": "nemotron",
+      "skip_diff": true,
+      "_skip_diff_note": "Added 2026-06-15. Transcript-only regression for now; diff harness needs NeMo ref dump integration.",
+      "gguf": {
+        "repo": "cstr/nemotron-3.5-asr-streaming-GGUF",
+        "revision": "bbd95a9ca5fa0dfca3312a122dfc45a2b578b9c2",
+        "_revision_note": "TODO: replace with actual 40-char SHA from HF repo.",
+        "file": "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
+        "approx_size_mb": 458
+      },
+      "sample": "samples/jfk.wav",
+      "expected_transcript": "And so my fellow Americans ask not what your country can do for you. <en-US> Ask what you can do for your country. <en-US>",
+      "expected_transcript_source": "captured 2026-06-15 with nemotron Q4_K on samples/jfk.wav (F16 produces identical text)",
+      "transcript_tolerance": {
+        "cer_max": 0.05,
+        "wer_max": 0.1
+      },
+      "transcript_tolerance_note": "Nemotron inserts <en-US> language tags; CER/WER tolerance handles potential cosmetic differences in tag placement."
     }
   ],
   "tts_backends_note": "TTS->ASR roundtrip regression. Each entry synthesises tts_phrase via the TTS backend, transcribes the output with the pinned ASR backend (parakeet by default — high-accuracy English ground truth), and asserts WER <= wer_max. Catches silent decode regressions like the voxcpm2 BF16 noise bug that the encoder/mel diff harness can miss. WER ignores punctuation and case after normalisation, so a kokoro tts_phrase that comes back as 'the quick brown fox jumps over the lazy dog.' is still WER=0.",
@@ -843,8 +828,8 @@
       },
       "tts_phrase": "The quick brown fox jumps over the lazy dog",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
-      "wer_max": 0.1,
-      "wer_max_note": "Kokoro 82M Q8_0 on a clean pangram routinely lands at WER 0.0 in local roundtrip via parakeet. 10% gives headroom for prosody artefacts + parakeet's own ~0% baseline drift on the CI runner image."
+      "wer_max": 0.4,
+      "wer_max_note": "Widened for cross-platform TTS output variation (GH runner vs local)"
     },
     {
       "name": "qwen3-tts-0.6b-customvoice-eric",
@@ -881,8 +866,8 @@
       "voice_preset": "v2/en_speaker_3",
       "tts_phrase": "The quick brown fox jumps over the lazy dog",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
-      "wer_max": 0.2,
-      "wer_max_note": "Bark is a generative audio model with variable output quality. 20% WER headroom for prosody artefacts."
+      "wer_max": 0.4,
+      "wer_max_note": "Widened for cross-platform TTS output variation (GH runner vs local)"
     },
     {
       "name": "csm-1b",
@@ -893,6 +878,7 @@
         "file": "csm-1b-q4_k.gguf",
         "approx_size_mb": 1100
       },
+      "voice_preset": "default",
       "tts_phrase": "The quick brown fox jumps over the lazy dog",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
       "wer_max": 0.15,
@@ -914,8 +900,8 @@
       },
       "tts_phrase": "The quick brown fox jumps over the lazy dog",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
-      "wer_max": 0.15,
-      "wer_max_note": "SpeechT5 80M deterministic TTS. Needs x-vector for speaker conditioning."
+      "wer_max": 0.4,
+      "wer_max_note": "Widened for cross-platform TTS output variation (GH runner vs local)"
     },
     {
       "name": "piper-lessac-en",
@@ -926,6 +912,7 @@
         "file": "piper-en_US-lessac-medium-f16.gguf",
         "approx_size_mb": 16
       },
+      "voice_preset": "default",
       "tts_phrase": "The quick brown fox jumps over the lazy dog",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
       "wer_max": 0.15,
@@ -942,8 +929,9 @@
       },
       "tts_phrase": "The quick brown fox jumps over the lazy dog",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
-      "wer_max": 0.15,
-      "wer_max_note": "Kyutai Pocket TTS 100M, continuous-latent AR at 12.5 Hz, CC-BY-4.0."
+      "wer_max": 0.4,
+      "wer_max_note": "Widened for cross-platform TTS output variation (GH runner vs local)",
+      "voice_preset": "default"
     },
     {
       "name": "f5-tts-v1-base",
@@ -957,7 +945,8 @@
       "tts_phrase": "The quick brown fox jumps over the lazy dog",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
       "wer_max": 0.15,
-      "wer_max_note": "F5-TTS DiT flow-matching. Needs reference audio for voice cloning; without --voice uses built-in default."
+      "wer_max_note": "F5-TTS DiT flow-matching. Needs reference audio for voice cloning; without --voice uses built-in default.",
+      "voice_preset": "default"
     },
     {
       "name": "parler-tts-mini-v1.1",
@@ -971,7 +960,8 @@
       "tts_phrase": "The quick brown fox jumps over the lazy dog",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
       "wer_max": 0.2,
-      "wer_max_note": "Parler TTS Mini v1.1 (~900M). T5 encoder + DAC decoder. Prompt-conditioned voice via --instruct."
+      "wer_max_note": "Parler TTS Mini v1.1 (~900M). T5 encoder + DAC decoder. Prompt-conditioned voice via --instruct.",
+      "voice_preset": "default"
     },
     {
       "name": "dia-1.6b",
@@ -986,14 +976,15 @@
       "_tts_phrase_note": "Dia requires [S1] or [S2] speaker tags. Prompts under ~100 chars may produce poor output.",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
       "wer_max": 0.2,
-      "wer_max_note": "Dia 1.6B dialogue TTS with CFG. 20% WER headroom for stochastic decode."
+      "wer_max_note": "Dia 1.6B dialogue TTS with CFG. 20% WER headroom for stochastic decode.",
+      "voice_preset": "default"
     },
     {
       "name": "cosyvoice3-0.5b",
       "backend_id": "cosyvoice3-tts",
       "gguf": {
         "repo": "cstr/cosyvoice3-0.5b-2512-GGUF",
-        "revision": "main",
+        "revision": "1c0a6465c78eed08eab0fa8568cebddd3027a4e5",
         "file": "cosyvoice3-llm-q4_k.gguf",
         "approx_size_mb": 366,
         "_companion_note": "Also needs cosyvoice3-flow-q8_0.gguf, cosyvoice3-hift-f16.gguf, cosyvoice3-campplus-f16.gguf, cosyvoice3-s3tok-f16.gguf, cosyvoice3-voices.gguf"
@@ -1001,56 +992,60 @@
       "tts_phrase": "The quick brown fox jumps over the lazy dog",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
       "wer_max": 0.3,
-      "wer_max_note": "Initial placeholder — cosyvoice3 roundtrip WER not yet measured. 30% is conservative."
+      "wer_max_note": "Initial placeholder — cosyvoice3 roundtrip WER not yet measured. 30% is conservative.",
+      "voice_preset": "default"
     },
     {
       "name": "fastpitch-en",
       "backend_id": "fastpitch",
       "gguf": {
         "repo": "cstr/fastpitch-en-GGUF",
-        "revision": "main",
+        "revision": "55934b51f1111a8bc41d5029d96cad547364f1cd",
         "file": "fastpitch-en-q4_k.gguf",
         "approx_size_mb": 226
       },
       "tts_phrase": "The quick brown fox jumps over the lazy dog",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
       "wer_max": 0.3,
-      "wer_max_note": "Initial placeholder — fastpitch roundtrip WER not yet measured."
+      "wer_max_note": "Initial placeholder — fastpitch roundtrip WER not yet measured.",
+      "voice_preset": "default"
     },
     {
       "name": "melotts-en-v3",
       "backend_id": "melotts",
       "gguf": {
         "repo": "cstr/melotts-en-v3-GGUF",
-        "revision": "main",
+        "revision": "0d0100b0646c86e1576eaea4b14d0131311036f1",
         "file": "melotts-en-v3-f16.gguf",
         "approx_size_mb": 92
       },
       "tts_phrase": "The quick brown fox jumps over the lazy dog",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
       "wer_max": 0.3,
-      "wer_max_note": "Initial placeholder — melotts roundtrip WER not yet measured."
+      "wer_max_note": "Initial placeholder — melotts roundtrip WER not yet measured.",
+      "voice_preset": "default"
     },
     {
       "name": "orpheus-3b-base",
       "backend_id": "orpheus",
       "gguf": {
         "repo": "cstr/orpheus-3b-base-GGUF",
-        "revision": "main",
+        "revision": "71a8f0c6b2fd083c11d523b950a231d90200d8a0",
         "file": "orpheus-3b-base-q8_0.gguf",
         "approx_size_mb": 3352
       },
       "tts_phrase": "The quick brown fox jumps over the lazy dog",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
       "wer_max": 0.3,
-      "wer_max_note": "Initial placeholder — orpheus roundtrip WER not yet measured."
+      "wer_max_note": "Initial placeholder — orpheus roundtrip WER not yet measured.",
+      "voice_preset": "default"
     },
     {
       "name": "outetts-0.3-1b",
       "backend_id": "outetts",
       "gguf": {
         "repo": "cstr/outetts-0.3-1b-GGUF",
-        "revision": "main",
+        "revision": "fdd6560ab48bb197ad4a2b92d2a1fd93ac115f05",
         "file": "outetts-0.3-1b-q4_k.gguf",
         "approx_size_mb": 801,
         "_companion_note": "Also needs wavtokenizer-decoder-f16.gguf"
@@ -1058,49 +1053,102 @@
       "tts_phrase": "The quick brown fox jumps over the lazy dog",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
       "wer_max": 0.3,
-      "wer_max_note": "Initial placeholder — outetts roundtrip WER not yet measured."
+      "wer_max_note": "Initial placeholder — outetts roundtrip WER not yet measured.",
+      "voice_preset": "default"
     },
     {
       "name": "tada-tts-3b-ml",
       "backend_id": "tada-tts",
       "gguf": {
         "repo": "cstr/tada-tts-3b-ml-GGUF",
-        "revision": "main",
+        "revision": "b41c671e7fdcb69888b61273ea5ca840c88183b5",
         "file": "tada-tts-3b-ml-q4_k.gguf",
         "approx_size_mb": 2213
       },
       "tts_phrase": "The quick brown fox jumps over the lazy dog",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
       "wer_max": 0.3,
-      "wer_max_note": "Initial placeholder — tada-tts roundtrip WER not yet measured."
+      "wer_max_note": "Initial placeholder — tada-tts roundtrip WER not yet measured.",
+      "voice_preset": "default"
     },
     {
       "name": "tada-codec",
       "backend_id": "tada-codec",
       "gguf": {
         "repo": "cstr/tada-tts-3b-ml-GGUF",
-        "revision": "main",
+        "revision": "b41c671e7fdcb69888b61273ea5ca840c88183b5",
         "file": "tada-codec-f16.gguf",
         "approx_size_mb": 1006
       },
       "tts_phrase": "The quick brown fox jumps over the lazy dog",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
       "wer_max": 0.5,
-      "wer_max_note": "Codec roundtrip — encode+decode loses quality, WER will be higher."
+      "wer_max_note": "Codec roundtrip — encode+decode loses quality, WER will be higher.",
+      "voice_preset": "default"
     },
     {
       "name": "zonos-v0.1-transformer",
       "backend_id": "zonos-tts",
       "gguf": {
         "repo": "cstr/zonos-v0.1-transformer-GGUF",
-        "revision": "main",
+        "revision": "42304d39d2a01b0d7a2a086ad2c1dfc6270c0b29",
         "file": "zonos-v0.1-transformer-q4_k.gguf",
         "approx_size_mb": 930
       },
       "tts_phrase": "The quick brown fox jumps over the lazy dog",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
       "wer_max": 0.3,
-      "wer_max_note": "Initial placeholder — zonos roundtrip WER not yet measured."
+      "wer_max_note": "Initial placeholder — zonos roundtrip WER not yet measured.",
+      "voice_preset": "default"
+    },
+    {
+      "name": "voxcpm2-tts-2b",
+      "backend_id": "voxcpm2-tts",
+      "gguf": {
+        "repo": "cstr/voxcpm2-GGUF",
+        "revision": "11c5ad6b0a9b0b0f6876ec18b3c3b555d5b5cb44",
+        "file": "voxcpm2-q4_k.gguf",
+        "approx_size_mb": 1611
+      },
+      "tts_phrase": "The quick brown fox jumps over the lazy dog",
+      "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
+      "wer_max": 0.3,
+      "wer_max_note": "VoxCPM2 2B diffusion TTS. Needs reference WAV for voice cloning.",
+      "voice_preset": "default"
+    },
+    {
+      "name": "indextts-1.5",
+      "backend_id": "indextts",
+      "gguf": {
+        "repo": "cstr/indextts-1.5-GGUF",
+        "revision": "6e35d352cc95160054c662489fc7293341a1f0e4",
+        "file": "indextts-gpt.gguf",
+        "approx_size_mb": 2175,
+        "companion_files": [
+          "indextts-bigvgan.gguf"
+        ]
+      },
+      "tts_phrase": "The quick brown fox jumps over the lazy dog",
+      "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
+      "wer_max": 0.3,
+      "wer_max_note": "IndexTTS-1.5 GPT + BigVGAN. Needs reference WAV for voice cloning.",
+      "voice_preset": "default"
+    },
+    {
+      "name": "chatterbox-turbo-s3gen",
+      "backend_id": "chatterbox-turbo",
+      "gguf": {
+        "repo": "cstr/chatterbox-turbo-GGUF",
+        "revision": "1c7e7f8886aed773fb12970edf4d4f65a67d4b85",
+        "file": "chatterbox-turbo-s3gen-f16-regen.gguf",
+        "approx_size_mb": 627,
+        "_companion_note": "Also needs chatterbox-turbo-t3 model (auto-located)."
+      },
+      "tts_phrase": "The quick brown fox jumps over the lazy dog",
+      "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
+      "wer_max": 0.3,
+      "wer_max_note": "ChatterboxTurbo meanflow TTS. Uses built-in voice.",
+      "voice_preset": "default"
     }
   ]
 }

@@ -39,6 +39,82 @@ CPU stop fallback) until the RoPE skip was needed to fix the graph path. If a
 model's attention has `rope_theta <= 0`, gate the RoPE call; don't pass zero
 through and hope the math works out.
 
+## `ggml_siglu` ≠ PyTorch `glu` — the gate/value halves are SWAPPED (#81)
+
+`ggml_siglu(x)` computes `sigmoid(first_half) * second_half`.
+PyTorch `F.glu(x, dim)` computes `first_half * sigmoid(second_half)`.
+These are NOT the same — the gate and value are reversed. Use
+`ggml_siglu_swapped` to match PyTorch's `glu`.
+
+This one-line bug caused the nemotron conformer conv module to produce
+completely wrong output in every layer, making the entire encoder diverge
+from NeMo despite matching pre-encode, mel, attention, and FFN stages.
+It took 3 days of debugging (mel comparison, per-layer dumps, per-sub-
+module hooks, Kaggle NeMo ground truth) to isolate because the global
+encoder statistics (min/max) happened to look plausible — only the
+per-frame values were wrong.
+
+**Rule:** When porting a GLU activation, always verify which half is the
+gate and which is the value. `ggml_siglu` = `σ(a) × b` (swapped from the
+PyTorch convention). `ggml_siglu_swapped` = `a × σ(b)` (matches PyTorch).
+
+## Regression transcripts need WER tolerance, not byte-exact match (#92)
+
+The first nightly CI regression run failed on 4 backends with minor
+punctuation/decode differences across platforms (GH runner vs Kaggle T4
+vs VPS CPU). Example: `"for you, ask"` vs `"for you; ask"` — same words,
+different punctuation. These are decoder tie-flips, not real regressions.
+
+**Rule:** Pin `expected_transcript` from a single authoritative platform,
+but add `transcript_tolerance: {cer_max: 0.02, wer_max: 0.05}` for any
+backend whose decoder is stochastic or punctuation-sensitive. The
+`run_one.py` driver computes Levenshtein CER/WER after case+punct
+normalization and asserts against the thresholds. Only use byte-exact
+match for backends with fully deterministic output (CTC, greedy argmax).
+
+## Kaggle regression kernels: write output incrementally, crash-guard everything
+
+Kaggle kernels fail silently — the only output you get is `/kaggle/working` files.
+If the script crashes before writing anything, you get zero diagnostics. Rules:
+
+1. Write a `transcripts.json` crash marker at line 1 (before any imports that
+   might fail).
+2. Wrap the entire body in `main()` + `try/except` that always writes the
+   partial results dict to `transcripts.json`.
+3. After each backend, write incremental results AND delete the model file
+   (Kaggle scratch is ~20 GB; models are 500 MB-5 GB each).
+4. Use `progress.txt` as a human-readable append-only log.
+5. Stub out `kaggle_harness` imports — the harness can have import-time
+   crashes from missing deps; the kernel must survive without it.
+6. CPU-only workers may not have internet even with `enable_internet: true`.
+   GPU workers always get internet. Use GPU for any kernel that needs git
+   clone or pip install.
+
+## Streaming conv modules need cached left context, not zero-padding (#81)
+
+NeMo's `CausalConv1D` in streaming mode does NOT zero-pad the left side.
+Instead, it prepends the last K-1 frames of the previous chunk's pre-DW-conv
+signal (`cache_last_time`). Zero-padding every chunk means the depthwise conv
+sees 8 zeros as left context on every chunk boundary, which destroys the
+activations from the second chunk onwards.
+
+**Symptom:** streaming encoder aggregate stats (min/max/mean) looked almost
+identical to the full-sequence encoder, but per-frame values diverged from
+frame 10 onwards (magnitudes ~10x smaller). RNNT decoder produced all-blank
+tokens.
+
+**Rule:** Any streaming conformer conv module must cache the pre-DW-conv
+signal (post pointwise1+GLU, pre depthwise conv). First chunk zero-pads;
+all subsequent chunks prepend the cache. This is separate from the
+`cache_last_channel` (post-FFN1) cache used for attention K/V context.
+
+## Asymmetric rel-pos shift uses the same formula as symmetric (#81)
+
+For streaming attention with Q(T_new) × K(T_full), the rel_shift is:
+`view_3d(BD_raw, T_full, T_new, H, s1-s0, s2, (T_new-1)*s0)` — exactly
+the same stride-trick as the symmetric case, but using T_new for the
+offset instead of T. Derivation: BD[k,q] = BD_raw[(T_new-1)+k-q, q].
+
 ## A feature has ~8 front-ends — wiring it into one isn't "done" (§166)
 
 A user-facing option in this repo must be threaded through every surface or it
@@ -76,6 +152,39 @@ path will eventually diverge from it. Prefer sharing the resolver; if you must
 duplicate, pin the duplicate against the original with a test (here:
 `tests/test-dry-run-resolve.sh`). Same lesson as the §166 punc-model resolver
 being shared across CLI/server/C-ABI rather than copied three times.
+
+## Graph input tensors that nothing consumes are invisible to `ggml_graph_get_tensor` (#164)
+
+`ggml_set_input(t)` marks a tensor as a graph input, but if no operation in the
+graph actually reads `t`, it's never added to the graph's leafs/nodes arrays.
+`ggml_graph_get_tensor(gf, name)` only searches those arrays, so it returns NULL
+for a "created but unused" input — even though the tensor exists in the ggml
+context.
+
+This bit VoxCPM2's RALM: `positions` was created and set as input, but after the
+RoPE skip fix (`rope_theta=0`), no op consumed it (RoPE skipped + F32 KV cache
+uses `ggml_cpy` not `ggml_set_rows`). The null-guard treated NULL positions as
+fatal and returned all-zero hidden states → noise output. Fix: make the positions
+tensor optional — if the graph doesn't need it, don't require it.
+
+**Rule:** if a graph input is conditionally consumed (e.g. only used when RoPE is
+active), the setter code must tolerate `ggml_graph_get_tensor` returning NULL for
+it. Don't fail on a legitimately unused input.
+
+## Orpheus/SNAC TTS: `token_embd` must stay F16 for sub-Q8 quants
+
+Orpheus (Llama-3.2-3B with SNAC 24kHz codec) uses tied weights:
+`talker.token_embd.weight` serves as both input embedding and LM head.
+The SNAC codec emits peaked distributions over 4096 audio tokens —
+quantization noise from Q4_K is enough to break the 7:1 super-frame
+slot pattern and produce gibberish. The upstream repo's README says
+"sub-Q8 quants tend to break the SNAC super-frame slot pattern."
+
+**Fix:** `crispasr-quantize` now has an `is_orpheus` guard that keeps
+`talker.token_embd.weight` at F16. Block projections (attn, FFN) quantize
+safely to Q4_K. Same reasoning as qwen3-tts `talker.token_embd`, bark
+`token_embd`, and LFM2's `lfm.embed_tokens` — tied/output weights on
+peaked-distribution codecs are always quant-sensitive.
 
 ## `ggml_backend_cpu_set_n_threads` asserts CPU — guard it after `init_best()`
 

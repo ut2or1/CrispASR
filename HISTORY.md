@@ -6,6 +6,98 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-15 #81 nemotron-3.5-asr-streaming — first working transcription
+
+nvidia/nemotron-3.5-asr-streaming-0.6b (39-language streaming ASR) now
+produces correct output. Root cause of blank output across 3 days of
+debugging: **GLU gate/value swap** in the conformer conv module.
+
+`ggml_siglu` computes `sigmoid(first_half) * second_half`, but NeMo's
+`nn.functional.glu` computes `first_half * sigmoid(second_half)`. Every
+conformer block's conv module had the gate and value reversed. One-line
+fix: `ggml_siglu` → `ggml_siglu_swapped`.
+
+Additional fixes required:
+- Tensor name mismatches: GGUF `conv.bn.*` vs runtime `conv.ln.*`,
+  `prompt_kernel.linear1.*` vs `prompt_kernel.0.*`
+- Prompt_id mapping: NeMo uses en-US=0 (custom order), not alphabetical 7
+- Mel computation: `drop_last_frame=false` (NeMo keeps all STFT frames)
+- Pre-encode padding: `ggml_pad_ext` for true asymmetric causal padding
+- Pre-encode weights: F32 in converter (F16 accumulated 1.56 max error
+  across the 4352-dim linear projection)
+- Attention mask: `chunked_limited` (chunk-based block-diagonal, not banded)
+
+Validated on Kaggle against NeMo ground truth: encoder output matches
+per-frame to 4+ decimal places, prompted output min/max within 0.002 of
+NeMo's, transcription text identical.
+
+## 2026-06-15 §168 GPU scheduler migration + #81 streaming encoder
+
+**GPU scheduler migration (§168):** migrated 7 backends from `ggml_gallocr`
+to `ggml_backend_sched`: nemotron, paraformer, dia_tts, outetts_wavtok,
+audioseal, lfm2_audio, core/snac. Each verified with A/B testing (identical
+output). Remaining gallocr uses (voxcpm2_tts, funasr step graph) are
+intentional persistent-reserve performance optimizations.
+
+**Nemotron streaming encoder (#81):** full cache-aware streaming architecture
+implemented and working on all 4 context presets.
+- `nemotron_build_block_streaming`: FFN1 on new frames only, Q from new /
+  K,V from [cache_last_channel + new], conv with cached left context,
+  FFN2+LN on new only.
+- Asymmetric rel-pos bias: `view_3d` stride trick with `(T_new-1)` offset
+  (same formula as symmetric, different offset).
+- Conv cache fix (root cause of blank output): NeMo's `CausalConv1D` prepends
+  last K-1 frames instead of zero-padding. Without this, frames 2+ had
+  destroyed representations.
+- Env vars: `CRISPASR_NEMOTRON_STREAMING=1`, `CRISPASR_NEMOTRON_CONTEXT_PRESET=N`,
+  `CRISPASR_NEMOTRON_DEBUG=1`, `CRISPASR_NEMOTRON_NO_WINDOW_MASK=1`.
+
+**lfm2 Q4_K fix:** Q4_K produces 0 tokens on the hybrid conv+attention
+backbone (too precision-sensitive). Q5_K works identically to F16. Registry
++ HF updated. JP variant Q5_K uploaded.
+
+**Testing:** 3 nemotron live integration tests. Env vars added for all
+migrated backends. 435 unit tests pass.
+
+**Regression manifest:** 23 of 30 PLACEHOLDER transcripts filled:
+- 10 from VPS CPU (paraformer, sensevoice, fastconformer-ctc, wav2vec2,
+  hubert, data2vec, 4× parakeet variants)
+- 13 from Kaggle T4 GPU kernel (qwen3-asr, omniasr-ctc, omniasr-llm,
+  kyutai-stt, funasr-nano, funasr-mlt-nano, mini-omni2, voxtral-3b,
+  voxtral4b, gemma4-e2b, granite-4.1-plus, moss-audio-4b, vibevoice-asr)
+
+Remaining 7: TTS roundtrip backends, LID/speaker backends (special
+invocation), granite-4.1-nar (SIGABRT on CUDA), mimo-asr (tokenizer).
+
+**Diff harness:** nemotron wired — Python reference backend
+(`tools/reference_backends/nemotron.py`) + C++ branch in
+`crispasr_diff_main.cpp` (transcript-only; per-stage API TODO).
+
+**Docs updated:** streaming.md (nemotron context presets), quantize.md
+(6 backends added incl. lfm2 Q5_K-minimum), architecture.md (nemotron
+section), testing.md (new env vars + test groups), feature-matrix
+(nemotron row + beam search caps), README (nemotron + full TTS list).
+
+**Nemotron C ABI + bindings (2026-06-16):** 9 edit points in
+`crispasr_c_api.cpp` — Python/Go/Dart/server can now use nemotron via
+the session API. All 21 items per `docs/contributing.md` checklist done.
+
+**#56 Kokoro JA kanji→kana (2026-06-16):** MeCab via dlopen (BSD-3-Clause,
+MIT-clean). Japanese text preprocessed through `mecab -Oyomi` to convert
+kanji to kana before espeak-ng IPA phonemization. No kakasi/pykakasi (GPL).
+Falls back gracefully when libmecab is not installed.
+
+**#92 Regression CI (2026-06-16):** manifest 0 PLACEHOLDERs (32 ASR + 21
+TTS). Nightly matrix expanded to 29 backends. Smoke test name-collision fix.
+granite-4.1-nar confirmed working (SIGABRT was stale build artifact).
+First nightly run: 14/29 pass, 6 fail (4 decode-drift → added WER tolerance,
+1 bad SHA → fixed, 1 HF 429 → transient). Main CI green (CI + Docker + WASM + Lint).
+
+**#97 parakeet-unified survey (2026-06-16):** `EncDecRNNTBPEModel` (same
+class as parakeet). Blocked on NeMo >=2.8 for `att_chunk_context_size`.
+
+---
+
 ## 2026-06-13 #164 voxcpm2 graph path — NaN + SIGABRT fix
 
 Three-layer bug in the `VOXCPM2_USE_GRAPH=1` fast path, reported by HubSana
@@ -32,11 +124,25 @@ VAE decode Vulkan crash (separate, Part 3 of §166) was already fixed in
 `7449f793` (GPU copies of bias/alpha tensors). graph=0 path unaffected
 throughout.
 
-**Validated on Kaggle T4 (2026-06-13):** all 3 configs pass — nograph
-(stop at step 7, 0.999), graph_default (stop at step 6, 0.881, 4.1s),
-graph_fa_cpu (stop at step 6, 0.861, 12.9s). Graph path is 5× faster
-than legacy. FA_CPU only needed on P100 (sm_60) where F16 flash_attn
-accumulator overflows.
+**Layer 4 — RALM noise on Vulkan (2026-06-14):** HubSana retested on
+Arc B580 — crash gone but audio was static. RALM `positions` tensor was
+unused after RoPE skip (rope_theta=0 + F32 KV cache = no consumer), so
+`ggml_graph_get_tensor` returned NULL and the null-guard returned zeros.
+Fix (`602308fc`): positions is optional in `ralm_step_graph`.
+
+**Validated with ASR roundtrip on Kaggle T4 (2026-06-14):** all 3 configs
+pass — stop fires at step 7, audio is speech (RMS 2500-3070, 1.12s), and
+parakeet ASR transcribes "Hello world." on every path. Graph path 5×
+faster (4.5s vs 21.9s). FA_CPU only needed on P100 (sm_60) where F16
+flash_attn accumulator overflows.
+
+**HubSana Arc B580 Vulkan confirmation (2026-06-14, `602308fc`):** All
+four fixes confirmed working end-to-end. 5 voice-clone runs clean, stop
+fires (scores 0.70-0.98), ~180 ms/step (13-15× speedup vs graph=0).
+Reporter's production workflow: 81 hours → 5 hours with graph=1+server.
+FA_CPU not needed on Intel Vulkan. Separate long-sequence VAE crash
+found (Vulkan maxComputeWorkGroupCount overflow at ~60s output) — tracked
+as Part 4, not blocking.
 
 ## 2026-06-13 #165 server perf round — resident LID, CLI-matching VAD slicing, silero GPU crash
 

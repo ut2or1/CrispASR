@@ -198,12 +198,18 @@ struct nemotron_context {
 
     // Streaming state
     int att_context_preset = 0;
-    int prompt_id = 7; // language prompt index (7 = en-US in sorted order)
+    int prompt_id = 0; // language prompt index (0 = en-US in NeMo's prompt_dictionary)
 
     // Decode controls
     float decode_temperature = 0.0f;
     uint64_t decode_seed = 0;
     int decode_beam_size = 1;
+
+    // MAES controls
+    bool decode_maes = false;
+    int maes_num_steps = 2;
+    float maes_gamma = 2.3f;
+    int maes_beta = 2;
 
     // Prompt language map: lang_code -> prompt_id
     std::unordered_map<std::string, int> lang_to_prompt;
@@ -248,8 +254,19 @@ static std::vector<float> tensor_to_f32(ggml_tensor* t) {
         ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(ggml_fp16_t));
         for (int64_t i = 0; i < n; i++)
             out[i] = ggml_fp16_to_fp32(tmp[i]);
+    } else if (ggml_is_quantized(t->type)) {
+        size_t raw_sz = ggml_nbytes(t);
+        std::vector<uint8_t> raw(raw_sz);
+        ggml_backend_tensor_get(t, raw.data(), 0, raw_sz);
+        const auto* traits = ggml_get_type_traits(t->type);
+        if (traits && traits->to_float) {
+            traits->to_float(raw.data(), out.data(), n);
+        } else {
+            fprintf(stderr, "nemotron: no dequant for type %d\n", t->type);
+            out.assign(n, 0.0f);
+        }
     } else {
-        fprintf(stderr, "nemotron: unsupported tensor type %d for CPU conversion\n", t->type);
+        fprintf(stderr, "nemotron: unsupported tensor type %d\n", t->type);
         out.assign(n, 0.0f);
     }
     return out;
@@ -309,22 +326,69 @@ static bool nemotron_load_model(nemotron_model& model, nemotron_vocab& vocab,
         // expose directly for int arrays. Use defaults for now; the runtime
         // picks the preset index and the C++ code handles the mapping.
 
-        // Populate language → prompt_id mapping (alphabetically sorted, matching converter)
+        // Populate language → prompt_id mapping from NeMo's prompt_dictionary.
+        // This is NOT alphabetical — it's the order from the model_config.yaml
+        // training config. The prompt_kernel one-hot encoding must match this
+        // exact mapping or the encoder output will be conditioned on the wrong
+        // language (#81).
         {
-            const char* langs[] = {
-                "ar-AR", "bg-BG", "cs-CZ", "da-DK", "de-DE", "el-GR", "en-GB", "en-US", "es-ES", "es-US",
-                "et-EE", "fi-FI", "fr-CA", "fr-FR", "he-IL", "hi-IN", "hr-HR", "hu-HU", "it-IT", "ja-JP",
-                "ko-KR", "lt-LT", "lv-LV", "nb-NO", "nl-NL", "nn-NO", "pl-PL", "pt-BR", "pt-PT", "ro-RO",
-                "ru-RU", "sk-SK", "sl-SL", "sv-SE", "th-TH", "tr-TR", "uk-UA", "vi-VN", "zh-CN",
+            // clang-format off
+            const struct { const char* code; int id; } prompts[] = {
+                {"en-US", 0}, {"en-GB", 1}, {"es-ES", 2}, {"es-US", 3},
+                {"zh-CN", 4}, {"zh-TW", 5}, {"hi-IN", 6}, {"ar-AR", 7},
+                {"fr-FR", 8}, {"de-DE", 9}, {"ja-JP", 10}, {"ru-RU", 11},
+                {"pt-BR", 12}, {"pt-PT", 13}, {"ko-KR", 14}, {"it-IT", 15},
+                {"nl-NL", 16}, {"pl-PL", 17}, {"tr-TR", 18}, {"uk-UA", 19},
+                {"ro-RO", 20}, {"el-GR", 21}, {"cs-CZ", 22}, {"hu-HU", 23},
+                {"sv-SE", 24}, {"da-DK", 25}, {"fi-FI", 26}, {"nb-NO", 27},
+                {"sk-SK", 28}, {"hr-HR", 29}, {"bg-BG", 30}, {"lt-LT", 31},
+                {"th-TH", 32}, {"vi-VN", 33}, {"et-EE", 60}, {"lv-LV", 61},
+                {"sl-SI", 62}, {"he-IL", 64}, {"fr-CA", 100}, {"nn-NO", 104},
             };
-            for (int i = 0; i < 39; i++) {
-                lang_to_prompt[langs[i]] = i;
-                // Also add lowercase version for case-insensitive matching
-                std::string lo = langs[i];
+            // clang-format on
+            for (const auto& p : prompts) {
+                lang_to_prompt[p.code] = p.id;
+                std::string lo = p.code;
                 for (auto& c : lo)
                     c = (char)std::tolower((unsigned char)c);
-                lang_to_prompt[lo] = i;
+                lang_to_prompt[lo] = p.id;
             }
+            // Short ISO 639-1 aliases → first matching locale
+            lang_to_prompt["en"] = 0;   // en-US
+            lang_to_prompt["es"] = 3;   // es-US
+            lang_to_prompt["zh"] = 4;   // zh-CN
+            lang_to_prompt["hi"] = 6;   // hi-IN
+            lang_to_prompt["ar"] = 7;   // ar-AR
+            lang_to_prompt["fr"] = 8;   // fr-FR
+            lang_to_prompt["de"] = 9;   // de-DE
+            lang_to_prompt["ja"] = 10;  // ja-JP
+            lang_to_prompt["ru"] = 11;  // ru-RU
+            lang_to_prompt["pt"] = 13;  // pt-PT
+            lang_to_prompt["ko"] = 14;  // ko-KR
+            lang_to_prompt["it"] = 15;  // it-IT
+            lang_to_prompt["nl"] = 16;  // nl-NL
+            lang_to_prompt["pl"] = 17;  // pl-PL
+            lang_to_prompt["tr"] = 18;  // tr-TR
+            lang_to_prompt["uk"] = 19;  // uk-UA
+            lang_to_prompt["ro"] = 20;  // ro-RO
+            lang_to_prompt["el"] = 21;  // el-GR
+            lang_to_prompt["cs"] = 22;  // cs-CZ
+            lang_to_prompt["hu"] = 23;  // hu-HU
+            lang_to_prompt["sv"] = 24;  // sv-SE
+            lang_to_prompt["da"] = 25;  // da-DK
+            lang_to_prompt["fi"] = 26;  // fi-FI
+            lang_to_prompt["nb"] = 27;  // nb-NO
+            lang_to_prompt["sk"] = 28;  // sk-SK
+            lang_to_prompt["hr"] = 29;  // hr-HR
+            lang_to_prompt["bg"] = 30;  // bg-BG
+            lang_to_prompt["lt"] = 31;  // lt-LT
+            lang_to_prompt["th"] = 32;  // th-TH
+            lang_to_prompt["vi"] = 33;  // vi-VN
+            lang_to_prompt["et"] = 60;  // et-EE
+            lang_to_prompt["lv"] = 61;  // lv-LV
+            lang_to_prompt["sl"] = 62;  // sl-SI
+            lang_to_prompt["he"] = 64;  // he-IL
+            lang_to_prompt["nn"] = 104; // nn-NO
         }
 
         core_gguf::free_metadata(gctx);
@@ -449,8 +513,10 @@ static bool nemotron_load_model(nemotron_model& model, nemotron_vocab& vocab,
     fprintf(stderr, "nemotron: vocab=%u  d_model=%u  n_layers=%u  n_heads=%u  ff=%u  pred=%u  joint=%u\n",
             model.hparams.vocab_size, model.hparams.d_model, model.hparams.n_layers, model.hparams.n_heads,
             model.hparams.ff_dim, model.hparams.pred_hidden, model.hparams.joint_hidden);
-    fprintf(stderr, "nemotron: streaming: %u presets, causal_ds=%d, conv_norm=layer_norm\n",
-            model.hparams.n_att_context_presets, model.hparams.causal_downsampling ? 1 : 0);
+    fprintf(stderr,
+            "nemotron: streaming: %u presets, causal_ds=%d, conv_norm=layer_norm, conv_ln=%s, prompt_kernel=%s\n",
+            model.hparams.n_att_context_presets, model.hparams.causal_downsampling ? 1 : 0,
+            model.enc[0].conv_ln_w ? "loaded" : "NULL", model.prompt_kernel.l0_w ? "loaded" : "NULL");
     return true;
 }
 
@@ -527,7 +593,7 @@ static std::vector<float> nemotron_compute_mel_impl(nemotron_context* ctx, const
     p.layout = core_mel::Layout::TimeMels;
     p.log_eps = (float)(1.0 / (1 << 24));
     p.center_pad = true;
-    p.drop_last_frame = true;
+    p.drop_last_frame = false; // NeMo default: keep all frames (1101 not 1100)
     p.preemph = 0.97f;
 
     auto mel = core_mel::compute(samples, n_samples, window_raw.data(), win, mel_fb.data(), n_freqs, nemotron_fft_r2c,
@@ -559,81 +625,31 @@ static ggml_tensor* nemotron_build_pre_encode(ggml_context* ctx0, ggml_tensor* m
         return ggml_cast(ctx0, ggml_reshape_4d(ctx0, b, 1, 1, b->ne[0], 1), GGML_TYPE_F32);
     };
 
-    // CausalConv2D padding: (left=k-1=2, right=s-1=1) on BOTH freq and time axes
-    // ggml_conv_2d(w, x, sx, sy, px, py, dx, dy) — px/py are symmetric.
-    // We need asymmetric padding, so we pad manually and use p=0 in the conv.
-    // ggml_pad: pads ne[0] with (p0, p0) and ne[1] with (p1, p1) — symmetric only!
-    // So we use ggml_conv_2d with padding=(2, 2) and then trim the right/bottom by 1.
-    // Actually, for stride=2 conv with pad=(2,2): output = (W+4-3)/2+1 = (W+1)/2+1
-    // For pad=(2,1): output = (W+3-3)/2+1 = W/2+1
-    // So pad=(2,2) gives one extra element compared to pad=(2,1).
-    //
-    // Cleaner approach: use pad=(1,1) (the symmetric parakeet default) and accept
-    // that we get W3=16 not 17 from the conv chain. Then we just need to make the
-    // flatten dim match the linear weight. Since the linear weight is (4352, 1024),
-    // and we'd flatten to 4096 instead of 4352, the shapes won't match.
-    //
-    // Best approach: use ggml_conv_2d with excess padding, then slice to trim.
-    // ggml_conv_2d(w, x, 2, 2, 2, 2, 1, 1) gives output (W+4-3)/2+1 for dim0.
-    // For 128: (128+4-3)/2+1 = 65. Need 65. Then trim... no, 65 is correct!
-    // For second stage (DW, input=65): (65+4-3)/2+1 = 34. Need 33. Off by 1.
-    //
-    // Simplest correct approach: pad input explicitly, then conv with p=0.
-    // ggml doesn't have a general asymmetric 2D pad, but we can use views/concat.
-    // Actually, the simplest approach for a first pass: use (2, 2) padding and
-    // take a view that drops the last element in the freq dimension after each conv.
-
-    // APPROACH: Use the standard ggml_conv_2d with padding (2, 2) for strided convs.
-    // This gives output freq = (W+4-3)/2+1 = (W+1)/2+1 per stage.
-    // For pad(2,1): freq = (W+3-3)/2+1 = W/2+1.
-    // Difference is always 1 extra element with pad(2,2). We can remove it
-    // using ggml_view to trim the last freq element.
+    // CausalConv2D: pad left=k-1=2, right=s-1=1 on BOTH freq (ne[0]) and time (ne[1]).
+    // Use ggml_pad_ext for true asymmetric padding, then conv with p=0.
+    // This produces correct per-element values (symmetric pad=(2,2) changes values
+    // because the extra right-side zeros participate in the convolution).
+    auto causal_pad = [&](ggml_tensor* x) -> ggml_tensor* {
+        return ggml_pad_ext(ctx0, x, /*lp0*/ 2, /*rp0*/ 1, /*lp1*/ 2, /*rp1*/ 1, 0, 0, 0, 0);
+    };
 
     // Stage 0: Conv2d(1, C, k=3, s=2) with causal padding
-    // Standard symmetric pad = (1,1): gives floor((128+2-3)/2)+1 = 64
-    // Causal pad = (2,1): gives floor((128+3-3)/2)+1 = 65
-    // Use pad (2,2): gives floor((128+4-3)/2)+1 = 65 (same as causal if W is even)
-    // For W even: (2,1) gives (W+3-3)/2+1 = W/2+1, (2,2) gives (W+4-3)/2+1 = (W+1)/2+1
-    // When W is even: W/2+1 vs (W+1)/2+1. floor((W+1)/2)+1 = W/2+1. Same! Good.
-
-    ggml_tensor* cur = ggml_conv_2d(ctx0, w.conv0_w, mel, 2, 2, 2, 2, 1, 1);
+    ggml_tensor* cur = ggml_conv_2d(ctx0, w.conv0_w, causal_pad(mel), 2, 2, 0, 0, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv0_b));
     cur = ggml_relu(ctx0, cur);
 
-    // Stage 2: DW Conv2d(C, k=3, s=2)
-    // Input freq after stage 0 with pad(2,2) on 128: (128+4-3)/2+1 = 65
-    // Causal pad on 65: (65+3-3)/2+1 = 33
-    // Our pad(2,2) on 65: (65+4-3)/2+1 = 34. Need to trim to 33.
-    cur = ggml_conv_2d_dw(ctx0, w.conv2_w, cur, 2, 2, 2, 2, 1, 1);
+    // Stage 2: DW Conv2d(C, k=3, s=2) with causal padding
+    cur = ggml_conv_2d_dw(ctx0, w.conv2_w, causal_pad(cur), 2, 2, 0, 0, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv2_b));
-    // Trim: freq is cur->ne[0]. Trim last element: view with ne[0]-1
-    {
-        int64_t W = cur->ne[0] - 1;
-        int64_t H = cur->ne[1];
-        int64_t C = cur->ne[2];
-        int64_t N = cur->ne[3];
-        cur = ggml_view_4d(ctx0, cur, W, H, C, N, cur->nb[1], cur->nb[2], cur->nb[3], 0);
-        cur = ggml_cont(ctx0, cur);
-    }
 
-    // Stage 3: PW Conv2d(C, C, k=1, s=1)
+    // Stage 3: PW Conv2d(C, C, k=1, s=1) — no padding
     cur = ggml_conv_2d(ctx0, w.conv3_w, cur, 1, 1, 0, 0, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv3_b));
     cur = ggml_relu(ctx0, cur);
 
-    // Stage 5: DW Conv2d(C, k=3, s=2)
-    // Input freq = 33. Causal pad: (33+3-3)/2+1 = 17.
-    // Our pad(2,2): (33+4-3)/2+1 = 18. Trim to 17.
-    cur = ggml_conv_2d_dw(ctx0, w.conv5_w, cur, 2, 2, 2, 2, 1, 1);
+    // Stage 5: DW Conv2d(C, k=3, s=2) with causal padding
+    cur = ggml_conv_2d_dw(ctx0, w.conv5_w, causal_pad(cur), 2, 2, 0, 0, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv5_b));
-    {
-        int64_t W = cur->ne[0] - 1;
-        int64_t H = cur->ne[1];
-        int64_t C = cur->ne[2];
-        int64_t N = cur->ne[3];
-        cur = ggml_view_4d(ctx0, cur, W, H, C, N, cur->nb[1], cur->nb[2], cur->nb[3], 0);
-        cur = ggml_cont(ctx0, cur);
-    }
 
     // Stage 6: PW Conv2d(C, C, k=1, s=1)
     cur = ggml_conv_2d(ctx0, w.conv6_w, cur, 1, 1, 0, 0, 1, 1);
@@ -661,17 +677,24 @@ static ggml_tensor* nemotron_build_pre_encode(ggml_context* ctx0, ggml_tensor* m
 // conv_dw_b add with a proper LayerNorm using the conv_ln_w/conv_ln_b tensors.
 // ===========================================================================
 
-// Build a banded attention window mask (F16) for cache-aware streaming.
-// mask[k, q] = 0 if q-left <= k <= q+right, else -inf.
+// Build a chunked_limited attention mask (F16) matching NeMo's att_context_style.
+// Each frame belongs to a chunk of size (right+1). A frame can attend to frames
+// in its own chunk and up to left_chunks_num previous chunks.
+// mask[q, k] = 0 if visible, -inf if masked.
 // Shape: (T, T) broadcast across heads.
 static std::vector<ggml_fp16_t> build_window_mask(int T, int left, int right) {
+    const int chunk_size = right + 1;
+    const int left_chunks_num = left >= 0 ? left / chunk_size : 10000;
     std::vector<ggml_fp16_t> mask((size_t)T * T);
     const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-1e9f);
     const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
     for (int q = 0; q < T; q++) {
+        int q_chunk = q / chunk_size;
         for (int k = 0; k < T; k++) {
-            bool in_window = (k >= q - left) && (k <= q + right);
-            mask[(size_t)q * T + k] = in_window ? zero : neg_inf;
+            int k_chunk = k / chunk_size;
+            int diff = q_chunk - k_chunk;
+            bool visible = (diff >= 0) && (diff <= left_chunks_num);
+            mask[(size_t)q * T + k] = visible ? zero : neg_inf;
         }
     }
     return mask;
@@ -683,9 +706,12 @@ static std::vector<ggml_fp16_t> build_window_mask(int T, int left, int right) {
 // pos_enc:   (d, 2*(T_cache+T_new)-1) — rel-pos for the full window
 // Output:    (d, T_new) — block output for new frames only
 // Also tags "cache_ch_out" = post-FFN1 new frames for caching.
+// conv_cache_in: (d, K-1) tensor of pre-DW-conv signal from previous chunk (or nullptr for first chunk).
+// NeMo's CausalConv1D.update_cache prepends this instead of zero-padding.
 static ggml_tensor* nemotron_build_block_streaming(ggml_context* ctx0, ggml_tensor* new_in, ggml_tensor* cache_ch,
-                                                   ggml_tensor* pos_enc, int T_new, int T_cache,
-                                                   const nemotron_enc_layer& e, const core_conformer::BlockParams& p) {
+                                                   ggml_tensor* conv_cache_in, ggml_tensor* pos_enc, int T_new,
+                                                   int T_cache, const nemotron_enc_layer& e,
+                                                   const core_conformer::BlockParams& p) {
     const int d = p.d;
     const int n_heads = p.n_heads;
     const int head_dim = p.head_dim;
@@ -752,43 +778,70 @@ static ggml_tensor* nemotron_build_block_streaming(ggml_context* ctx0, ggml_tens
     ggml_tensor* V_ =
         ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, V, head_dim, n_heads, T_full), 0, 2, 1, 3));
 
-    // BD = rel_shift(Q_v @ R^T): shape (T_full, T_new, n_heads)
-    // Note: Q_v has T_new queries, R has 2*T_full-1 positions
-    // Q_v @ R^T → (T_new, 2*T_full-1, n_heads). rel_shift extracts (T_full, T_new).
-    // But rel_shift expects (2T-1, T, H) input. Here Q has T_new, R has 2*T_full-1.
-    // For asymmetric Q/K: BD_raw[q, r] = Q_v[q] · R[r], shape (2*T_full-1, T_new, H).
-    // rel_shift skews to (T_full, T_new, H).
+    // BD = rel_shift(Q_v @ R^T): asymmetric version for Q(T_new) × K(T_full).
+    // BD_raw shape: (2*T_full-1, T_new, n_heads).
+    // Asymmetric rel_shift: BD[k, q, h] = BD_raw[(T_new-1)+k-q, q, h]
+    //   = data[(T_new-1)*s0 + k*s0 + q*(s1-s0) + h*s2]
+    // This is view_3d(BD_raw, T_full, T_new, H, s1-s0, s2, (T_new-1)*s0).
     ggml_tensor* BD_raw = ggml_mul_mat(ctx0, ggml_cont(ctx0, R), Q_v); // (2*T_full-1, T_new, n_heads)
-    // rel_shift needs input (2*T_full-1, T_new, H) → output (T_full, T_new, H)
-    // The standard rel_shift works when Q and K have the same length T.
-    // For asymmetric Q(T_new) × K(T_full), the shift indexing is different.
-    // Simpler: skip rel-pos bias for the streaming path (it's a small accuracy hit).
-    // TODO: implement proper asymmetric rel-pos shift.
+    ggml_tensor* BD = ggml_view_3d(ctx0, BD_raw, T_full, T_new, n_heads, BD_raw->nb[1] - BD_raw->nb[0], BD_raw->nb[2],
+                                   (T_new - 1) * BD_raw->nb[0]);
 
     const float scale = 1.0f / sqrtf((float)head_dim);
+    ggml_tensor* BD_c = ggml_cont(ctx0, BD);
+    ggml_tensor* BD_scaled = ggml_scale(ctx0, BD_c, scale);
+    ggml_tensor* BD_mask = ggml_cast(ctx0, BD_scaled, GGML_TYPE_F16);
 
-    // For now: use flash_attn_ext without BD mask (pure dot-product attention)
-    // This loses the rel-pos bias but lets us test the cache architecture.
     ggml_tensor* attn_out =
-        ggml_flash_attn_ext(ctx0, ggml_cont(ctx0, Q_u), ggml_cont(ctx0, K_), V_, nullptr, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext(ctx0, ggml_cont(ctx0, Q_u), ggml_cont(ctx0, K_), V_, BD_mask, scale, 0.0f, 0.0f);
     attn_out = ggml_reshape_2d(ctx0, attn_out, d, T_new);
 
     attn_out = mm_bias(e.attn_out_w, attn_out, e.attn_out_b);
     cur = ggml_add(ctx0, inpAttn, attn_out);
 
-    // ---- Conv module (new frames only, causal padding) ----
+    // ---- Conv module (new frames only, with conv state cache) ----
     ggml_tensor* inpConv = cur;
     x = ggml_norm_affine(ctx0, cur, e.norm_conv_w, e.norm_conv_b, eps);
     ggml_tensor* pw1_w = ggml_reshape_2d(ctx0, e.conv_pw1_w, d, 2 * d);
     ggml_tensor* cnv = mm_bias(pw1_w, x, e.conv_pw1_b);
-    cnv = ggml_siglu(ctx0, cnv);
+    cnv = ggml_siglu_swapped(ctx0, cnv);
 
-    // DW conv with causal padding
+    // Save post-GLU signal for conv cache output (last K-1 frames)
+    // NeMo's CausalConv1D.update_cache stores this for the next chunk.
+    {
+        // cnv is (d, T_new). We need the last (K-1) frames.
+        int cache_frames = K - 1;
+        ggml_tensor* conv_cache_new;
+        if (T_new >= cache_frames) {
+            int offset_frames = T_new - cache_frames;
+            conv_cache_new = ggml_view_2d(ctx0, cnv, d, cache_frames, cnv->nb[1], (size_t)offset_frames * cnv->nb[1]);
+        } else {
+            // T_new < K-1: prepend part of old cache + all new frames
+            // This case handles very small chunks; for simplicity, just save what we have
+            conv_cache_new = cnv;
+        }
+        conv_cache_new = ggml_cont(ctx0, conv_cache_new);
+        ggml_set_name(conv_cache_new, "conv_cache_out");
+        ggml_set_output(conv_cache_new);
+    }
+
+    // DW conv: prepend conv cache (or zero-pad) for left context
     ggml_tensor* dw_w_f32 = ggml_cast(ctx0, e.conv_dw_w, GGML_TYPE_F32);
     ggml_tensor* dw_w_4d = ggml_reshape_4d(ctx0, dw_w_f32, K, 1, 1, d);
-    cnv = ggml_cont(ctx0, ggml_transpose(ctx0, cnv));
-    cnv = ggml_reshape_4d(ctx0, cnv, T_new, 1, d, 1);
-    cnv = ggml_conv_2d_dw_direct(ctx0, dw_w_4d, cnv, 1, 1, K - 1, 0, 1, 1);
+
+    if (conv_cache_in) {
+        // Prepend cached frames: [conv_cache_in (d,K-1), cnv (d,T_new)] → (d, K-1+T_new)
+        ggml_tensor* cnv_padded = ggml_concat(ctx0, conv_cache_in, cnv, 1);
+        cnv_padded = ggml_cont(ctx0, ggml_transpose(ctx0, cnv_padded));
+        cnv_padded = ggml_reshape_4d(ctx0, cnv_padded, K - 1 + T_new, 1, d, 1);
+        // Conv with no padding — output is (T_new, 1, d, 1)
+        cnv = ggml_conv_2d_dw_direct(ctx0, dw_w_4d, cnv_padded, 1, 1, 0, 0, 1, 1);
+    } else {
+        // First chunk: zero-pad left by K-1 (same as NeMo's first-call behavior)
+        cnv = ggml_cont(ctx0, ggml_transpose(ctx0, cnv));
+        cnv = ggml_reshape_4d(ctx0, cnv, T_new, 1, d, 1);
+        cnv = ggml_conv_2d_dw_direct(ctx0, dw_w_4d, cnv, 1, 1, K - 1, 0, 1, 1);
+    }
     {
         cnv = ggml_view_4d(ctx0, cnv, T_new, cnv->ne[1], cnv->ne[2], cnv->ne[3], cnv->nb[1], cnv->nb[2], cnv->nb[3], 0);
         cnv = ggml_cont(ctx0, cnv);
@@ -899,8 +952,9 @@ static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, g
 
     ggml_tensor* pw1_w = ggml_reshape_2d(ctx0, e.conv_pw1_w, d, 2 * d);
     ggml_tensor* cnv = mm_bias(pw1_w, x, e.conv_pw1_b);
-    // NeMo Conformer GLU: first_half=value, second_half=gate → non-swapped siglu
-    cnv = ggml_siglu(ctx0, cnv);
+    // NeMo Conformer GLU: first_half * sigmoid(second_half) = swapped siglu
+    // ggml_siglu does sigmoid(first) * second; ggml_siglu_swapped does first * sigmoid(second)
+    cnv = ggml_siglu_swapped(ctx0, cnv);
 
     // DW conv (kernel K, CAUSAL padding: left=K-1, right=0)
     // ggml_conv_2d_dw_direct only supports symmetric padding, so we use
@@ -919,7 +973,6 @@ static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, g
     }
     cnv = ggml_cont(ctx0, ggml_permute(ctx0, cnv, 1, 2, 0, 3));
     cnv = ggml_reshape_2d(ctx0, cnv, d, T);
-
     // LayerNorm (replaces BN-folded bias add in parakeet)
     if (e.conv_ln_w && e.conv_ln_b) {
         cnv = ggml_norm_affine(ctx0, cnv, e.conv_ln_w, e.conv_ln_b, eps);
@@ -980,10 +1033,10 @@ static ggml_cgraph* nemotron_build_graph_encoder(nemotron_context* ctx, int T_me
     ggml_set_input(pos_enc);
 
     // ----- Window mask for cache-aware streaming attention -----
-    // NEMOTRON_NO_WINDOW_MASK=1 → bidirectional attention (for A/B testing).
+    // CRISPASR_NEMOTRON_NO_WINDOW_MASK=1 → bidirectional attention (for A/B testing).
     // Default: banded attention with att_context_left/right.
     ggml_tensor* window_mask_t = nullptr;
-    const bool use_window_mask = !getenv("NEMOTRON_NO_WINDOW_MASK");
+    const bool use_window_mask = !getenv("CRISPASR_CRISPASR_NEMOTRON_NO_WINDOW_MASK");
     if (use_window_mask && T > 0) {
         window_mask_t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, T, T);
         ggml_set_name(window_mask_t, "window_mask");
@@ -1010,6 +1063,19 @@ static ggml_cgraph* nemotron_build_graph_encoder(nemotron_context* ctx, int T_me
 }
 
 // ===========================================================================
+// Lazy-init backend scheduler (replaces per-call gallocr)
+// ===========================================================================
+
+static bool nemotron_ensure_sched(nemotron_context* ctx) {
+    if (ctx->sched)
+        return true;
+    ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+    int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
+    ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+    return ctx->sched != nullptr;
+}
+
+// ===========================================================================
 // Run encoder: mel → encoder output
 // ===========================================================================
 
@@ -1017,16 +1083,11 @@ static bool nemotron_run_encoder(nemotron_context* ctx, const float* mel, int n_
                                  std::vector<float>& enc_out, int& T_enc, int& d_model_out) {
     ggml_cgraph* gf = nemotron_build_graph_encoder(ctx, T_mel);
 
-    // Allocate with gallocr
-    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-    if (!ggml_gallocr_reserve(alloc, gf)) {
-        fprintf(stderr, "nemotron: gallocr reserve failed\n");
-        ggml_gallocr_free(alloc);
+    if (!nemotron_ensure_sched(ctx))
         return false;
-    }
-    if (!ggml_gallocr_alloc_graph(alloc, gf)) {
-        fprintf(stderr, "nemotron: gallocr alloc failed\n");
-        ggml_gallocr_free(alloc);
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "nemotron: sched alloc encoder graph failed\n");
         return false;
     }
 
@@ -1052,23 +1113,34 @@ static bool nemotron_run_encoder(nemotron_context* ctx, const float* mel, int n_
         int right = ctx->model.hparams.att_context_right[preset];
         auto wm = build_window_mask(T_enc, left, right);
         ggml_backend_tensor_set(wm_t, wm.data(), 0, wm.size() * sizeof(ggml_fp16_t));
-        fprintf(stderr, "nemotron: streaming attention L=%d R=%d (NEMOTRON_NO_WINDOW_MASK to disable)\n", left, right);
+        fprintf(stderr, "nemotron: streaming attention L=%d R=%d (CRISPASR_NEMOTRON_NO_WINDOW_MASK to disable)\n", left,
+                right);
     }
 
     // Run
-    if (ctx->backend_cpu) {
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "nemotron: encoder graph compute failed\n");
+        return false;
     }
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
-    }
-    ggml_backend_graph_compute(ctx->backend, gf);
 
     // Read output: (d_model, T_enc) in column-major → row-major (T_enc, d_model)
     enc_out.resize((size_t)T_enc * d_model_out);
     ggml_backend_tensor_get(enc_out_t, enc_out.data(), 0, enc_out.size() * sizeof(float));
 
-    ggml_gallocr_free(alloc);
+    if (getenv("CRISPASR_NEMOTRON_DEBUG")) {
+        float emin = 1e30f, emax = -1e30f, esum = 0.0f;
+        for (size_t i = 0; i < enc_out.size(); i++) {
+            float v = enc_out[i];
+            if (v < emin)
+                emin = v;
+            if (v > emax)
+                emax = v;
+            esum += v;
+        }
+        fprintf(stderr, "nemotron: default enc_out T=%d d=%d min=%.4f max=%.4f mean=%.6f\n", T_enc, d_model_out, emin,
+                emax, esum / (float)enc_out.size());
+    }
+
     return true;
 }
 
@@ -1087,16 +1159,18 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
     const auto& m = ctx->model;
     const int n_layers = (int)hp.n_layers;
     const int preset = ctx->att_context_preset;
-    const int L = hp.att_context_left[preset];  // left context frames
+    const int L = hp.att_context_left[preset];  // left context frames (cache_last_channel)
     const int R = hp.att_context_right[preset]; // right context frames
     const int chunk_size = R + 1;               // new frames per chunk
     const int K = (int)hp.conv_kernel;
     const int d = d_model;
 
-    fprintf(stderr, "nemotron: chunked encoder L=%d R=%d chunk=%d T_enc=%d layers=%d\n", L, R, chunk_size, T_enc,
-            n_layers);
+    fprintf(stderr, "nemotron: chunked encoder (streaming) L=%d R=%d chunk=%d T_enc=%d layers=%d\n", L, R, chunk_size,
+            T_enc, n_layers);
 
-    // Initialize per-layer caches
+    // Initialize per-layer caches.
+    // k_cache stores post-FFN1 output (NeMo's cache_last_channel): the input
+    // to the self-attention K/V projections.  Up to L frames per layer.
     ctx->enc_cache.resize(n_layers);
     for (int il = 0; il < n_layers; il++) {
         auto& c = ctx->enc_cache[il];
@@ -1107,16 +1181,8 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
         c.conv_cached = 0;
     }
 
-    // Split input into chunks
     int n_chunks = (T_enc + chunk_size - 1) / chunk_size;
     enc_out.resize((size_t)T_enc * d);
-
-    // Current layer input for the full sequence — starts as pre_enc, then
-    // gets overwritten layer by layer for each chunk
-    // We process chunk-by-chunk, and for each chunk all layers sequentially.
-    // layer_input[il] holds the output of layer il for all processed frames so far.
-    std::vector<std::vector<float>> layer_output(n_layers + 1);
-    layer_output[0].assign(pre_enc, pre_enc + (size_t)T_enc * d);
 
     core_conformer::BlockParams bp;
     bp.d = d;
@@ -1126,21 +1192,17 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
     bp.ln_eps = kLayerNormEps;
 
     // Streaming graph cache keyed by (layer, T_new, T_cache).
-    // Uses nemotron_build_block_streaming: FFN1 on new only, Q new / KV [cache,new],
-    // conv on new with causal pad, FFN2+LN on new. Caches post-FFN1 for next chunk.
+    // Uses nemotron_build_block_streaming: FFN1 on new only, Q from new,
+    // K/V from [cache_ch + new_post_ffn1], conv with causal pad, FFN2+LN on new.
     struct layer_graph {
         ggml_context* ctx0 = nullptr;
         ggml_cgraph* gf = nullptr;
-        ggml_gallocr_t alloc = nullptr;
     };
     std::map<std::tuple<int, int, int>, layer_graph> graph_cache;
 
-    // Use the non-streaming block (full window): pass [cached, new] through the
-    // complete conformer block. Simpler and includes rel-pos bias. The cached
-    // frames get re-processed through FFN1 but FFN1 is pointwise so this is
-    // mathematically equivalent to NeMo's cache_last_channel approach.
-    auto get_or_build = [&](int il, int T_win) -> layer_graph& {
-        auto key = std::make_tuple(il, T_win, 0);
+    auto get_or_build = [&](int il, int T_new, int T_cache, bool has_conv_cache) -> layer_graph& {
+        // Key includes has_conv_cache (bit-packed into T_cache sign is awkward; use a 4th field)
+        auto key = std::make_tuple(il, T_new, T_cache + (has_conv_cache ? 10000 : 0));
         auto it = graph_cache.find(key);
         if (it != graph_cache.end())
             return it->second;
@@ -1150,25 +1212,54 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
         layer_graph lg;
         lg.ctx0 = ggml_init(ip2);
         lg.gf = ggml_new_graph_custom(lg.ctx0, 2048, false);
-        ggml_tensor* inp2 = ggml_new_tensor_2d(lg.ctx0, GGML_TYPE_F32, d, T_win);
-        ggml_set_name(inp2, "block_in");
-        ggml_set_input(inp2);
-        ggml_tensor* pos2 = ggml_new_tensor_2d(lg.ctx0, GGML_TYPE_F32, d, 2 * T_win - 1);
+
+        // Input: new frames (pre-FFN1 input for this layer)
+        ggml_tensor* inp_new = ggml_new_tensor_2d(lg.ctx0, GGML_TYPE_F32, d, T_new);
+        ggml_set_name(inp_new, "block_in");
+        ggml_set_input(inp_new);
+
+        // Cache: post-FFN1 output from previous chunks (nullptr for first chunk)
+        ggml_tensor* cache_ch = nullptr;
+        if (T_cache > 0) {
+            cache_ch = ggml_new_tensor_2d(lg.ctx0, GGML_TYPE_F32, d, T_cache);
+            ggml_set_name(cache_ch, "cache_ch");
+            ggml_set_input(cache_ch);
+        }
+
+        // Conv cache: last K-1 frames of pre-DW-conv signal from previous chunk
+        ggml_tensor* conv_cache = nullptr;
+        if (has_conv_cache) {
+            conv_cache = ggml_new_tensor_2d(lg.ctx0, GGML_TYPE_F32, d, K - 1);
+            ggml_set_name(conv_cache, "conv_cache_in");
+            ggml_set_input(conv_cache);
+        }
+
+        // Pos enc covers the full attention window
+        int T_full = T_cache + T_new;
+        ggml_tensor* pos2 = ggml_new_tensor_2d(lg.ctx0, GGML_TYPE_F32, d, 2 * T_full - 1);
         ggml_set_name(pos2, "pos_enc");
         ggml_set_input(pos2);
-        ggml_tensor* out2 = nemotron_build_block(lg.ctx0, inp2, pos2, T_win, m.enc[il], bp, nullptr);
+
+        ggml_tensor* out2 =
+            nemotron_build_block_streaming(lg.ctx0, inp_new, cache_ch, conv_cache, pos2, T_new, T_cache, m.enc[il], bp);
         ggml_set_name(out2, "block_out");
         ggml_set_output(out2);
         ggml_build_forward_expand(lg.gf, out2);
-        lg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-        ggml_gallocr_reserve(lg.alloc, lg.gf);
-        ggml_gallocr_alloc_graph(lg.alloc, lg.gf);
+
+        // Also expand cache outputs — they're not reachable from block_out's
+        // dependency tree. Find them by scanning the ggml context's tensor list.
+        for (ggml_tensor* t = ggml_get_first_tensor(lg.ctx0); t; t = ggml_get_next_tensor(lg.ctx0, t)) {
+            if (t->name && (std::string(t->name) == "cache_ch_out" || std::string(t->name) == "conv_cache_out")) {
+                ggml_build_forward_expand(lg.gf, t);
+            }
+        }
+
         graph_cache[key] = lg;
         return graph_cache[key];
     };
 
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (!nemotron_ensure_sched(ctx))
+        return false;
 
     // Process each chunk
     for (int ci = 0; ci < n_chunks; ci++) {
@@ -1176,44 +1267,116 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
         int t_end = std::min(t_start + chunk_size, T_enc);
         int n_new = t_end - t_start;
 
+        // chunk_in: this chunk's input to each layer (starts as pre_enc slice,
+        // then gets replaced with each layer's output)
         std::vector<float> chunk_in(pre_enc + (size_t)t_start * d, pre_enc + (size_t)t_end * d);
 
         for (int il = 0; il < n_layers; il++) {
             auto& cache = ctx->enc_cache[il];
             int n_ctx = std::min(cache.n_cached, L);
-            int T_win = n_ctx + n_new;
 
-            // Assemble [cached, new] window
-            std::vector<float> win_input((size_t)T_win * d);
-            if (n_ctx > 0 && !cache.k_cache.empty()) {
-                int off = cache.n_cached - n_ctx;
-                memcpy(win_input.data(), cache.k_cache.data() + (size_t)off * d, (size_t)n_ctx * d * sizeof(float));
+            bool has_conv = (cache.conv_cached > 0);
+            auto& lg = get_or_build(il, n_new, n_ctx, has_conv);
+
+            ggml_backend_sched_reset(ctx->sched);
+            if (!ggml_backend_sched_alloc_graph(ctx->sched, lg.gf)) {
+                fprintf(stderr, "nemotron: sched alloc streaming layer %d failed\n", il);
+                return false;
             }
-            memcpy(win_input.data() + (size_t)n_ctx * d, chunk_in.data(), (size_t)n_new * d * sizeof(float));
 
-            auto& lg = get_or_build(il, T_win);
-
+            // Set new frames input
             ggml_tensor* inp_t = ggml_graph_get_tensor(lg.gf, "block_in");
-            ggml_backend_tensor_set(inp_t, win_input.data(), 0, (size_t)T_win * d * sizeof(float));
+            if (!inp_t) {
+                fprintf(stderr, "nemotron: BUG block_in nil ci=%d il=%d n_new=%d n_ctx=%d\n", ci, il, n_new, n_ctx);
+                return false;
+            }
+            ggml_backend_tensor_set(inp_t, chunk_in.data(), 0, (size_t)n_new * d * sizeof(float));
 
-            auto pe = core_conformer::make_pos_enc(d, T_win);
+            // Set cache_last_channel (post-FFN1 from previous chunks)
+            if (n_ctx > 0) {
+                ggml_tensor* cache_t = ggml_graph_get_tensor(lg.gf, "cache_ch");
+                if (!cache_t) {
+                    fprintf(stderr, "nemotron: BUG cache_ch nil ci=%d il=%d n_ctx=%d\n", ci, il, n_ctx);
+                    return false;
+                }
+                int off = cache.n_cached - n_ctx;
+                ggml_backend_tensor_set(cache_t, cache.k_cache.data() + (size_t)off * d, 0,
+                                        (size_t)n_ctx * d * sizeof(float));
+            }
+
+            // Set conv cache (pre-DW-conv signal from previous chunk)
+            if (has_conv) {
+                ggml_tensor* cc_t = ggml_graph_get_tensor(lg.gf, "conv_cache_in");
+                if (cc_t) {
+                    ggml_backend_tensor_set(cc_t, cache.conv_cache.data(), 0, (size_t)(K - 1) * d * sizeof(float));
+                }
+            }
+
+            // Set pos enc for the full attention window (cache + new)
+            int T_full = n_ctx + n_new;
+            auto pe = core_conformer::make_pos_enc(d, T_full);
             ggml_tensor* pos_t = ggml_graph_get_tensor(lg.gf, "pos_enc");
+            if (!pos_t) {
+                fprintf(stderr, "nemotron: pos_enc tensor missing (il=%d)\n", il);
+                return false;
+            }
             ggml_backend_tensor_set(pos_t, pe.data(), 0, pe.size() * sizeof(float));
 
-            ggml_backend_graph_compute(ctx->backend, lg.gf);
+            if (ggml_backend_sched_graph_compute(ctx->sched, lg.gf) != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "nemotron: streaming layer %d compute failed\n", il);
+                return false;
+            }
 
-            // Read full window output, extract last n_new frames
+            // Read block output (new frames only, shape (d, n_new))
             ggml_tensor* out_t = ggml_graph_get_tensor(lg.gf, "block_out");
-            std::vector<float> win_output((size_t)T_win * d);
-            ggml_backend_tensor_get(out_t, win_output.data(), 0, win_output.size() * sizeof(float));
+            chunk_in.resize((size_t)n_new * d);
+            ggml_backend_tensor_get(out_t, chunk_in.data(), 0, chunk_in.size() * sizeof(float));
 
-            chunk_in.assign(win_output.data() + (size_t)n_ctx * d, win_output.data() + (size_t)(n_ctx + n_new) * d);
+            // Read post-FFN1 output for cache update
+            ggml_tensor* cache_out = ggml_graph_get_tensor(lg.gf, "cache_ch_out");
+            if (cache_out) {
+                std::vector<float> new_cache((size_t)n_new * d);
+                ggml_backend_tensor_get(cache_out, new_cache.data(), 0, new_cache.size() * sizeof(float));
 
-            // Cache: keep last min(L, T_win) frames of block output
-            int keep = std::min(L, T_win);
-            int skip = T_win - keep;
-            cache.k_cache.assign(win_output.begin() + (size_t)skip * d, win_output.end());
-            cache.n_cached = keep;
+                // Append to cache and trim to L frames
+                cache.k_cache.insert(cache.k_cache.end(), new_cache.begin(), new_cache.end());
+                cache.n_cached += n_new;
+                if (cache.n_cached > L) {
+                    int excess = cache.n_cached - L;
+                    cache.k_cache.erase(cache.k_cache.begin(), cache.k_cache.begin() + (size_t)excess * d);
+                    cache.n_cached = L;
+                }
+            }
+
+            // Read conv cache output (last K-1 frames of pre-DW-conv signal)
+            ggml_tensor* conv_out = ggml_graph_get_tensor(lg.gf, "conv_cache_out");
+            if (conv_out) {
+                int conv_frames = (int)conv_out->ne[1];
+                if (conv_frames == K - 1) {
+                    cache.conv_cache.resize((size_t)(K - 1) * d);
+                    ggml_backend_tensor_get(conv_out, cache.conv_cache.data(), 0, (size_t)(K - 1) * d * sizeof(float));
+                    cache.conv_cached = K - 1;
+                } else {
+                    // Small chunk: save what we have, pad rest with zeros
+                    cache.conv_cache.assign((size_t)(K - 1) * d, 0.0f);
+                    size_t copy = (size_t)conv_frames * d;
+                    size_t offset = (size_t)(K - 1 - conv_frames) * d;
+                    ggml_backend_tensor_get(conv_out, cache.conv_cache.data() + offset, 0, copy * sizeof(float));
+                    cache.conv_cached = K - 1;
+                }
+            }
+
+            // Debug: print per-layer stats for first chunk
+            if (ci == 0 && getenv("CRISPASR_NEMOTRON_DEBUG")) {
+                float lmin = 1e30f, lmax = -1e30f;
+                for (size_t i = 0; i < chunk_in.size(); i++) {
+                    if (chunk_in[i] < lmin)
+                        lmin = chunk_in[i];
+                    if (chunk_in[i] > lmax)
+                        lmax = chunk_in[i];
+                }
+                fprintf(stderr, "  layer %d output: min=%.2f max=%.2f\n", il, lmin, lmax);
+            }
         }
 
         memcpy(enc_out.data() + (size_t)t_start * d, chunk_in.data(), (size_t)n_new * d * sizeof(float));
@@ -1226,10 +1389,22 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
 
     // Cleanup
     for (auto& [key, lg] : graph_cache) {
-        ggml_gallocr_free(lg.alloc);
         ggml_free(lg.ctx0);
     }
 
+    if (getenv("CRISPASR_NEMOTRON_DEBUG")) {
+        float emin = 1e30f, emax = -1e30f, esum = 0.0f;
+        for (size_t i = 0; i < enc_out.size(); i++) {
+            float v = enc_out[i];
+            if (v < emin)
+                emin = v;
+            if (v > emax)
+                emax = v;
+            esum += v;
+        }
+        fprintf(stderr, "nemotron: chunked enc_out T=%d d=%d min=%.4f max=%.4f mean=%.6f\n", T_enc, d, emin, emax,
+                esum / (float)enc_out.size());
+    }
     fprintf(stderr, "nemotron: chunked encoder done\n");
     return true;
 }
@@ -1436,6 +1611,306 @@ static std::vector<nemotron_emitted_token> nemotron_rnnt_decode(nemotron_context
 }
 
 // ===========================================================================
+// RNN-T beam search decode
+// ===========================================================================
+// Same structure as greedy decode above but expands top-B hypotheses at
+// each step and prunes globally by cumulative log-probability.
+// When beam_size==1 produces bit-identical output to greedy.
+// LSTM state snapshots are plain vector copies (~few KB per beam).
+
+static std::vector<nemotron_emitted_token> nemotron_rnnt_beam_decode(nemotron_context* ctx, const float* enc, int T_enc,
+                                                                     int d_model, int beam_size) {
+    nemotron_init_pred_weights(ctx);
+    nemotron_init_joint_weights(ctx);
+
+    const auto& W = ctx->pred_w;
+    const auto& J = ctx->joint_w;
+    const int blank_id = (int)ctx->model.hparams.blank_id;
+    const int n_vocab = J.vocab_total; // vocab + blank
+    const int max_per_step = 10;
+    const int B = std::max(1, beam_size);
+
+    struct Hyp {
+        nemotron_lstm_state lstm;
+        std::vector<float> pred_out;
+        int t = 0;
+        int n_inner = 0;
+        double cum_logprob = 0.0;
+        std::vector<nemotron_emitted_token> emitted;
+        bool active = true;
+    };
+
+    // Seed: single hypothesis at t=0 with SOS predictor state
+    std::vector<Hyp> beam(1);
+    {
+        auto& h = beam[0];
+        h.lstm.init(W.H);
+        predictor_step(W, blank_id, h.lstm, h.pred_out);
+        h.emitted.reserve(256);
+    }
+
+    std::vector<float> proj_e(J.joint_hidden);
+    std::vector<float> logits(n_vocab);
+
+    for (;;) {
+        bool any_active = false;
+        for (const auto& h : beam)
+            if (h.active) {
+                any_active = true;
+                break;
+            }
+        if (!any_active)
+            break;
+
+        struct Candidate {
+            int parent;
+            int token;
+            double cum_logprob;
+            float tok_p;
+        };
+        std::vector<Candidate> cands;
+        cands.reserve((size_t)beam.size() * (size_t)(B + 1));
+
+        for (int bi = 0; bi < (int)beam.size(); bi++) {
+            auto& h = beam[bi];
+            if (!h.active) {
+                cands.push_back({bi, -1, h.cum_logprob, 0.0f});
+                continue;
+            }
+
+            joint_proj_enc(J, enc + (size_t)h.t * d_model, proj_e);
+            joint_step(J, proj_e.data(), h.pred_out.data(), logits);
+
+            // Log-partition (log-sum-exp) over all tokens
+            float max_logit = logits[0];
+            for (int v = 1; v < n_vocab; v++)
+                if (logits[v] > max_logit)
+                    max_logit = logits[v];
+            double logZ = 0.0;
+            for (int v = 0; v < n_vocab; v++)
+                logZ += std::exp((double)(logits[v] - max_logit));
+            logZ = (double)max_logit + std::log(logZ);
+
+            // Top-B tokens
+            std::vector<int> top_ids(std::min(B, n_vocab));
+            std::vector<float> top_vals(top_ids.size(), -1e30f);
+            for (int v = 0; v < n_vocab; v++) {
+                int mi = 0;
+                for (int j = 1; j < (int)top_ids.size(); j++)
+                    if (top_vals[j] < top_vals[mi])
+                        mi = j;
+                if (logits[v] > top_vals[mi]) {
+                    top_vals[mi] = logits[v];
+                    top_ids[mi] = v;
+                }
+            }
+            // Ensure blank is always a candidate
+            bool has_blank = false;
+            for (int id : top_ids)
+                if (id == blank_id) {
+                    has_blank = true;
+                    break;
+                }
+            if (!has_blank)
+                top_ids.push_back(blank_id);
+
+            for (int id : top_ids) {
+                double log_p = (double)logits[id] - logZ;
+                float tok_p = (float)std::exp(log_p);
+                cands.push_back({bi, id, h.cum_logprob + log_p, tok_p});
+            }
+        }
+
+        // Global prune: keep top-B
+        const size_t keep = std::min<size_t>((size_t)B, cands.size());
+        std::partial_sort(cands.begin(), cands.begin() + (ptrdiff_t)keep, cands.end(),
+                          [](const Candidate& a, const Candidate& b) { return a.cum_logprob > b.cum_logprob; });
+        cands.resize(keep);
+
+        std::vector<Hyp> next_beam;
+        next_beam.reserve(keep);
+
+        for (auto& c : cands) {
+            const auto& parent = beam[c.parent];
+
+            if (c.token < 0) {
+                next_beam.push_back(parent);
+                next_beam.back().active = false;
+                continue;
+            }
+
+            Hyp nh;
+            nh.lstm = parent.lstm;
+            nh.pred_out = parent.pred_out;
+            nh.cum_logprob = c.cum_logprob;
+            nh.emitted = parent.emitted;
+
+            if (c.token == blank_id) {
+                // Blank: advance frame by 1
+                nh.t = parent.t + 1;
+                nh.n_inner = 0;
+            } else {
+                // Real token: emit, advance predictor, stay on frame
+                nh.emitted.push_back({c.token, parent.t, parent.t + 1, c.tok_p});
+                predictor_step(W, c.token, nh.lstm, nh.pred_out);
+                nh.t = parent.t;
+                nh.n_inner = parent.n_inner + 1;
+                if (nh.n_inner >= max_per_step) {
+                    nh.t = parent.t + 1;
+                    nh.n_inner = 0;
+                }
+            }
+
+            nh.active = (nh.t < T_enc);
+            next_beam.push_back(std::move(nh));
+        }
+
+        beam = std::move(next_beam);
+    }
+
+    if (beam.empty())
+        return {};
+    int best = 0;
+    for (int i = 1; i < (int)beam.size(); i++)
+        if (beam[i].cum_logprob > beam[best].cum_logprob)
+            best = i;
+    return std::move(beam[best].emitted);
+}
+
+// ===========================================================================
+// MAES (Modified Adaptive Expansion Search) for RNNT
+// ===========================================================================
+// Time-synchronous beam search: process ALL beams at the same encoder frame,
+// allow up to maes_num_steps non-blank expansions per frame, prune with
+// gamma-threshold. Blank always advances by 1 frame.
+
+static std::vector<nemotron_emitted_token> nemotron_rnnt_maes_decode(nemotron_context* ctx, const float* enc, int T_enc,
+                                                                     int d_model, int beam_size, int maes_num_steps = 2,
+                                                                     float maes_gamma = 2.3f, int maes_beta = 2) {
+    nemotron_init_pred_weights(ctx);
+    nemotron_init_joint_weights(ctx);
+
+    const auto& W = ctx->pred_w;
+    const auto& J = ctx->joint_w;
+    const int blank_id = (int)ctx->model.hparams.blank_id;
+    const int n_vocab = J.vocab_total;
+    const int B = std::max(1, beam_size);
+    const int topk = B + maes_beta;
+
+    struct Hyp {
+        nemotron_lstm_state lstm;
+        std::vector<float> pred_out;
+        double score = 0.0;
+        std::vector<nemotron_emitted_token> emitted;
+    };
+
+    std::vector<Hyp> kept(1);
+    {
+        auto& h = kept[0];
+        h.lstm.init(W.H);
+        predictor_step(W, blank_id, h.lstm, h.pred_out);
+        h.emitted.reserve(256);
+    }
+
+    std::vector<float> proj_e(J.joint_hidden);
+    std::vector<float> logits(n_vocab);
+
+    for (int t = 0; t < T_enc; t++) {
+        joint_proj_enc(J, enc + (size_t)t * d_model, proj_e);
+
+        std::vector<Hyp> hyps = kept;
+        std::vector<Hyp> list_b;
+
+        for (int n = 0; n < maes_num_steps; n++) {
+            std::vector<Hyp> list_exp;
+
+            for (auto& h : hyps) {
+                joint_step(J, proj_e.data(), h.pred_out.data(), logits);
+
+                // Log-softmax
+                float max_l = logits[0];
+                for (int v = 1; v < n_vocab; v++)
+                    if (logits[v] > max_l)
+                        max_l = logits[v];
+                double logZ = 0.0;
+                for (int v = 0; v < n_vocab; v++)
+                    logZ += std::exp((double)(logits[v] - max_l));
+                logZ = (double)max_l + std::log(logZ);
+
+                // Top-k + gamma pruning
+                std::vector<std::pair<float, int>> topk_pairs(n_vocab);
+                for (int v = 0; v < n_vocab; v++)
+                    topk_pairs[v] = {logits[v], v};
+                std::partial_sort(topk_pairs.begin(), topk_pairs.begin() + std::min(topk, n_vocab), topk_pairs.end(),
+                                  [](const auto& a, const auto& b) { return a.first > b.first; });
+
+                double best_exp = h.score + ((double)topk_pairs[0].first - logZ);
+                for (int k = 0; k < std::min(topk, n_vocab); k++) {
+                    double new_score = h.score + ((double)topk_pairs[k].first - logZ);
+                    if (new_score < best_exp - (double)maes_gamma)
+                        continue;
+
+                    int tok = topk_pairs[k].second;
+                    if (tok == blank_id) {
+                        Hyp bh;
+                        bh.lstm = h.lstm;
+                        bh.pred_out = h.pred_out;
+                        bh.score = new_score;
+                        bh.emitted = h.emitted;
+                        list_b.push_back(std::move(bh));
+                    } else {
+                        Hyp nh;
+                        nh.lstm = h.lstm;
+                        nh.score = new_score;
+                        nh.emitted = h.emitted;
+                        nh.emitted.push_back({tok, t, t + 1, (float)std::exp(new_score - h.score)});
+                        predictor_step(W, tok, nh.lstm, nh.pred_out);
+                        list_exp.push_back(std::move(nh));
+                    }
+                }
+            }
+
+            if (list_exp.empty())
+                break;
+
+            if (n < maes_num_steps - 1) {
+                hyps = std::move(list_exp);
+            } else {
+                // Last expansion step: score remaining expansions with blank
+                for (auto& nh : list_exp) {
+                    joint_step(J, proj_e.data(), nh.pred_out.data(), logits);
+                    float max_l = logits[0];
+                    for (int v = 1; v < n_vocab; v++)
+                        if (logits[v] > max_l)
+                            max_l = logits[v];
+                    double logZ2 = 0.0;
+                    for (int v = 0; v < n_vocab; v++)
+                        logZ2 += std::exp((double)(logits[v] - max_l));
+                    logZ2 = (double)max_l + std::log(logZ2);
+                    nh.score += ((double)logits[blank_id] - logZ2);
+                    list_b.push_back(std::move(nh));
+                }
+            }
+        }
+
+        if ((int)list_b.size() > B) {
+            std::partial_sort(list_b.begin(), list_b.begin() + B, list_b.end(),
+                              [](const Hyp& a, const Hyp& b) { return a.score > b.score; });
+            list_b.resize(B);
+        }
+        kept = std::move(list_b);
+    }
+
+    if (kept.empty())
+        return {};
+    int best = 0;
+    for (int i = 1; i < (int)kept.size(); i++)
+        if (kept[i].score > kept[best].score)
+            best = i;
+    return std::move(kept[best].emitted);
+}
+
+// ===========================================================================
 // Token → text conversion
 // ===========================================================================
 
@@ -1553,6 +2028,20 @@ extern "C" struct nemotron_context* nemotron_init_from_file(const char* path_mod
         return nullptr;
     }
 
+    // CRISPASR_NEMOTRON_CONTEXT_PRESET=N selects attention context preset
+    // 0: L=56, R=3  (streaming, chunk=4)
+    // 1: L=56, R=0  (left-only)
+    // 2: L=56, R=6  (chunk=7)
+    // 3: L=56, R=13 (chunk=14, best quality)
+    if (const char* s = getenv("CRISPASR_NEMOTRON_CONTEXT_PRESET")) {
+        int p = atoi(s);
+        if (p >= 0 && p < (int)ctx->model.hparams.n_att_context_presets) {
+            ctx->att_context_preset = p;
+            fprintf(stderr, "nemotron: context preset %d (L=%d, R=%d)\n", p, ctx->model.hparams.att_context_left[p],
+                    ctx->model.hparams.att_context_right[p]);
+        }
+    }
+
     return ctx;
 }
 
@@ -1560,6 +2049,8 @@ extern "C" void nemotron_free(struct nemotron_context* ctx) {
     if (!ctx)
         return;
 
+    if (ctx->sched)
+        ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
         ggml_backend_buffer_free(ctx->model.buf);
     if (ctx->model.ctx)
@@ -1602,36 +2093,18 @@ extern "C" struct nemotron_result* nemotron_transcribe_ex(struct nemotron_contex
     if (mel.empty() || T_mel <= 0)
         return nullptr;
 
-    // Run encoder — use cache-aware chunked path (NEMOTRON_BATCH=1 for old bidirectional path)
+    // Run encoder — default: full-sequence with chunked_limited attention mask.
+    // CRISPASR_NEMOTRON_STREAMING=1 selects the cache-aware streaming path.
     std::vector<float> enc_out;
     int T_enc = 0, d_model = 0;
-    const bool use_batch = getenv("NEMOTRON_BATCH");
-    if (use_batch) {
-        // Legacy: full-sequence bidirectional (doesn't produce tokens — for debugging only)
+    const bool use_chunked = getenv("CRISPASR_NEMOTRON_STREAMING");
+    if (!use_chunked) {
         if (!nemotron_run_encoder(ctx, mel.data(), (int)ctx->model.hparams.n_mels, T_mel, enc_out, T_enc, d_model))
             return nullptr;
     } else {
-        // Cache-aware chunked encoder (streaming-correct)
-        // Step 1: run pre-encode only (extract from the full graph)
-        if (!nemotron_run_encoder(ctx, mel.data(), (int)ctx->model.hparams.n_mels, T_mel, enc_out, T_enc, d_model))
-            return nullptr;
-        // enc_out now has the full bidirectional output — but we need the pre-encode output.
-        // TODO: extract pre-encode separately. For now, re-run with the pre-encode only.
-        // WORKAROUND: run the chunked encoder on the pre-encode output.
-        // We need to get the pre-encode output first. Let's add a tag for it.
-        // For now, we use the Kaggle-validated CPU pre-encode from the worktree approach.
-        // Actually — the simplest approach is to just run the chunked encoder directly
-        // on the mel, computing pre-encode first.
-
-        // For now, run the full-graph pre-encode and extract it
-        // The enc_out already has the bidirectional result; we need the pre-encode.
-        // Let's modify the graph to output pre-encode too... but that's complex.
-        // SIMPLER: just run chunked encoder on enc_out from the bidirectional path
-        // (won't work — the chunked encoder expects pre-encode input).
-
-        // The right fix: build a pre-encode-only graph, extract, then run chunked.
-        // For this first pass, let's build a separate pre-encode graph.
-        fprintf(stderr, "nemotron: running chunked encoder path\n");
+        // Cache-aware streaming encoder: pre-encode → chunked conformer layers.
+        // Step 1: run pre-encode only, step 2: chunked conformer with cache_last_channel.
+        fprintf(stderr, "nemotron: running streaming chunked encoder path\n");
 
         // Build pre-encode-only graph
         {
@@ -1653,16 +2126,25 @@ extern "C" struct nemotron_result* nemotron_transcribe_ex(struct nemotron_contex
             ggml_set_output(pre);
             ggml_build_forward_expand(gf, pre);
 
-            ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-            ggml_gallocr_reserve(alloc, gf);
-            ggml_gallocr_alloc_graph(alloc, gf);
+            if (!nemotron_ensure_sched(ctx)) {
+                ggml_free(ctx0);
+                return nullptr;
+            }
+            ggml_backend_sched_reset(ctx->sched);
+            if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+                fprintf(stderr, "nemotron: sched alloc pre-encode graph failed\n");
+                ggml_free(ctx0);
+                return nullptr;
+            }
 
             ggml_tensor* mel_in = ggml_graph_get_tensor(gf, "mel");
             ggml_backend_tensor_set(mel_in, mel.data(), 0, mel.size() * sizeof(float));
 
-            if (ggml_backend_is_cpu(ctx->backend))
-                ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
-            ggml_backend_graph_compute(ctx->backend, gf);
+            if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "nemotron: pre-encode compute failed\n");
+                ggml_free(ctx0);
+                return nullptr;
+            }
 
             ggml_tensor* pre_out = ggml_graph_get_tensor(gf, "pre_enc");
             T_enc = (int)pre_out->ne[1];
@@ -1670,7 +2152,20 @@ extern "C" struct nemotron_result* nemotron_transcribe_ex(struct nemotron_contex
             std::vector<float> pre_enc((size_t)T_enc * d_model);
             ggml_backend_tensor_get(pre_out, pre_enc.data(), 0, pre_enc.size() * sizeof(float));
 
-            ggml_gallocr_free(alloc);
+            {
+                float pmin = 1e30f, pmax = -1e30f, psum = 0.0f;
+                for (size_t i = 0; i < pre_enc.size(); i++) {
+                    float v = pre_enc[i];
+                    if (v < pmin)
+                        pmin = v;
+                    if (v > pmax)
+                        pmax = v;
+                    psum += v;
+                }
+                fprintf(stderr, "nemotron: pre-encode T=%d d=%d min=%.2f max=%.2f mean=%.4f\n", T_enc, d_model, pmin,
+                        pmax, psum / (float)pre_enc.size());
+            }
+
             ggml_free(ctx0);
 
             // Step 2: run chunked encoder on pre-encode output
@@ -1735,8 +2230,41 @@ extern "C" struct nemotron_result* nemotron_transcribe_ex(struct nemotron_contex
         fprintf(stderr, "nemotron: prompt kernel applied (prompt_id=%d)\n", prompt_id);
     }
 
+    if (getenv("CRISPASR_NEMOTRON_DEBUG")) {
+        float emin = 1e30f, emax = -1e30f;
+        for (size_t i = 0; i < enc_out.size(); i++) {
+            if (enc_out[i] < emin)
+                emin = enc_out[i];
+            if (enc_out[i] > emax)
+                emax = enc_out[i];
+        }
+        fprintf(stderr, "nemotron: post-prompt enc_out min=%.4f max=%.4f\n", emin, emax);
+        // Dump first 8 values of frames 0, 10, 50, 100
+        for (int tf : {0, 10, 50, 100}) {
+            if (tf < T_enc) {
+                fprintf(stderr, "  frame %d:", tf);
+                for (int k = 0; k < 8; k++)
+                    fprintf(stderr, " %.4f", enc_out[(size_t)tf * d_model + k]);
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+
     // RNN-T decode
-    auto emitted = nemotron_rnnt_decode(ctx, enc_out.data(), T_enc, d_model);
+    const int beam_sz = ctx->decode_beam_size;
+    const bool use_maes = ctx->decode_maes && beam_sz > 1;
+    auto emitted = use_maes        ? nemotron_rnnt_maes_decode(ctx, enc_out.data(), T_enc, d_model, beam_sz,
+                                                               ctx->maes_num_steps, ctx->maes_gamma, ctx->maes_beta)
+                   : (beam_sz > 1) ? nemotron_rnnt_beam_decode(ctx, enc_out.data(), T_enc, d_model, beam_sz)
+                                   : nemotron_rnnt_decode(ctx, enc_out.data(), T_enc, d_model);
+
+    if (getenv("CRISPASR_NEMOTRON_DEBUG")) {
+        fprintf(stderr, "nemotron: RNNT emitted %zu tokens\n", emitted.size());
+        for (size_t i = 0; i < std::min(emitted.size(), (size_t)5); i++) {
+            fprintf(stderr, "  tok %zu: id=%d t=%d-%d p=%.3f\n", i, emitted[i].id, emitted[i].t_start, emitted[i].t_end,
+                    emitted[i].p);
+        }
+    }
 
     // Build result
     auto* r = (nemotron_result*)calloc(1, sizeof(nemotron_result));
@@ -1794,9 +2322,9 @@ extern "C" void nemotron_set_language(struct nemotron_context* ctx, const char* 
     if (it != ctx->lang_to_prompt.end()) {
         ctx->prompt_id = it->second;
     } else {
-        // Default to English (en-US = index 7 in sorted lang order)
+        // Default to English (en-US = index 0 in NeMo's prompt_dictionary)
         fprintf(stderr, "nemotron: unknown language '%s', defaulting to en-US\n", lang_code);
-        ctx->prompt_id = 7;
+        ctx->prompt_id = 0;
     }
 }
 
@@ -1811,6 +2339,17 @@ extern "C" void nemotron_set_beam_size(struct nemotron_context* ctx, int beam_si
     if (!ctx)
         return;
     ctx->decode_beam_size = beam_size > 0 ? beam_size : 1;
+}
+
+extern "C" void nemotron_set_maes(struct nemotron_context* ctx, bool enable, int num_steps, float gamma, int beta) {
+    if (!ctx)
+        return;
+    ctx->decode_maes = enable;
+    if (enable) {
+        ctx->maes_num_steps = num_steps > 0 ? num_steps : 2;
+        ctx->maes_gamma = gamma > 0.0f ? gamma : 2.3f;
+        ctx->maes_beta = beta > 0 ? beta : 2;
+    }
 }
 
 extern "C" int nemotron_n_vocab(struct nemotron_context* ctx) {
