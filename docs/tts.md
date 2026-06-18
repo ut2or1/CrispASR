@@ -9,7 +9,7 @@ trade-off:
 | **`melotts`** | Multilingual VITS2 (MeloTTS). 4 English speakers (US/BR/India/AU). 44.1 kHz output, ~102 MB GGUF. Neural G2P + CMU dict. BERT companion (Q4_K 52 MB) auto-downloads with `-m auto`; also via `--codec-model` or `MELOTTS_BERT` env. | No (per-speaker ID) | ~154 MB via `-m auto` |
 | **`piper`** | Tiniest footprint (30 MB). rhasspy/piper VITS; 250+ community voices across 30+ languages. Built-in G2P (CMUdict + LTS rules) for English — no espeak-ng needed. Optional espeak-ng for other langs (loaded via dlopen). 22 kHz output. Use `--g2p-dict` to select dictionary source. | No (per-voice GGUF) | Manual `wget` |
 | **`kokoro`** | Smallest + fastest. 82 M-param StyleTTS2-derived model. Multilingual via built-in G2P or espeak-ng (dlopen/popen fallback). | No (preset voice packs) | Manual `wget` (no `-m auto`) |
-| **`qwen3-tts`** | Highest fidelity / strongest cloning. Speech-LLM (talker + code predictor + 12 Hz codec). | Yes (WAV + ref-text or baked voice GGUF) | ~1.3 GB via `-m auto` |
+| **`qwen3-tts`** | Highest fidelity / strongest cloning. Speech-LLM (talker + code predictor + 12 Hz codec). Default voice auto-downloaded with `-m auto`; or supply your own WAV + ref-text. | Optional (auto default voice; or WAV + ref-text or baked voice GGUF) | ~1.3 GB via `-m auto` |
 | **`vibevoice-tts`** | Lowest-latency streaming TTS, designed for realtime. | Preset voice packs | ~636 MB via `-m auto` |
 | **`vibevoice-1.5b`** | Base VibeVoice TTS model with WAV cloning. | Yes (`VIBEVOICE_VOICE_AUDIO=<wav>` or `--voice <wav>`) | ~1.6 GB via `-m auto` |
 | **`orpheus`** | Llama-3.2-3B talker + SNAC 24 kHz codec. 8 baked English speakers; expressive output. Greedy loops — pass `--temperature 0.6`. | Preset names via `--voice tara/leah/...` | ~3.5 GB via `-m auto` (talker Q8 + 26 MB SNAC) |
@@ -198,11 +198,17 @@ pulled into `~/.cache/crispasr/` on first run (Q8_0 talker + F16
 codec by default).
 
 ```bash
-# Auto-download, runtime WAV clone (~1.3 GB on first run):
+# Zero-setup: auto-downloads talker + codec + default voice pack (~1.3 GB):
+./build/bin/crispasr \
+    --backend qwen3-tts -m auto \
+    --tts "Hello there" \
+    --tts-output hello.wav
+
+# Runtime WAV clone — supply your own reference:
 ./build/bin/crispasr \
     --backend qwen3-tts -m auto \
     --voice samples/qwen3_tts/clone.wav \
-    --ref-text "Okay, yeah. I resent you, I love you, I respect you. But you know what - You blew it, and thanks to you." \
+    --ref-text "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you." \
     --tts "Hello there" \
     --tts-output hello.wav
 
@@ -218,7 +224,7 @@ codec by default).
 # Baked voice-pack GGUF (skips the WAV+ref-text step):
 ./build/bin/crispasr \
     --backend qwen3-tts -m auto \
-    --voice /tmp/qwen3-tts-voice-pack.gguf \
+    --voice my-voice.gguf \
     --tts "Hello there" \
     --tts-output hello.wav
 
@@ -243,6 +249,10 @@ codec by default).
 ```
 
 Notes:
+- **No `--voice` needed**: `-m auto` downloads a baked default voice pack
+  (`qwen3-tts-voice-default.gguf`) alongside the talker and codec so the
+  Base model works out of the box. The default voice is auto-selected when
+  no `--voice` flag is given and the GGUF sits next to the talker.
 - When `--voice` points to a `.wav`, `--ref-text` is required. When it
   points to a `.gguf`, it is treated as a baked voice pack and
   `--ref-text` is ignored.
@@ -273,7 +283,8 @@ defaults reproduce the validated, end-to-end-tested code path.
 | `QWEN3_TTS_PROF` | unset | Per-op profiler (more granular than `BENCH`). |
 | `QWEN3_TTS_CP_BACKEND` | unset | Pin the code predictor to a chosen backend. `cpu`, `cpu-f16`, `cpu-f32` keep its weights on the CPU backend — useful when isolating bugs to the talker vs. code-predictor or when comparing CPU and Metal end-to-end. |
 | `QWEN3_TTS_DUMP_DIR` | unset | Write per-frame intermediate tensors into the named directory. Bulky; intended for diff-harness work (`tools/dump_reference.py --backend qwen3-tts`). |
-| `QWEN3_TTS_CODEC_GPU` | unset | Route the codec decode through the main GPU scheduler instead of the CPU-only `codec_sched`. **Now safe on all backends** — `GGML_OP_CONV_TRANSPOSE_1D` is forced to CPU fallback across CUDA/Metal/Vulkan/SYCL/CANN (#155), so the rest of the codec runs on GPU while only the transpose conv falls back to CPU. On Jetson Orin AGX, codec on CPU is ~50× slower than CUDA; with this fix, `CODEC_GPU=1` gives ~50% TTS speedup without driver crashes. Distinct from `QWEN3_TTS_CODEC_FORCE_METAL`, which also enables a per-op trace callback for debugging. |
+| `QWEN3_TTS_CODEC_GPU` | auto | Force codec weights and decode through the GPU scheduler. GPU is now the default on all GPU backends including Metal — the `CONV_TRANSPOSE_1D` hang was fixed in `f8fc8b8e` and the op replaced by `mul_mat+col2im_1d` in `5f600f25`. Distinct from `QWEN3_TTS_CODEC_FORCE_METAL`, which also enables a per-op trace callback for debugging. |
+| `QWEN3_TTS_CODEC_CPU` | unset | Force codec weights and decode through the CPU-only `codec_sched`. Useful for A/B timing and regression bisection. |
 | `QWEN3_TTS_SKIP_REF_DECODE` | **on** (set `=0` to opt out) | Skip the codec decode of the reference audio in `qwen3_tts_synthesize`. The default-on path emits `codec_decode_codes(gen)` directly; the opt-out path concatenates `ref_codes + gen_codes`, decodes both, then trims the ref portion. With a 26 s reference (~334 codec frames at 12 Hz), the ref half adds ~16 s of constant codec compute regardless of how much new audio is generated (Jetson Orin AGX, issue #64). End-to-end RTF on Orin drops from ~7-9 → ~1.5; the win compounds N× under `/v1/audio/speech` long-form chunking. Bit-identity verified 2026-05-05 on Apple Silicon Metal, qwen3-tts-customvoice 0.6B Q8_0: max\|diff\| = 0, cosine similarity = 1.0 — equivalence holds because the codec is a straight-line forward pass with no rolling state. Set `QWEN3_TTS_SKIP_REF_DECODE=0` only for A/B verification or if a future codec graph variant grows rolling state. |
 
 ## VibeVoice — realtime streaming TTS
@@ -289,6 +300,14 @@ preset; the realtime `0.5B` flow is typically driven by a voice GGUF.
     --tts "Hello, how are you today?" \
     --tts-output hello.wav
 ```
+
+The realtime backend preserves the beginning of the sigma-VAE decoder output.
+Older builds trimmed a fixed 100 ms warmup window, which could skip the clean
+first decoded chunk and create a click by starting on a later waveform peak.
+For parity debugging, `VIBEVOICE_TTS_LATENTS=/path/to/latents.bin` can replay a
+raw float32 latent stack, `VIBEVOICE_TTS_DUMP=/dir` writes `tts_scaled_latent`
+and `tts_raw_audio`, and `VIBEVOICE_TTS_DUMP_DECODER=1` adds per-stage decoder
+dumps.
 
 ## VibeVoice 1.5B — base TTS with WAV cloning
 
@@ -373,6 +392,31 @@ and the GPT-2-T3 path (turbo/kartoffelbox-turbo):
 ./build/bin/crispasr --backend lahgtna-chatterbox -m auto -l ar \
     --tts "مرحباً" -ow out-ar.wav
 ```
+
+### Multilingual language selection
+
+The base `chatterbox` backend uses the upstream multilingual v3 T3 weights
+from `cstr/chatterbox-GGUF`. Pass `-l <code>` / `--language <code>` to
+select the language token for multilingual synthesis:
+
+```bash
+./build/bin/crispasr --backend chatterbox -m auto -l fr \
+    --tts "bonjour tout le monde" \
+    --tts-output out-fr.wav
+```
+
+The flag is wired into the T3 prompt, not concatenated into the spoken text.
+With the rebuilt 2026-06-18 GGUFs, `-l fr` inserts the `[fr]` token after
+`[START]` (token id 634 in the multilingual tokenizer) and changes the
+generated speech-token stream. A local Q4_K smoke check with seed 123 showed
+that no-language `bonjour tout le monde` roundtripped through Parakeet as
+`Bonjour tout monde.`, while `-l fr` roundtripped as
+`Bonjour tout le monde.`.
+
+Quality is still model-dependent. The rebuilt artifacts fix the previous
+tokenizer/model mismatch and make `-l` active, but some French Q4_K samples
+remain heavily accented. Treat language-token checks as a wiring smoke test,
+not a guarantee of native pronunciation.
 
 ### Voice cloning
 
@@ -522,7 +566,7 @@ warms the cache for the rest.
 
 | Variant | T3 default | S3Gen companion | Total |
 |---|---|---|---:|
-| `chatterbox`         | T3 Q8_0 (541 MB)  | base S3Gen Q8_0  (342 MB) | ~880 MB |
+| `chatterbox`         | T3 Q8_0 (610 MB)  | base S3Gen Q8_0  (348 MB) | ~960 MB |
 | `chatterbox-turbo`   | T3 F16  (963 MB)  | turbo S3Gen F16  (627 MB) | ~1.6 GB |
 | `kartoffelbox-turbo` | T3 Q8_0 (623 MB)  | turbo S3Gen F16  (shared)  | ~1.25 GB |
 | `lahgtna-chatterbox` | T3 F16  (1059 MB) | base S3Gen Q8_0  (shared)  | ~1.4 GB |
@@ -777,6 +821,9 @@ complementary layers. This is non-optional and cannot be bypassed.
 
 A frequency-domain watermark embedded in the PCM signal after synthesis.
 Survives re-encoding, volume normalization, and moderate compression.
+The embedder writes only a ramped watermark delta back into the signal and
+leaves under-covered FFT boundary samples untouched, so quiet starts/ends do
+not become click impulses.
 
 ```bash
 # Detect watermark in any audio file (C API)

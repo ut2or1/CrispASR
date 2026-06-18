@@ -15,6 +15,7 @@
 
 #include "vibevoice.h"
 #include "core/attention.h"
+#include "core/bpe.h"
 #include "core/conv.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
@@ -35,6 +36,7 @@
 #include <map>
 #include <numeric>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // ===========================================================================
@@ -69,6 +71,8 @@ struct vibevoice_model {
     vibevoice_hparams hp;
     std::map<std::string, ggml_tensor*> tensors;
     std::vector<std::string> vocab;
+    std::unordered_map<std::string, int32_t> token_to_id;
+    std::unordered_map<std::string, int32_t> merge_rank;
 };
 
 struct vibevoice_context {
@@ -105,8 +109,8 @@ struct vibevoice_context {
         ggml_backend_buffer_t buf = nullptr;
     } voice;
     std::vector<uint8_t> compute_meta;
-    // Pre-permuted ConvTranspose1d weights for decomposed col2im path
-    std::vector<ggml_tensor*> dec_ups_w_perm; // one per upsample stage
+    // Pre-permuted ConvTranspose1d weights for decomposed col2im path.
+    std::vector<ggml_tensor*> dec_ups_w_perm;
     ggml_context* ctx_perm = nullptr;
     ggml_backend_buffer_t buf_perm = nullptr;
     // Cached prediction head graph (reused across DPM steps)
@@ -186,10 +190,23 @@ extern "C" struct vibevoice_context* vibevoice_init_from_file(const char* path_m
     if (tok_key >= 0) {
         int n = gguf_get_arr_n(gctx, tok_key);
         m.vocab.resize(n);
+        m.token_to_id.reserve((size_t)n);
         for (int i = 0; i < n; i++) {
             const char* s = gguf_get_arr_str(gctx, tok_key, i);
-            if (s)
+            if (s) {
                 m.vocab[i] = s;
+                m.token_to_id[m.vocab[i]] = (int32_t)i;
+            }
+        }
+    }
+    const int merges_key = gguf_find_key(gctx, "tokenizer.ggml.merges");
+    if (merges_key >= 0) {
+        int n = gguf_get_arr_n(gctx, merges_key);
+        m.merge_rank.reserve((size_t)n);
+        for (int i = 0; i < n; i++) {
+            const char* s = gguf_get_arr_str(gctx, merges_key, i);
+            if (s)
+                m.merge_rank[s] = (int32_t)i;
         }
     }
 
@@ -258,9 +275,10 @@ extern "C" struct vibevoice_context* vibevoice_init_from_file(const char* path_m
     ctx->buf_cpu = wl.buf_cpu;
     m.tensors = wl.tensors;
 
-    // Permute ConvTranspose1d upsample weights for decomposed col2im path
-    {
-        const int n_stages = (int)hp.encoder_ratios.size(); // 6 upsample stages
+    // VibeVoice decoder upsampling is ConvTranspose1d. The decomposed
+    // mul_mat + col2im path has stable backend behavior across CPU/GPU.
+    if (hp.has_decoder && !hp.encoder_ratios.empty()) {
+        const int n_stages = (int)hp.encoder_ratios.size();
         std::vector<ggml_tensor*> srcs(n_stages);
         std::vector<ggml_tensor**> dsts(n_stages);
         ctx->dec_ups_w_perm.resize(n_stages, nullptr);
@@ -321,10 +339,6 @@ extern "C" void vibevoice_free(struct vibevoice_context* ctx) {
         return;
     if (ctx->pred_graph_ctx)
         ggml_free(ctx->pred_graph_ctx);
-    if (ctx->buf_perm)
-        ggml_backend_buffer_free(ctx->buf_perm);
-    if (ctx->ctx_perm)
-        ggml_free(ctx->ctx_perm);
     if (ctx->kv_neg_buf)
         ggml_backend_buffer_free(ctx->kv_neg_buf);
     if (ctx->kv_neg_ctx)
@@ -335,6 +349,10 @@ extern "C" void vibevoice_free(struct vibevoice_context* ctx) {
         ggml_free(ctx->kv_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    if (ctx->buf_perm)
+        ggml_backend_buffer_free(ctx->buf_perm);
+    if (ctx->ctx_perm)
+        ggml_free(ctx->ctx_perm);
     if (ctx->voice.buf)
         ggml_backend_buffer_free(ctx->voice.buf);
     if (ctx->voice.ctx)
@@ -819,6 +837,26 @@ static void vibevoice_dump_f32(const char* dir, const char* name, const float* d
         return;
     fwrite(data, sizeof(float), n, f);
     fclose(f);
+}
+
+static bool vibevoice_load_f32_file(const char* path, std::vector<float>& out) {
+    FILE* f = fopen(path, "rb");
+    if (!f)
+        return false;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return false;
+    }
+    long n_bytes = ftell(f);
+    if (n_bytes < 0 || (n_bytes % (long)sizeof(float)) != 0) {
+        fclose(f);
+        return false;
+    }
+    rewind(f);
+    out.resize((size_t)n_bytes / sizeof(float));
+    bool ok = out.empty() || fread(out.data(), sizeof(float), out.size(), f) == out.size();
+    fclose(f);
+    return ok;
 }
 
 // ===========================================================================
@@ -1606,6 +1644,91 @@ static std::vector<int32_t> tokenize_text_greedy(const vibevoice_model& m, const
     return ids;
 }
 
+static void vibevoice_bpe_one_vocab_rank(const std::unordered_map<std::string, int32_t>& token_to_id,
+                                         const std::string& word, std::vector<int32_t>& out) {
+    std::vector<std::string> symbols;
+    size_t i = 0;
+    while (i < word.size()) {
+        unsigned char c = (unsigned char)word[i];
+        size_t len = 1;
+        if ((c & 0xE0) == 0xC0)
+            len = 2;
+        else if ((c & 0xF0) == 0xE0)
+            len = 3;
+        else if ((c & 0xF8) == 0xF0)
+            len = 4;
+        if (i + len > word.size())
+            len = 1;
+        symbols.emplace_back(word, i, len);
+        i += len;
+    }
+
+    while (symbols.size() >= 2) {
+        int best_i = -1;
+        int32_t best_id = INT32_MAX;
+        for (size_t k = 0; k + 1 < symbols.size(); k++) {
+            std::string merged = symbols[k] + symbols[k + 1];
+            auto it = token_to_id.find(merged);
+            if (it != token_to_id.end() && it->second < best_id) {
+                best_id = it->second;
+                best_i = (int)k;
+            }
+        }
+        if (best_i < 0)
+            break;
+        symbols[best_i] += symbols[best_i + 1];
+        symbols.erase(symbols.begin() + best_i + 1);
+    }
+
+    for (const auto& s : symbols) {
+        auto it = token_to_id.find(s);
+        if (it != token_to_id.end()) {
+            out.push_back(it->second);
+            continue;
+        }
+        size_t j = 0;
+        while (j < s.size()) {
+            unsigned char c = (unsigned char)s[j];
+            size_t len = 1;
+            if ((c & 0xE0) == 0xC0)
+                len = 2;
+            else if ((c & 0xF0) == 0xE0)
+                len = 3;
+            else if ((c & 0xF8) == 0xF0)
+                len = 4;
+            if (j + len > s.size())
+                len = 1;
+            auto jt = token_to_id.find(std::string(s, j, len));
+            if (jt != token_to_id.end())
+                out.push_back(jt->second);
+            j += len;
+        }
+    }
+}
+
+static std::vector<int32_t> tokenize_text_bpe_vocab_rank(const vibevoice_model& m, const std::string& text) {
+    std::vector<int32_t> result;
+    size_t i = 0;
+    bool first = true;
+    while (i < text.size()) {
+        while (i < text.size() && (text[i] == ' ' || text[i] == '\t' || text[i] == '\n'))
+            i++;
+        if (i >= text.size())
+            break;
+        size_t j = i;
+        while (j < text.size() && text[j] != ' ' && text[j] != '\t' && text[j] != '\n')
+            j++;
+        std::string word = text.substr(i, j - i);
+        if (!first)
+            word = std::string(" ") + word;
+        first = false;
+        word = core_bpe::bytes_to_unicode(word.data(), word.size());
+        vibevoice_bpe_one_vocab_rank(m.token_to_id, word, result);
+        i = j;
+    }
+    return result;
+}
+
 // ── Gaussian noise ──────────────────────────────────────────────────────────
 
 // Mersenne Twister MT19937 — matches PyTorch's torch.manual_seed()
@@ -2171,7 +2294,8 @@ static ggml_tensor* build_transposed_conv1d(ggml_context* ctx, ggml_tensor* x, g
                                             int stride, ggml_tensor* w_perm = nullptr) {
     if (w_perm) {
         const int K = (int)w->ne[0];
-        return core_convt::convt1d_decomp(ctx, x, w_perm, b, stride, K, /*crop_left=*/0, /*crop_right=*/K - stride);
+        return core_convt::convt1d_decomp(ctx, x, w_perm, b, stride, K, /*crop_left=*/0,
+                                          /*crop_right=*/K - stride);
     }
 
     int T_in = (int)x->ne[1];
@@ -2210,6 +2334,7 @@ static ggml_tensor* build_transposed_conv1d(ggml_context* ctx, ggml_tensor* x, g
 static ggml_cgraph* build_vae_decoder_graph(vibevoice_context* ctx, int n_frames) {
     auto& hp = ctx->model.hp;
     auto& ts = ctx->model.tensors;
+    const bool dump_decoder = getenv("VIBEVOICE_TTS_DUMP_DECODER") != nullptr;
     auto G = [&](const std::string& name) -> ggml_tensor* {
         auto it = ts.find(name);
         return it != ts.end() ? it->second : nullptr;
@@ -2233,6 +2358,10 @@ static ggml_cgraph* build_vae_decoder_graph(vibevoice_context* ctx, int n_frames
 
     // 1. Stem conv (us.0): Conv1d(vae_dim → C_max, K=7, stride=1)
     h = build_causal_conv1d(ctx0, h, G("at_dec.us.0.0.conv.weight"), G("at_dec.us.0.0.conv.bias"), 1);
+    if (dump_decoder) {
+        ggml_set_name(h, "dec_stem");
+        ggml_set_output(h);
+    }
 
     // 2. Stage 0: ConvNeXt blocks at full channel width
     for (int bi = 0; bi < depths[0]; bi++) {
@@ -2244,6 +2373,10 @@ static ggml_cgraph* build_vae_decoder_graph(vibevoice_context* ctx, int n_frames
                           G(std::string(base) + ".ffn.up.bias"), G(std::string(base) + ".ffn.down.weight"),
                           G(std::string(base) + ".ffn.down.bias"), G(std::string(base) + ".ffn_gamma"));
     }
+    if (dump_decoder) {
+        ggml_set_name(h, "dec_stage0");
+        ggml_set_output(h);
+    }
 
     // 3. Stages 1-6: transposed conv upsample + ConvNeXt blocks
     int n_upsample_stages = (int)ratios.size(); // 6
@@ -2254,6 +2387,12 @@ static ggml_cgraph* build_vae_decoder_graph(vibevoice_context* ctx, int n_frames
         int stride = ratios[si - 1];
         ggml_tensor* wp = (si - 1 < (int)ctx->dec_ups_w_perm.size()) ? ctx->dec_ups_w_perm[si - 1] : nullptr;
         h = build_transposed_conv1d(ctx0, h, G(wn), G(bn_str), stride, wp);
+        if (dump_decoder) {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "dec_up%d", si);
+            ggml_set_name(h, nm);
+            ggml_set_output(h);
+        }
 
         int n_blocks = (si < (int)depths.size()) ? depths[si] : 3;
         for (int bi = 0; bi < n_blocks; bi++) {
@@ -2264,6 +2403,12 @@ static ggml_cgraph* build_vae_decoder_graph(vibevoice_context* ctx, int n_frames
                               G(std::string(base) + ".ffn_ln.weight"), G(std::string(base) + ".ffn.up.weight"),
                               G(std::string(base) + ".ffn.up.bias"), G(std::string(base) + ".ffn.down.weight"),
                               G(std::string(base) + ".ffn.down.bias"), G(std::string(base) + ".ffn_gamma"));
+        }
+        if (dump_decoder) {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "dec_stage%d", si);
+            ggml_set_name(h, nm);
+            ggml_set_output(h);
         }
     }
 
@@ -2614,7 +2759,19 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
 
     // 1. Tokenize text (append newline — VibeVoice TTS tokenizer does this)
     std::string text_with_nl = std::string(text) + "\n";
-    std::vector<int32_t> text_ids = tokenize_text_greedy(m, text_with_nl.c_str());
+    std::vector<int32_t> text_ids;
+    if (!m.token_to_id.empty()) {
+        if (!m.merge_rank.empty())
+            text_ids = core_bpe::tokenize_simple(m.token_to_id, m.merge_rank, std::string(text));
+        else
+            text_ids = tokenize_text_bpe_vocab_rank(m, std::string(text));
+        std::string nl = core_bpe::bytes_to_unicode("\n", 1);
+        auto nl_it = m.token_to_id.find(nl);
+        if (nl_it != m.token_to_id.end())
+            text_ids.push_back(nl_it->second);
+    } else {
+        text_ids = tokenize_text_greedy(m, text_with_nl.c_str());
+    }
     if (text_ids.empty()) {
         fprintf(stderr, "vibevoice TTS: tokenization produced no tokens\n");
         return nullptr;
@@ -3378,7 +3535,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
 
             int base_n_layers = hp.n_lm_layers;   // 4 for Realtime model
             int base_vsl = ctx->voice.lm_seq_len; // 74
-            int n_text = (int)text_ids.size();    // process ALL text tokens at once
+            int n_text = (int)text_ids.size();
 
             // Allocate temporary base LM KV cache
             int base_max_ctx = base_vsl + n_text + 16;
@@ -3420,124 +3577,138 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                 }
             }
 
-            // Run base LM (4 layers) on text tokens with KV cache
-            // Build graph using base LM weights ("lm." prefix) with the temp KV cache
+            // Run base LM (4 layers) on text tokens with KV cache. The official realtime
+            // loop feeds text to forward_lm in 5-token windows; doing the same here keeps
+            // the base-LM KV writes and hidden states aligned with the TTS interleave.
             auto base_embeds = run_token_embedding_lookup(ctx, text_ids.data(), n_text);
             if ((int)base_embeds.size() == n_text * d_lm) {
-                // Build and run base LM graph with temp KV cache
-                size_t mem = ctx->compute_meta.size();
-                ggml_init_params ip_b = {mem, ctx->compute_meta.data(), true};
-                ggml_context* ctx_b = ggml_init(ip_b);
-                ggml_cgraph* gf_b = ggml_new_graph_custom(ctx_b, 65536, false);
+                const int base_text_window = 5;
+                int base_n_past = base_vsl;
+                all_base_hidden.assign((size_t)n_text * d_lm, 0.0f);
 
-                ggml_tensor* emb_t = ggml_new_tensor_2d(ctx_b, GGML_TYPE_F32, d_lm, n_text);
-                ggml_set_name(emb_t, "base_in");
-                ggml_set_input(emb_t);
-                ggml_tensor* positions = ggml_new_tensor_1d(ctx_b, GGML_TYPE_I32, n_text);
-                ggml_set_name(positions, "base_pos");
-                ggml_set_input(positions);
-                ggml_tensor* causal_mask = ggml_new_tensor_2d(ctx_b, GGML_TYPE_F16, base_vsl + n_text, n_text);
-                ggml_set_name(causal_mask, "base_mask");
-                ggml_set_input(causal_mask);
+                for (int cursor = 0; cursor < n_text; cursor += base_text_window) {
+                    int win_len = std::min(base_text_window, n_text - cursor);
+                    int Lk = base_n_past + win_len;
+                    size_t mem = ctx->compute_meta.size();
+                    ggml_init_params ip_b = {mem, ctx->compute_meta.data(), true};
+                    ggml_context* ctx_b = ggml_init(ip_b);
+                    ggml_cgraph* gf_b = ggml_new_graph_custom(ctx_b, 65536, false);
 
-                ggml_tensor* cur = emb_t;
-                for (int il = 0; il < base_n_layers; il++) {
-                    char p[64];
-                    snprintf(p, sizeof(p), "lm.layers.%d", il);
-                    ggml_tensor* residual = cur;
-                    cur = ggml_rms_norm(ctx_b, cur, 1e-6f);
-                    cur = ggml_mul(ctx_b, cur, G(std::string(p) + ".attn_ln.weight"));
-                    {
-                        int Lk = base_vsl + n_text;
-                        ggml_tensor* Q = ggml_mul_mat(ctx_b, G(std::string(p) + ".attn.q_proj.weight"), cur);
-                        auto* qb = G(std::string(p) + ".attn.q_proj.bias");
-                        if (qb)
-                            Q = ggml_add(ctx_b, Q, qb);
-                        ggml_tensor* K = ggml_mul_mat(ctx_b, G(std::string(p) + ".attn.k_proj.weight"), cur);
-                        auto* kb = G(std::string(p) + ".attn.k_proj.bias");
-                        if (kb)
-                            K = ggml_add(ctx_b, K, kb);
-                        ggml_tensor* V = ggml_mul_mat(ctx_b, G(std::string(p) + ".attn.v_proj.weight"), cur);
-                        auto* vb = G(std::string(p) + ".attn.v_proj.bias");
-                        if (vb)
-                            V = ggml_add(ctx_b, V, vb);
-                        Q = ggml_reshape_3d(ctx_b, Q, hp.head_dim, hp.n_heads, n_text);
-                        K = ggml_reshape_3d(ctx_b, K, hp.head_dim, hp.n_kv_heads, n_text);
-                        V = ggml_reshape_3d(ctx_b, V, hp.head_dim, hp.n_kv_heads, n_text);
-                        Q = ggml_rope_ext(ctx_b, Q, positions, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX, 0,
-                                          hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-                        K = ggml_rope_ext(ctx_b, K, positions, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX, 0,
-                                          hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-                        // Write K, V to temp base KV cache
-                        ggml_tensor* K_perm = ggml_permute(ctx_b, K, 0, 2, 1, 3);
-                        ggml_tensor* V_perm = ggml_permute(ctx_b, V, 0, 2, 1, 3);
-                        ggml_tensor* k_view = ggml_view_4d(
-                            ctx_b, base_kv_k, hp.head_dim, n_text, hp.n_kv_heads, 1, base_kv_k->nb[1], base_kv_k->nb[2],
-                            base_kv_k->nb[3], (size_t)il * base_kv_k->nb[3] + (size_t)base_vsl * base_kv_k->nb[1]);
-                        ggml_tensor* v_view = ggml_view_4d(
-                            ctx_b, base_kv_v, hp.head_dim, n_text, hp.n_kv_heads, 1, base_kv_v->nb[1], base_kv_v->nb[2],
-                            base_kv_v->nb[3], (size_t)il * base_kv_v->nb[3] + (size_t)base_vsl * base_kv_v->nb[1]);
-                        ggml_build_forward_expand(gf_b, ggml_cpy(ctx_b, K_perm, k_view));
-                        ggml_build_forward_expand(gf_b, ggml_cpy(ctx_b, V_perm, v_view));
-                        // Read full KV
-                        ggml_tensor* Kf = ggml_cont(
-                            ctx_b, ggml_view_3d(ctx_b, base_kv_k, hp.head_dim, Lk, hp.n_kv_heads, base_kv_k->nb[1],
-                                                base_kv_k->nb[2], (size_t)il * base_kv_k->nb[3]));
-                        ggml_tensor* Vf = ggml_cont(
-                            ctx_b, ggml_view_3d(ctx_b, base_kv_v, hp.head_dim, Lk, hp.n_kv_heads, base_kv_v->nb[1],
-                                                base_kv_v->nb[2], (size_t)il * base_kv_v->nb[3]));
-                        Q = ggml_cont(ctx_b, ggml_permute(ctx_b, Q, 0, 2, 1, 3));
-                        float scale = 1.0f / sqrtf((float)hp.head_dim);
-                        ggml_tensor* attn = ggml_flash_attn_ext(ctx_b, Q, Kf, Vf, causal_mask, scale, 0.0f, 0.0f);
-                        attn = ggml_reshape_2d(ctx_b, attn, d_lm, n_text);
-                        attn = ggml_mul_mat(ctx_b, G(std::string(p) + ".attn.o_proj.weight"), attn);
-                        cur = ggml_add(ctx_b, residual, attn);
+                    ggml_tensor* emb_t = ggml_new_tensor_2d(ctx_b, GGML_TYPE_F32, d_lm, win_len);
+                    ggml_set_name(emb_t, "base_in");
+                    ggml_set_input(emb_t);
+                    ggml_tensor* positions = ggml_new_tensor_1d(ctx_b, GGML_TYPE_I32, win_len);
+                    ggml_set_name(positions, "base_pos");
+                    ggml_set_input(positions);
+                    ggml_tensor* causal_mask = ggml_new_tensor_2d(ctx_b, GGML_TYPE_F16, Lk, win_len);
+                    ggml_set_name(causal_mask, "base_mask");
+                    ggml_set_input(causal_mask);
+
+                    ggml_tensor* cur = emb_t;
+                    for (int il = 0; il < base_n_layers; il++) {
+                        char p[64];
+                        snprintf(p, sizeof(p), "lm.layers.%d", il);
+                        ggml_tensor* residual = cur;
+                        cur = ggml_rms_norm(ctx_b, cur, 1e-6f);
+                        cur = ggml_mul(ctx_b, cur, G(std::string(p) + ".attn_ln.weight"));
+                        {
+                            ggml_tensor* Q = ggml_mul_mat(ctx_b, G(std::string(p) + ".attn.q_proj.weight"), cur);
+                            auto* qb = G(std::string(p) + ".attn.q_proj.bias");
+                            if (qb)
+                                Q = ggml_add(ctx_b, Q, qb);
+                            ggml_tensor* K = ggml_mul_mat(ctx_b, G(std::string(p) + ".attn.k_proj.weight"), cur);
+                            auto* kb = G(std::string(p) + ".attn.k_proj.bias");
+                            if (kb)
+                                K = ggml_add(ctx_b, K, kb);
+                            ggml_tensor* V = ggml_mul_mat(ctx_b, G(std::string(p) + ".attn.v_proj.weight"), cur);
+                            auto* vb = G(std::string(p) + ".attn.v_proj.bias");
+                            if (vb)
+                                V = ggml_add(ctx_b, V, vb);
+                            Q = ggml_reshape_3d(ctx_b, Q, hp.head_dim, hp.n_heads, win_len);
+                            K = ggml_reshape_3d(ctx_b, K, hp.head_dim, hp.n_kv_heads, win_len);
+                            V = ggml_reshape_3d(ctx_b, V, hp.head_dim, hp.n_kv_heads, win_len);
+                            Q = ggml_rope_ext(ctx_b, Q, positions, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                                              hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+                            K = ggml_rope_ext(ctx_b, K, positions, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                                              hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+                            ggml_tensor* K_perm = ggml_permute(ctx_b, K, 0, 2, 1, 3);
+                            ggml_tensor* V_perm = ggml_permute(ctx_b, V, 0, 2, 1, 3);
+                            ggml_tensor* k_view =
+                                ggml_view_4d(ctx_b, base_kv_k, hp.head_dim, win_len, hp.n_kv_heads, 1, base_kv_k->nb[1],
+                                             base_kv_k->nb[2], base_kv_k->nb[3],
+                                             (size_t)il * base_kv_k->nb[3] + (size_t)base_n_past * base_kv_k->nb[1]);
+                            ggml_tensor* v_view =
+                                ggml_view_4d(ctx_b, base_kv_v, hp.head_dim, win_len, hp.n_kv_heads, 1, base_kv_v->nb[1],
+                                             base_kv_v->nb[2], base_kv_v->nb[3],
+                                             (size_t)il * base_kv_v->nb[3] + (size_t)base_n_past * base_kv_v->nb[1]);
+                            ggml_build_forward_expand(gf_b, ggml_cpy(ctx_b, K_perm, k_view));
+                            ggml_build_forward_expand(gf_b, ggml_cpy(ctx_b, V_perm, v_view));
+                            ggml_tensor* Kf = ggml_cont(
+                                ctx_b, ggml_view_3d(ctx_b, base_kv_k, hp.head_dim, Lk, hp.n_kv_heads, base_kv_k->nb[1],
+                                                    base_kv_k->nb[2], (size_t)il * base_kv_k->nb[3]));
+                            ggml_tensor* Vf = ggml_cont(
+                                ctx_b, ggml_view_3d(ctx_b, base_kv_v, hp.head_dim, Lk, hp.n_kv_heads, base_kv_v->nb[1],
+                                                    base_kv_v->nb[2], (size_t)il * base_kv_v->nb[3]));
+                            Q = ggml_cont(ctx_b, ggml_permute(ctx_b, Q, 0, 2, 1, 3));
+                            float scale = 1.0f / sqrtf((float)hp.head_dim);
+                            ggml_tensor* attn = ggml_flash_attn_ext(ctx_b, Q, Kf, Vf, causal_mask, scale, 0.0f, 0.0f);
+                            attn = ggml_reshape_2d(ctx_b, attn, d_lm, win_len);
+                            attn = ggml_mul_mat(ctx_b, G(std::string(p) + ".attn.o_proj.weight"), attn);
+                            cur = ggml_add(ctx_b, residual, attn);
+                        }
+                        residual = cur;
+                        cur = ggml_rms_norm(ctx_b, cur, 1e-6f);
+                        cur = ggml_mul(ctx_b, cur, G(std::string(p) + ".ffn_ln.weight"));
+                        ggml_tensor* ffn = core_ffn::swiglu(ctx_b, cur, G(std::string(p) + ".ffn.gate.weight"),
+                                                            G(std::string(p) + ".ffn.up.weight"),
+                                                            G(std::string(p) + ".ffn.down.weight"));
+                        cur = ggml_add(ctx_b, residual, ffn);
                     }
-                    residual = cur;
-                    cur = ggml_rms_norm(ctx_b, cur, 1e-6f);
-                    cur = ggml_mul(ctx_b, cur, G(std::string(p) + ".ffn_ln.weight"));
-                    ggml_tensor* ffn =
-                        core_ffn::swiglu(ctx_b, cur, G(std::string(p) + ".ffn.gate.weight"),
-                                         G(std::string(p) + ".ffn.up.weight"), G(std::string(p) + ".ffn.down.weight"));
-                    cur = ggml_add(ctx_b, residual, ffn);
+                    ggml_set_name(cur, "base_out");
+                    ggml_set_output(cur);
+                    ggml_build_forward_expand(gf_b, cur);
+
+                    ggml_backend_sched_reset(ctx->sched);
+                    bool ok = false;
+                    if (ggml_backend_sched_alloc_graph(ctx->sched, gf_b)) {
+                        ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b, "base_in"),
+                                                base_embeds.data() + (size_t)cursor * d_lm, 0,
+                                                (size_t)win_len * d_lm * sizeof(float));
+                        std::vector<int32_t> bpos(win_len);
+                        for (int i = 0; i < win_len; i++)
+                            bpos[i] = base_n_past + i;
+                        ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b, "base_pos"), bpos.data(), 0,
+                                                bpos.size() * sizeof(int32_t));
+                        std::vector<ggml_fp16_t> bmask((size_t)win_len * Lk, ggml_fp32_to_fp16(0.0f));
+                        ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+                        for (int q = 0; q < win_len; q++)
+                            for (int k = base_n_past + q + 1; k < Lk; k++)
+                                bmask[(size_t)q * Lk + k] = neg_inf;
+                        ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b, "base_mask"), bmask.data(), 0,
+                                                bmask.size() * sizeof(ggml_fp16_t));
+
+                        if (ggml_backend_sched_graph_compute(ctx->sched, gf_b) == GGML_STATUS_SUCCESS) {
+                            ggml_backend_tensor_get(ggml_graph_get_tensor(gf_b, "base_out"),
+                                                    all_base_hidden.data() + (size_t)cursor * d_lm, 0,
+                                                    (size_t)win_len * d_lm * sizeof(float));
+                            ok = true;
+                        }
+                    }
+                    ggml_free(ctx_b);
+                    if (!ok) {
+                        all_base_hidden.clear();
+                        break;
+                    }
+                    base_n_past += win_len;
                 }
-                // No final norm for Realtime base LM (only 4 layers, no lm.norm.weight)
-                ggml_set_name(cur, "base_out");
-                ggml_set_output(cur);
-                ggml_build_forward_expand(gf_b, cur);
 
-                ggml_backend_sched_reset(ctx->sched);
-                if (ggml_backend_sched_alloc_graph(ctx->sched, gf_b)) {
-                    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b, "base_in"), base_embeds.data(), 0,
-                                            base_embeds.size() * sizeof(float));
-                    std::vector<int32_t> bpos(n_text);
-                    for (int i = 0; i < n_text; i++)
-                        bpos[i] = base_vsl + i;
-                    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b, "base_pos"), bpos.data(), 0,
-                                            bpos.size() * sizeof(int32_t));
-                    // Causal mask: can attend to all voice positions + past text positions
-                    int Lk = base_vsl + n_text;
-                    std::vector<ggml_fp16_t> bmask((size_t)n_text * Lk, ggml_fp32_to_fp16(0.0f));
-                    ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
-                    for (int q = 0; q < n_text; q++)
-                        for (int k = base_vsl + q + 1; k < Lk; k++)
-                            bmask[(size_t)q * Lk + k] = neg_inf;
-                    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b, "base_mask"), bmask.data(), 0,
-                                            bmask.size() * sizeof(ggml_fp16_t));
-
-                    if (ggml_backend_sched_graph_compute(ctx->sched, gf_b) == GGML_STATUS_SUCCESS) {
-                        std::vector<float> base_hidden(n_text * d_lm);
-                        ggml_backend_tensor_get(ggml_graph_get_tensor(gf_b, "base_out"), base_hidden.data(), 0,
-                                                base_hidden.size() * sizeof(float));
-                        // Store ALL base hidden for use by process_text_window
-                        all_base_hidden = base_hidden;
-                        vibevoice_dump_f32(dump_dir, "tts_base_lm_hidden_voice", base_hidden.data(),
-                                           base_hidden.size());
-                        if (verbosity >= 1)
-                            fprintf(stderr,
-                                    "  base LM with voice KV (%d layers, %d ctx): replaced %d text embeddings + type\n",
-                                    base_n_layers, base_vsl, n_text);
-                    }
+                if (!all_base_hidden.empty()) {
+                    vibevoice_dump_f32(dump_dir, "tts_base_lm_hidden_voice", all_base_hidden.data(),
+                                       all_base_hidden.size());
+                    if (verbosity >= 1)
+                        fprintf(stderr,
+                                "  base LM with voice KV (%d layers, %d ctx): windowed %d text embeddings + type\n",
+                                base_n_layers, base_vsl, n_text);
                 }
             }
 
@@ -3923,21 +4094,8 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         return true;
     };
 
-    // Initial TTS-LM prefill / first text window.
-    if (has_voice) {
-        // With voice: voice.tts_lm KV is already loaded into the cache (positions 0..vsl_tts-1).
-        // We feed the first TEXT_WINDOW tokens of the user text through the TTS LM at the
-        // tail (positions vsl_tts..vsl_tts+win-1). all_base_hidden was populated above by the
-        // base LM run with voice.lm KV.
-        int first_win = std::min((int)text_ids.size(), TEXT_WINDOW);
-        if (verbosity >= 1)
-            fprintf(stderr, "vibevoice TTS: text window 1: %d tokens, pos %d\n", first_win, n_past);
-        if (!process_text_window(0, first_win)) {
-            fprintf(stderr, "vibevoice TTS: first text window failed\n");
-            return nullptr;
-        }
-        text_cursor = first_win;
-    } else {
+    bool dumped_prefill_hidden = false;
+    if (!has_voice) {
         // No voice loaded: prefix_embeds holds the full chat-template prompt (system + user
         // with the entire text + assistant header) with type embeddings already added and
         // base-LM hidden states spliced at the text positions. Prefill the whole thing
@@ -3952,8 +4110,9 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         }
         n_past = prefix_len;
         text_cursor = (int)text_ids.size(); // skip subsequent text windows
+        vibevoice_dump_f32(dump_dir, "tts_prefill_hidden", hidden.data(), hidden.size());
+        dumped_prefill_hidden = true;
     }
-    vibevoice_dump_f32(dump_dir, "tts_prefill_hidden", hidden.data(), hidden.size());
     vibevoice_dump_f32(dump_dir, "tts_neg_condition_frame0", neg_condition.data(), neg_condition.size());
 
     const auto t_prefill_done = std::chrono::high_resolution_clock::now();
@@ -4041,6 +4200,26 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     int bench_frames = 0;
 
     while (!finished && total_frames < n_frames) {
+        if (has_voice && text_cursor < (int)text_ids.size()) {
+            int next_win = std::min((int)text_ids.size() - text_cursor, TEXT_WINDOW);
+            if (verbosity >= 1)
+                fprintf(stderr, "  text window: %d tokens (cursor %d/%d), pos %d\n", next_win, text_cursor,
+                        (int)text_ids.size(), n_past);
+            if (!process_text_window(text_cursor, next_win)) {
+                fprintf(stderr, "vibevoice TTS: text window failed at cursor %d\n", text_cursor);
+                return nullptr;
+            }
+            text_cursor += next_win;
+            if (!dumped_prefill_hidden) {
+                vibevoice_dump_f32(dump_dir, "tts_prefill_hidden", hidden.data(), hidden.size());
+                dumped_prefill_hidden = true;
+            }
+        }
+        if (hidden.empty()) {
+            fprintf(stderr, "vibevoice TTS: no positive TTS condition available\n");
+            return nullptr;
+        }
+
         // Generate SPEECH_WINDOW frames
         int frames_this_window = std::min(SPEECH_WINDOW, n_frames - total_frames);
 
@@ -4277,19 +4456,21 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
 
         total_frames += frames_this_window;
 
-        // Process next text window (if any remaining)
-        if (text_cursor < (int)text_ids.size() && !finished) {
-            int next_win = std::min((int)text_ids.size() - text_cursor, TEXT_WINDOW);
-            if (verbosity >= 1)
-                fprintf(stderr, "  text window: %d tokens (cursor %d/%d), pos %d\n", next_win, text_cursor,
-                        (int)text_ids.size(), n_past);
-            if (!process_text_window(text_cursor, next_win)) {
-                fprintf(stderr, "vibevoice TTS: text window failed at cursor %d\n", text_cursor);
-                return nullptr;
-            }
-            text_cursor += next_win;
-        }
     } // end text/speech interleave loop
+
+    if (const char* latent_file = getenv("VIBEVOICE_TTS_LATENTS")) {
+        std::vector<float> override_latents;
+        if (!vibevoice_load_f32_file(latent_file, override_latents) || override_latents.empty() ||
+            (override_latents.size() % (size_t)vae_dim) != 0) {
+            fprintf(stderr, "vibevoice TTS: failed to load valid latent override '%s'\n", latent_file);
+            return nullptr;
+        }
+        all_latents.swap(override_latents);
+        if (verbosity >= 1) {
+            fprintf(stderr, "vibevoice TTS: using latent override '%s' (%zu frames)\n", latent_file,
+                    all_latents.size() / (size_t)vae_dim);
+        }
+    }
 
     int total_latent = (int)all_latents.size();
     if (verbosity >= 1) {
@@ -4318,6 +4499,9 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     std::vector<float> scaled_latent(total_latent);
     for (int i = 0; i < total_latent; i++)
         scaled_latent[i] = all_latents[i] / scaling_factor - bias_factor;
+    if (dump_dir) {
+        vibevoice_dump_f32(dump_dir, "tts_scaled_latent", scaled_latent.data(), scaled_latent.size());
+    }
 
     auto t_vae_build0 = std::chrono::high_resolution_clock::now();
     ggml_cgraph* dec_gf = build_vae_decoder_graph(ctx, actual_frames);
@@ -4391,25 +4575,32 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
 
     std::vector<float> raw_audio((size_t)total_audio);
     ggml_backend_tensor_get(audio_out, raw_audio.data(), 0, (size_t)total_audio * sizeof(float));
+    if (dump_dir) {
+        vibevoice_dump_f32(dump_dir, "tts_raw_audio", raw_audio.data(), raw_audio.size());
+        if (getenv("VIBEVOICE_TTS_DUMP_DECODER")) {
+            const char* names[] = {"dec_stem",   "dec_stage0", "dec_up1",    "dec_stage1", "dec_up2",
+                                   "dec_stage2", "dec_up3",    "dec_stage3", "dec_up4",    "dec_stage4",
+                                   "dec_up5",    "dec_stage5", "dec_up6",    "dec_stage6"};
+            for (const char* name : names) {
+                ggml_tensor* t = ggml_graph_get_tensor(dec_gf, name);
+                if (!t)
+                    continue;
+                std::vector<float> tmp((size_t)ggml_nelements(t));
+                ggml_backend_tensor_get(t, tmp.data(), 0, tmp.size() * sizeof(float));
+                vibevoice_dump_f32(dump_dir, name, tmp.data(), tmp.size());
+            }
+        }
+    }
 
-    // ── Start trim: the σ-VAE decoder's first ~100ms is a deterministic
-    //               warmup transient from zero-pad propagation through 7
-    //               cascaded causal-conv stages. With the GELU FFN fix
-    //               (#39) the transient peaks reach ~0.18 — well above any
-    //               sensible noise floor — so the previous "find first
-    //               sample > 0.005, back up 800" heuristic kept the
-    //               transient in the output. Issue #40: that came out as
-    //               an audible click at the start.
-    //
-    //               Always skip at least the warmup samples; THEN apply
-    //               the noise-floor heuristic on the remainder so we still
-    //               include the attack of the first phoneme.
-    const int decoder_warmup_samples = 2400; // 100 ms @ 24 kHz
+    // ── Start trim: preserve the decoder's initial samples unless there is
+    //               leading digital silence. The official realtime path keeps
+    //               the first decoded chunk; a fixed warmup skip can jump into
+    //               a later waveform peak and create an audible click.
     const float noise_floor = 0.005f;
-    int trim_start = std::min(decoder_warmup_samples, total_audio);
-    for (int i = decoder_warmup_samples; i < total_audio; i++) {
+    int trim_start = 0;
+    for (int i = 0; i < total_audio; i++) {
         if (fabsf(raw_audio[i]) > noise_floor) {
-            trim_start = std::max(decoder_warmup_samples, i - 800); // ~33ms attack margin
+            trim_start = std::max(0, i - 800); // ~33ms attack margin
             break;
         }
     }
@@ -4436,8 +4627,8 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     int trimmed_len = trim_end - trim_start;
     if (trimmed_len <= 0) {
         // Pathological case: no audio above floor (e.g. very short input).
-        // Fall back to the full decoder output minus the warmup, no tail trim.
-        trim_start = std::min(decoder_warmup_samples, total_audio);
+        // Fall back to the full decoder output, no tail trim.
+        trim_start = 0;
         trim_end = total_audio;
         trimmed_len = trim_end - trim_start;
     }

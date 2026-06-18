@@ -1423,10 +1423,16 @@ static std::vector<float> tslm_step_graph(voxcpm2_context* ctx, const float* hid
     int Lk = 0;
     bool bucketed = false;
     // VOXCPM2_NO_BUCKET=1 forces the dynamic (non-bucketed) graph path,
-    // which uses ggml_cpy for KV writes instead of ggml_set_rows. This
-    // works around a NaN bug where ggml_set_rows on CUDA corrupts the
-    // KV cache on the second AR step (#164).
-    static const bool no_bucket = vox_env_bool("VOXCPM2_NO_BUCKET");
+    // which uses ggml_cpy for KV writes instead of ggml_set_rows. The
+    // bucketed path is also disabled by default on CUDA because
+    // ggml_set_rows corrupts the KV cache on the second AR step on CUDA
+    // (#164). Set VOXCPM2_BUCKET_CUDA=1 to re-enable buckets on CUDA
+    // (e.g. for benchmarking), or VOXCPM2_NO_BUCKET=1 to disable on all
+    // backends.
+    static const bool env_no_bucket = vox_env_bool("VOXCPM2_NO_BUCKET");
+    static const bool env_bucket_cuda = vox_env_bool("VOXCPM2_BUCKET_CUDA");
+    const bool is_cuda = (strncmp(ggml_backend_name(ctx->backend), "CUDA", 4) == 0);
+    const bool no_bucket = env_no_bucket || (is_cuda && !env_bucket_cuda);
     const int needed_lk = pos + 1;
     const int bucket_idx = no_bucket ? -1 : tslm_pick_bucket(needed_lk);
     if (bucket_idx >= 0) {
@@ -3206,8 +3212,8 @@ static void vae_residual_unit(voxcpm2_context* ctx, const std::string& prefix, c
 // so we don't cache the graph itself — only the weight bridge.
 // ===========================================================================
 
-static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std::vector<float>>& patches,
-                                     ggml_backend_t cpu_be); // fwd-decl for fallback
+static std::vector<float> vae_decode_cpu(voxcpm2_context* ctx,
+                                         const std::vector<std::vector<float>>& patches); // fwd-decl for graph fallback
 
 // ---------------------------------------------------------------------------
 // Snake1d as a ggml subgraph.
@@ -3671,7 +3677,7 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
     if (!vae_wn_init_ggml(ctx)) {
         if (ctx->verbosity >= 1)
             fprintf(stderr, "voxcpm2: vae_wn_init_ggml failed; falling back to CPU vae_decode\n");
-        return vae_decode(ctx, patches, ctx->backend_cpu);
+        return vae_decode_cpu(ctx, patches);
     }
 
     const int feat_dim = 64;
@@ -3692,7 +3698,7 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
                     "voxcpm2: VAE output too long for GPU dispatch "
                     "(%lld samples, %d patches); using CPU\n",
                     (long long)out_samples, n_patches);
-        return vae_decode(ctx, patches, ctx->backend_cpu);
+        return vae_decode_cpu(ctx, patches);
     }
 
     // Pack patches into a flat [T_lat, feat_dim] host buffer.
@@ -3722,7 +3728,7 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
     };
     ggml_context* ctx0 = ggml_init(ip);
     if (!ctx0) {
-        return vae_decode(ctx, patches, ctx->backend_cpu);
+        return vae_decode_cpu(ctx, patches);
     }
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
 
@@ -3868,14 +3874,14 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
     if (!ggml_gallocr_alloc_graph(ctx->galloc, gf)) {
         fprintf(stderr, "voxcpm2: vae_decode_graph gallocr alloc failed; falling back to CPU\n");
         ggml_free(ctx0);
-        return vae_decode(ctx, patches, ctx->backend_cpu);
+        return vae_decode_cpu(ctx, patches);
     }
 
     ggml_tensor* t_latents = ggml_graph_get_tensor(gf, "latents");
     if (!t_latents) {
         fprintf(stderr, "voxcpm2: vae_decode_graph missing latents tensor; falling back to CPU\n");
         ggml_free(ctx0);
-        return vae_decode(ctx, patches, ctx->backend_cpu);
+        return vae_decode_cpu(ctx, patches);
     }
     ggml_backend_tensor_set(t_latents, latents_host.data(), 0, latents_host.size() * sizeof(float));
 
@@ -3885,7 +3891,7 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "voxcpm2: vae_decode_graph compute failed; falling back to CPU\n");
         ggml_free(ctx0);
-        return vae_decode(ctx, patches, ctx->backend_cpu);
+        return vae_decode_cpu(ctx, patches);
     }
 
     ggml_tensor* pcm_t = ggml_graph_get_tensor(gf, "pcm");
@@ -3953,15 +3959,10 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
 // When VAE weights are absent, returns silence of the correct duration.
 // ---------------------------------------------------------------------------
 
-static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std::vector<float>>& patches,
-                                     ggml_backend_t /*cpu_be*/) {
+static std::vector<float> vae_decode_cpu(voxcpm2_context* ctx, const std::vector<std::vector<float>>& patches) {
     int n_patches = (int)patches.size();
     if (n_patches == 0)
         return {};
-
-    if (vox_env_bool_default_on("VOXCPM2_USE_GRAPH")) {
-        return vae_decode_graph(ctx, patches);
-    }
 
     int feat_dim = 64;
     int P = (int)ctx->hp.patch_frames; // 4
@@ -4265,6 +4266,17 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std
     }
 
     return pcm;
+}
+
+// Dispatcher: routes to the ggml graph path or the legacy CPU path.
+// All fallback sites inside vae_decode_graph call vae_decode_cpu directly
+// to avoid the mutual recursion that caused STATUS_STACK_OVERFLOW (#164).
+static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std::vector<float>>& patches,
+                                     ggml_backend_t /*cpu_be*/) {
+    if (vox_env_bool_default_on("VOXCPM2_USE_GRAPH")) {
+        return vae_decode_graph(ctx, patches);
+    }
+    return vae_decode_cpu(ctx, patches);
 }
 
 // ===========================================================================
@@ -6861,7 +6873,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
         if (stage == "vae_only_graph") {
             pcm = vae_decode_graph(ctx, patches);
         } else {
-            pcm = vae_decode(ctx, patches, ctx->backend_cpu);
+            pcm = vae_decode_cpu(ctx, patches);
         }
         *out_n = (int)pcm.size();
         float* out = (float*)std::malloc(pcm.size() * sizeof(float));

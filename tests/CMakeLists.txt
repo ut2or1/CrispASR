@@ -377,6 +377,22 @@ catch_discover_tests(test-punctuation-policy
     PROPERTIES LABELS "unit"
 )
 
+# ─── test - chatterbox - text - prep — unit tests for the shared text
+# normalizer used by the multilingual Chatterbox path.
+add_executable(test-chatterbox-text-prep
+    test-chatterbox-text-prep.cpp
+)
+target_include_directories(test-chatterbox-text-prep PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-chatterbox-text-prep PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-chatterbox-text-prep
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;chatterbox"
+)
+
 # ─── test - punc - resolve — Catch2 unit tests for the shared --punc-model
 # resolver (CLI/server parity). Pure string mapping, header-only, no model load.
 add_executable(test-punc-resolve
@@ -1252,7 +1268,7 @@ catch_discover_tests(test-chat-ggml
 # range of T values around the failure boundary and asserts CPU and
 # Metal outputs match bit-exactly. Guards against ggml bumps reverting
 # the patch.
-if(APPLE)
+if(APPLE AND TARGET ggml-metal)
     add_executable(test_metal_norm_repro test_metal_norm_repro.cpp)
     target_link_libraries(test_metal_norm_repro PRIVATE
         ggml
@@ -1268,6 +1284,51 @@ if(APPLE)
             LABELS "unit;metal"
             TIMEOUT 30)
     endforeach()
+endif()
+
+# ─── test_ggml_audio_ops_backend — carried ggml audio-op backend patches ─────
+#
+# These run conv_transpose_1d and col2im_1d directly on a single GPU backend
+# without a CPU fallback scheduler. They catch ggml bumps that drop CrispASR's
+# backend kernels or dtype support for audio codec/vocoder paths.
+function(add_ggml_audio_ops_backend_test TEST_TARGET BACKEND_DEF BACKEND_TARGET)
+    add_executable(${TEST_TARGET} test_ggml_audio_ops_backend.cpp)
+    target_include_directories(${TEST_TARGET} PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+    )
+    target_compile_definitions(${TEST_TARGET} PRIVATE ${BACKEND_DEF})
+    target_link_libraries(${TEST_TARGET} PRIVATE
+        ggml
+        ggml-base
+        ggml-cpu
+        ${BACKEND_TARGET}
+    )
+    add_test(NAME ${TEST_TARGET} COMMAND ${TEST_TARGET})
+    set_tests_properties(${TEST_TARGET} PROPERTIES
+        LABELS "unit;ggml;backend"
+        TIMEOUT 45
+        SKIP_RETURN_CODE 4)
+endfunction()
+
+if(APPLE AND TARGET ggml-metal)
+    add_ggml_audio_ops_backend_test(test_ggml_audio_ops_metal
+        "CRISPASR_TEST_BACKEND_METAL;CRISPASR_TEST_COL2IM_F16"
+        ggml-metal)
+    set_tests_properties(test_ggml_audio_ops_metal PROPERTIES LABELS "unit;ggml;backend;metal")
+endif()
+
+if(TARGET ggml-vulkan)
+    add_ggml_audio_ops_backend_test(test_ggml_audio_ops_vulkan
+        CRISPASR_TEST_BACKEND_VULKAN
+        ggml-vulkan)
+    set_tests_properties(test_ggml_audio_ops_vulkan PROPERTIES LABELS "unit;ggml;backend;vulkan")
+endif()
+
+if(TARGET ggml-cuda)
+    add_ggml_audio_ops_backend_test(test_ggml_audio_ops_cuda
+        "CRISPASR_TEST_BACKEND_CUDA;CRISPASR_TEST_COL2IM_F16"
+        ggml-cuda)
+    set_tests_properties(test_ggml_audio_ops_cuda PROPERTIES LABELS "unit;ggml;backend;cuda")
 endif()
 
 # ─── test - backends — integration tests for all CrispASR backends ────────────

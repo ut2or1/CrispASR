@@ -485,7 +485,10 @@ constexpr Entry k_registry[] = {
      "snac-24khz.gguf",
      "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf",
      "~80 MB"},
-    // Chatterbox family — ResembleAI MIT TTS. Two-GGUF runtime:
+    // Chatterbox family — ResembleAI MIT TTS. Base model is the 23-language
+    // multilingual Chatterbox; language-specific fine-tunes live in
+    // `kartoffelbox-turbo` (German turbo) and `lahgtna-chatterbox` (Arabic).
+    // Two-GGUF runtime:
     //   primary  = T3 (text → speech tokens) — also carries baked conds
     //   companion = S3Gen (tokens → 24 kHz waveform via CFM + HiFTGenerator)
     // CLI adapter (`crispasr_backend_chatterbox.cpp`) is shipped — surfaces
@@ -840,10 +843,21 @@ constexpr ExtraCompanion k_cosyvoice3_tts_extras[] = {
     {nullptr, nullptr},
 };
 
+// qwen3-tts Base variants need a default voice pack so synthesis works
+// without --voice. One pack covers both 0.6B and 1.7B Base since the
+// voice embedding format is model-size-agnostic (spk_embedding + ref_code).
+constexpr ExtraCompanion k_qwen3_tts_base_extras[] = {
+    {"qwen3-tts-voice-default.gguf",
+     "https://huggingface.co/cstr/qwen3-tts-voices-GGUF/resolve/main/qwen3-tts-voice-default.gguf"},
+    {nullptr, nullptr},
+};
+
 constexpr ExtraList k_extras[] = {
     {"kokoro", k_kokoro_extras},
     {"vibevoice-tts", k_vibevoice_tts_extras},
     {"cosyvoice3-tts", k_cosyvoice3_tts_extras},
+    {"qwen3-tts", k_qwen3_tts_base_extras},
+    {"qwen3-tts-1.7b-base", k_qwen3_tts_base_extras},
     {nullptr, nullptr},
 };
 // clang-format on

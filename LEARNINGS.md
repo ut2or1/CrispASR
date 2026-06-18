@@ -7808,6 +7808,76 @@ a different name and update `crispasr_model_registry.cpp` to point
 at it. The C++ side is already correct. The patched GGUF was
 verified locally as `chatterbox-t3-q8_0-bpe.gguf`.
 
+Follow-up for multilingual v3: the language signal should be injected
+as a model-input token, not concatenated into the user text. Otherwise
+the language tag can leak into speech output as a spoken prefix even
+when the tokenizer contains the tag.
+
+### Resolution — multilingual text prep now shares the upstream punctuation / lowercase path (2026-06-18)
+
+The C++ Chatterbox synthesis path now runs all text through a shared
+normalizer before tokenization:
+
+- collapses repeated whitespace and trims Unicode-space variants that
+  the old path left intact;
+- normalizes the common punctuation shorthands from upstream `punc_norm`
+  (`...`, `:`, `;`, `" - "`, curly quotes, dashes);
+- lowercases ASCII text when a language tag is set, so the multilingual
+  model no longer sees the uppercase-heavy text that the Python MTL
+  tokenizer would have normalized away.
+
+That closes the obvious `-l fr` / `-l ar` drift in the C++ path, but it
+does not yet implement Python's full Unicode NFKD / script-specific
+normalizers for zh/ja/he/ko/ru.
+
+### Root cause — the published q4_k multilingual GGUF used the wrong tokenizer (2026-06-18)
+
+The `cstr/chatterbox-GGUF/chatterbox-t3-q4_k.gguf` artifact tested on
+2026-06-18 is internally inconsistent: `chatterbox.t3.text_vocab_size`
+is 2454 from `t3_mtl23ls_v3.safetensors`, but the embedded
+`tokenizer.ggml.tokens` array has only 2352 entries. That file was
+converted with `mtl_tokenizer.json`; upstream
+`ChatterboxMultilingualTTS.from_local()` loads
+`grapheme_mtl_merged_expanded_v1.json` for multilingual inference.
+
+Audible symptom: no-language prompts like `"Justice justice."` and
+`"Bonjour tout le monde."` synthesize intelligibly, but adding `-l fr`
+produces a spoken leading artifact before the real phrase, and `-l ar`
+produces gibberish. This is a TTS/model artifact issue, not ASR.
+
+Fixes:
+
+- converter tokenizer selection now prefers
+  `grapheme_mtl_merged_expanded_v1.json`;
+- conversion fails if tokenizer length differs from T3 `text_vocab_size`;
+- runtime load fails on the same mismatch so broken GGUFs cannot produce
+  plausible but invalid multilingual audio.
+
+Follow-up verification after regenerating and uploading
+`cstr/chatterbox-GGUF` on 2026-06-18:
+
+- all rebuilt T3 variants (`f16`, `q8_0`, `q4_k`) have
+  `chatterbox.t3.text_vocab_size=2454`, `tokenizer.ggml.tokens=2454`,
+  and `tokenizer.ggml.merges=265`;
+- `-l fr` is not a no-op in the C++ CLI. With fixed Q4_K, seed 123,
+  and text `"justice justice"`, no-language tokenization is
+  `[START], J, ust, ic, e, [SPACE], just, ic, e, ., [STOP]`, while
+  `-l fr` is `[START], [fr], just, ic, e, [SPACE], just, ic, e, .,
+  [STOP]` (`[fr]` is token id 634);
+- the no-language repeat is bit-identical, but no-language vs `-l fr`
+  produces different AR speech tokens, different duration
+  (`1.52 s` vs `1.92 s` for `"justice justice"`), and near-zero
+  waveform cosine (`-0.004`). For `"bonjour tout le monde"`, `-l fr`
+  similarly inserts `[fr]`, changes speech tokens, and improves the
+  Parakeet roundtrip from `"Bonjour tout monde."` to
+  `"Bonjour tout le monde."`.
+
+That proves the CLI/runtime language wiring is active after the artifact
+fix. It does **not** prove French quality is solved; listening tests still
+reported heavy accent / imperfect pronunciation on some Q4_K French
+samples, so remaining work is model-semantics / upstream-text-prep parity,
+not "is `-l` wired at all?".
+
 ### Operational note — the regen variants already have merges
 
 The `chatterbox-t3-q8_0-regen.gguf` and `chatterbox-t3-q4_k-regen.gguf`
@@ -10014,3 +10084,81 @@ computation (stop prediction, scoring, etc.) should also be in the graph.
 The precision difference between `ggml_mul_mat` (SIMD/BLAS) and scalar
 loops is small per step but compounds exponentially across autoregressive
 decode steps.
+
+## VibeVoice TTS: missing BPE merges still need BPE behavior (issue #171, 2026-06-18)
+
+### Problem
+
+The VibeVoice Realtime GGUF in the local cache had `tokenizer.ggml.tokens` but
+no `tokenizer.ggml.merges`. Falling back to greedy longest-vocab matching is not
+equivalent to Qwen BPE: the issue text `1. La genèse : L’inversion des rôles
+parentaux` produced different token IDs from the official Python tokenizer,
+which shifted the positive TTS condition and surfaced as accented/garbled speech.
+
+### Fix
+
+Load `tokenizer.ggml.merges` when present and use the shared BPE tokenizer. For
+older GGUFs without merges, do a vocab-rank BPE fallback: split the byte-encoded
+word into Unicode byte symbols, repeatedly merge adjacent symbols whose
+concatenation exists in the vocab, and rank candidates by the merged token ID.
+Append VibeVoice's trailing newline token explicitly.
+
+Voice-conditioned Realtime also needs to match the official streaming loop: run
+the base LM over text in 5-token windows using the cached voice KV, and feed the
+next TTS text window before the following speech window. Processing all text at
+once or moving the text window after speech generation creates hidden-state drift.
+
+### Takeaway
+
+If TTS diffusion noise is exact and the first divergence is the positive TTS LM
+condition, don't start by chasing VAE ops such as `col2im_1d` or
+`conv_transpose_1d`. Check tokenizer parity, required sentinel tokens, and
+voice-cache scheduling first.
+
+On macOS, platform-specific tests must guard on the backend target they link
+against, not only `APPLE`. A Vulkan-on-MoltenVK build is still Apple, but it does
+not provide `ggml-metal`; Metal-only repro tests should use
+`if(APPLE AND TARGET ggml-metal)`.
+
+## VibeVoice TTS start clicks: distinguish decoder PCM from CLI post-processing (issue #171, 2026-06-18)
+
+### Problem
+
+Recent VibeVoice realtime WAVs had loud clicks at the start, while the Python
+reference decoder output did not. The first instinct was to chase decoder
+parity (`conv_transpose_1d`, `col2im_1d`, or the upstream cached streaming
+decoder), but a latent-controlled comparison showed the C++ VAE raw output was
+clean and numerically matched the official PyTorch decoder:
+
+- Python decoder from saved latents: first samples around `0.005`, `peak250ms`
+  around `0.019`, `maxjump250ms` around `0.0013`.
+- C++ `tts_raw_audio` from the same latents: same clean start.
+- User-visible CLI WAV before the fix: first nonzero sample could jump to
+  `0.2` to `1.0`.
+
+The click came after VAE decode:
+
+1. VibeVoice realtime used a fixed 2400-sample start trim. That skipped the
+   clean initial decoded chunk and could land directly on a later waveform peak.
+2. The built-in spread-spectrum watermark was global CLI/server post-processing.
+   Its overlap-add normalization could be tiny at Hann-window boundaries, which
+   amplified boundary samples and created an impulse. This affected any backend
+   using the fallback spread-spectrum watermark, not just VibeVoice.
+
+### Fix
+
+- Preserve VibeVoice realtime's decoder start unless there is actual leading
+  digital silence; use only floor-based trim with attack margin.
+- Write the spread-spectrum watermark back as a ramped delta and ignore
+  under-covered boundary samples.
+- Keep VibeVoice debug hooks env-gated:
+  `VIBEVOICE_TTS_LATENTS` replays a raw float32 latent stack,
+  `VIBEVOICE_TTS_DUMP` writes `tts_scaled_latent` and `tts_raw_audio`, and
+  `VIBEVOICE_TTS_DUMP_DECODER=1` adds decoder stage dumps.
+
+### Takeaway
+
+When a generated WAV clicks but a reference decoder does not, diff every
+post-decoder stage too: backend PCM, backend trim/fade, watermark/provenance
+mutation, then file serialization. A clean `tts_raw_audio` plus a broken WAV is
+not a model-runtime bug; it is post-processing.
