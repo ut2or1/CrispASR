@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -46,6 +47,42 @@
 #include <random>
 #include <string>
 #include <vector>
+
+#if defined(HAVE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+static bool piper_use_scalar() {
+    static int v = -1;
+    if (v < 0)
+        v = (getenv("PIPER_FORCE_SCALAR") != nullptr) ? 1 : 0;
+    return v != 0;
+}
+#endif
+
+// ===========================================================================
+// Bench instrumentation — `PIPER_TTS_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool piper_tts_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("PIPER_TTS_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct piper_tts_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit piper_tts_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~piper_tts_bench_stage() {
+        if (!piper_tts_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  piper_tts_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // espeak-ng phonemizer (shared with kokoro.cpp).
 // Three modes:
@@ -586,6 +623,12 @@ struct piper_tts_context {
     int verbosity;
     int n_threads;
     std::string dump_dir; // if non-empty, dump intermediates for diff harness
+
+    // Pre-cached F32 weight data. Populated at init to avoid repeated
+    // ggml_backend_tensor_get + dequant on every synthesis call.
+    // Gated by CRISPASR_PIPER_WEIGHT_CACHE (default ON).
+    std::unordered_map<ggml_tensor*, std::vector<float>> weight_cache;
+    bool weight_cache_enabled = true;
 };
 
 // ── Diff harness: dump intermediate tensors to binary files ────────
@@ -669,8 +712,23 @@ struct mini_graph {
 } // namespace
 
 // ── Tensor read helper (handles F16→F32 conversion) ───────────────
+// When g_piper_ctx is set and its weight_cache contains t, the cached
+// F32 data is returned directly (no backend round-trip or dequant).
+// g_piper_ctx is set at the top of each synthesize call and cleared
+// on return — safe because piper synthesis is single-threaded.
+
+static piper_tts_context* g_piper_ctx = nullptr;
 
 static void read_tensor_f32(ggml_tensor* t, std::vector<float>& out) {
+    // Fast path: return pre-cached F32 data if available.
+    if (g_piper_ctx && g_piper_ctx->weight_cache_enabled) {
+        auto it = g_piper_ctx->weight_cache.find(t);
+        if (it != g_piper_ctx->weight_cache.end()) {
+            out = it->second;
+            return;
+        }
+    }
+
     const int64_t n = ggml_nelements(t);
     out.resize(n);
     const size_t nbytes = ggml_nbytes(t);
@@ -737,18 +795,39 @@ static void cpu_multihead_attention_relpos(
 
     // Q, K, V: (C, T) via 1x1 conv. ne=[1,C,C] → flat[ci + co*C]
     std::vector<float> Q(C * T), K(C * T), V(C * T);
-    for (int t = 0; t < T; t++) {
-        for (int co = 0; co < C; co++) {
-            float sq = bq[co], sk = bk[co], sv = bv[co];
-            for (int ci = 0; ci < C; ci++) {
-                float xv = x[t * C + ci];
-                sq += xv * wq[ci + co * C];
-                sk += xv * wk[ci + co * C];
-                sv += xv * wv[ci + co * C];
+#if defined(HAVE_ACCELERATE)
+    if (!piper_use_scalar()) {
+        // Q/K/V[T,C] = x[T,C] @ w^T[C,C] + bias[C]
+        // Weight layout: w[ci + co*C] = column-major; CblasTrans reads as [C_in × C_out].
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, C, C, 1.0f, x.data(), C, wq.data(), C, 0.0f, Q.data(),
+                    C);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, C, C, 1.0f, x.data(), C, wk.data(), C, 0.0f, K.data(),
+                    C);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, C, C, 1.0f, x.data(), C, wv.data(), C, 0.0f, V.data(),
+                    C);
+        for (int t = 0; t < T; t++) {
+            for (int c = 0; c < C; c++) {
+                Q[t * C + c] += bq[c];
+                K[t * C + c] += bk[c];
+                V[t * C + c] += bv[c];
             }
-            Q[t * C + co] = sq;
-            K[t * C + co] = sk;
-            V[t * C + co] = sv;
+        }
+    } else
+#endif
+    {
+        for (int t = 0; t < T; t++) {
+            for (int co = 0; co < C; co++) {
+                float sq = bq[co], sk = bk[co], sv = bv[co];
+                for (int ci = 0; ci < C; ci++) {
+                    float xv = x[t * C + ci];
+                    sq += xv * wq[ci + co * C];
+                    sk += xv * wk[ci + co * C];
+                    sv += xv * wv[ci + co * C];
+                }
+                Q[t * C + co] = sq;
+                K[t * C + co] = sk;
+                V[t * C + co] = sv;
+            }
         }
     }
 
@@ -769,28 +848,34 @@ static void cpu_multihead_attention_relpos(
     for (int h = 0; h < H; h++) {
         int ch_off = h * D;
 
-        // 3a. Compute attention scores: scores[i][j] = Q[i] · K[j] / sqrt(D)
-        //     + relative key bias: Q[i] · rel_k[clip(j-i+W, 0, 2W)] / sqrt(D)
+        // 3a. Attention scores: Q_h@K_h^T / sqrt(D) + relative key bias
         std::vector<float> scores(T * T);
+#if defined(HAVE_ACCELERATE)
+        if (!piper_use_scalar()) {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, T, D, inv_sqrt_d, Q.data() + ch_off, C,
+                        K.data() + ch_off, C, 0.0f, scores.data(), T);
+        } else
+#endif
+        {
+            for (int i = 0; i < T; i++) {
+                for (int j = 0; j < T; j++) {
+                    float s = 0;
+                    for (int d = 0; d < D; d++)
+                        s += Q[i * C + ch_off + d] * K[j * C + ch_off + d];
+                    scores[i * T + j] = s * inv_sqrt_d;
+                }
+            }
+        }
+
+        // Relative key bias — 2W+1 window only, O(T*2W*D) << O(T²*D)
         for (int i = 0; i < T; i++) {
-            for (int j = 0; j < T; j++) {
-                float s = 0;
-                for (int d = 0; d < D; d++) {
-                    s += Q[i * C + ch_off + d] * K[j * C + ch_off + d];
-                }
-                s *= inv_sqrt_d;
-
-                // Relative position key bias
+            int j0 = std::max(0, i - W), j1 = std::min(T, i + W + 1);
+            for (int j = j0; j < j1; j++) {
                 int r = j - i + W;
-                if (r >= 0 && r < n_rel) {
-                    float rel_s = 0;
-                    for (int d = 0; d < D; d++) {
-                        rel_s += Q[i * C + ch_off + d] * rel_k[d + r * D];
-                    }
-                    s += rel_s * inv_sqrt_d;
-                }
-
-                scores[i * T + j] = s;
+                float rel_s = 0;
+                for (int d = 0; d < D; d++)
+                    rel_s += Q[i * C + ch_off + d] * rel_k[d + r * D];
+                scores[i * T + j] += rel_s * inv_sqrt_d;
             }
         }
 
@@ -806,26 +891,42 @@ static void cpu_multihead_attention_relpos(
                 scores[i * T + j] = expf(scores[i * T + j] - max_s);
                 sum_e += scores[i * T + j];
             }
-            for (int j = 0; j < T; j++) {
+            for (int j = 0; j < T; j++)
                 scores[i * T + j] /= sum_e;
-            }
         }
 
-        // 3c. Weighted sum of V + relative value bias
-        for (int i = 0; i < T; i++) {
-            for (int d = 0; d < D; d++) {
-                float s = 0;
-                for (int j = 0; j < T; j++) {
-                    float w_ij = scores[i * T + j];
-                    s += w_ij * V[j * C + ch_off + d];
-
-                    // Relative position value bias
+        // 3c. V accumulation + relative value bias
+#if defined(HAVE_ACCELERATE)
+        if (!piper_use_scalar()) {
+            std::vector<float> tmp(T * D, 0.0f);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, T, D, T, 1.0f, scores.data(), T, V.data() + ch_off,
+                        C, 0.0f, tmp.data(), D);
+            for (int i = 0; i < T; i++) {
+                int j0 = std::max(0, i - W), j1 = std::min(T, i + W + 1);
+                for (int j = j0; j < j1; j++) {
                     int r = j - i + W;
-                    if (r >= 0 && r < n_rel) {
-                        s += w_ij * rel_v[d + r * D];
-                    }
+                    float w_ij = scores[i * T + j];
+                    for (int d = 0; d < D; d++)
+                        tmp[i * D + d] += w_ij * rel_v[d + r * D];
                 }
-                out[i * C + ch_off + d] = s;
+            }
+            for (int t = 0; t < T; t++)
+                std::memcpy(out.data() + t * C + ch_off, tmp.data() + t * D, D * sizeof(float));
+        } else
+#endif
+        {
+            for (int i = 0; i < T; i++) {
+                for (int d = 0; d < D; d++) {
+                    float s = 0;
+                    for (int j = 0; j < T; j++) {
+                        float w_ij = scores[i * T + j];
+                        s += w_ij * V[j * C + ch_off + d];
+                        int r = j - i + W;
+                        if (r >= 0 && r < n_rel)
+                            s += w_ij * rel_v[d + r * D];
+                    }
+                    out[i * C + ch_off + d] = s;
+                }
             }
         }
     }
@@ -2204,6 +2305,39 @@ struct piper_tts_context* piper_tts_init_from_file(const char* path_model, struc
     ctx->speaker_id = params.speaker_id;
     ctx->espeak_voice = ctx->hp.espeak_voice;
 
+    // Pre-cache all weights as F32 to avoid repeated backend_tensor_get +
+    // dequant on every synthesis call. Gated by CRISPASR_PIPER_WEIGHT_CACHE
+    // (default ON). Cost: ~2× model RAM (30 MB F16 → +60 MB F32 cache).
+    {
+        const char* env = std::getenv("CRISPASR_PIPER_WEIGHT_CACHE");
+        ctx->weight_cache_enabled = (!env || *env != '0');
+    }
+    if (ctx->weight_cache_enabled && ctx->w_ctx) {
+        int n_cached = 0;
+        size_t bytes_cached = 0;
+        // Walk all tensors in the weight context and cache them as F32.
+        for (ggml_tensor* t = ggml_get_first_tensor(ctx->w_ctx); t; t = ggml_get_next_tensor(ctx->w_ctx, t)) {
+            const int64_t n = ggml_nelements(t);
+            std::vector<float> f32(n);
+            const size_t nbytes = ggml_nbytes(t);
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(t, f32.data(), 0, nbytes);
+            } else {
+                std::vector<uint8_t> raw(nbytes);
+                ggml_backend_tensor_get(t, raw.data(), 0, nbytes);
+                const auto to_float = ggml_get_type_traits(t->type)->to_float;
+                if (to_float)
+                    to_float(raw.data(), f32.data(), n);
+            }
+            bytes_cached += n * sizeof(float);
+            ctx->weight_cache[t] = std::move(f32);
+            n_cached++;
+        }
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "piper_tts: cached %d tensors (%.1f MB F32) for fast CPU path\n", n_cached,
+                    (double)bytes_cached / (1024.0 * 1024.0));
+    }
+
     if (ctx->verbosity >= 1) {
         fprintf(stderr,
                 "piper_tts: loaded %s (hidden=%u, enc=%u layers, "
@@ -2257,6 +2391,11 @@ int piper_tts_synthesize_phonemes(struct piper_tts_context* ctx, const char* ipa
     if (!ctx || !ipa_phonemes || !pcm_out)
         return 0;
 
+    // Set module-level context for read_tensor_f32 cache lookup.
+    g_piper_ctx = ctx;
+
+    piper_tts_bench_stage _bs_synth("synthesize");
+
     // 1. Encode phonemes to IDs
     std::vector<int64_t> phoneme_ids = encode_phonemes(ipa_phonemes, ctx->pmap);
     int T = (int)phoneme_ids.size();
@@ -2268,7 +2407,10 @@ int piper_tts_synthesize_phonemes(struct piper_tts_context* ctx, const char* ipa
 
     // 2. Text encoder
     std::vector<float> enc_out, enc_mean, enc_logvar;
-    text_encoder_forward(ctx, phoneme_ids, enc_out, enc_mean, enc_logvar);
+    {
+        piper_tts_bench_stage _bs("text_encoder");
+        text_encoder_forward(ctx, phoneme_ids, enc_out, enc_mean, enc_logvar);
+    }
 
     int C = (int)ctx->hp.inter_channels;
 
@@ -2287,7 +2429,10 @@ int piper_tts_synthesize_phonemes(struct piper_tts_context* ctx, const char* ipa
 
     // 3. Duration prediction — SDP takes raw encoder output, not projected mean
     std::vector<float> log_dur;
-    sdp_forward(ctx, enc_out, T, ctx->noise_w, log_dur);
+    {
+        piper_tts_bench_stage _bs("duration_predict");
+        sdp_forward(ctx, enc_out, T, ctx->noise_w, log_dur);
+    }
 
     // Convert log-durations to integer durations
     std::vector<int> durations(T);
@@ -2332,13 +2477,20 @@ int piper_tts_synthesize_phonemes(struct piper_tts_context* ctx, const char* ipa
     dump_stage(ctx, "z_p", z.data(), z.size());
 
     // 6. Residual coupling flow (inverse)
-    flow_inverse(ctx, z, T_latent);
+    {
+        piper_tts_bench_stage _bs("flow_inverse");
+        flow_inverse(ctx, z, T_latent);
+    }
     dump_stage(ctx, "z_dec", z.data(), z.size());
 
     // 7. HiFi-GAN decode
     std::vector<float> pcm;
-    if (!hifigan_decode(ctx, z, T_latent, pcm)) {
-        return 0;
+    {
+        piper_tts_bench_stage _bs("hifigan_decode");
+        if (!hifigan_decode(ctx, z, T_latent, pcm)) {
+            g_piper_ctx = nullptr;
+            return 0;
+        }
     }
     dump_stage(ctx, "audio", pcm.data(), pcm.size());
 
@@ -2355,6 +2507,7 @@ int piper_tts_synthesize_phonemes(struct piper_tts_context* ctx, const char* ipa
                 ctx->hp.sample_rate);
     }
 
+    g_piper_ctx = nullptr;
     return n_samples;
 }
 

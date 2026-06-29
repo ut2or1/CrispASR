@@ -28,11 +28,218 @@ trade-off:
 | **`voxcpm2-tts`** | VoxCPM2: 2B Qwen2 backbone + flow matching + BigVGAN @ 48 kHz (decimated to 24 kHz). Zero-shot voice cloning via `--voice <ref.wav>`. | Yes | ~2.4 GB via `-m auto` |
 | **`pocket-tts`** | Kyutai Pocket TTS 100M: continuous-latent AR @ 12.5 Hz + one-step LSD flow head + Mimi VAE decoder → 24 kHz. MIT / CC-BY-4.0. Voice cloning via `--voice ref.wav`. | Yes (`--voice`) | ~220 MB via `-m auto` (F16 GGUF) |
 | **`kugelaudio`** | KugelAudio-0-Open: 7B Qwen2.5 backbone + 4-layer DiT diffusion head (20-step SDE-DPMSolver++) + acoustic VAE decoder → 24 kHz. 23 languages. MIT. | Pre-encoded voices (`--voice voice.gguf`) | ~5.3 GB Q4_K / ~16 GB F16 via `-m auto` |
-| **`tada`** | HumeAI TADA-3B-ML: Llama-3.2-3B backbone + per-token flow-matching diffusion head + TADA codec → 24 kHz. 1:1 text-to-acoustic alignment (no expansion). Voice cloning via reference audio prompt. Requires `--codec-model` for companion codec GGUF. | Yes (`--voice <ref.wav>`) | ~2.2 GB talker Q4_K + ~1 GB codec GGUF |
+| **`tada-1b`** | HumeAI TADA 1B: Llama-3.2-1B backbone + per-token flow-matching diffusion head + TADA codec → 24 kHz. **English-only.** `-m auto` downloads model + default `tada-ref.gguf`. | Yes (`--voice <tada-ref.gguf>`, English voice refs only) | ~1.7 GB Q4_K + ~1 GB codec |
+| **`tada` / `tada-3b-ml`** | HumeAI TADA 3B Multilingual: same architecture, 3B params. Supports **ar, ch, de, es, fr, it, ja, pl, pt** in addition to English. `-l <lang>` auto-downloads `tada-ref-<lang>.gguf`. | Yes (`--voice <tada-ref.gguf>`) | ~4 GB Q4_K + ~1 GB codec |
 | **`lfm2-audio`** | LiquidAI LFM2.5-Audio 1.5B: FastConformer encoder + LFM2 hybrid conv+attention backbone + 6L depthformer (8-codebook Mimi) + ISTFT detokenizer → 24 kHz. Interleaved text+audio generation. Also does ASR and speech-to-speech. LFM Open License v1.0 ($10M revenue cap). | No | ~1.5 GB Q4_K (JP) / ~1.6 GB Q5_K (EN) + ~157 MB detokenizer companion |
 | **`mini-omni2`** | gpt-omni/mini-omni2: Whisper-small encoder + Qwen2-0.5B LLM with 8-stream architecture + SNAC 24 kHz decoder → 24 kHz. Also does ASR and speech-to-speech. MIT license. Requires `--codec-model snac-24khz.gguf` companion. | No | ~1.0 GB Q4_K + ~80 MB SNAC companion |
 
 All backends write mono WAV via `--tts-output` (22 kHz for piper/fastpitch, 16 kHz for speecht5, 24 kHz for most others, 44.1 kHz for melotts/dia/parler-tts/zonos-tts, 48 kHz for voxcpm2-tts).
+
+## TADA — multilingual and voice cloning
+
+TADA ships as two variants; only the 3B multilingual model can synthesise
+non-English text:
+
+| Backend | Model | Languages |
+|---|---|---|
+| `tada-1b` | HumeAI/tada-1b | English only |
+| `tada` / `tada-3b-ml` | HumeAI/tada-3b-ml | en + ar, ch, de, es, fr, it, ja, pl, pt |
+
+### Use case (a) — built-in default voice for a language
+
+Pass `-l <lang>` with the `tada-3b-ml` backend. CrispASR auto-downloads
+`tada-ref-<lang>.gguf` from `cstr/tada-tts-3b-ml-GGUF` on first use (<200 KB
+per language):
+
+```bash
+crispasr --backend tada-3b-ml -m auto -l fr \
+    --tts "La justice sans force est impuissante." \
+    --tts-output justice.wav
+```
+
+The `tada-ref-fr.gguf` encodes the acoustic fingerprint (speaker identity,
+prosody) extracted offline from a 10 s FLEURS CC-BY-4.0 French clip. Once
+cached it is reused for every subsequent French synthesis call. Available
+language codes: `ar`, `ch`, `de`, `es`, `fr`, `it`, `ja`, `pl`, `pt`.
+
+#### Switching voice at query time (server, #201)
+
+On the HTTP server the voice is **per request** — point `voice` at a different
+`tada-ref-*.gguf` and the backend reloads it on the next call, no container
+restart needed. Omitting `voice` (or `"default"`/`"auto"`) keeps the
+currently-loaded reference, so requests that don't care pay nothing.
+
+```bash
+# request 1: French built-in voice
+curl -s :8080/v1/audio/speech -d '{"input":"Bonjour.","voice":"tada-ref-fr.gguf"}' -o fr.wav
+# request 2: German voice — switched live, same running server
+curl -s :8080/v1/audio/speech -d '{"input":"Guten Tag.","voice":"tada-ref-de.gguf"}' -o de.wav
+```
+
+The name resolves like any other model path (absolute path, or a cache/registry
+name that auto-downloads). Embedders going through the session C ABI get the
+same capability via `crispasr_session_set_voice(s, "tada-ref-de.gguf", NULL)`.
+Generating a brand-new reference from raw audio+transcript at query time is not
+yet wired into the server (it needs the encoder+aligner GGUFs loaded) — bake the
+ref offline with the `--make-ref` pipeline below, then switch to it live.
+
+### Use case (b) — custom voice cloning
+
+To speak in a specific person's voice, bake a ref GGUF from ~10 s of their
+speech. Two options — pure C++ (no Python) or the Python converter:
+
+#### Option 1: C++ `--make-ref` (no Python needed)
+
+Place `tada-encoder-f16.gguf` and `tada-aligner-en.gguf` (from
+[cstr/tada-encoder-GGUF](https://huggingface.co/cstr/tada-encoder-GGUF))
+next to your TADA model GGUF, then:
+
+```bash
+# Step 1 — bake the ref GGUF (one-time per speaker):
+crispasr --backend tada-3b-ml -m auto \
+    --make-ref \
+    --voice speaker_10s.wav \
+    --ref-text "Exact words spoken in the audio." \
+    --make-ref-output tada-ref-custom.gguf
+
+# Step 2 — synthesise with that voice:
+crispasr --backend tada-3b-ml -m auto \
+    --voice tada-ref-custom.gguf \
+    --tts "Bonjour, comment allez-vous ?" \
+    --tts-output result.wav \
+    --i-have-rights
+```
+
+The `--make-ref` pipeline runs entirely in C++: wav2vec2 aligner → BPE
+tokenization → DP alignment → WavEncoder → LocalAttentionEncoder → GGUF
+output. Auto-discovers the encoder + aligner GGUFs next to the model file;
+override with `--make-ref-encoder` / `--make-ref-aligner` if needed.
+
+#### Option 2: Python converter
+
+```bash
+pip install hume-tada
+python models/convert-tada-ref-to-gguf.py \
+    --audio speaker_10s.wav \
+    --language fr \
+    --output tada-ref-custom.gguf
+```
+
+A 5–15 s clip of clean speech (no music/noise) produces the best fingerprint.
+`--language` (Python) selects the language-specific TADA aligner; it must match
+the language of the text you will synthesise.
+
+### Encoder / aligner GGUFs
+
+The encoder pipeline (WAV+transcript → voice reference) is ported to C++/ggml.
+Pre-converted GGUFs are on HuggingFace at
+[cstr/tada-encoder-GGUF](https://huggingface.co/cstr/tada-encoder-GGUF):
+
+| File | Size | Description |
+|------|------|-------------|
+| `tada-encoder-f16.gguf` | 178 MB | Shared WavEncoder + 6-layer LocalAttentionEncoder + hidden linear |
+| `tada-aligner-en.gguf` | 1.1 GB | English aligner (wav2vec2-large + 128K-class Llama CTC head) |
+
+The encoder GGUF is loaded by `src/tada_encoder.{h,cpp}`. The aligner GGUF
+is loaded by the existing `wav2vec2_load()` runtime (same architecture).
+
+To convert language-specific aligners:
+```bash
+python models/convert-tada-aligner-to-gguf.py \
+    --codec-repo HumeAI/tada-codec --language fr \
+    --output tada-aligner-fr.gguf
+```
+
+If `--voice` is omitted, the runtime uses `tada-ref-<lang>.gguf` when `-l
+<lang>` is set, then falls back to `tada-ref.gguf` (the built-in English
+voice).
+
+### Timing quality (`TADA_NUM_CANDIDATES`)
+
+TADA predicts each token's duration with a per-token flow-matching head that
+is **noise-sensitive**: an unlucky noise draw can collapse durations into a
+rushed, unintelligible utterance (a known property of the model — the PyTorch
+reference behaves identically with the same noise). To make output robust,
+CrispASR generates several flow-matching candidates per token and keeps the
+best one by reconstruction likelihood (the same `num_acoustic_candidates`
+ranking the reference implements).
+
+The CLI defaults to **4 candidates**. Override with `TADA_NUM_CANDIDATES`:
+
+```bash
+# Fastest, single noise draw (may occasionally rush/garble timing):
+TADA_NUM_CANDIDATES=1 crispasr --backend tada-3b-ml -m auto -l fr \
+    --tts "Bonjour, comment allez-vous ?" --tts-output out.wav
+
+# Higher quality / more robust timing (slower):
+TADA_NUM_CANDIDATES=8 crispasr --backend tada-3b-ml -m auto -l de \
+    --tts "Guten Tag, wie geht es Ihnen?" --tts-output out.wav
+```
+
+All candidates for a step are solved in a single batched flow-matching forward,
+so raising the count adds little wall-clock on top of the (model-load-dominated)
+baseline. `1` reproduces a single draw and is the fastest.
+
+The same **default of 4** applies through the session C ABI, so the bindings
+and HTTP server get robust timing out of the box. Bindings can override it at
+runtime with `set_tts_num_candidates(n)` (Python/Go/Rust/Ruby),
+`SetTtsNumCandidates` (C#/Java), or `setTtsNumCandidates` (Dart/JS) — and the
+`TADA_NUM_CANDIDATES` env var is honoured by every consumer, not just the CLI.
+
+### Talker text sampling (`TADA_TEMPERATURE`, `TADA_TOP_P`, …)
+
+`TADA_NUM_CANDIDATES` tunes only the **duration** flow-matching head, not the
+**content** (which words are spoken). The talker text decoder is a separate
+knob. It samples by default, matching upstream `InferenceOptions`
+(do_sample=True, temperature=0.6, top_k=0, top_p=0.9, repetition_penalty=1.1);
+pure greedy decoding has no repetition control and loops, cuts words off, or
+adds trailing noise — worst on harder or non-English text.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `TADA_DO_SAMPLE` | `1` | `0` = greedy argmax (the old behaviour); also `set_do_sample` |
+| `TADA_TEMPERATURE` | `0.6` | also set by `--temperature` / `set_temperature` |
+| `TADA_TOP_P` | `0.9` | nucleus; also `set_top_p` |
+| `TADA_TOP_K` | `0` | `0` = disabled; also `set_top_k` |
+| `TADA_REPETITION_PENALTY` | `1.1` | `1.0` = none; also `set_repetition_penalty` |
+
+Honoured by the CLI, C ABI, bindings and server. Raising
+`TADA_REPETITION_PENALTY` measurably reduces repeats; with sampling on, `--seed`
+changes the wording.
+
+On the HTTP server these are **per-request** JSON fields on `POST
+/v1/audio/speech` — `temperature`, `top_p`, `top_k`, `repetition_penalty`,
+`do_sample`, `num_candidates` — so a long-running container can be retuned at
+query time without a restart. A field that is omitted falls back to the value
+the server was started with (env / flags), so requests don't leak settings into
+each other.
+
+### Acoustic fidelity — quick vs accurate (`TADA_NUM_FM_STEPS`, …)
+
+The **acoustic** flow-matching head (which renders the predicted features into
+codec frames) has its own knobs, separate from the talker sampler and the
+duration-candidate ranking. These are the upstream `InferenceOptions` fields
+(`tada.py`) the reporter in #197 flagged as the "quick and dirty" vs "slow and
+accurate" axis. `num_flow_matching_steps` is the primary lever — more ODE steps
+cost proportionally more wall-clock but improve fidelity (e.g. ~4 steps is fast
+and intelligible; ~25 is noticeably slower and crisper).
+
+| Env var | Default | Notes |
+|---|---|---|
+| `TADA_NUM_FM_STEPS` | `10` | Flow-matching ODE steps (Python `num_flow_matching_steps`); higher = slower/more accurate. Also `set_tts_steps` |
+| `TADA_ACOUSTIC_CFG` | `1.6` | Acoustic classifier-free-guidance scale (Python `acoustic_cfg`). Also `set_cfg_weight` |
+| `TADA_NOISE_TEMP` | `0.9` | FM noise temperature (Python `noise_temp`). Also `set_tts_noise_temp` |
+
+On the HTTP server these are also **per-request** JSON fields on `POST
+/v1/audio/speech`: `num_steps` (→ FM steps), `cfg_scale` (→ acoustic CFG), and
+`noise_temp`. Same omit-falls-back-to-default, no-leak semantics as the sampler.
+
+```bash
+# Slow and accurate: more ODE steps for crisper acoustics.
+curl -s http://localhost:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"Hi. My name is Bob.","num_steps":25}' -o out.wav
+```
 
 ### Reproducible / diverse generation (`--seed`)
 
@@ -57,7 +264,7 @@ each run can produce a different prosody or phrasing.
 ```
 
 The seed is wired through the sampling-capable TTS backends:
-qwen3-tts, chatterbox, vibevoice, orpheus, indextts, f5-tts, voxcpm2, and parler-tts. It
+qwen3-tts, chatterbox, vibevoice, orpheus, tada, indextts, f5-tts, voxcpm2, and parler-tts. It
 also works for ASR backends with temperature sampling (parakeet,
 canary, cohere, qwen3-asr, voxtral4b, granite, glm-asr, kyutai-stt,
 moonshine). The server API accepts `"seed"` in the `/v1/audio/speech`
@@ -285,6 +492,8 @@ defaults reproduce the validated, end-to-end-tested code path.
 | `QWEN3_TTS_DUMP_DIR` | unset | Write per-frame intermediate tensors into the named directory. Bulky; intended for diff-harness work (`tools/dump_reference.py --backend qwen3-tts`). |
 | `QWEN3_TTS_CODEC_GPU` | auto | Force codec weights and decode through the GPU scheduler. GPU is now the default on all GPU backends including Metal — the `CONV_TRANSPOSE_1D` hang was fixed in `f8fc8b8e` and the op replaced by `mul_mat+col2im_1d` in `5f600f25`. Distinct from `QWEN3_TTS_CODEC_FORCE_METAL`, which also enables a per-op trace callback for debugging. |
 | `QWEN3_TTS_CODEC_CPU` | unset | Force codec weights and decode through the CPU-only `codec_sched`. Useful for A/B timing and regression bisection. |
+| `QWEN3_TTS_CODEC_CHUNK` | `150` (`64` on CUDA) | Maximum generated codec frames per decode chunk. CUDA clamps values above `64` and treats `0` as `64` unless `QWEN3_TTS_CODEC_ALLOW_FULL=1` is also set, avoiding oversized `mul_mat+col2im_1d` allocations on 10 GB cards. |
+| `QWEN3_TTS_CODEC_CTX` | `128` (`96` on CUDA) | Left-context codec frames prepended to each chunk. Values below the codec sliding window are raised; CUDA clamps larger values unless `QWEN3_TTS_CODEC_ALLOW_FULL=1` is set. |
 | `QWEN3_TTS_SKIP_REF_DECODE` | **on** (set `=0` to opt out) | Skip the codec decode of the reference audio in `qwen3_tts_synthesize`. The default-on path emits `codec_decode_codes(gen)` directly; the opt-out path concatenates `ref_codes + gen_codes`, decodes both, then trims the ref portion. With a 26 s reference (~334 codec frames at 12 Hz), the ref half adds ~16 s of constant codec compute regardless of how much new audio is generated (Jetson Orin AGX, issue #64). End-to-end RTF on Orin drops from ~7-9 → ~1.5; the win compounds N× under `/v1/audio/speech` long-form chunking. Bit-identity verified 2026-05-05 on Apple Silicon Metal, qwen3-tts-customvoice 0.6B Q8_0: max\|diff\| = 0, cosine similarity = 1.0 — equivalence holds because the codec is a straight-line forward pass with no rolling state. Set `QWEN3_TTS_SKIP_REF_DECODE=0` only for A/B verification or if a future codec graph variant grows rolling state. |
 
 ## VibeVoice — realtime streaming TTS
@@ -417,6 +626,27 @@ Quality is still model-dependent. The rebuilt artifacts fix the previous
 tokenizer/model mismatch and make `-l` active, but some French Q4_K samples
 remain heavily accented. Treat language-token checks as a wiring smoke test,
 not a guarantee of native pronunciation.
+
+On the multilingual path the text is **NFKD-normalized** (then ASCII-lowercased)
+before tokenization, matching upstream `MTLTokenizer.preprocess_text`. This
+matters for scripts with precomposed diacritics: e.g. Arabic `أ`
+(ALEF-WITH-HAMZA) decomposes to base alef + combining hamza, the form the model
+was trained on. Without it, partial-diacritic Arabic produced spurious onset
+letters (#170). Script-specific normalizers (zh cangjie / ja kakasi / he dicta /
+ko jamo / ru stress) are not yet implemented.
+
+> **Note on published GGUFs.** Some published multilingual T3 artifacts pair a
+> 2352-token tokenizer with a 2454-vocab T3; the loader rejects that mismatch.
+> Repair locally with `models/patch-chatterbox-gguf-add-merges.py` and the
+> matching `grapheme_mtl_merged_expanded_v1.json` (2454 tokens).
+
+### Performance
+
+The compute-bound T3 AR decode is the slow stage. It runs on CPU by default on
+Metal (GPU has higher per-step kernel-launch overhead for the many T=1 steps).
+The CPU thread count defaults to `min(8, hardware_concurrency)`; override with
+`CRISPASR_CHATTERBOX_THREADS=<n>` (e.g. dial down on a heavily shared host).
+Output is bit-identical regardless of thread count.
 
 ### Voice cloning
 
@@ -648,7 +878,7 @@ are supported for reproducible / diverse generation.
 [`cstr/qwen3-tts-1.7b-base-GGUF`](https://huggingface.co/cstr/qwen3-tts-1.7b-base-GGUF) ·
 [`cstr/qwen3-tts-1.7b-voicedesign-GGUF`](https://huggingface.co/cstr/qwen3-tts-1.7b-voicedesign-GGUF) ·
 [`cstr/qwen3-tts-tokenizer-12hz-GGUF`](https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF) ·
-[`cstr/orpheus-3b-base-GGUF`](https://huggingface.co/cstr/orpheus-3b-base-GGUF) ·
+[`cstr/orpheus-3b-0.1-ft-GGUF`](https://huggingface.co/cstr/orpheus-3b-0.1-ft-GGUF) ·
 [`cstr/kartoffel-orpheus-3b-german-natural-GGUF`](https://huggingface.co/cstr/kartoffel-orpheus-3b-german-natural-GGUF) ·
 [`cstr/kartoffel-orpheus-3b-german-synthetic-GGUF`](https://huggingface.co/cstr/kartoffel-orpheus-3b-german-synthetic-GGUF) ·
 [`cstr/snac-24khz-GGUF`](https://huggingface.co/cstr/snac-24khz-GGUF) ·
@@ -811,6 +1041,33 @@ When the hook fires you'll see no extra log line by default; pass
 N tokens`).
 
 ---
+
+## Local speaker output (`--tts-play`)
+
+Pass `--tts-play` to play TTS output through the local speaker immediately
+after synthesis, in addition to (or instead of) writing a file. The
+spread-spectrum watermark is always embedded before playback, so the audio
+leaving the speaker carries the provenance marker.
+
+```bash
+# Synthesize and play through default speaker
+crispasr --tts --tts-play -m model.gguf "Hello world."
+
+# Write file AND play
+crispasr --tts --tts-play -m model.gguf -o output.wav "Hello world."
+
+# Select a non-default output device (index from --list-audio-devices)
+crispasr --tts --tts-play --tts-play-device 2 -m model.gguf "Hello world."
+```
+
+Playback is synchronous — the CLI blocks until audio drains, then exits.
+Device -1 (the default) selects the system default output device.
+
+**Implementation note:** the device is opened at the hardware-native sample
+rate (`sampleRate=0 / channels=0`). The model's mono float32 PCM is
+pre-resampled via linear interpolation before the device starts. This avoids
+miniaudio's 4× upsampler artefacts on devices that run natively at 96 kHz
+(MacBook Air Speakers and many Core Audio devices).
 
 ## AI-generated audio provenance & watermarking
 

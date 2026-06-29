@@ -19,10 +19,14 @@ backend doesn't expose that knob, but the call is safe to make.
 | `set_max_new_tokens(n)` | `set_max_new_tokens` / `set_max_new_tokens` / `SetMaxNewTokens` / `setMaxNewTokens` | AR backends; ≤ 0 clears override |
 | `set_frequency_penalty(f)` | `set_frequency_penalty` / `set_frequency_penalty` / `SetFrequencyPenalty` / `setFrequencyPenalty` | AR backends; ≤ 0 disables |
 | `set_tts_steps(n)` | `set_tts_steps` / `set_tts_steps` / `SetTTSSteps` / `setTtsSteps` | Chatterbox S3Gen CFM steps; vibevoice DPM-Solver++ steps |
+| `set_tts_num_candidates(n)` | `set_tts_num_candidates` / `set_tts_num_candidates` / `SetTTSNumCandidates` / `setTtsNumCandidates` | TADA flow-matching timing candidates ranked per token (default 4); rc=-2 for others |
 | `set_top_p(p)` | `set_top_p` / `set_top_p` / `SetTopP` / `setTopP` | Chatterbox AR T3 loop |
+| `set_top_k(k)` | `set_top_k` / `set_top_k` / `SetTopK` / `setTopK` | TADA talker sampler (0 = disabled); rc=-2 for others |
+| `set_do_sample(enable)` | `set_do_sample` / `set_do_sample` / `SetDoSample` / `setDoSample` | TADA talker: false = greedy; rc=-2 for others |
 | `set_min_p(p)` | `set_min_p` / `set_min_p` / `SetMinP` / `setMinP` | Chatterbox AR T3 loop |
 | `set_repetition_penalty(r)` | `set_repetition_penalty` / `set_repetition_penalty` / `SetRepetitionPenalty` / `setRepetitionPenalty` | Chatterbox (1.0 = no penalty) |
-| `set_cfg_weight(w)` | `set_cfg_weight` / `set_cfg_weight` / `SetCFGWeight` / `setCfgWeight` | Chatterbox (0.5 = upstream default; 0 = unconditional) |
+| `set_cfg_weight(w)` | `set_cfg_weight` / `set_cfg_weight` / `SetCFGWeight` / `setCfgWeight` | Chatterbox (0.5 = upstream default; 0 = unconditional); TADA acoustic_cfg |
+| `set_tts_noise_temp(t)` | `set_tts_noise_temp` / `set_tts_noise_temp` / `SetTtsNoiseTemp` / `setTtsNoiseTemp` | TADA flow-matching noise temperature (0.9 = upstream default) |
 | `set_exaggeration(e)` | `set_exaggeration` / `set_exaggeration` / `SetExaggeration` / `setExaggeration` | Chatterbox emotion scalar (0.5 = upstream default) |
 | `set_max_speech_tokens(n)` | `set_max_speech_tokens` / `set_max_speech_tokens` / `SetMaxSpeechTokens` / `setMaxSpeechTokens` | Chatterbox AR loop token budget (default 1000 ≈ 20 s) |
 | `set_length_scale(s)` | `set_length_scale` / `set_length_scale` / `SetLengthScale` / `setLengthScale` | Kokoro phoneme duration multiplier (1.0 = normal) |

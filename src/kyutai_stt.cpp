@@ -26,12 +26,39 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `KYUTAI_STT_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool kyutai_stt_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("KYUTAI_STT_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct kyutai_stt_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit kyutai_stt_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~kyutai_stt_bench_stage() {
+        if (!kyutai_stt_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  kyutai_stt_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // Temperature-aware token selection: argmax when temp<=0, softmax sampling otherwise.
 // When `out_prob` is non-null, also returns the softmax probability of the picked token.
@@ -223,6 +250,12 @@ struct kyutai_stt_context {
     ggml_tensor* kv_v = nullptr;
 
     int n_threads = 4;
+
+    // §176s: cached Mimi encoder graph — reused when n_samples matches.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    ggml_context* cached_enc_ctx = nullptr;
+    std::vector<uint8_t> cached_enc_meta;
+    int cached_enc_n_samples = 0;
 };
 
 // ===========================================================================
@@ -526,6 +559,8 @@ extern "C" struct kyutai_stt_context* kyutai_stt_init_from_file(const char* path
 extern "C" void kyutai_stt_free(struct kyutai_stt_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->cached_enc_ctx)
+        ggml_free(ctx->cached_enc_ctx);
     if (ctx->kv_buf)
         ggml_backend_buffer_free(ctx->kv_buf);
     if (ctx->kv_ctx)
@@ -787,74 +822,69 @@ static bool mimi_encode(kyutai_stt_context* sctx, const float* pcm_24k, int n_sa
     auto& m = sctx->model;
     auto& hp = m.hp;
 
-    // Build graph for SEANet + transformer + downsample
-    struct ggml_init_params gp = {
-        /*.mem_size   =*/sctx->compute_meta.size(),
-        /*.mem_buffer =*/sctx->compute_meta.data(),
-        /*.no_alloc   =*/true,
-    };
-    ggml_context* ctx0 = ggml_init(gp);
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
+    // §176s: reuse cached Mimi encoder graph when n_samples matches.
+    ggml_cgraph* gf;
+    if (sctx->cached_enc_gf && sctx->cached_enc_n_samples == n_samples) {
+        gf = sctx->cached_enc_gf;
+    } else {
+        if (sctx->cached_enc_ctx) {
+            ggml_free(sctx->cached_enc_ctx);
+            sctx->cached_enc_ctx = nullptr;
+            sctx->cached_enc_gf = nullptr;
+        }
+        sctx->cached_enc_meta.assign(sctx->compute_meta.size(), 0);
+        struct ggml_init_params gp = {
+            /*.mem_size   =*/sctx->cached_enc_meta.size(),
+            /*.mem_buffer =*/sctx->cached_enc_meta.data(),
+            /*.no_alloc   =*/true,
+        };
+        sctx->cached_enc_ctx = ggml_init(gp);
+        ggml_context* ctx0 = sctx->cached_enc_ctx;
+        gf = ggml_new_graph_custom(ctx0, 16384, false);
 
-    // Input PCM as a 1D tensor
-    ggml_tensor* pcm = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_samples);
-    ggml_set_name(pcm, "pcm_input");
-    ggml_set_input(pcm);
+        ggml_tensor* pcm = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_samples);
+        ggml_set_name(pcm, "pcm_input");
+        ggml_set_input(pcm);
 
-    // SEANet encoder
-    ggml_tensor* enc = build_seanet_encoder(ctx0, m.seanet, pcm);
-    ggml_set_name(enc, "seanet_out");
+        ggml_tensor* enc = build_seanet_encoder(ctx0, m.seanet, pcm);
+        ggml_set_name(enc, "seanet_out");
+        enc = build_mimi_transformer(ctx0, m.mimi_layers, enc, hp.mimi_num_heads, hp.mimi_head_dim);
+        ggml_set_name(enc, "enc_transformer_out");
+        enc = ggml_cont(ctx0, ggml_transpose(ctx0, enc));
+        enc = conv1d_fwd(ctx0, m.downsample, enc, 2);
+        ggml_set_name(enc, "downsampled");
+        ggml_tensor* proj_first = conv1d_fwd(ctx0, m.rvq_first.input_proj, enc, 1);
+        ggml_set_name(proj_first, "rvq_first_proj");
+        ggml_tensor* proj_rest = conv1d_fwd(ctx0, m.rvq_rest.input_proj, enc, 1);
+        ggml_set_name(proj_rest, "rvq_rest_proj");
+        ggml_set_output(proj_first);
+        ggml_set_output(proj_rest);
+        ggml_build_forward_expand(gf, proj_first);
+        ggml_build_forward_expand(gf, proj_rest);
 
-    // enc is now [mimi_dim, T_enc] (transposed for transformer)
-    // Encoder transformer expects [dim, T]
-    enc = build_mimi_transformer(ctx0, m.mimi_layers, enc, hp.mimi_num_heads, hp.mimi_head_dim);
-    ggml_set_name(enc, "enc_transformer_out");
-
-    // Transpose back to [T, channels] for conv1d
-    enc = ggml_cont(ctx0, ggml_transpose(ctx0, enc)); // [T_enc, mimi_dim]
-
-    // Downsample: Conv1d(512→512, k=4, s=2)
-    // Padding: (kernel_size - stride) / 2 = (4-2)/2 = 1
-    enc = conv1d_fwd(ctx0, m.downsample, enc, 2);
-    ggml_set_name(enc, "downsampled");
-    // enc is [T_frames, mimi_dim]
-
-    // RVQ input projection (Conv1d, kernel=1, stride=1)
-    ggml_tensor* proj_first = conv1d_fwd(ctx0, m.rvq_first.input_proj, enc, 1);
-    ggml_set_name(proj_first, "rvq_first_proj");
-    // proj_first is [T_frames, codebook_dim]
-
-    ggml_tensor* proj_rest = conv1d_fwd(ctx0, m.rvq_rest.input_proj, enc, 1);
-    ggml_set_name(proj_rest, "rvq_rest_proj");
-    // proj_rest is [T_frames, codebook_dim]
-
-    // Mark outputs
-    ggml_set_output(proj_first);
-    ggml_set_output(proj_rest);
-
-    ggml_build_forward_expand(gf, proj_first);
-    ggml_build_forward_expand(gf, proj_rest);
+        sctx->cached_enc_gf = gf;
+        sctx->cached_enc_n_samples = n_samples;
+    }
 
     // Allocate and compute
     ggml_backend_sched_reset(sctx->sched);
     if (!ggml_backend_sched_alloc_graph(sctx->sched, gf)) {
         fprintf(stderr, "kyutai_stt: failed to alloc mimi encoder graph\n");
-        ggml_free(ctx0);
         return false;
     }
 
     // Set input data
-    ggml_backend_tensor_set(pcm, pcm_24k, 0, n_samples * sizeof(float));
-
-    // Set position indices for transformer (ggml_arange handles this internally)
+    ggml_tensor* pcm_t = ggml_graph_get_tensor(gf, "pcm_input");
+    ggml_backend_tensor_set(pcm_t, pcm_24k, 0, n_samples * sizeof(float));
 
     if (ggml_backend_sched_graph_compute(sctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "kyutai_stt: mimi encoder compute failed\n");
-        ggml_free(ctx0);
         return false;
     }
 
-    // Get T_frames from output shape: [T, codebook_dim]
+    // Get T_frames from output shape
+    ggml_tensor* proj_first = ggml_graph_get_tensor(gf, "rvq_first_proj");
+    ggml_tensor* proj_rest = ggml_graph_get_tensor(gf, "rvq_rest_proj");
     T_frames = (int)proj_first->ne[0];
     int cdim = (int)proj_first->ne[1];
 
@@ -867,7 +897,7 @@ static bool mimi_encode(kyutai_stt_context* sctx, const float* pcm_24k, int n_sa
     rvq_encode_group(sctx, proj_first, m.rvq_first, hp.n_q_semantic, codes, T_frames);
     rvq_encode_group(sctx, proj_rest, m.rvq_rest, hp.n_q_acoustic, codes, T_frames);
 
-    ggml_free(ctx0);
+    // Do NOT free — cached (§176s).
     return true;
 }
 
@@ -1087,7 +1117,8 @@ static bool kyutai_lm_step(struct kyutai_stt_context* ctx, int32_t text_token,
 // are non-null.
 static char* kyutai_stt_transcribe_impl(struct kyutai_stt_context* ctx, const float* samples, int n_samples,
                                         std::vector<int32_t>* out_token_ids, std::vector<float>* out_token_probs,
-                                        std::vector<int32_t>* out_frame_indices = nullptr) {
+                                        std::vector<int32_t>* out_frame_indices = nullptr,
+                                        kyutai_stt_token_cb on_tok = nullptr, void* on_tok_ud = nullptr) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
 
@@ -1096,7 +1127,10 @@ static char* kyutai_stt_transcribe_impl(struct kyutai_stt_context* ctx, const fl
 
     // Step 1: Resample 16 kHz → 24 kHz
     std::vector<float> pcm_24k;
-    resample_16k_to_24k(samples, n_samples, pcm_24k);
+    {
+        kyutai_stt_bench_stage _b("resample");
+        resample_16k_to_24k(samples, n_samples, pcm_24k);
+    }
 
     if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "kyutai_stt: resampled %d → %d samples (16k → 24k)\n", n_samples, (int)pcm_24k.size());
@@ -1105,9 +1139,12 @@ static char* kyutai_stt_transcribe_impl(struct kyutai_stt_context* ctx, const fl
     // Step 2: Mimi encode → audio codes
     std::vector<std::vector<int32_t>> codes;
     int T_frames = 0;
-    if (!mimi_encode(ctx, pcm_24k.data(), (int)pcm_24k.size(), codes, T_frames)) {
-        fprintf(stderr, "kyutai_stt: mimi encode failed\n");
-        return nullptr;
+    {
+        kyutai_stt_bench_stage _b("mimi_encode");
+        if (!mimi_encode(ctx, pcm_24k.data(), (int)pcm_24k.size(), codes, T_frames)) {
+            fprintf(stderr, "kyutai_stt: mimi encode failed\n");
+            return nullptr;
+        }
     }
 
     if (ctx->params.verbosity >= 1) {
@@ -1118,12 +1155,16 @@ static char* kyutai_stt_transcribe_impl(struct kyutai_stt_context* ctx, const fl
     // Audio delay in frames
     int delay_frames = (int)(hp.audio_delay_seconds * hp.frame_rate);
     int max_ctx = T_frames + delay_frames + 64; // some extra for text tokens
-    if (!kv_cache_init(ctx, max_ctx)) {
-        fprintf(stderr, "kyutai_stt: KV cache init failed\n");
-        return nullptr;
+    {
+        kyutai_stt_bench_stage _b("kv_init");
+        if (!kv_cache_init(ctx, max_ctx)) {
+            fprintf(stderr, "kyutai_stt: KV cache init failed\n");
+            return nullptr;
+        }
     }
 
     // Step 4: Autoregressive LM decoding
+    kyutai_stt_bench_stage _b_lm("lm_decode");
     // The LM consumes audio codes and generates text tokens.
     // At each step: sum all n_q audio embeddings + text embedding → transformer → logits
     // Start with padding text token.
@@ -1153,6 +1194,8 @@ static char* kyutai_stt_transcribe_impl(struct kyutai_stt_context* ctx, const fl
             }
             if (out_frame_indices)
                 out_frame_indices->push_back(frame_idx);
+            if (on_tok)
+                on_tok(tok, prob, on_tok_ud);
         }
     };
 
@@ -1250,6 +1293,14 @@ static char* kyutai_stt_transcribe_impl(struct kyutai_stt_context* ctx, const fl
 
 extern "C" char* kyutai_stt_transcribe(struct kyutai_stt_context* ctx, const float* samples, int n_samples) {
     return kyutai_stt_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr);
+}
+
+extern "C" void kyutai_stt_transcribe_cb(struct kyutai_stt_context* ctx, const float* samples, int n_samples,
+                                         kyutai_stt_token_cb cb, void* userdata) {
+    if (!ctx || !samples || n_samples <= 0 || !cb)
+        return;
+    char* s = kyutai_stt_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr, nullptr, cb, userdata);
+    free(s);
 }
 
 extern "C" struct kyutai_stt_result* kyutai_stt_transcribe_with_probs(struct kyutai_stt_context* ctx,

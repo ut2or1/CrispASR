@@ -356,6 +356,31 @@ catch_discover_tests(test-speaker-cluster
     PROPERTIES LABELS "unit;diarize"
 )
 
+# Named-voiceprint profile DB used by the opt-in --speaker-db path. Drives
+# enroll/load/match on synthetic embeddings; no model, no audio, no network.
+add_executable(test-speaker-db
+    test-speaker-db.cpp
+)
+target_include_directories(test-speaker-db PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-speaker-db PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+catch_discover_tests(test-speaker-db
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;diarize"
+)
+
+# test-titanet — TitaNet speaker-embedding smoke/live tool. Plain main(); takes
+# <model.gguf> <audio...> and prints embeddings + a cosine-sim matrix. Builds
+# the orphaned smoke test so it can serve as a live check (same-speaker high /
+# cross-speaker low cosine; GEMM vs TITANET_FORCE_SCALAR equivalence).
+add_executable(test-titanet test-titanet.cpp)
+target_include_directories(test-titanet PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-titanet PRIVATE titanet crispasr-core ggml ggml-base ggml-cpu)
+
 # ─── test - punctuation - policy — Catch2 unit tests for punctuation auto - enable
 #policy.Pure logic, no model load.
 add_executable(test-punctuation-policy
@@ -604,6 +629,741 @@ target_link_libraries(test-chatterbox-params PRIVATE
 catch_discover_tests(test-chatterbox-params
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;chatterbox"
+)
+
+# ─── test-firered-params — Catch2 unit tests for firered_asr_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-firered-params
+    test-firered-params.cpp
+)
+target_include_directories(test-firered-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-firered-params PRIVATE
+    Catch2::Catch2WithMain
+    firered-asr
+)
+catch_discover_tests(test-firered-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;firered"
+)
+
+# ─── test-cosyvoice3-params — Catch2 unit tests for cosyvoice3_tts_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-cosyvoice3-params
+    test-cosyvoice3-params.cpp
+)
+target_include_directories(test-cosyvoice3-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-cosyvoice3-params PRIVATE
+    Catch2::Catch2WithMain
+    cosyvoice3_tts
+    chatterbox
+)
+catch_discover_tests(test-cosyvoice3-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;cosyvoice3"
+)
+
+# ─── test-funasr-params — Catch2 unit tests for funasr_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-funasr-params
+    test-funasr-params.cpp
+)
+target_include_directories(test-funasr-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-funasr-params PRIVATE
+    Catch2::Catch2WithMain
+    funasr
+)
+catch_discover_tests(test-funasr-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;funasr"
+)
+
+# ─── test-f5tts-params — Catch2 unit tests for f5_tts_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-f5tts-params
+    test-f5tts-params.cpp
+)
+target_include_directories(test-f5tts-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-f5tts-params PRIVATE
+    Catch2::Catch2WithMain
+    f5-tts
+)
+catch_discover_tests(test-f5tts-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;f5tts"
+)
+
+# ─── test-parakeet-params — Catch2 unit tests for parakeet_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-parakeet-params
+    test-parakeet-params.cpp
+)
+target_include_directories(test-parakeet-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-parakeet-params PRIVATE
+    Catch2::Catch2WithMain
+    parakeet
+)
+catch_discover_tests(test-parakeet-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;parakeet"
+)
+
+# ─── test-piper-params — Catch2 unit tests for piper_tts_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-piper-params
+    test-piper-params.cpp
+)
+target_include_directories(test-piper-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-piper-params PRIVATE
+    Catch2::Catch2WithMain
+    piper-tts
+)
+catch_discover_tests(test-piper-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;piper"
+)
+
+# ─── test-canary-params — Catch2 unit tests for canary_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-canary-params
+    test-canary-params.cpp
+)
+target_include_directories(test-canary-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-canary-params PRIVATE
+    Catch2::Catch2WithMain
+    canary
+)
+catch_discover_tests(test-canary-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;canary"
+)
+
+# ─── test-orpheus-params — Catch2 unit tests for orpheus_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-orpheus-params
+    test-orpheus-params.cpp
+)
+target_include_directories(test-orpheus-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-orpheus-params PRIVATE
+    Catch2::Catch2WithMain
+    orpheus
+)
+catch_discover_tests(test-orpheus-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;orpheus"
+)
+
+# ─── test-zonos-params — Catch2 unit tests for zonos_tts_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-zonos-params
+    test-zonos-params.cpp
+)
+target_include_directories(test-zonos-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-zonos-params PRIVATE
+    Catch2::Catch2WithMain
+    zonos-tts
+)
+catch_discover_tests(test-zonos-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;zonos"
+)
+
+# ─── test-bark-params — Catch2 unit tests for bark_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-bark-params
+    test-bark-params.cpp
+)
+target_include_directories(test-bark-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-bark-params PRIVATE
+    Catch2::Catch2WithMain
+    bark-tts
+)
+catch_discover_tests(test-bark-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;bark"
+)
+
+# ─── test-canaryctc-params — Catch2 unit tests for canary_ctc_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-canaryctc-params
+    test-canaryctc-params.cpp
+)
+target_include_directories(test-canaryctc-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-canaryctc-params PRIVATE
+    Catch2::Catch2WithMain
+    canary_ctc
+)
+catch_discover_tests(test-canaryctc-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;canary_ctc"
+)
+
+# ─── test-csm-params — Catch2 unit tests for csm_tts_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-csm-params
+    test-csm-params.cpp
+)
+target_include_directories(test-csm-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-csm-params PRIVATE
+    Catch2::Catch2WithMain
+    csm-tts
+)
+catch_discover_tests(test-csm-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;csm"
+)
+
+# ─── test-kokoro-params — Catch2 unit tests for kokoro_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-kokoro-params
+    test-kokoro-params.cpp
+)
+target_include_directories(test-kokoro-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-kokoro-params PRIVATE
+    Catch2::Catch2WithMain
+    kokoro
+)
+catch_discover_tests(test-kokoro-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;kokoro"
+)
+
+# ─── test-sensevoice-params — Catch2 unit tests for sensevoice_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-sensevoice-params
+    test-sensevoice-params.cpp
+)
+target_include_directories(test-sensevoice-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-sensevoice-params PRIVATE
+    Catch2::Catch2WithMain
+    sensevoice
+)
+catch_discover_tests(test-sensevoice-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;sensevoice"
+)
+
+# ─── test-speecht5-params — Catch2 unit tests for speecht5_tts_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-speecht5-params
+    test-speecht5-params.cpp
+)
+target_include_directories(test-speecht5-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-speecht5-params PRIVATE
+    Catch2::Catch2WithMain
+    speecht5-tts
+)
+catch_discover_tests(test-speecht5-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;speecht5"
+)
+
+# ─── test-dia-params — Catch2 unit tests for dia_tts_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-dia-params
+    test-dia-params.cpp
+)
+target_include_directories(test-dia-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-dia-params PRIVATE
+    Catch2::Catch2WithMain
+    dia-tts
+)
+catch_discover_tests(test-dia-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;dia"
+)
+
+# ─── test-melotts-params — Catch2 unit tests for melotts_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-melotts-params
+    test-melotts-params.cpp
+)
+target_include_directories(test-melotts-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-melotts-params PRIVATE
+    Catch2::Catch2WithMain
+    melotts
+)
+catch_discover_tests(test-melotts-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;melotts"
+)
+
+# ─── test-mimoasr-params — Catch2 unit tests for mimo_asr_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-mimoasr-params
+    test-mimoasr-params.cpp
+)
+target_include_directories(test-mimoasr-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-mimoasr-params PRIVATE
+    Catch2::Catch2WithMain
+    mimo_asr
+)
+catch_discover_tests(test-mimoasr-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;mimo_asr"
+)
+
+# ─── test-nemotron-params — Catch2 unit tests for nemotron_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-nemotron-params
+    test-nemotron-params.cpp
+)
+target_include_directories(test-nemotron-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-nemotron-params PRIVATE
+    Catch2::Catch2WithMain
+    nemotron
+)
+catch_discover_tests(test-nemotron-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;nemotron"
+)
+
+# ─── test-omniasr-params — Catch2 unit tests for omniasr_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-omniasr-params
+    test-omniasr-params.cpp
+)
+target_include_directories(test-omniasr-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-omniasr-params PRIVATE
+    Catch2::Catch2WithMain
+    omniasr
+)
+catch_discover_tests(test-omniasr-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;omniasr"
+)
+
+# ─── test-outetts-params — Catch2 unit tests for outetts_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-outetts-params
+    test-outetts-params.cpp
+)
+target_include_directories(test-outetts-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-outetts-params PRIVATE
+    Catch2::Catch2WithMain
+    outetts
+)
+catch_discover_tests(test-outetts-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;outetts"
+)
+
+# ─── test-parlertts-params — Catch2 unit tests for parler_tts_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-parlertts-params
+    test-parlertts-params.cpp
+)
+target_include_directories(test-parlertts-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-parlertts-params PRIVATE
+    Catch2::Catch2WithMain
+    parler-tts
+)
+catch_discover_tests(test-parlertts-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;parler_tts"
+)
+
+# ─── test-pockettts-params — Catch2 unit tests for pocket_tts_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-pockettts-params
+    test-pockettts-params.cpp
+)
+target_include_directories(test-pockettts-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-pockettts-params PRIVATE
+    Catch2::Catch2WithMain
+    pocket-tts
+)
+catch_discover_tests(test-pockettts-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;pocket_tts"
+)
+
+# ─── test-qwen3asr-params — Catch2 unit tests for qwen3_asr_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-qwen3asr-params
+    test-qwen3asr-params.cpp
+)
+target_include_directories(test-qwen3asr-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-qwen3asr-params PRIVATE
+    Catch2::Catch2WithMain
+    qwen3_asr
+)
+catch_discover_tests(test-qwen3asr-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;qwen3_asr"
+)
+
+# ─── test-qwen3tts-params — Catch2 unit tests for qwen3_tts_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-qwen3tts-params
+    test-qwen3tts-params.cpp
+)
+target_include_directories(test-qwen3tts-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-qwen3tts-params PRIVATE
+    Catch2::Catch2WithMain
+    qwen3_tts
+)
+catch_discover_tests(test-qwen3tts-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;qwen3_tts"
+)
+
+# ─── test-tada-params — Catch2 unit tests for tada_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-tada-params
+    test-tada-params.cpp
+)
+target_include_directories(test-tada-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-tada-params PRIVATE
+    Catch2::Catch2WithMain
+    tada-tts
+)
+catch_discover_tests(test-tada-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;tada"
+)
+
+# ─── test-vibevoice-params — Catch2 unit tests for vibevoice_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-vibevoice-params
+    test-vibevoice-params.cpp
+)
+target_include_directories(test-vibevoice-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-vibevoice-params PRIVATE
+    Catch2::Catch2WithMain
+    vibevoice
+)
+catch_discover_tests(test-vibevoice-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;vibevoice"
+)
+
+# ─── test-voxcpm2-params — Catch2 unit tests for voxcpm2_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-voxcpm2-params
+    test-voxcpm2-params.cpp
+)
+target_include_directories(test-voxcpm2-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-voxcpm2-params PRIVATE
+    Catch2::Catch2WithMain
+    voxcpm2_tts
+)
+catch_discover_tests(test-voxcpm2-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;voxcpm2"
+)
+
+# ─── test-cohere-params — Catch2 unit tests for cohere_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-cohere-params
+    test-cohere-params.cpp
+)
+target_include_directories(test-cohere-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-cohere-params PRIVATE
+    Catch2::Catch2WithMain
+    cohere
+)
+catch_discover_tests(test-cohere-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;cohere"
+)
+
+# ─── test-fastpitch-params — Catch2 unit tests for fastpitch_tts_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-fastpitch-params
+    test-fastpitch-params.cpp
+)
+target_include_directories(test-fastpitch-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-fastpitch-params PRIVATE
+    Catch2::Catch2WithMain
+    fastpitch-tts
+)
+catch_discover_tests(test-fastpitch-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;fastpitch"
+)
+
+# ─── test-glmasr-params — Catch2 unit tests for glm_asr_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-glmasr-params
+    test-glmasr-params.cpp
+)
+target_include_directories(test-glmasr-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-glmasr-params PRIVATE
+    Catch2::Catch2WithMain
+    glm-asr
+)
+catch_discover_tests(test-glmasr-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;glm_asr"
+)
+
+# ─── test-granitespeech-params — Catch2 unit tests for granite_speech_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-granitespeech-params
+    test-granitespeech-params.cpp
+)
+target_include_directories(test-granitespeech-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-granitespeech-params PRIVATE
+    Catch2::Catch2WithMain
+    granite_speech
+)
+catch_discover_tests(test-granitespeech-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;granite_speech"
+)
+
+# ─── test-indextts-params — Catch2 unit tests for indextts_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-indextts-params
+    test-indextts-params.cpp
+)
+target_include_directories(test-indextts-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-indextts-params PRIVATE
+    Catch2::Catch2WithMain
+    indextts
+)
+catch_discover_tests(test-indextts-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;indextts"
+)
+
+# ─── test-kyutaistt-params — Catch2 unit tests for kyutai_stt_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-kyutaistt-params
+    test-kyutaistt-params.cpp
+)
+target_include_directories(test-kyutaistt-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-kyutaistt-params PRIVATE
+    Catch2::Catch2WithMain
+    kyutai-stt
+)
+catch_discover_tests(test-kyutaistt-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;kyutai_stt"
+)
+
+# ─── test-m2m100-params — Catch2 unit tests for m2m100_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-m2m100-params
+    test-m2m100-params.cpp
+)
+target_include_directories(test-m2m100-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-m2m100-params PRIVATE
+    Catch2::Catch2WithMain
+    m2m100
+)
+catch_discover_tests(test-m2m100-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;m2m100"
+)
+
+# ─── test-moonshine-stream-params — Catch2 unit tests for moonshine_streaming_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-moonshine-stream-params
+    test-moonshine-stream-params.cpp
+)
+target_include_directories(test-moonshine-stream-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-moonshine-stream-params PRIVATE
+    Catch2::Catch2WithMain
+    moonshine_streaming
+    crispasr-core
+)
+catch_discover_tests(test-moonshine-stream-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;moonshine_streaming"
+)
+
+# ─── test-openvoice2-params — Catch2 unit tests for openvoice2_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-openvoice2-params
+    test-openvoice2-params.cpp
+)
+target_include_directories(test-openvoice2-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-openvoice2-params PRIVATE
+    Catch2::Catch2WithMain
+    openvoice2
+)
+catch_discover_tests(test-openvoice2-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;openvoice2"
+)
+
+# ─── test-t5translate-params — Catch2 unit tests for t5_translate_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-t5translate-params
+    test-t5translate-params.cpp
+)
+target_include_directories(test-t5translate-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-t5translate-params PRIVATE
+    Catch2::Catch2WithMain
+    t5_translate
+)
+catch_discover_tests(test-t5translate-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;t5_translate"
+)
+
+# ─── test-gemma4e2b-params — Catch2 unit tests for gemma4_e2b_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-gemma4e2b-params
+    test-gemma4e2b-params.cpp
+)
+target_include_directories(test-gemma4e2b-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-gemma4e2b-params PRIVATE
+    Catch2::Catch2WithMain
+    gemma4_e2b
+    crispasr-core
+)
+catch_discover_tests(test-gemma4e2b-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;gemma4_e2b"
+)
+
+# ─── test-granitenle-params — Catch2 unit tests for granite_nle_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-granitenle-params
+    test-granitenle-params.cpp
+)
+target_include_directories(test-granitenle-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-granitenle-params PRIVATE
+    Catch2::Catch2WithMain
+    granite_nle
+)
+catch_discover_tests(test-granitenle-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;granite_nle"
+)
+
+# ─── test-orpheussnac-params — Catch2 unit tests for snac_decoder_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-orpheussnac-params
+    test-orpheussnac-params.cpp
+)
+target_include_directories(test-orpheussnac-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-orpheussnac-params PRIVATE
+    Catch2::Catch2WithMain
+    snac
+    crispasr-core
+)
+catch_discover_tests(test-orpheussnac-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;orpheus_snac"
+)
+
+# ─── test-voxtral-params — Catch2 unit tests for voxtral_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-voxtral-params
+    test-voxtral-params.cpp
+)
+target_include_directories(test-voxtral-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-voxtral-params PRIVATE
+    Catch2::Catch2WithMain
+    voxtral
+)
+catch_discover_tests(test-voxtral-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;voxtral"
+)
+
+# ─── test-voxtral4b-params — Catch2 unit tests for voxtral4b_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-voxtral4b-params
+    test-voxtral4b-params.cpp
+)
+target_include_directories(test-voxtral4b-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-voxtral4b-params PRIVATE
+    Catch2::Catch2WithMain
+    voxtral4b
+)
+catch_discover_tests(test-voxtral4b-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;voxtral4b"
 )
 
 # ─── test-qwen3-tts-cv-style — Catch2 unit tests for qwen3_tts_set_cv_style_instruct
@@ -1121,6 +1881,57 @@ catch_discover_tests(test-core-sentencepiece
     PROPERTIES LABELS "unit"
 )
 
+# ─── test-core-lang-names — core/lang_names.h ISO-639-1 → English map ─────────
+# Locks the shared language-name map that replaced four copy-pasted copies
+# (PLAN §175): the common 15 codes (bit-identical to the former CLI + C-ABI
+# maps), the gemma4-only union (uk/vi), and unknown-input passthrough.
+add_executable(test-core-lang-names test-core-lang-names.cpp)
+target_include_directories(test-core-lang-names PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-core-lang-names PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-core-lang-names
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-bench-enabled — unit tests for the bench_enabled() + BenchStage RAII
+# pattern shared by 70+ backends. Pure env-var logic, no model load.
+add_executable(test-bench-enabled test-bench-enabled.cpp)
+target_link_libraries(test-bench-enabled PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-bench-enabled
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;bench"
+)
+
+# ─── test-core-bpe — core/bpe.h GPT-2 byte-level BPE tokenizer ──────────────
+# Verifies byte_encoder, utf8_encode, bytes_to_unicode, bpe_one merge,
+# token_bytes_to_utf8, detokenize round-trips. No model load, pure CPU.
+add_executable(test-core-bpe test-core-bpe.cpp)
+target_include_directories(test-core-bpe PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-core-bpe PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-core-bpe
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;bpe"
+)
+
+# ─── test-core-wordpiece — core/wordpiece.h BERT WordPiece tokenizer ─────────
+# Verifies build_map, lookup, cased/uncased detection, BasicTokenizer,
+# WordPiece greedy subword splitting, [UNK] fallback. No model load, pure CPU.
+add_executable(test-core-wordpiece test-core-wordpiece.cpp)
+target_include_directories(test-core-wordpiece PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-core-wordpiece PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-core-wordpiece
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;wordpiece"
+)
+
 # ─── test-core-istft — core/istft.h inverse-STFT overlap-add ──────────────────
 # Verifies the extracted iSTFT against an independent full-DFT reference
 # (fuzzed) + a forward-STFT→iSTFT sinusoid round-trip.
@@ -1134,6 +1945,22 @@ target_link_libraries(test-core-istft PRIVATE
 catch_discover_tests(test-core-istft
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit"
+)
+
+# ─── test-core-mel-parallel — core/mel.cpp §176f parallel-STFT bit-identity ───
+# Asserts the OpenMP-parallel STFT (Params::allow_parallel_stft) is bit-identical
+# to the serial path. Links crispasr-core (core_mel::compute is not header-only).
+add_executable(test-core-mel-parallel test-core-mel-parallel.cpp)
+target_include_directories(test-core-mel-parallel PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-core-mel-parallel PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-core
+)
+catch_discover_tests(test-core-mel-parallel
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;mel"
 )
 
 # ─── test-core-cross-attn — core/cross_attn.h manual path (ggml graph) ────────
@@ -1184,6 +2011,28 @@ target_link_libraries(test-core-seanet PRIVATE
 catch_discover_tests(test-core-seanet
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit"
+)
+
+# ─── test-audio-formats — Catch2 unit tests for crispasr_audio_load format coverage
+#
+# Validates AU (µ-law), AMR-NB, and WebM (Opus) decode against the WAV
+# reference (jfk.wav). Cross-correlation + length + energy checks. Pure CPU,
+# no model load — only requires sample files in samples/.
+add_executable(test-audio-formats test-audio-formats.cpp)
+target_include_directories(test-audio-formats PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-audio-formats PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+target_compile_definitions(test-audio-formats PRIVATE
+    SAMPLES_DIR="${PROJECT_SOURCE_DIR}/samples"
+)
+catch_discover_tests(test-audio-formats
+    TEST_SPEC "[audio]"
+    PROPERTIES LABELS "unit;audio"
 )
 
 # ─── test-audio-chunking — Catch2 unit tests for audio_chunking::find_energy_min_split
@@ -1467,6 +2316,18 @@ set_tests_properties(test-piper-roundtrip PROPERTIES
     TIMEOUT 300)
 endif()
 
+# ─── test-speaker-id-live — live test: consent gate (--speaker-db-consent) +
+# session-scoped --diarize-speakers. SKIPs cleanly without audio/models. ──────
+if(TARGET crispasr-cli)
+add_test(NAME test-speaker-id-live
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-speaker-id-live.sh
+            $<TARGET_FILE:crispasr-cli>
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-speaker-id-live PROPERTIES
+    LABELS "live;diarize;speaker"
+    TIMEOUT 600)
+endif()
+
 # ─── test-progress-output — live test: -pp/--print-progress emits per-slice
 # progress on stderr for unified backends (issue #130).
 add_test(NAME test-progress-output
@@ -1494,6 +2355,79 @@ add_test(NAME test-server-ws-stream
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 set_tests_properties(test-server-ws-stream PROPERTIES
     LABELS "live;server"
+    TIMEOUT 300)
+
+# ─── test-wyoming-proto — Catch2 unit tests for Wyoming wire format, PCM
+# conversion (f32↔s16), and linear-interpolation resampler.
+# Pure CPU, no model or audio device needed. The socket-pair framing tests
+# are POSIX-only and compiled out on Windows.
+add_executable(test-wyoming-proto test-wyoming-proto.cpp)
+target_link_libraries(test-wyoming-proto PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-wyoming-proto
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;wyoming")
+
+# ─── test-crispasr-speaker-resample — Catch2 unit tests for the pre-resample
+# math inside crispasr_speaker_play(): upsample/downsample, mono expansion,
+# stereo mix-down, DC preservation. No audio device or model needed.
+add_executable(test-crispasr-speaker-resample test-crispasr-speaker-resample.cpp)
+target_link_libraries(test-crispasr-speaker-resample PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-crispasr-speaker-resample
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;speaker")
+
+# ─── test-server-wyoming — live: --wyoming-port Wyoming protocol TCP server.
+# Python stdlib client exercises describe→info, ASR transcription, disconnect
+# resilience, and unknown-event resilience. Needs a whisper ggml model; SKIPs
+# otherwise.
+add_test(NAME test-server-wyoming
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-server-wyoming.py
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-server-wyoming PROPERTIES
+    LABELS "live;server;wyoming"
+    TIMEOUT 300)
+
+# ─── test-server-tts — live: /v1/audio/speech + /v1/voices smoke, incl. the
+# PR #177 streaming path (stream=true per-chunk PCM, mp3 rejection, log marker).
+# Needs a qwen3-tts CustomVoice GGUF + tokenizer (set CRISPASR_MODELS); SKIPs
+# (exit 0) otherwise.
+add_test(NAME test-server-tts
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-server-tts.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-server-tts PROPERTIES
+    LABELS "live;server;tts"
+    TIMEOUT 600)
+
+# ─── test-server-stream-resilience — live: the detached streaming-TTS worker
+# must not crash the server on an exception. Forces a worker throw
+# (CRISPASR_TEST_STREAM_THROW=1 + magic input) and asserts the server survives +
+# keeps serving. Auto-discovers a qwen3-tts GGUF; SKIPs otherwise.
+add_test(NAME test-server-stream-resilience
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-server-stream-resilience.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-server-stream-resilience PROPERTIES
+    LABELS "live;server;tts;qwen3-tts"
+    TIMEOUT 400)
+
+# ─── test-qwen3-tts-codes-determinism — live: CLI whole-clip synthesis gates.
+# (1) two identical --tts runs are bit-identical (guards the shared talker AR
+# loop / streaming dedup); (2) QWEN3_TTS_O15=1 is byte-identical to O15=0
+# (guards #56). Auto-discovers a qwen3-tts GGUF; SKIPs (exit 0) otherwise.
+add_test(NAME test-qwen3-tts-codes-determinism
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-qwen3-tts-codes-determinism.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-qwen3-tts-codes-determinism PROPERTIES
+    LABELS "live;tts;qwen3-tts;determinism"
+    TIMEOUT 300)
+
+# ─── test-qwen3-tts-seed-live — live: server-side seed determinism on
+# /v1/audio/speech (same request seed → bit-identical WAV; different seed →
+# different). Needs CRISPASR_TEST_QWEN3_TTS_MODEL/CODEC (CustomVoice); SKIPs.
+add_test(NAME test-qwen3-tts-seed-live
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-qwen3-tts-seed-live.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-qwen3-tts-seed-live PROPERTIES
+    LABELS "live;server;tts;qwen3-tts;determinism"
     TIMEOUT 300)
 
 # ─── test-release-workflow — validate release.yml targets (issue #131).

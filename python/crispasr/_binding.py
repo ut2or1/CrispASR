@@ -1204,7 +1204,10 @@ class Session:
         lib.crispasr_session_available_backends.argtypes = [ctypes.c_char_p, ctypes.c_int]
         lib.crispasr_session_available_backends.restype = ctypes.c_int
         buf = ctypes.create_string_buffer(256)
-        lib.crispasr_session_available_backends(buf, 256)
+        needed = lib.crispasr_session_available_backends(buf, len(buf))
+        if needed >= len(buf):
+            buf = ctypes.create_string_buffer(needed + 1)
+            lib.crispasr_session_available_backends(buf, len(buf))
         csv = buf.value.decode("utf-8")
         return [s.strip() for s in csv.split(",") if s.strip()]
 
@@ -1671,6 +1674,21 @@ class Session:
         if rc != 0 and rc != -2:
             raise RuntimeError(f"set_tts_steps failed (rc={rc})")
 
+    def set_tts_num_candidates(self, n: int) -> None:
+        """Set the number of flow-matching timing candidates ranked per token.
+
+        Honoured by TADA, where more candidates give more reliable
+        multilingual timing at higher cost. Soft no-op (rc=-2) on backends
+        that don't rank timing candidates.
+        """
+        if not hasattr(self._lib, "crispasr_session_set_tts_num_candidates"):
+            return
+        self._lib.crispasr_session_set_tts_num_candidates.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.crispasr_session_set_tts_num_candidates.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_tts_num_candidates(self._handle, int(n))
+        if rc != 0 and rc != -2:
+            raise RuntimeError(f"set_tts_num_candidates failed (rc={rc})")
+
     def set_top_p(self, top_p: float) -> None:
         """Set the top-p nucleus-sampling threshold. Honoured by chatterbox."""
         if not hasattr(self._lib, "crispasr_session_set_top_p"):
@@ -1680,6 +1698,26 @@ class Session:
         rc = self._lib.crispasr_session_set_top_p(self._handle, float(top_p))
         if rc != 0 and rc != -2:
             raise RuntimeError(f"set_top_p failed (rc={rc})")
+
+    def set_top_k(self, top_k: int) -> None:
+        """Set the top-k sampling cutoff (0 = disabled). Honoured by TADA."""
+        if not hasattr(self._lib, "crispasr_session_set_top_k"):
+            return
+        self._lib.crispasr_session_set_top_k.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.crispasr_session_set_top_k.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_top_k(self._handle, int(top_k))
+        if rc != 0 and rc != -2:
+            raise RuntimeError(f"set_top_k failed (rc={rc})")
+
+    def set_do_sample(self, enable: bool) -> None:
+        """Enable/disable sampling (False = greedy). Honoured by TADA."""
+        if not hasattr(self._lib, "crispasr_session_set_do_sample"):
+            return
+        self._lib.crispasr_session_set_do_sample.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.crispasr_session_set_do_sample.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_do_sample(self._handle, 1 if enable else 0)
+        if rc != 0 and rc != -2:
+            raise RuntimeError(f"set_do_sample failed (rc={rc})")
 
     def set_min_p(self, min_p: float) -> None:
         """Set the min-p sampling threshold. Honoured by chatterbox."""
@@ -1710,6 +1748,16 @@ class Session:
         rc = self._lib.crispasr_session_set_cfg_weight(self._handle, float(cfg_weight))
         if rc != 0 and rc != -2:
             raise RuntimeError(f"set_cfg_weight failed (rc={rc})")
+
+    def set_tts_noise_temp(self, noise_temp: float) -> None:
+        """TADA flow-matching noise temperature (Python noise_temp, default 0.9)."""
+        if not hasattr(self._lib, "crispasr_session_set_tts_noise_temp"):
+            return
+        self._lib.crispasr_session_set_tts_noise_temp.argtypes = [ctypes.c_void_p, ctypes.c_float]
+        self._lib.crispasr_session_set_tts_noise_temp.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_tts_noise_temp(self._handle, float(noise_temp))
+        if rc != 0 and rc != -2:
+            raise RuntimeError(f"set_tts_noise_temp failed (rc={rc})")
 
     def set_exaggeration(self, exaggeration: float) -> None:
         """Set the emotion-exaggeration scalar (chatterbox). 0.5 is the upstream default."""

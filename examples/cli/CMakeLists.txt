@@ -42,6 +42,7 @@ add_executable(${TARGET}
     crispasr_backend_fastpitch.cpp
     crispasr_backend_bark.cpp
     crispasr_backend_dia.cpp
+    crispasr_backend_dots_tts.cpp
     crispasr_backend_voxcpm2_tts.cpp
     crispasr_backend_cosyvoice3.cpp
     crispasr_backend_kokoro.cpp
@@ -76,6 +77,9 @@ add_executable(${TARGET}
     # Real-time WebSocket ASR streaming, shared with the standalone server
     # (examples/server). Wired into `crispasr --server` via --ws-port.
     ${CMAKE_CURRENT_SOURCE_DIR}/../server/ws_stream.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../server/realtime_server.cpp
+    # Wyoming protocol TCP server (issue #172) — Home Assistant Assist STT+TTS.
+    wyoming.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -185,6 +189,7 @@ target_link_libraries(crispasr-diff PRIVATE
     kokoro
     chatterbox
     tada-tts
+    tada-encoder
     indextts
     m2m100
     gemma4_e2b
@@ -277,6 +282,7 @@ target_link_libraries(${TARGET} PRIVATE
     orpheus
     chatterbox
     tada-tts
+    tada-encoder
     indextts
     kokoro
     piper-tts
@@ -284,6 +290,7 @@ target_link_libraries(${TARGET} PRIVATE
     fastpitch-tts
     bark-tts
     dia-tts
+    dots-tts
     pocket-tts
     csm-tts
     voxcpm2_tts

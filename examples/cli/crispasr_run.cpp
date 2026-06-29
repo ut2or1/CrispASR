@@ -9,10 +9,14 @@
 
 #include "crispasr_backend.h"
 #include "crispasr_cache.h"
+#include "tada_encoder.h"
+
+#include <sys/stat.h>
 #include "crispasr_chunk_context_gate.h"
 #include "crispasr_lcs_dedup.h"
 #include "crispasr_long_audio_fallback.h"
 #include "crispasr_mic_cli.h"
+#include "crispasr_speaker.h"
 #include "crispasr_popen.h"
 #include "crispasr_vad_cli.h"
 #include "crispasr_output.h"
@@ -40,6 +44,7 @@
 #include "speaker_db.h"
 
 #include "crispasr_c2pa.h"
+#include "crispasr_tts_chunking.h"
 #include "crispasr_tts_disclaimer.h"
 #include "crispasr_watermark.h"
 #include "crispasr_watermark_dispatch.h"
@@ -296,6 +301,18 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
 
     // Speaker enrollment mode: extract TitaNet embedding, save to DB, exit.
     if (!params.enroll_speaker.empty()) {
+        // Biometric consent gate. Enrollment persists a voiceprint linked
+        // to a real name — special-category data under GDPR Art. 9. Refuse
+        // unless the deployer has affirmed a lawful basis + explicit consent.
+        if (!params.speaker_db_consent) {
+            fprintf(stderr, "crispasr: error: --enroll-speaker requires --speaker-db-consent.\n"
+                            "  Enrollment stores a voiceprint linked to a real name (biometric data,\n"
+                            "  GDPR Art. 9 special category). Pass --speaker-db-consent only if you have\n"
+                            "  explicit consent from this person and a lawful basis to store it.\n"
+                            "  For privacy-clean stable speaker labels that identify no one, use\n"
+                            "  --diarize-speakers instead (no database, no names).\n");
+            return 25;
+        }
         std::string tmodel = params.titanet_model;
         if (tmodel.empty() || tmodel == "auto") {
             tmodel =
@@ -775,7 +792,20 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
 
         // Speaker identification: match diarized speakers against profile DB.
         // Also supports standalone speaker ID (without diarize) when --speaker-db is set.
-        if (!params.speaker_db.empty() && !segs.empty()) {
+        //
+        // Biometric consent gate (1:N named identification, GDPR Art. 9):
+        // skip entirely unless the deployer affirmed --speaker-db-consent.
+        // Warn once (the slice loop may run on multiple workers).
+        if (!params.speaker_db.empty() && !params.speaker_db_consent) {
+            static std::once_flag spk_consent_warn;
+            std::call_once(spk_consent_warn, [] {
+                fprintf(stderr, "crispasr: --speaker-db ignored: 1:N matching against named voiceprints is\n"
+                                "  biometric identification (GDPR Art. 9). Re-run with --speaker-db-consent to\n"
+                                "  affirm consent + a lawful basis. For privacy-clean stable speaker labels\n"
+                                "  that identify no one, use --diarize-speakers instead.\n");
+            });
+        }
+        if (!params.speaker_db.empty() && params.speaker_db_consent && !segs.empty()) {
             static titanet_context* spk_ctx = nullptr;
             static speaker_db* spk_db = nullptr;
             if (!spk_ctx) {
@@ -1456,6 +1486,130 @@ int crispasr_run_backend(const whisper_params& params_in) {
         return 0;
     }
 
+    // ---- make-ref mode: create TADA voice reference GGUF ----
+    if (params.make_ref) {
+        if (params.tts_voice.empty()) {
+            fprintf(stderr, "crispasr[make-ref]: --make-ref requires --voice <audio.wav>\n");
+            return 20;
+        }
+        if (params.tts_ref_text.empty()) {
+            fprintf(stderr, "crispasr[make-ref]: --make-ref requires --ref-text \"transcript of the audio\"\n");
+            return 20;
+        }
+
+        // Resolve paths
+        std::string encoder_path = params.make_ref_encoder;
+        std::string aligner_path = params.make_ref_aligner;
+        std::string out_path = params.make_ref_output.empty() ? "tada-ref-custom.gguf" : params.make_ref_output;
+
+        // Auto-discover encoder + aligner GGUFs from model dir or cache
+        if (encoder_path.empty()) {
+            auto dir_of = [](const std::string& p) -> std::string {
+                auto sep = p.find_last_of("/\\");
+                return (sep == std::string::npos) ? "." : p.substr(0, sep);
+            };
+            std::string dir = dir_of(params.model);
+            for (const char* name : {"tada-encoder-f16.gguf", "tada-encoder.gguf"}) {
+                std::string p = dir + "/" + name;
+                struct stat st;
+                if (stat(p.c_str(), &st) == 0) {
+                    encoder_path = p;
+                    break;
+                }
+            }
+        }
+        if (aligner_path.empty()) {
+            auto dir_of = [](const std::string& p) -> std::string {
+                auto sep = p.find_last_of("/\\");
+                return (sep == std::string::npos) ? "." : p.substr(0, sep);
+            };
+            std::string dir = dir_of(params.model);
+            std::string lang_suffix = params.language.empty() ? "en" : params.language;
+            for (const char* fmt : {"tada-aligner-%s.gguf", "tada-aligner-en.gguf"}) {
+                char name[256];
+                snprintf(name, sizeof(name), fmt, lang_suffix.c_str());
+                std::string p = dir + "/" + name;
+                struct stat st;
+                if (stat(p.c_str(), &st) == 0) {
+                    aligner_path = p;
+                    break;
+                }
+            }
+        }
+
+        if (encoder_path.empty()) {
+            fprintf(stderr, "crispasr[make-ref]: cannot find tada-encoder GGUF. "
+                            "Pass --make-ref-encoder <path> or place tada-encoder-f16.gguf next to the model.\n");
+            return 20;
+        }
+        if (aligner_path.empty()) {
+            fprintf(stderr, "crispasr[make-ref]: cannot find tada-aligner GGUF. "
+                            "Pass --make-ref-aligner <path> or place tada-aligner-en.gguf next to the model.\n");
+            return 20;
+        }
+
+        fprintf(stderr, "crispasr[make-ref]: encoder=%s\n", encoder_path.c_str());
+        fprintf(stderr, "crispasr[make-ref]: aligner=%s\n", aligner_path.c_str());
+        fprintf(stderr, "crispasr[make-ref]: voice=%s\n", params.tts_voice.c_str());
+        fprintf(stderr, "crispasr[make-ref]: text='%s'\n", params.tts_ref_text.c_str());
+
+        // Load audio
+        std::vector<float> ref_audio;
+        std::vector<std::vector<float>> stereo_dummy;
+        if (!read_audio_data(params.tts_voice, ref_audio, stereo_dummy, false)) {
+            fprintf(stderr, "crispasr[make-ref]: failed to load audio '%s'\n", params.tts_voice.c_str());
+            return 20;
+        }
+        // ref_audio is 16kHz from the loader — resample to 24kHz for the encoder
+        int n_16k = (int)ref_audio.size();
+        int n_24k = (int)((int64_t)n_16k * 24000 / 16000);
+        std::vector<float> audio_24k(n_24k);
+        for (int i = 0; i < n_24k; i++) {
+            float src = (float)i * 16000.0f / 24000.0f;
+            int idx = (int)src;
+            float frac = src - idx;
+            if (idx + 1 < n_16k)
+                audio_24k[i] = ref_audio[idx] * (1.0f - frac) + ref_audio[idx + 1] * frac;
+            else if (idx < n_16k)
+                audio_24k[i] = ref_audio[idx];
+        }
+        fprintf(stderr, "crispasr[make-ref]: audio %.2fs @ 24kHz (%d samples)\n", n_24k / 24000.0f, n_24k);
+
+        // Init encoder
+        tada_encoder_params ep = tada_encoder_default_params();
+        ep.n_threads = params.n_threads;
+        ep.seed = params.seed;
+        ep.verbosity = params.no_prints ? 0 : 1;
+        tada_encoder_context* ectx = tada_encoder_init(encoder_path.c_str(), ep);
+        if (!ectx) {
+            fprintf(stderr, "crispasr[make-ref]: failed to load encoder '%s'\n", encoder_path.c_str());
+            return 20;
+        }
+
+        // Run full pipeline
+        tada_encoder_result result;
+        int rc = tada_encoder_encode(ectx, aligner_path.c_str(), audio_24k.data(), n_24k, params.tts_ref_text.c_str(),
+                                     result);
+        tada_encoder_free(ectx);
+
+        if (rc != 0) {
+            fprintf(stderr, "crispasr[make-ref]: encode failed (rc=%d)\n", rc);
+            return 20;
+        }
+
+        // Write GGUF via tada_encoder helper
+        fprintf(stderr, "crispasr[make-ref]: %d tokens × %d-d → %s\n", result.n_tokens, result.embed_dim,
+                out_path.c_str());
+        rc = tada_encoder_write_ref_gguf(out_path.c_str(), result, params.tts_ref_text.c_str(),
+                                         params.language.empty() ? nullptr : params.language.c_str());
+        if (rc != 0) {
+            fprintf(stderr, "crispasr[make-ref]: failed to write GGUF (rc=%d)\n", rc);
+            return 20;
+        }
+        fprintf(stderr, "crispasr[make-ref]: saved %s\n", out_path.c_str());
+        return 0;
+    }
+
     // ---- TTS mode: synthesize speech from text ----
     if (!params.tts_text.empty()) {
         if (!(backend->capabilities() & CAP_TTS)) {
@@ -1493,16 +1647,40 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     params.tts_consent_attestation.c_str());
         }
 
-        auto audio = backend->synthesize(params.tts_text, params);
-        if (audio.empty()) {
-            fprintf(stderr, "crispasr: error: TTS synthesis failed\n");
-            return 15;
-        }
-
         // Sample rate of the synthesized PCM — backend-declared. Most TTS
         // backends emit 24 kHz; voxcpm2-tts emits 48 kHz. Hard-coding 24 kHz
         // here is why voxcpm2 output played at half-speed before this fix.
         const int sr_in = backend->tts_sample_rate();
+
+        // §218 (#182): sentence-chunk long input before synthesis — every TTS
+        // talker has a finite positional/training horizon (chatterbox base T3
+        // hard-caps at 2050 text positions; longer text was truncated). Split on
+        // sentence boundaries, synthesize each chunk within the model's healthy
+        // horizon, and concatenate with a 200 ms pause between chunks. The
+        // server `/v1/audio/speech` path already does this (#66); this brings the
+        // CLI `--tts` path to parity. Single-sentence input is a 1-element vector
+        // (one std::vector move of overhead). The policy wrapper keeps VibeVoice
+        // voice cloning single-shot (chunking breaks its continuous-prompt ICL).
+        std::vector<float> audio;
+        {
+            const std::vector<std::string> chunks_txt =
+                crispasr_tts_plan_chunks_for_backend(params.tts_text, backend->name());
+            std::vector<std::vector<float>> chunk_pcm;
+            chunk_pcm.reserve(chunks_txt.size());
+            for (size_t ci = 0; ci < chunks_txt.size(); ci++) {
+                if (params.verbose && chunks_txt.size() > 1)
+                    fprintf(stderr, "crispasr[tts]: chunk %zu/%zu (%zu chars)\n", ci + 1, chunks_txt.size(),
+                            chunks_txt[ci].size());
+                std::vector<float> c = backend->synthesize(chunks_txt[ci], params);
+                if (!c.empty())
+                    chunk_pcm.push_back(std::move(c));
+            }
+            audio = crispasr_tts_concat_with_silence(chunk_pcm, sr_in / 5);
+        }
+        if (audio.empty()) {
+            fprintf(stderr, "crispasr: error: TTS synthesis failed\n");
+            return 15;
+        }
 
         // Prepend spoken AI-disclosure for voice-cloned output. The
         // disclaimer is synthesized with the neutral/default voice (not
@@ -1570,6 +1748,24 @@ int crispasr_run_backend(const whisper_params& params_in) {
         if (!params.no_prints)
             fprintf(stderr, "crispasr: TTS output written to '%s' (%zu samples @ %d Hz, %.2f sec)\n", out_path.c_str(),
                     audio.size(), sr_in, (double)audio.size() / (double)sr_in);
+
+        // --tts-play: play the watermarked PCM on the local speaker.
+        // Uses the same audio[] buffer (already watermarked at line above).
+        if (params.tts_play) {
+            crispasr_speaker* spk = crispasr_speaker_open(sr_in, 1, params.tts_play_device);
+            if (!spk) {
+                fprintf(stderr, "crispasr: warning: --tts-play: could not open playback device\n");
+            } else {
+                if (!params.no_prints)
+                    fprintf(stderr, "crispasr: playing on '%s'\n", crispasr_speaker_default_device_name());
+                if (crispasr_speaker_play(spk, audio.data(), (int)audio.size(), sr_in, 1) == 0)
+                    crispasr_speaker_wait(spk);
+                else
+                    fprintf(stderr, "crispasr: warning: --tts-play: playback failed\n");
+                crispasr_speaker_close(spk);
+            }
+        }
+
         crispasr_wm_dispatch::shutdown();
         return 0;
     }

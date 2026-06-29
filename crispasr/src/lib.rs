@@ -283,12 +283,24 @@ impl Session {
 
     /// List of backend names the loaded CrispASR library was compiled with.
     pub fn available_backends() -> Vec<String> {
-        let mut buf = [0i8; 256];
-        let n = unsafe {
+        let mut buf = vec![0i8; 256];
+        let mut n = unsafe {
             crispasr_sys::crispasr_session_available_backends(buf.as_mut_ptr(), buf.len() as i32)
         };
         if n <= 0 {
             return Vec::new();
+        }
+        if n as usize >= buf.len() {
+            buf.resize(n as usize + 1, 0);
+            n = unsafe {
+                crispasr_sys::crispasr_session_available_backends(
+                    buf.as_mut_ptr(),
+                    buf.len() as i32,
+                )
+            };
+            if n <= 0 {
+                return Vec::new();
+            }
         }
         let cstr = unsafe { CStr::from_ptr(buf.as_ptr()) };
         cstr.to_string_lossy()
@@ -875,11 +887,40 @@ impl Session {
         Ok(())
     }
 
+    /// Set the number of flow-matching timing candidates ranked per token
+    /// (TADA). Higher = more reliable multilingual timing at higher cost.
+    /// Other backends silently no-op.
+    pub fn set_tts_num_candidates(&self, n: i32) -> Result<(), String> {
+        let rc = unsafe { crispasr_sys::crispasr_session_set_tts_num_candidates(self.handle, n) };
+        if rc != 0 && rc != -2 {
+            return Err(format!("set_tts_num_candidates failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
     /// Set the top-p nucleus-sampling threshold. Honoured by chatterbox.
     pub fn set_top_p(&self, top_p: f32) -> Result<(), String> {
         let rc = unsafe { crispasr_sys::crispasr_session_set_top_p(self.handle, top_p) };
         if rc != 0 && rc != -2 {
             return Err(format!("set_top_p failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set the top-k sampling cutoff (0 = disabled). Honoured by TADA.
+    pub fn set_top_k(&self, top_k: i32) -> Result<(), String> {
+        let rc = unsafe { crispasr_sys::crispasr_session_set_top_k(self.handle, top_k) };
+        if rc != 0 && rc != -2 {
+            return Err(format!("set_top_k failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Enable/disable sampling (`false` = greedy). Honoured by TADA.
+    pub fn set_do_sample(&self, enable: bool) -> Result<(), String> {
+        let rc = unsafe { crispasr_sys::crispasr_session_set_do_sample(self.handle, enable as i32) };
+        if rc != 0 && rc != -2 {
+            return Err(format!("set_do_sample failed (rc={})", rc));
         }
         Ok(())
     }
@@ -910,6 +951,17 @@ impl Session {
             unsafe { crispasr_sys::crispasr_session_set_cfg_weight(self.handle, cfg_weight) };
         if rc != 0 && rc != -2 {
             return Err(format!("set_cfg_weight failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set the TADA flow-matching noise temperature (Python noise_temp,
+    /// default 0.9).
+    pub fn set_tts_noise_temp(&self, noise_temp: f32) -> Result<(), String> {
+        let rc =
+            unsafe { crispasr_sys::crispasr_session_set_tts_noise_temp(self.handle, noise_temp) };
+        if rc != 0 && rc != -2 {
+            return Err(format!("set_tts_noise_temp failed (rc={})", rc));
         }
         Ok(())
     }

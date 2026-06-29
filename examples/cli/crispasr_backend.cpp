@@ -58,6 +58,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_bark_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_pocket_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_speecht5_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_dia_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_dots_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_parler_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_fastpitch_backend();
 // csm-tts (§135): sesame/csm-1b — Llama backbone + depth decoder + Mimi codec.
@@ -82,7 +83,7 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
     if (name == "nemotron" || name == "nemotron-streaming" || name == "nemotron-3.5" || name == "nemotron-asr" ||
         name == "nemotron-speech-streaming")
         return crispasr_make_nemotron_backend();
-    if (name == "parakeet")
+    if (name == "parakeet" || name == "reazonspeech")
         return crispasr_make_parakeet_backend();
     if (name == "canary")
         return crispasr_make_canary_backend();
@@ -132,7 +133,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         name == "kartoffelbox_turbo" || name == "lahgtna" || name == "lahgtna-chatterbox" ||
         name == "lahgtna-chatterbox-v1")
         return crispasr_make_chatterbox_backend();
-    if (name == "tada" || name == "tada-tts" || name == "tada-3b" || name == "tada-3b-ml")
+    if (name == "tada" || name == "tada-tts" || name == "tada-1b" || name == "tada-tts-1b" || name == "tada-3b" ||
+        name == "tada-3b-ml")
         return crispasr_make_tada_backend();
     if (name == "indextts" || name == "indextts-1.5" || name == "indextts1.5" || name == "index-tts")
         return crispasr_make_indextts_backend();
@@ -192,6 +194,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_speecht5_backend();
     if (name == "dia" || name == "dia-tts" || name == "dia-1.6b" || name == "dia_tts")
         return crispasr_make_dia_backend();
+    if (name == "dots-tts" || name == "dots_tts" || name == "dots" || name == "dots.tts")
+        return crispasr_make_dots_tts_backend();
     if (name == "parler-tts" || name == "parler_tts" || name == "parler" || name == "parlertts")
         return crispasr_make_parler_tts_backend();
     if (name == "zonos" || name == "zonos-tts" || name == "zonos_tts")
@@ -208,6 +212,7 @@ std::vector<std::string> crispasr_list_backends() {
         "whisper",
         "nemotron",
         "parakeet",
+        "reazonspeech",
         "canary",
         "lfm2-audio",
         "mini-omni2",
@@ -241,6 +246,10 @@ std::vector<std::string> crispasr_list_backends() {
         "chatterbox-turbo",
         "kartoffelbox-turbo",
         "lahgtna-chatterbox",
+        "tada",
+        "tada-1b",
+        "tada-tts-1b",
+        "tada-3b-ml",
         "indextts",
         "f5-tts",
         "pocket-tts",
@@ -275,6 +284,7 @@ std::vector<std::string> crispasr_list_backends() {
         "speecht5",
         "dia",
         "dia-tts",
+        "dots-tts",
         "parler-tts",
         "zonos",
         "zonos-tts",
@@ -312,6 +322,7 @@ static constexpr feature_col kFeatures[] = {
     {"tts", CAP_TTS},
     {"s2s", CAP_S2S},
     {"voice-clone", CAP_VOICE_CLONING},
+    {"streaming", CAP_STREAMING},
 };
 
 void crispasr_print_backend_matrix() {
@@ -387,6 +398,7 @@ static constexpr cap_slug kCapSlugs[] = {
     {"tts", CAP_TTS},
     {"s2s", CAP_S2S},
     {"voice-cloning", CAP_VOICE_CLONING},
+    {"streaming", CAP_STREAMING},
 };
 
 void crispasr_print_backend_matrix_json() {
@@ -473,6 +485,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
     if (contains_ci("parakeet") && contains_ci("ctc") && !contains_ci("tdt"))
         return "fastconformer-ctc";
     if (contains_ci("parakeet"))
+        return "parakeet";
+    if (contains_ci("reazonspeech"))
         return "parakeet";
     // Check "fastconformer-ctc" / "stt_en_fc_ctc" style filenames before
     // the broader "canary" match so users who drop a NeMo standalone
@@ -569,6 +583,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "dia";
     if (contains_ci("dia-tts") || contains_ci("dia_tts"))
         return "dia";
+    if (contains_ci("dots-tts") || contains_ci("dots_tts") || contains_ci("dots.tts"))
+        return "dots-tts";
     if (contains_ci("csm") || contains_ci("sesame"))
         return "csm";
     if (contains_ci("parler") && contains_ci("tts"))
@@ -635,7 +651,7 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "f5-tts";
             else if (a == "chatterbox" || a == "chatterbox_turbo" || a == "kartoffelbox")
                 result = "chatterbox";
-            else if (a == "tada" || a == "tada-tts" || a == "tada-3b-ml")
+            else if (a == "tada" || a == "tada-tts" || a == "tada-1b" || a == "tada-tts-1b" || a == "tada-3b-ml")
                 result = "tada";
             else if (a == "m2m100" || a == "m2m_100")
                 result = "m2m100";
@@ -699,6 +715,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "bark";
             else if (a == "dia" || a == "dia-tts" || a == "dia_tts")
                 result = "dia";
+            else if (a == "dots-tts" || a == "dots_tts" || a == "dots.tts")
+                result = "dots-tts";
             else if (a == "csm" || a == "csm-tts" || a == "csm_tts")
                 result = "csm";
             else if (a == "parler-tts" || a == "parler_tts" || a == "parlertts")

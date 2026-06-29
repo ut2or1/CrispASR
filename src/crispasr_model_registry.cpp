@@ -310,6 +310,11 @@ constexpr Entry k_registry[] = {
     {"gemma4-e2b", "gemma4-e2b-it-q4_k.gguf",
      "https://huggingface.co/cstr/gemma4-e2b-it-GGUF/resolve/main/gemma4-e2b-it-q4_k.gguf",
      "~2.5 GB", nullptr, nullptr},
+    // gemma4-e4b: same `gemma4` architecture as E2B (byte-identical 1024d USM
+    // audio tower) with a larger decoder (42L×2560) — runs on the same backend.
+    {"gemma4-e4b", "gemma4-e4b-it-q4_k.gguf",
+     "https://huggingface.co/cstr/gemma4-e4b-it-GGUF/resolve/main/gemma4-e4b-it-q4_k.gguf",
+     "~4.1 GB", nullptr, nullptr},
     {"titanet", "titanet-large.gguf",
      "https://huggingface.co/cstr/titanet-large-GGUF/resolve/main/titanet-large.gguf",
      "~45 MB", nullptr, nullptr},
@@ -359,6 +364,20 @@ constexpr Entry k_registry[] = {
     {"parakeet-rnnt-1.1b", "parakeet-rnnt-1.1b-q4_k.gguf",
      "https://huggingface.co/cstr/parakeet-rnnt-1.1b-GGUF/resolve/main/parakeet-rnnt-1.1b-q4_k.gguf",
      "~770 MB", nullptr, nullptr},
+    // parakeet-ctc-1.1b-ja — Japanese FastConformer-CTC (42L, 1.1B params).
+    // Fine-tuned from nvidia/parakeet-ctc-1.1b on Japanese data. Uses the
+    // GAL checkpoint (parakeet-ja-gal.nemo) — the non-GAL checkpoint has
+    // corrupt F32 weights in layers 26-28 (NaN + values >1e38).
+    {"parakeet-ctc-1.1b-ja", "parakeet-ctc-1.1b-ja-q8_0.gguf",
+     "https://huggingface.co/cstr/parakeet-ctc-1.1b-ja-GGUF/resolve/main/parakeet-ctc-1.1b-ja-q8_0.gguf",
+     "~1.2 GB", nullptr, nullptr},
+    // reazonspeech-nemo-v2 — Japanese FastConformer-RNNT (619M params).
+    // 80-mel input, rel_pos_local_attn (window=128+128, 1 global token),
+    // 3000-token SentencePiece vocab. Pure RNNT (n_tdt_durations=0).
+    // Trained on the ReazonSpeech v2.0 corpus (multi-hour capability).
+    {"reazonspeech", "reazonspeech-nemo-v2-q8_0.gguf",
+     "https://huggingface.co/cstr/reazonspeech-nemo-v2-GGUF/resolve/main/reazonspeech-nemo-v2-q8_0.gguf",
+     "~704 MB", nullptr, nullptr},
     // Qwen3-TTS: the talker LM and the codec live in two separate HF
     // repos. Default download is Q8_0 talker (the LEARNINGS-recommended
     // deployment quant — Q4_K drifts noticeably in strict diffs) paired
@@ -441,12 +460,33 @@ constexpr Entry k_registry[] = {
     // ship-default (greedy loops in a 7-slot pattern). The companion
     // URL points at the cstr/snac-24khz-GGUF mirror that gets published
     // alongside the talker GGUF.
-    {"orpheus", "orpheus-3b-base-q8_0.gguf",
-     "https://huggingface.co/cstr/orpheus-3b-base-GGUF/resolve/main/orpheus-3b-base-q8_0.gguf",
-     "~3.5 GB",
+    {"orpheus", "orpheus-3b-0.1-ft-q8_0.gguf",
+     "https://huggingface.co/cstr/orpheus-3b-0.1-ft-GGUF/resolve/main/orpheus-3b-0.1-ft-q8_0.gguf",
+     "~3.7 GB",
      "snac-24khz.gguf",
      "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf",
      "~80 MB"},
+    // TADA TTS 1B: Llama-3.2-1B + flow matching + TADA codec.
+    // Q4_K is the canonical CLI auto-download target; F16 is also listed so
+    // explicit filename resolution can find the matching HF URL.
+    {"tada-1b", "tada-tts-1b-q4_k.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-tts-1b-q4_k.gguf",
+     "~1.7 GB",
+     "tada-codec-f16.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-codec-f16.gguf",
+     "~1 GB"},
+    {"tada-tts-1b", "tada-tts-1b-q4_k.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-tts-1b-q4_k.gguf",
+     "~1.7 GB",
+     "tada-codec-f16.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-codec-f16.gguf",
+     "~1 GB"},
+    {"tada-1b", "tada-tts-1b-f16.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-tts-1b-f16.gguf",
+     "~3.1 GB",
+     "tada-codec-f16.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-codec-f16.gguf",
+     "~1 GB"},
     // TADA-3B-ML (HumeAI/tada-3b-ml): Llama-3.2-3B + flow matching + TADA codec.
     {"tada", "tada-tts-3b-ml-f16.gguf",
      "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/tada-tts-3b-ml-f16.gguf",
@@ -552,6 +592,16 @@ constexpr Entry k_registry[] = {
      "dac-44khz.gguf",
      "https://huggingface.co/cstr/dia-1.6b-GGUF/resolve/main/dac-44khz.gguf",
      "~80 MB"},
+    // dots.tts: rednote-hilab's 2B continuous AR TTS (48 kHz, Apache-2.0).
+    // Qwen2.5-1.5B LLM + 18L DiT flow-matching + BigVGAN vocoder.
+    // No discrete codec tokens — generates continuous latents patch-by-patch.
+    // BPE text input (no phonemes). Vocoder is a separate GGUF companion.
+    {"dots-tts", "dots-tts-soar-f16.gguf",
+     "https://huggingface.co/cstr/dots-tts-soar-GGUF/resolve/main/dots-tts-soar-f16.gguf",
+     "~4.4 GB",
+     "dots-tts-soar-vocoder-f16.gguf",
+     "https://huggingface.co/cstr/dots-tts-soar-GGUF/resolve/main/dots-tts-soar-vocoder-f16.gguf",
+     "~345 MB"},
     // Pocket TTS: Kyutai's 100M continuous-latent AR TTS (24 kHz, MIT/CC-BY-4.0).
     // Generates continuous 32-dim float vectors at 12.5 Hz via one-step LSD,
     // decoded by Mimi VAE to 24 kHz PCM. Single GGUF, no codec companion.
@@ -595,6 +645,18 @@ constexpr Entry k_registry[] = {
     {"canary-ctc-aligner", "canary-ctc-aligner-q4_k.gguf",
      "https://huggingface.co/cstr/canary-ctc-aligner-GGUF/resolve/main/canary-ctc-aligner-q4_k.gguf",
      "~442 MB", nullptr, nullptr},
+    // Qwen3-ForcedAligner-0.6B — same architecture as qwen3-asr-0.6B but
+    // with a 5000-class timestamp head instead of a vocabulary head.
+    // Identified at load time by the lm_head output dimension; crispasr_aligner
+    // dispatches to the qwen3 path when the filename contains
+    // "forced-aligner", "qwen3-fa", or "qwen3-forced". Q4_K (~500 MB)
+    // is the recommended quant; Q5_0 / Q8_0 / F16 also available on the repo.
+    {"qwen3-forced-aligner", "qwen3-forced-aligner-0.6b-q4_k.gguf",
+     "https://huggingface.co/cstr/qwen3-forced-aligner-0.6b-GGUF/resolve/main/qwen3-forced-aligner-0.6b-q4_k.gguf",
+     "~500 MB", nullptr, nullptr},
+    {"qwen3-fa", "qwen3-forced-aligner-0.6b-q4_k.gguf",
+     "https://huggingface.co/cstr/qwen3-forced-aligner-0.6b-GGUF/resolve/main/qwen3-forced-aligner-0.6b-q4_k.gguf",
+     "~500 MB", nullptr, nullptr},
     // M2M-100 (facebook/m2m100_418M, MIT) — multilingual text-to-text
     // translation. 100 source/target languages via SentencePiece + lang
     // codes prefix. Encoder-decoder transformer with cross-attention
@@ -852,12 +914,29 @@ constexpr ExtraCompanion k_qwen3_tts_base_extras[] = {
     {nullptr, nullptr},
 };
 
+// TADA generation expects an aligned acoustic prompt, matching the official
+// model.generate(prompt=...) path. Ship the JFK prompt with auto-download so
+// `-m auto --backend tada[-1b] --tts ...` does not fall back to the unprompted
+// path with unstable timing.
+constexpr ExtraCompanion k_tada_1b_extras[] = {
+    {"tada-ref.gguf", "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-ref.gguf"},
+    {nullptr, nullptr},
+};
+
+constexpr ExtraCompanion k_tada_3b_extras[] = {
+    {"tada-ref.gguf", "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/tada-ref.gguf"},
+    {nullptr, nullptr},
+};
+
 constexpr ExtraList k_extras[] = {
     {"kokoro", k_kokoro_extras},
     {"vibevoice-tts", k_vibevoice_tts_extras},
     {"cosyvoice3-tts", k_cosyvoice3_tts_extras},
     {"qwen3-tts", k_qwen3_tts_base_extras},
     {"qwen3-tts-1.7b-base", k_qwen3_tts_base_extras},
+    {"tada", k_tada_3b_extras},
+    {"tada-1b", k_tada_1b_extras},
+    {"tada-tts-1b", k_tada_1b_extras},
     {nullptr, nullptr},
 };
 // clang-format on
@@ -866,6 +945,18 @@ const Entry* find_by_backend(const std::string& backend) {
     for (const auto& e : k_registry)
         if (backend == e.backend)
             return &e;
+    // Fallback: the CLI passes the raw `--backend` alias (e.g. the short
+    // `cosyvoice3` / `voxcpm2`) while the registry keys the canonical
+    // `cosyvoice3-tts` / `voxcpm2-tts`. When the exact alias has no entry,
+    // retry with a `-tts` suffix so `-m auto --backend cosyvoice3` resolves
+    // instead of failing with "no default model registered". Exact match is
+    // tried first, so this can never shadow a real non-`-tts` entry.
+    if (backend.size() < 4 || backend.compare(backend.size() - 4, 4, "-tts") != 0) {
+        const std::string with_tts = backend + "-tts";
+        for (const auto& e : k_registry)
+            if (with_tts == e.backend)
+                return &e;
+    }
     return nullptr;
 }
 

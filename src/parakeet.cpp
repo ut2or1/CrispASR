@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -47,9 +48,46 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(HAVE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+static bool parakeet_use_scalar() {
+    static int v = -1;
+    if (v < 0)
+        v = (getenv("PARAKEET_FORCE_SCALAR") != nullptr) ? 1 : 0;
+    return v != 0;
+}
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ===========================================================================
+// Bench instrumentation — `PARAKEET_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool parakeet_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("PARAKEET_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct parakeet_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit parakeet_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~parakeet_bench_stage() {
+        if (!parakeet_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  parakeet_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
+
 // ===========================================================================
 // CPU weight caches for the predictor LSTM and joint head
 //
@@ -104,6 +142,11 @@ struct parakeet_hparams {
     uint32_t n_tdt_durations = 5;
     uint32_t frame_dur_cs = 8; // 80 ms per encoder frame
     std::vector<int32_t> tdt_durations = {0, 1, 2, 3, 4};
+
+    // Local attention (rel_pos_local_attn). -1 = full (global) attention.
+    int32_t att_context_left = -1;
+    int32_t att_context_right = -1;
+    uint32_t global_tokens = 0; // positions that all tokens can attend to
 };
 
 // ===========================================================================
@@ -208,6 +251,11 @@ struct parakeet_context {
     // CTC-WS phrase-boost trie (PLAN #98). Set via parakeet_set_hotwords().
     core_context_bias::Trie hotword_trie;
     float hotword_boost = 2.0f; // per-frame prefix continuation boost
+
+    // §176s: cached encoder graph — reused when T_mel matches.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    std::vector<uint8_t> cached_enc_meta;
+    int cached_enc_T_mel = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -271,6 +319,11 @@ static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, co
         hp.blank_id = core_gguf::kv_u32(gctx, "parakeet.blank_id", hp.blank_id);
         hp.n_tdt_durations = core_gguf::kv_u32(gctx, "parakeet.n_tdt_durations", hp.n_tdt_durations);
         hp.frame_dur_cs = core_gguf::kv_u32(gctx, "parakeet.frame_dur_cs", hp.frame_dur_cs);
+
+        // Local attention context (rel_pos_local_attn models).
+        hp.att_context_left = core_gguf::kv_i32(gctx, "parakeet.att_context_left", hp.att_context_left);
+        hp.att_context_right = core_gguf::kv_i32(gctx, "parakeet.att_context_right", hp.att_context_right);
+        hp.global_tokens = core_gguf::kv_u32(gctx, "parakeet.global_tokens", hp.global_tokens);
 
         // CTC head metadata (hybrid TDT+CTC models).
         model.has_ctc = core_gguf::kv_bool(gctx, "parakeet.has_ctc", false);
@@ -696,12 +749,23 @@ static ggml_cgraph* parakeet_build_graph_encoder(parakeet_context* ctx, int T_me
     ggml_set_name(pos_enc, "pos_enc");
     ggml_set_input(pos_enc);
 
+    // ----- Local attention mask (rel_pos_local_attn models) -----
+    ggml_tensor* local_mask = nullptr;
+    const bool use_local_attn =
+        hp.att_context_left >= 0 && hp.att_context_right >= 0 && T > hp.att_context_left + hp.att_context_right + 1;
+    if (use_local_attn) {
+        local_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T, T);
+        ggml_set_name(local_mask, "local_attn_mask");
+        ggml_set_input(local_mask);
+    }
+
     // ----- 24× FastConformer block -----
     core_conformer::BlockParams bp = {
-        (int)hp.d_model, (int)hp.n_heads, (int)hp.head_dim, (int)hp.conv_kernel, kLayerNormEps,
+        (int)hp.d_model, (int)hp.n_heads,     (int)hp.head_dim,     (int)hp.conv_kernel,
+        kLayerNormEps,   hp.att_context_left, hp.att_context_right, (int)hp.global_tokens,
     };
     for (uint32_t il = 0; il < hp.n_layers; il++) {
-        cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp);
+        cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp, local_mask);
     }
 
     ggml_set_name(cur, "enc_out");
@@ -731,7 +795,18 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
         ctx->compute_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
     }
 
-    ggml_cgraph* gf = parakeet_build_graph_encoder(ctx, T_mel);
+    // §176s: reuse cached encoder graph when T_mel matches.
+    ggml_cgraph* gf;
+    if (ctx->cached_enc_gf && ctx->cached_enc_T_mel == T_mel) {
+        gf = ctx->cached_enc_gf;
+    } else {
+        ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
+        std::swap(ctx->compute_meta, ctx->cached_enc_meta);
+        gf = parakeet_build_graph_encoder(ctx, T_mel);
+        std::swap(ctx->compute_meta, ctx->cached_enc_meta);
+        ctx->cached_enc_gf = gf;
+        ctx->cached_enc_T_mel = T_mel;
+    }
 
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
@@ -748,6 +823,15 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
     T_enc = (T_enc + 1) / 2; // pos_enc has 2T-1 columns; recover T
     auto pe = core_conformer::make_pos_enc((int)ctx->model.hparams.d_model, T_enc);
     ggml_backend_tensor_set(pos_in, pe.data(), 0, pe.size() * sizeof(float));
+
+    // Local attention mask (when present in the graph).
+    ggml_tensor* local_mask_in = ggml_graph_get_tensor(gf, "local_attn_mask");
+    if (local_mask_in) {
+        const auto& hp = ctx->model.hparams;
+        auto lm = core_conformer::make_local_attn_mask(T_enc, hp.att_context_left, hp.att_context_right,
+                                                       (int)hp.global_tokens);
+        ggml_backend_tensor_set(local_mask_in, lm.data(), 0, lm.size() * sizeof(float));
+    }
 
     // Compute
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
@@ -838,20 +922,30 @@ static void lstm_step_layer(const float* x, // [in_dim]
     for (int i = 0; i < H4; i++)
         gates[i] = b_ih[i] + b_hh[i];
 
-    for (int i = 0; i < H4; i++) {
-        const float* row = w_ih + (size_t)i * in_dim;
-        float s = 0.0f;
-        for (int k = 0; k < in_dim; k++)
-            s += row[k] * x[k];
-        gates[i] += s;
+#if defined(HAVE_ACCELERATE)
+    if (!parakeet_use_scalar()) {
+        // w_ih[4H, in_dim] @ x[in_dim] and w_hh[4H, H] @ h[H], adding into gates
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, H4, in_dim, 1.0f, w_ih, in_dim, x, 1, 1.0f, gates.data(), 1);
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, H4, H, 1.0f, w_hh, H, h, 1, 1.0f, gates.data(), 1);
+    } else {
+#endif
+        for (int i = 0; i < H4; i++) {
+            const float* row = w_ih + (size_t)i * in_dim;
+            float s = 0.0f;
+            for (int k = 0; k < in_dim; k++)
+                s += row[k] * x[k];
+            gates[i] += s;
+        }
+        for (int i = 0; i < H4; i++) {
+            const float* row = w_hh + (size_t)i * H;
+            float s = 0.0f;
+            for (int k = 0; k < H; k++)
+                s += row[k] * h[k];
+            gates[i] += s;
+        }
+#if defined(HAVE_ACCELERATE)
     }
-    for (int i = 0; i < H4; i++) {
-        const float* row = w_hh + (size_t)i * H;
-        float s = 0.0f;
-        for (int k = 0; k < H; k++)
-            s += row[k] * h[k];
-        gates[i] += s;
-    }
+#endif
 
     auto sig = [](float x) { return 1.0f / (1.0f + expf(-x)); };
 
@@ -901,9 +995,17 @@ static void predictor_step(const parakeet_predictor_weights& W, int token_id, pa
 // Pre-compute proj_e once per encoder frame so we don't redo it inside the
 // inner predictor loop.
 static void joint_proj_enc(const parakeet_joint_weights& J, const float* enc_t, std::vector<float>& out) {
-    out.assign(J.joint_hidden, 0.0f);
+    out.assign(J.enc_b.begin(), J.enc_b.end());
+#if defined(HAVE_ACCELERATE)
+    if (!parakeet_use_scalar()) {
+        // enc_w[joint_hidden, d_model] @ enc_t[d_model], adding into out (which holds enc_b)
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, J.joint_hidden, J.d_model, 1.0f, J.enc_w.data(), J.d_model, enc_t, 1,
+                    1.0f, out.data(), 1);
+        return;
+    }
+#endif
     for (int i = 0; i < J.joint_hidden; i++) {
-        float s = J.enc_b[i];
+        float s = out[i]; // already has enc_b[i]
         const float* row = J.enc_w.data() + (size_t)i * J.d_model;
         for (int k = 0; k < J.d_model; k++)
             s += row[k] * enc_t[k];
@@ -916,25 +1018,44 @@ static void joint_step(const parakeet_joint_weights& J,
                        const float* pred_u,   // [pred_hidden]
                        std::vector<float>& logits) {
     std::vector<float> mid(J.joint_hidden);
-    for (int i = 0; i < J.joint_hidden; i++) {
-        float s = J.pred_b[i];
-        const float* row = J.pred_w.data() + (size_t)i * J.pred_hidden;
-        for (int k = 0; k < J.pred_hidden; k++)
-            s += row[k] * pred_u[k];
-        // NeMo RNNTJoint uses ReLU (not tanh) — see jointnet.activation in
-        // model_config.yaml.
-        float v = proj_enc[i] + s;
-        mid[i] = v > 0.0f ? v : 0.0f;
-    }
+#if defined(HAVE_ACCELERATE)
+    if (!parakeet_use_scalar()) {
+        // pred_w[joint_hidden, pred_hidden] @ pred_u + pred_b → mid, then relu(proj_enc + mid)
+        mid.assign(J.pred_b.begin(), J.pred_b.end());
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, J.joint_hidden, J.pred_hidden, 1.0f, J.pred_w.data(), J.pred_hidden,
+                    pred_u, 1, 1.0f, mid.data(), 1);
+        for (int i = 0; i < J.joint_hidden; i++) {
+            float v = proj_enc[i] + mid[i];
+            mid[i] = v > 0.0f ? v : 0.0f;
+        }
+        // out_w[vocab_total, joint_hidden] @ mid + out_b → logits
+        logits.assign(J.out_b.begin(), J.out_b.end());
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, J.vocab_total, J.joint_hidden, 1.0f, J.out_w.data(), J.joint_hidden,
+                    mid.data(), 1, 1.0f, logits.data(), 1);
+    } else {
+#endif
+        for (int i = 0; i < J.joint_hidden; i++) {
+            float s = J.pred_b[i];
+            const float* row = J.pred_w.data() + (size_t)i * J.pred_hidden;
+            for (int k = 0; k < J.pred_hidden; k++)
+                s += row[k] * pred_u[k];
+            // NeMo RNNTJoint uses ReLU (not tanh) — see jointnet.activation in
+            // model_config.yaml.
+            float v = proj_enc[i] + s;
+            mid[i] = v > 0.0f ? v : 0.0f;
+        }
 
-    logits.assign(J.vocab_total, 0.0f);
-    for (int v = 0; v < J.vocab_total; v++) {
-        float s = J.out_b[v];
-        const float* row = J.out_w.data() + (size_t)v * J.joint_hidden;
-        for (int k = 0; k < J.joint_hidden; k++)
-            s += row[k] * mid[k];
-        logits[v] = s;
+        logits.assign(J.vocab_total, 0.0f);
+        for (int v = 0; v < J.vocab_total; v++) {
+            float s = J.out_b[v];
+            const float* row = J.out_w.data() + (size_t)v * J.joint_hidden;
+            for (int k = 0; k < J.joint_hidden; k++)
+                s += row[k] * mid[k];
+            logits[v] = s;
+        }
+#if defined(HAVE_ACCELERATE)
     }
+#endif
 }
 
 // ===========================================================================
@@ -2447,11 +2568,21 @@ static ggml_cgraph* parakeet_build_graph_encoder_dump(parakeet_context* ctx, int
     ggml_set_name(pos_enc, "pos_enc");
     ggml_set_input(pos_enc);
 
+    ggml_tensor* local_mask_dump = nullptr;
+    const bool use_local_attn_dump =
+        hp.att_context_left >= 0 && hp.att_context_right >= 0 && T > hp.att_context_left + hp.att_context_right + 1;
+    if (use_local_attn_dump) {
+        local_mask_dump = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T, T);
+        ggml_set_name(local_mask_dump, "local_attn_mask");
+        ggml_set_input(local_mask_dump);
+    }
+
     core_conformer::BlockParams bp = {
-        (int)hp.d_model, (int)hp.n_heads, (int)hp.head_dim, (int)hp.conv_kernel, kLayerNormEps,
+        (int)hp.d_model, (int)hp.n_heads,     (int)hp.head_dim,     (int)hp.conv_kernel,
+        kLayerNormEps,   hp.att_context_left, hp.att_context_right, (int)hp.global_tokens,
     };
     for (uint32_t il = 0; il < hp.n_layers; il++) {
-        cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp);
+        cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp, local_mask_dump);
         char nm[64];
         snprintf(nm, sizeof(nm), "dump_layer_%u", il);
         ggml_tensor* tag = ggml_cont(ctx0, cur);
@@ -2501,6 +2632,14 @@ extern "C" int parakeet_run_encoder_dump(struct parakeet_context* ctx, const flo
     T_enc = (T_enc + 1) / 2;
     auto pe = core_conformer::make_pos_enc((int)ctx->model.hparams.d_model, T_enc);
     ggml_backend_tensor_set(pos_in, pe.data(), 0, pe.size() * sizeof(float));
+
+    ggml_tensor* local_mask_in2 = ggml_graph_get_tensor(gf, "local_attn_mask");
+    if (local_mask_in2) {
+        const auto& hp = ctx->model.hparams;
+        auto lm = core_conformer::make_local_attn_mask(T_enc, hp.att_context_left, hp.att_context_right,
+                                                       (int)hp.global_tokens);
+        ggml_backend_tensor_set(local_mask_in2, lm.data(), 0, lm.size() * sizeof(float));
+    }
 
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "parakeet: dump: encoder graph compute failed\n");
@@ -3080,7 +3219,11 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
 
     // 1. Mel
     int T_mel = 0;
-    auto mel = parakeet_compute_mel_impl(ctx, samples, n_samples, T_mel);
+    std::vector<float> mel;
+    {
+        parakeet_bench_stage _b("mel");
+        mel = parakeet_compute_mel_impl(ctx, samples, n_samples, T_mel);
+    }
     if (mel.empty())
         return nullptr;
     if (getenv("PARAKEET_DEBUG"))
@@ -3088,7 +3231,11 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
 
     // 2. Encoder
     int T_enc = 0;
-    auto enc = parakeet_encode_mel(ctx, mel.data(), (int)ctx->model.hparams.n_mels, T_mel, &T_enc);
+    std::vector<float> enc;
+    {
+        parakeet_bench_stage _b("encoder");
+        enc = parakeet_encode_mel(ctx, mel.data(), (int)ctx->model.hparams.n_mels, T_mel, &T_enc);
+    }
     if (enc.empty())
         return nullptr;
     if (getenv("PARAKEET_DEBUG")) {
@@ -3105,6 +3252,7 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
     }
 
     // 3. Decode (TDT or CTC, greedy or beam)
+    parakeet_bench_stage _b_dec("decode");
     const bool use_ctc = ctx->decode_ctc && ctx->model.has_ctc;
     const bool use_rnnt = !use_ctc && ctx->model.hparams.n_tdt_durations == 0;
     const bool use_beam = !use_ctc && ctx->decode_beam_size > 1;

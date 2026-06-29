@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +38,32 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ===========================================================================
+// Bench instrumentation — `TADA_CODEC_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool tada_codec_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("TADA_CODEC_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct tada_codec_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit tada_codec_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~tada_codec_bench_stage() {
+        if (!tada_codec_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  tada_codec_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ─────────────────────────── internal types ─────────────────────────
 
@@ -114,10 +141,14 @@ struct tada_codec_context {
 
     // ggml state
     ggml_backend_t backend = nullptr;
+    ggml_backend_t backend_cpu = nullptr;
+    bool owns_backend = true;
     ggml_context* ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
     ggml_context* ctx_perm = nullptr;
     ggml_backend_buffer_t buf_perm = nullptr;
+    ggml_context* ctx_inv = nullptr;
+    ggml_backend_buffer_t buf_inv = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
     std::vector<uint8_t> compute_meta;
 };
@@ -266,9 +297,8 @@ static void precompute_all_inv_alphas(tada_codec_context* c) {
         ggml_backend_tensor_set(*p.dst, inv.data(), 0, n * sizeof(float));
     }
 
-    // Store ctx and buf for cleanup (leak for now — small, lives for process lifetime)
-    (void)inv_buf;
-    (void)inv_ctx;
+    c->ctx_inv = inv_ctx;
+    c->buf_inv = inv_buf;
 }
 
 // Get the materialized weight (pre-computed g*v/||v|| by the converter).
@@ -283,7 +313,6 @@ static ggml_tensor* snake1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* alph
     if (!alpha || !inv_alpha)
         return x;
     const int C = (int)x->ne[0];
-    const int T = (int)x->ne[1];
 
     ggml_tensor* a = ggml_cast(ctx, ggml_cont(ctx, ggml_reshape_2d(ctx, alpha, C, 1)), GGML_TYPE_F32);
     ggml_tensor* ia = ggml_cast(ctx, ggml_cont(ctx, ggml_reshape_2d(ctx, inv_alpha, C, 1)), GGML_TYPE_F32);
@@ -617,9 +646,9 @@ static ggml_cgraph* build_dac_only_graph(tada_codec_context* c, int n_frames) {
 
 // ──────────────────────── public API ────────────────────────────────
 
-extern "C" {
-
-struct tada_codec_context* tada_codec_init_from_file(const char* path, int n_threads) {
+static tada_codec_context* tada_codec_init_from_file_impl(const char* path, int n_threads, bool use_gpu,
+                                                          ggml_backend_t shared_backend,
+                                                          ggml_backend_t shared_backend_cpu) {
     auto* c = new tada_codec_context();
     c->n_threads = n_threads;
     c->compute_meta.resize(32 * 1024 * 1024); // 32 MB for large graph
@@ -647,8 +676,24 @@ struct tada_codec_context* tada_codec_init_from_file(const char* path, int n_thr
             c->n_attn_heads);
 
     // Backend
-    c->backend = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(c->backend, n_threads);
+    if (shared_backend && shared_backend_cpu) {
+        c->backend = shared_backend;
+        c->backend_cpu = shared_backend_cpu;
+        c->owns_backend = false;
+    } else {
+        c->backend_cpu = ggml_backend_cpu_init();
+        if (!c->backend_cpu) {
+            fprintf(stderr, "tada-codec: failed to init CPU backend\n");
+            delete c;
+            return nullptr;
+        }
+        ggml_backend_cpu_set_n_threads(c->backend_cpu, n_threads);
+        c->backend = use_gpu ? ggml_backend_init_best() : c->backend_cpu;
+        if (!c->backend)
+            c->backend = c->backend_cpu;
+    }
+    fprintf(stderr, "tada-codec: backend=%s%s\n", ggml_backend_name(c->backend),
+            (c->backend == c->backend_cpu) ? " (CPU)" : " + CPU fallback");
 
     // Weights
     core_gguf::WeightLoad wl;
@@ -686,17 +731,34 @@ struct tada_codec_context* tada_codec_init_from_file(const char* path, int n_thr
     return c;
 }
 
+extern "C" {
+
+struct tada_codec_context* tada_codec_init_from_file_ex(const char* path, int n_threads, bool use_gpu) {
+    return tada_codec_init_from_file_impl(path, n_threads, use_gpu, nullptr, nullptr);
+}
+
+struct tada_codec_context* tada_codec_init_from_file_with_backend(const char* path, int n_threads,
+                                                                  ggml_backend_t backend, ggml_backend_t backend_cpu) {
+    return tada_codec_init_from_file_impl(path, n_threads, false, backend, backend_cpu);
+}
+
+struct tada_codec_context* tada_codec_init_from_file(const char* path, int n_threads) {
+    return tada_codec_init_from_file_ex(path, n_threads, false);
+}
+
 float* tada_codec_decode(struct tada_codec_context* ctx, const float* features, int n_frames,
                          const int32_t* token_masks, int* out_n_samples) {
     if (!ctx || !features || n_frames <= 0)
         return nullptr;
+    tada_codec_bench_stage _bs_total("decode_total");
 
     const int ed = ctx->embed_dim;
 
     ggml_cgraph* gf = build_decode_graph(ctx, n_frames);
 
-    ggml_backend_t backends[] = {ctx->backend};
-    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, 32768, false, false);
+    ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+    int n_be = (ctx->backend && ctx->backend != ctx->backend_cpu) ? 2 : 1;
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, n_be, 32768, false, false);
     ggml_backend_sched_reset(sched);
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
         fprintf(stderr, "tada-codec: failed to alloc graph\n");
@@ -749,41 +811,45 @@ float* tada_codec_decode(struct tada_codec_context* ctx, const float* features, 
         return nullptr;
     }
 
-    // Dump intermediate tensors for diff comparison
-    auto dump = [&](const char* name) {
-        ggml_tensor* t = ggml_graph_get_tensor(gf, name);
-        if (!t)
-            return;
-        int n = (int)ggml_nelements(t);
-        std::vector<float> buf(n);
-        ggml_backend_tensor_get(t, buf.data(), 0, (size_t)n * sizeof(float));
-        float rms = 0;
-        for (int i = 0; i < n; i++)
-            rms += buf[i] * buf[i];
-        rms = std::sqrt(rms / n);
-        float mn = *std::min_element(buf.begin(), buf.end());
-        float mx = *std::max_element(buf.begin(), buf.end());
-        fprintf(stderr, "  DUMP %s: n=%d range=[%.4f, %.4f] rms=%.4f\n", name, n, mn, mx, rms);
-    };
-    dump("dump_proj");
-    dump("dump_attn");
-    dump("dump_layer0");
-    dump("dump_dac_in");
-    dump("dump_b0_snake");
-    dump("dump_b0_convt");
-    dump("dump_blk0");
-    dump("dump_blk1");
-    dump("dump_blk2");
-    dump("dump_blk3");
-    dump("dump_dac_out");
+    const bool dump_stats = [] {
+        const char* e = std::getenv("TADA_CODEC_DUMP");
+        return e && *e && *e != '0';
+    }();
+    if (dump_stats) {
+        auto dump = [&](const char* name) {
+            ggml_tensor* t = ggml_graph_get_tensor(gf, name);
+            if (!t)
+                return;
+            int n = (int)ggml_nelements(t);
+            std::vector<float> buf(n);
+            ggml_backend_tensor_get(t, buf.data(), 0, (size_t)n * sizeof(float));
+            float rms = 0;
+            for (int i = 0; i < n; i++)
+                rms += buf[i] * buf[i];
+            rms = std::sqrt(rms / n);
+            float mn = *std::min_element(buf.begin(), buf.end());
+            float mx = *std::max_element(buf.begin(), buf.end());
+            fprintf(stderr, "  DUMP %s: n=%d range=[%.4f, %.4f] rms=%.4f\n", name, n, mn, mx, rms);
+        };
+        dump("dump_proj");
+        dump("dump_attn");
+        dump("dump_layer0");
+        dump("dump_dac_in");
+        dump("dump_b0_snake");
+        dump("dump_b0_convt");
+        dump("dump_blk0");
+        dump("dump_blk1");
+        dump("dump_blk2");
+        dump("dump_blk3");
+        dump("dump_dac_out");
+    }
 
     ggml_tensor* pcm_t = ggml_graph_get_tensor(gf, "pcm");
     int n_samples = (int)ggml_nelements(pcm_t);
     float* pcm = (float*)malloc((size_t)n_samples * sizeof(float));
     ggml_backend_tensor_get(pcm_t, pcm, 0, (size_t)n_samples * sizeof(float));
 
-    // Dump PCM stats
-    {
+    if (dump_stats) {
         float rms = 0, mn = pcm[0], mx = pcm[0];
         for (int i = 0; i < n_samples; i++) {
             rms += pcm[i] * pcm[i];
@@ -801,14 +867,93 @@ float* tada_codec_decode(struct tada_codec_context* ctx, const float* features, 
     return pcm;
 }
 
+float* tada_codec_extract_stage(struct tada_codec_context* ctx, const float* features, int n_frames,
+                                const int32_t* token_masks, const char* stage, int* out_n) {
+    if (out_n)
+        *out_n = 0;
+    if (!ctx || !features || !stage || !*stage || n_frames <= 0)
+        return nullptr;
+
+    const int ed = ctx->embed_dim;
+    ggml_cgraph* gf = build_decode_graph(ctx, n_frames);
+
+    ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+    int n_be = (ctx->backend && ctx->backend != ctx->backend_cpu) ? 2 : 1;
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, n_be, 32768, false, false);
+    ggml_backend_sched_reset(sched);
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        fprintf(stderr, "tada-codec: failed to alloc graph for stage '%s'\n", stage);
+        ggml_backend_sched_free(sched);
+        return nullptr;
+    }
+
+    ggml_tensor* inp = ggml_graph_get_tensor(gf, "features");
+    ggml_backend_tensor_set(inp, features, 0, (size_t)ed * n_frames * sizeof(float));
+
+    ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "codec_pos");
+    if (pos_t) {
+        std::vector<int32_t> positions(n_frames);
+        for (int i = 0; i < n_frames; i++)
+            positions[i] = i;
+        ggml_backend_tensor_set(pos_t, positions.data(), 0, (size_t)n_frames * sizeof(int32_t));
+    }
+
+    ggml_tensor* mask_t = ggml_graph_get_tensor(gf, "attn_mask");
+    if (mask_t) {
+        std::vector<int32_t> block_ids(n_frames);
+        int block = 0;
+        for (int i = 0; i < n_frames; i++) {
+            if (token_masks && token_masks[i])
+                block++;
+            block_ids[i] = block - ((token_masks && token_masks[i]) ? 1 : 0);
+        }
+
+        std::vector<ggml_fp16_t> mask_data((size_t)n_frames * n_frames);
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+        for (int i = 0; i < n_frames; i++) {
+            for (int j = 0; j < n_frames; j++) {
+                bool same = (block_ids[j] == block_ids[i]);
+                bool prev = (block_ids[j] == block_ids[i] - 1);
+                mask_data[(size_t)i * n_frames + j] = (same || prev) ? zero : neg_inf;
+            }
+        }
+        ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+    }
+
+    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "tada-codec: graph compute failed for stage '%s'\n", stage);
+        ggml_backend_sched_free(sched);
+        return nullptr;
+    }
+
+    ggml_tensor* t = ggml_graph_get_tensor(gf, stage);
+    if (!t) {
+        ggml_backend_sched_free(sched);
+        return nullptr;
+    }
+    const int n = (int)ggml_nelements(t);
+    float* out = (float*)malloc((size_t)n * sizeof(float));
+    if (!out) {
+        ggml_backend_sched_free(sched);
+        return nullptr;
+    }
+    ggml_backend_tensor_get(t, out, 0, (size_t)n * sizeof(float));
+    if (out_n)
+        *out_n = n;
+    ggml_backend_sched_free(sched);
+    return out;
+}
+
 float* tada_codec_decode_dac(struct tada_codec_context* ctx, const float* hidden, int n_frames, int* out_n_samples) {
     if (!ctx || !hidden || n_frames <= 0)
         return nullptr;
     const int d = ctx->hidden_dim;
 
     ggml_cgraph* gf = build_dac_only_graph(ctx, n_frames);
-    ggml_backend_t backends[] = {ctx->backend};
-    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, 32768, false, false);
+    ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+    int n_be = (ctx->backend && ctx->backend != ctx->backend_cpu) ? 2 : 1;
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, n_be, 32768, false, false);
     ggml_backend_sched_reset(sched);
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
         fprintf(stderr, "tada-codec: failed to alloc DAC graph\n");
@@ -871,6 +1016,10 @@ void tada_codec_pcm_free(float* pcm) {
 void tada_codec_free(struct tada_codec_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->buf_inv)
+        ggml_backend_buffer_free(ctx->buf_inv);
+    if (ctx->ctx_inv)
+        ggml_free(ctx->ctx_inv);
     if (ctx->buf_perm)
         ggml_backend_buffer_free(ctx->buf_perm);
     if (ctx->ctx_perm)
@@ -879,8 +1028,12 @@ void tada_codec_free(struct tada_codec_context* ctx) {
         ggml_backend_buffer_free(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
-    if (ctx->backend)
-        ggml_backend_free(ctx->backend);
+    if (ctx->owns_backend) {
+        if (ctx->backend && ctx->backend != ctx->backend_cpu)
+            ggml_backend_free(ctx->backend);
+        if (ctx->backend_cpu)
+            ggml_backend_free(ctx->backend_cpu);
+    }
     delete ctx;
 }
 

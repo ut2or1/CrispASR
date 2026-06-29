@@ -56,10 +56,14 @@ public final class CrispasrSession implements AutoCloseable {
         int     crispasr_session_set_max_new_tokens(Pointer session, int maxNewTokens);
         int     crispasr_session_set_frequency_penalty(Pointer session, float penalty);
         int     crispasr_session_set_tts_steps(Pointer session, int steps);
+        int     crispasr_session_set_tts_num_candidates(Pointer session, int n);
         int     crispasr_session_set_top_p(Pointer session, float topP);
+        int     crispasr_session_set_top_k(Pointer session, int topK);
+        int     crispasr_session_set_do_sample(Pointer session, int enable);
         int     crispasr_session_set_min_p(Pointer session, float minP);
         int     crispasr_session_set_repetition_penalty(Pointer session, float r);
         int     crispasr_session_set_cfg_weight(Pointer session, float cfgWeight);
+        int     crispasr_session_set_tts_noise_temp(Pointer session, float noiseTemp);
         int     crispasr_session_set_exaggeration(Pointer session, float exaggeration);
         int     crispasr_session_set_max_speech_tokens(Pointer session, int n);
         int     crispasr_session_set_length_scale(Pointer session, float scale);
@@ -391,10 +395,28 @@ public final class CrispasrSession implements AutoCloseable {
         if (rc != 0 && rc != -2) throw new IllegalStateException("set_tts_steps failed (rc=" + rc + ")");
     }
 
+    /** Flow-matching timing candidates ranked per token (TADA). Soft no-op on other backends. */
+    public void setTtsNumCandidates(int n) {
+        int rc = Lib.INSTANCE.crispasr_session_set_tts_num_candidates(handle, n);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_tts_num_candidates failed (rc=" + rc + ")");
+    }
+
     /** Top-p nucleus-sampling threshold. Honoured by chatterbox; other backends no-op. */
     public void setTopP(float topP) {
         int rc = Lib.INSTANCE.crispasr_session_set_top_p(handle, topP);
         if (rc != 0 && rc != -2) throw new IllegalStateException("set_top_p failed (rc=" + rc + ")");
+    }
+
+    /** Top-k sampling cutoff (0 = disabled). Honoured by TADA; other backends no-op. */
+    public void setTopK(int topK) {
+        int rc = Lib.INSTANCE.crispasr_session_set_top_k(handle, topK);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_top_k failed (rc=" + rc + ")");
+    }
+
+    /** Enable/disable sampling (false = greedy). Honoured by TADA; other backends no-op. */
+    public void setDoSample(boolean enable) {
+        int rc = Lib.INSTANCE.crispasr_session_set_do_sample(handle, enable ? 1 : 0);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_do_sample failed (rc=" + rc + ")");
     }
 
     /** Min-p sampling threshold. Honoured by chatterbox; other backends no-op. */
@@ -413,6 +435,12 @@ public final class CrispasrSession implements AutoCloseable {
     public void setCfgWeight(float cfgWeight) {
         int rc = Lib.INSTANCE.crispasr_session_set_cfg_weight(handle, cfgWeight);
         if (rc != 0 && rc != -2) throw new IllegalStateException("set_cfg_weight failed (rc=" + rc + ")");
+    }
+
+    /** TADA flow-matching noise temperature (Python noise_temp, default 0.9). */
+    public void setTtsNoiseTemp(float noiseTemp) {
+        int rc = Lib.INSTANCE.crispasr_session_set_tts_noise_temp(handle, noiseTemp);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_tts_noise_temp failed (rc=" + rc + ")");
     }
 
     /** Emotion-exaggeration scalar (chatterbox). 0.5 is the upstream default. */

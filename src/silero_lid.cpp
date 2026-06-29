@@ -19,7 +19,12 @@
 
 #include "core/gguf_loader.h"
 
+#if defined(HAVE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#endif
+
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +32,32 @@
 #include <map>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `SILERO_LID_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool silero_lid_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("SILERO_LID_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct silero_lid_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit silero_lid_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~silero_lid_bench_stage() {
+        if (!silero_lid_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  silero_lid_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ===========================================================================
 // Model structures
@@ -184,6 +215,36 @@ static bool lid_load(lid_model& m, const char* path, ggml_backend_t backend) {
 // Forward pass (manual F32, CPU-only for the small 17 MB model)
 // ===========================================================================
 
+// The whole forward is hand-rolled CPU scalar. The pointwise convs (96×) +
+// transformer QKV/out-proj/FFN + stage projections are matmuls; cblas_sgemm
+// (Accelerate) is the bulk of the win. Set SILERO_FORCE_SCALAR=1 to validate
+// scalar == GEMM or run on non-Apple.
+static bool silero_use_scalar() {
+#if defined(HAVE_ACCELERATE)
+    static const bool force_scalar = std::getenv("SILERO_FORCE_SCALAR") != nullptr;
+    return force_scalar;
+#else
+    return true;
+#endif
+}
+
+// C[M,N] = A[M,K] @ B[K,N]  (all row-major, no bias). cblas, scalar fallback.
+static void silero_mm(const float* A, const float* B, float* C, int M, int N, int K) {
+#if defined(HAVE_ACCELERATE)
+    if (!silero_use_scalar()) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, M, N, K, 1.0f, A, K, B, N, 0.0f, C, N);
+        return;
+    }
+#endif
+    for (int i = 0; i < M; i++)
+        for (int j = 0; j < N; j++) {
+            float s = 0.f;
+            for (int k = 0; k < K; k++)
+                s += A[(size_t)i * K + k] * B[(size_t)k * N + j];
+            C[(size_t)i * N + j] = s;
+        }
+}
+
 // Depthwise-separable conv1d with residual:
 //   dw_conv(k=5) + bias → ReLU → pw_conv(k=1) + bias + residual_input → ReLU
 // The ONNX graph (confirmed by tracing Conv_73→Relu_74→Conv_75→Add_76→Relu_77)
@@ -205,12 +266,12 @@ static void dw_sep_conv1d(const float* in, int C_in, int T_in, const float* dw_w
             dw_out[c * T_in + t] = std::max(0.f, sum); // ReLU
         }
     }
-    // Pointwise: [C_out, C_in, 1] + optional residual + ReLU
+    // Pointwise: out[C_out,T] = pw_w[C_out,C_in] @ dw_out[C_in,T], then bias +
+    // optional residual + ReLU.
+    silero_mm(pw_w, dw_out.data(), out, C_out, T_in, C_in);
     for (int co = 0; co < C_out; co++) {
         for (int t = 0; t < T_in; t++) {
-            float sum = pw_b[co];
-            for (int ci = 0; ci < C_in; ci++)
-                sum += pw_w[co * C_in + ci] * dw_out[ci * T_in + t];
+            float sum = out[co * T_in + t] + pw_b[co];
             if (add_residual && C_in == C_out && co < C_in) {
                 sum += in[co * T_in + t];
             }
@@ -253,14 +314,10 @@ static void self_attention(float* x, int D, int T, const float* qkv_w, const flo
     // ONNX MatMul: output = input @ weight, weight shape (D, 3D).
     // GGUF stores (D, 3D) as ne=(3D, D) → data[d * 3D + j] = weight[d, j].
     std::vector<float> qkv(T * 3 * D);
-    for (int t = 0; t < T; t++) {
-        for (int j = 0; j < 3 * D; j++) {
-            float sum = qkv_b[j];
-            for (int d = 0; d < D; d++)
-                sum += xt[t * D + d] * qkv_w[d * 3 * D + j];
-            qkv[t * 3 * D + j] = sum;
-        }
-    }
+    silero_mm(xt.data(), qkv_w, qkv.data(), T, 3 * D, D); // [T,3D] = xt[T,D] @ qkv_w[D,3D]
+    for (int t = 0; t < T; t++)
+        for (int j = 0; j < 3 * D; j++)
+            qkv[t * 3 * D + j] += qkv_b[j];
 
     // ONNX slice order is K [0:D], Q [D:2D], V [2D:3D] (confirmed by
     // intermediate dump: tensor 746=K, 749=Q, 752=V).
@@ -306,14 +363,10 @@ static void self_attention(float* x, int D, int T, const float* qkv_w, const flo
     // Output projection: attn @ out_w + out_b → [T, D]
     // out_w stored as (D, D) → data[dd * D + d] = weight[dd, d]
     std::vector<float> proj(T * D);
-    for (int t = 0; t < T; t++) {
-        for (int d = 0; d < D; d++) {
-            float sum = out_b[d];
-            for (int dd = 0; dd < D; dd++)
-                sum += attn[t * D + dd] * out_w[dd * D + d];
-            proj[t * D + d] = sum;
-        }
-    }
+    silero_mm(attn.data(), out_w, proj.data(), T, D, D); // [T,D] = attn[T,D] @ out_w[D,D]
+    for (int t = 0; t < T; t++)
+        for (int d = 0; d < D; d++)
+            proj[t * D + d] += out_b[d];
 
     // Residual add back to x (transpose proj [T,D] → [D,T])
     for (int t = 0; t < T; t++)
@@ -330,23 +383,17 @@ static void ffn_residual(float* x, int D, int T, const float* ff1_w, const float
         for (int d = 0; d < D; d++)
             xt[t * D + d] = x[d * T + t];
 
-    // linear1: x @ ff1_w + ff1_b. ff1_w stored as (D, D) → data[dd * D + d]
+    // linear1: x @ ff1_w + ff1_b → ReLU. ff1_w stored as (D, D) → data[dd*D+d]
+    silero_mm(xt.data(), ff1_w, mid.data(), T, D, D);
     for (int t = 0; t < T; t++)
-        for (int d = 0; d < D; d++) {
-            float sum = ff1_b[d];
-            for (int dd = 0; dd < D; dd++)
-                sum += xt[t * D + dd] * ff1_w[dd * D + d];
-            mid[t * D + d] = std::max(0.f, sum); // ReLU
-        }
+        for (int d = 0; d < D; d++)
+            mid[t * D + d] = std::max(0.f, mid[t * D + d] + ff1_b[d]);
 
     // linear2
+    silero_mm(mid.data(), ff2_w, out.data(), T, D, D);
     for (int t = 0; t < T; t++)
-        for (int d = 0; d < D; d++) {
-            float sum = ff2_b[d];
-            for (int dd = 0; dd < D; dd++)
-                sum += mid[t * D + dd] * ff2_w[dd * D + d];
-            out[t * D + d] = sum;
-        }
+        for (int d = 0; d < D; d++)
+            out[t * D + d] += ff2_b[d];
 
     // Residual
     for (int t = 0; t < T; t++)
@@ -429,6 +476,7 @@ extern "C" const char* silero_lid_detect(struct silero_lid_context* ctx, const f
                                          float* out_confidence) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
+    silero_lid_bench_stage _bs_total("detect_total");
     const auto& m = ctx->model;
 
     // ---- Front-end: learned Conv1d(1→322, k=320, stride=160) ----
@@ -602,14 +650,11 @@ extern "C" const char* silero_lid_detect(struct silero_lid_context* ctx, const f
                 // proj applies to cur (block input), NOT out (conv output)!
                 // proj: (C_proj, C_in, 1) where C_in = original channel count
                 std::vector<float> proj_res(C_proj * T);
-                for (int co = 0; co < C_proj; co++) {
-                    for (int t = 0; t < T; t++) {
-                        float sum = pj_b ? pj_b[co] : 0.f;
-                        for (int ci = 0; ci < C; ci++)
-                            sum += pj_w[co * C + ci] * cur[ci * T + t];
-                        proj_res[co * T + t] = sum;
-                    }
-                }
+                silero_mm(pj_w, cur.data(), proj_res.data(), C_proj, T, C); // [C_proj,T] = pj_w[C_proj,C] @ cur[C,T]
+                if (pj_b)
+                    for (int co = 0; co < C_proj; co++)
+                        for (int t = 0; t < T; t++)
+                            proj_res[co * T + t] += pj_b[co];
                 // Add proj(input) to pw_conv output + ReLU
                 for (int co = 0; co < C_proj; co++) {
                     for (int t = 0; t < T; t++) {

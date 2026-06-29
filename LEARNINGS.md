@@ -1,6 +1,6 @@
 # CrispASR — Technical learnings
 
-Distilled from months of porting eight ASR architectures into one ggml
+Distilled from months of porting ASR/TTS architectures into one ggml
 codebase. Nothing here is breaking news; everything here is something
 we'd have saved days if we'd known up front.
 
@@ -9,6 +9,430 @@ If a lesson is still "live" (affects current work), it's linked from
 `HISTORY.md`.
 
 ---
+
+## Always A/B against the *upstream reference*, not just your own option matrix (§216)
+
+Parakeet long-form shipped a "streamed" (chunked-encode + single-decode) default
+because a 2026-05-26 option matrix found it beat the dispatcher's chunk-30+merge.
+Both were inferior: on the v3/multilingual model the streamed path *collapses*
+(5 min → 75 words), and chunk-30+merge duplicates a phrase at every boundary.
+The matrix never included the obvious third option — **one full-attention pass
+over the whole clip** — which turns out to be byte-for-byte identical to upstream
+NeMo (`nvidia/parakeet-tdt-0.6b-v3`, 706/706 words, 30 s→5 min, 100.00 %).
+
+Lessons:
+- When a model has a Python reference (NeMo here), make the reference output the
+  baseline for the A/B, not just internal variants of your own pipeline. A
+  length sweep (30/60/120/240/300 s) vs the reference localized the collapse
+  immediately and proved single-pass was exact. Run the reference on macOS by
+  stubbing `sys.modules["eventlet"]=None` before `import nemo` (else the
+  wandb→trio import dies with "unsupported platform").
+- "Complete output" ≠ "correct": chunk-30+merge produced *more* text than
+  streamed, which is exactly why it was picked — but the extra text was boundary
+  duplicates. Diff against the reference, don't count words.
+- Token-id-exact LCS dedup can't stitch overlap regions that two chunks
+  transcribe *differently* (different encoder context → different tokens). If
+  you must chunk, cut at silence and commit each piece by word timestamp at a
+  single shared cut — no overlap region to dedup.
+- Full self-attention is O(T²): ~5 min is memory-safe on 16 GB, ~28 min OOMs
+  (it crashed the dev M1). Cap single-pass and silence-split beyond the cap;
+  each piece stays bounded. See HISTORY §216.
+
+## §214 Metal batched (B=2) quantized mat-vec ≠ the single-token PREC_F32 path
+
+When you batch a single-token decode into `B=2` (cond+uncond CFG, hidden
+`(D,1,2)`), the projection `ggml_mul_mat(W, x_b2)` becomes a mat-vec with
+`ne[1]=1, ne[2]=2`. With **F16 weights** this is bit-identical to two separate
+forwards on Metal. With **quantized weights it is NOT**: the batched path does
+not dispatch Metal's PREC_F32 `mul_mv_q*_K` exact-dot kernel that the
+`ne==1`-vector single-token decode hits, so the result drifts enough to flip the
+greedy speech-token sampler (chatterbox T3: divergence at step ~2 → repetition
+collapse). Same failure class as the §211 native-batched-quant-CFM garbage.
+**Rule:** B=2 batching of quantized matmuls is safe on the CPU backend (all
+quants) and on Metal only with F16 weights. **Fix for Metal+quant:** dequantize
+the matmul weights q*→F16 GPU-resident once at first use (host `to_float` →
+`ggml_fp32_to_fp16_row` → upload to the GPU backend; `chatterbox.cpp
+ensure_t3_b2_f16_weights`, `chatterbox_s3gen.cpp dequant_cfm_f16`) and batch
+against the F16 copies — the `mul_mm_f16` path is correct batched on Metal. This
+is the **only** other-backend solution in the tree: every non-batched TTS backend
+(dia/zonos/tada/cosyvoice3/f5/voxcpm2) instead runs two sequential B=1 passes and
+blends post-hoc, sidestepping the issue at a latency cost; s3gen's CFM and (now)
+chatterbox T3 are the only two that batch CFG, and both dequant-to-F16 on GPU.
+Corollary win: a per-step-rebuilt B=2 graph **sidesteps the §186 Lk-bucket
+`buffer is nil` Metal crash**, making B=2 the first working T3-on-GPU path.
+
+## TTS WAV md5 is only a valid parity gate with a pinned seed
+
+Chatterbox's S3Gen flow-matching prior is RNG-seeded (default seed 0). Two runs
+with identical T3 tokens but different `CRISPASR_CHATTERBOX_SEED` produce
+different WAVs — so a WAV md5 diff across seeds is a **false** parity failure. For
+greedy T3 parity (B=2 vs legacy) either pin `CRISPASR_CHATTERBOX_SEED` for both
+runs, or — better, because it's seed-independent — compare the **speech-token
+sequence** directly (`CRISPASR_CHATTERBOX_TEMP=0`, dump steps + EOS + count;
+`CRISPASR_CHATTERBOX_DUMP_LOGITS_AT=9e9` also bypasses the bucket for a
+like-for-like legacy graph).
+
+---
+
+## Kaggle: datasets are per-account, and the ccache dataset has a required shape (§213)
+
+Two traps cost a couple of cold ~25 min CUDA builds before they were caught:
+
+1. **Datasets can't be cross-used between accounts.** A kernel only attaches
+   datasets owned by the account it runs under — Kaggle silently drops a
+   cross-account `dataset_sources` entry (*"not valid dataset sources"*) and
+   pushes the kernel **without** it. So `chr1s4/crispasr-ccache` cannot attach to
+   a `chr1str` kernel. The fix is a per-account **copy** of every dataset (both
+   accounts already keep their own `crispasr-hf-token`); make `crispasr-ccache`
+   exist under both too. (Don't switch the kernel's account to chase a dataset.)
+
+2. **The ccache dataset must be a `ccache.tar` (a tar of `.ccache/`) or a literal
+   `.ccache/` directory** at the mount root — that's all `kaggle_harness`
+   `_warm_ccache_from_dataset()` looks for. Both `crispasr-ccache` datasets had
+   the cache **shards (`0`–`f`) at the dataset root** instead, so the harness
+   printed `ccache: no seed dataset found (cold build)` and **every build had
+   been cold** (nobody noticed — cold builds still finish, just ~10 min slower).
+   Re-pack as `cd /kaggle/working && tar cf ccache.tar .ccache/` and
+   `datasets version -r tar` under **each** account's token. To refresh, pull a
+   completed build kernel's `/kaggle/working/.ccache` (or its `ccache.tar`) and
+   re-version both copies.
+
+Also: Kaggle GPU workers have ~20 GB RAM (the older "13 GB" note is stale), so a
+3B PyTorch reference fits in F32 on CPU even on a P100 — but the P100 is sm_60,
+which modern torch wheels don't support (`cuda.is_available()` returns True yet
+every GPU kernel fails), so gate GPU use on `get_device_capability()[0] >= 7`.
+
+## DRY shared headers can exist for months before callers migrate (§175)
+
+Both `src/core/lang_names.h` (§175 item 1) and `src/core/bpe.h` (§175 item 2)
+were already written, tested, and merged — but the 10+ call sites still used
+local copies. The shared header *existing* is not the same as the migration
+*happening*. When creating a shared helper, migrate at least one caller in the
+same commit to establish the pattern. Otherwise the old copies persist
+indefinitely and the DRY benefit is zero until someone does the mechanical
+search-and-replace pass later.
+
+---
+
+## Cross-attention KV is a free F16 win — encoder-decoder backends (§176i)
+
+Cross-attention K/V in encoder-decoder models is projected once from the
+encoder output and then read-only for all decode steps. Unlike self-attention
+KV (which accumulates per-step and where quantization noise compounds), cross-KV
+is write-once/read-many — F16 halves memory with zero measurable quality impact.
+
+**Pattern:** change the allocation from `GGML_TYPE_F32` to `GGML_TYPE_F16`, then
+convert the F32 projection output to F16 before writing:
+```cpp
+std::vector<ggml_fp16_t> buf16(n_elem);
+ggml_backend_tensor_get(graph_output, f32_buf.data(), 0, n_elem * sizeof(float));
+ggml_fp32_to_fp16_row(f32_buf.data(), buf16.data(), (int)n_elem);
+ggml_backend_tensor_set(cross_kv_tensor, buf16.data(), 0, n_elem * sizeof(ggml_fp16_t));
+```
+
+If the backend uses `ggml_cpy` to write into the cross-KV tensor (like speecht5),
+just changing the tensor type is enough — `ggml_cpy` auto-converts F32→F16.
+
+Downstream consumers (`ggml_mul_mat`, `ggml_flash_attn_ext`) handle F16 inputs
+natively. For backends that feed cross-KV through graph *input* tensors each step
+(dia, parler legacy path), the input tensor type must also change to F16 and the
+staging vectors to `std::vector<ggml_fp16_t>`.
+
+Applied to 5 backends (m2m100, t5, speecht5, dia, parler) in one pass.
+
+---
+
+## Localizing a GPU miscompute with CPU-vs-Metal diffing — the ggml_backend_sched weight-less-first-op trap (§206)
+
+lfm2-audio transcribed garbage on Metal but was bit-correct on CPU. Technique to
+localize a "works on CPU, garbage on GPU" backend, entirely on an M1 (no CUDA):
+
+1. **Run the same input on `--no-gpu` and `--gpu-backend metal`.** CPU is your
+   ground truth. If CPU is correct, every divergence is a GPU bug.
+2. **Per-stage cosine dumps.** Env-gate a dump that marks intermediate tensors
+   `ggml_set_output` + `ggml_backend_tensor_get` into per-stage `.f32` files for
+   both backends, then compute cosine. The first stage with cos≪1 is the suspect.
+   Verify the *input* to that stage matches first (cos≈1) — otherwise the bug is
+   upstream (here the embeddings matched, the first backbone layer didn't).
+3. **`GGML_SCHED_DEBUG=2` to see backend placement.** It prints every node's
+   assigned backend and the split points. This distinguishes a *cross-backend
+   copy* bug (ops ping-pong CPU↔GPU) from a *single-backend miscompute* (the
+   whole subgraph is one Metal split, yet wrong). lfm2's backbone was entirely on
+   Metal with no splits → a real ggml-Metal op bug, not a copy issue.
+
+**Caveat on the dump itself — `set_output` snapshots LIE under the Metal sched.**
+This cost the most time. Marking intermediate tensors `ggml_set_output` +
+`tensor_get` for a per-stage dump is *unreliable* on GPU: the snapshots read
+cos≈1.0 vs the reference (looking perfect) even when the real forward is garbage,
+and they flip between values when you change the sched (shared vs fresh-per-call
+→ all-zeros). Do **not** trust per-intermediate snapshots to localize a GPU bug.
+
+**Reliable bisection: truncate the graph and diff the genuine OUTPUT.** Add an
+env (`LFM2_AO_MAX_LAYERS=N`) that stops the backbone after N layers and returns
+that as the real graph output (the thing the harness already reads), then compare
+CPU-vs-GPU of *that output* for N=1,2,4,…. The first N that diverges is the
+buggy layer — and within a layer, add probe env-gates that `return` early at each
+sub-step (after-norm, after-operator, after-residual) so the early-return value
+*is* the output, not a snapshot. This pinned lfm2's divergence to the very first
+layer and showed it tracks **weight-reading ops** (the norm-weight broadcast
+`ggml_mul` and Q5_K `mul_mat`s) while weightless `ggml_rms_norm` matches exactly.
+What this *ruled out* (each a real experiment): the im2col depthwise conv (an
+explicit shift-add gave identical divergence), the shared scheduler, weight
+placement, and every op in isolation (rms_norm, broadcast-mul, Q5_K mul_mat,
+even a full short_conv replica — all cos≈1.0 on Metal).
+
+**ROOT CAUSE — `ggml_backend_sched` + a weight-less first op.** `GGML_SCHED_DEBUG=2`
+showed the input `ao_in [CPU]` and `node_0 (RMS_NORM) [CPU]`, then a `MTL0#ao_in#0`
+copy feeding the next op on Metal. The backbone's leading op is a *weight-less*
+RMSNorm, so the scheduler (op_offload=false) placed it AND the leaf input on the
+CPU backend, then inserted a CPU→GPU copy of the activation — and on this ggml
+revision that cross-backend copy is miscomputed, corrupting the whole backbone.
+The encoder/adapter were fine because their first op uses a weight, keeping the
+input on the GPU. The standalone op tests falsely passed because the sched ran
+the weight-less ops on CPU for *both* the CPU and Metal runs (so they trivially
+matched) — **always confirm with `GGML_SCHED_DEBUG` which backend each op actually
+ran on; a "Metal" sched run may be computing on CPU.**
+
+**FIX:** when a whole subgraph is supported on the active backend, compute it
+*directly* on `ctx->backend` with `ggml_gallocr` + `ggml_backend_graph_compute`
+instead of `ggml_backend_sched`. A single-backend graph never inserts the broken
+cross-backend copy. (Pinning the input with `set_tensor_backend` or op_offload=true
+did NOT help — the copy persisted; only avoiding the split entirely worked.) Use
+the published PyTorch ref (`cstr/crispasr-regression-fixtures`
+`lfm2-audio-1.5b/jfk_11s/ref.gguf`) + `CRISPASR_DIFF_USE_GPU=1` to re-validate.
+
+**The same root cause hit KugelAudio (§209)** — its Qwen2.5-7B LM also leads with
+a weight-less RMSNorm, so the sweep's "0 bytes after 322 s" was garbage logits →
+the constrained decode never emitting the speech-diffusion token. Same gallocr
+fix. **Per-graph decision when one graph has a Metal-unsupported op:** KugelAudio's
+VAE decoder uses `ggml_pad` (causal left-pad), which Metal rejects and a
+single-backend gallocr graph can't fall back for. So mix: run the
+weight-less-first-op graphs (LM/diffusion) on gallocr (the §206 fix) but keep the
+VAE on `ggml_backend_sched` (which falls back to CPU for PAD on Metal; CUDA
+supports PAD so it runs fully on GPU). That's safe because the VAE's first op is a
+conv (input lands on GPU) — only the *leaf-input + weight-less-first-op* combo
+triggers the broken copy; mid-graph CPU splits are fine. (Trying to make the pad
+Metal-native via `ggml_concat`-of-a-scaled-view fails when pad>T — you can't build
+zeros wider than the source view — so keep `ggml_pad_ext` and let the sched handle
+it.)
+
+**When you can't crack it: default to CPU.** If the GPU path is broken end-to-end
+and CPU is correct + fast enough, force the backend to CPU
+(`params.use_gpu = false`) behind an env opt-in (`CRISPASR_<X>_GPU=1`) rather than
+shipping garbage. On a CUDA box this runs on CPU → no crash, correct output, sweep
+passes — and the env flag preserves a path to debug the GPU bug later. Honest and
+reversible beats a fast wrong answer.
+
+## A glibc-only crash reproduces on macOS under AddressSanitizer — and the bug is often a non-power-of-two FFT (§205)
+
+A backend that crashes on a Linux/CUDA host with `free(): corrupted unsorted
+chunks` (or `malloc(): ...`) but runs fine on macOS is almost always a **latent
+heap buffer overflow**, not a platform/kernel difference: glibc's allocator
+traps the overwrite of an adjacent chunk header that macOS's allocator silently
+tolerates. You do **not** need the Linux box to find it — build the failing
+binary on M1 with `-fsanitize=address` and run the exact failing command. ASan
+instruments every allocation regardless of platform, so it reports the same
+overflow with a precise stack. (`libgmalloc` via `DYLD_INSERT_LIBRARIES` is a
+fallback, but its 16-byte-slack mode misses small overruns and it can't see
+writes that stay within a `std::vector`'s `capacity()`; ASan's container
+annotations can — prefer ASan.)
+
+The specific trap that bit chatterbox: **`fft_radix2_inplace` is power-of-two
+only**, but several mel front-ends pass a non-pow2 `n_fft` — VoiceEncoder and
+S3Tokenizer use 400, CAMPPlus 1920, CosyVoice3 400. For N=400 the `len=256`
+butterfly stage writes `re[400..511]`, 112 floats past the N-element scratch.
+Whisper-style n_fft=400 needs a **true 400-point transform** (the mel
+filterbank is built for `N/2+1` bins), so the fix is a mixed-radix real FFT
+(radix-2 DIT split down to an odd-N naive DFT base case — like `voxtral_fft`),
+gated to non-pow2 N so the pow2 callers (granite 512, indextts 1024) stay
+bit-identical. Audit rule: **any `core_mel::compute` caller passing
+`fft_radix2_wrapper` must use a power-of-two `p.n_fft`** — grep the call sites
+when adding a backend. See [[project_tts_gpu_cuda_crash_patterns]].
+
+## Metal's q8_0 mat-vec kernel requantizes activations to q8 and ignores the F32 prec hint (§205)
+
+Chatterbox's S3Gen CFM (flow-matching UNet1D) produces **all-NaN mel on M1
+Metal with q8 weights** but is clean with F16 — and the temptation is to call it
+"compound F16 accumulation." **It is not** (that was a wrong first guess; a NaN
+is a specific event, so instrument and find it). The real mechanism, confirmed
+by per-step dumps + the compiled Metal pipelines:
+
+- **It is single-pass, not compounding.** `CRISPASR_S3GEN_DUMP=1` prints the
+  per-Euler-step `x_rms`: the **first** step is already `nan` (`CFM step 1/10
+  x_rms=nan`). The 10-step solver doesn't accumulate to NaN — one UNet forward
+  emits it.
+- **It is not a backend-split-count effect.** F16 (clean) and q8 (NaN) both
+  report `n_splits=31` for the same b2 graph.
+- **It is the q8 Metal mul_mat, specifically its mat-vec path.** The q8 run
+  compiles `kernel_quantize_q8_0_f32` + `kernel_mul_mv_q8_0_q8_0` — i.e. Metal
+  **requantizes the F32 activation to q8_0 and does a q8×q8 GEMV**, throwing away
+  the activation precision and ignoring the `GGML_PREC_F32` that `mul_mat_hp()`
+  set. The F16 run compiles only `kernel_mul_mm_f16_f32_hp` (f16×f32, F32 accum,
+  no activation requant). So: **q8-GPU is wrong; F16-GPU and q8-CPU are correct**
+  — because only the q8-GPU path requantizes activations.
+- **The batch shape decides NaN vs garbage.** The default cond+uncond **batch=2
+  fused CFG graph** (`build_graph_unet1d_b2`) NaNs at step 1; forcing the
+  **batch=1** single-pass path (`CRISPASR_S3GEN_UNET_CFG_SINGLE=1`) on the same
+  q8-GPU weights is *finite but unintelligible* (`conv_pre rms` ~2× ref, ASR
+  transcribes to nothing). Same root cause (activation requant), different blowup.
+
+Bisecting per-op (`CRISPASR_S3GEN_UNET_PIN_CPU_OP` / `..._KEEP_GPU_OP`) is a dead
+end here precisely because the culprit is the q8 *mul_mat* path, not an
+activation op (`flash_attn_ext`/`mish` were individually exonerated). Fix:
+detect a quantized CFM (peek GGUF tensor types for `s3.fd.*` via
+`open_metadata`) on Metal builds, and **dequantise those weights to F16 at load,
+GPU-resident** (`dequant_cfm_f16`) — replace each quantized `s3.fd.*` tensor with
+an F16 GPU copy so the CFM takes the correct `mul_mm_f16_f32_hp` path instead of
+the activation-requantising q8 GEMV, keeping full GPU speed. This reproduces the
+CPU-dequant result bit-for-bit (`conv_pre rms` 3.380 vs 3.379, identical ASR) on
+the default batch=2 GPU graph. `CRISPASR_S3GEN_UNET_CPU=1` is the slower
+all-CPU fallback. CUDA is unaffected (PLAN #83 validated GPU+`GGML_PREC_F32` to
+cos 1.0 on P100). Lessons: (1) never diagnose a NaN by adjective — print the
+first NaN and the compiled kernels; (2) `GGML_PREC_F32` does **not** stop
+activation requantisation in Metal's q8 mat-vec kernel, so quantized weights on
+Metal can be silently wrong for precision-sensitive iterative solvers, not just
+slightly drifted — and the cheap fix is to keep the *weights* off the q8 kernel
+(dequantise to F16 at load) rather than move the whole subgraph to CPU.
+
+---
+
+## A byte-identical standalone reproducer is the only way to (dis)prove a "ggml bug" (§203)
+
+When a batched/fused graph misbehaves and you suspect ggml's allocator or a
+kernel, build a tiny standalone that links the **same** `libggml` dylibs and
+constructs the **same graph**, then diff the two graphs node-by-node. F5's
+batch-CFG (B=2) corrupted batch-1 (batch-0 stayed bit-exact); after a dozen
+in-tree probes pointed vaguely at "gallocr packing", a standalone with the
+**byte-identical 979-node graph** (verified via `CRISPASR_F5_DUMP_GRAPH` vs the
+repro's dump — same op/ne/contiguity/view per node) computed batch-1 **perfectly**
+across every variation (full scale, F16 weights, double `alloc_graph`, weight σ
+0.1–3.0, shared-backend sched). That single result **exonerated ggml entirely** —
+the bug had to be runtime-specific to the backend (values / surrounding state),
+not the graph. Corollaries:
+
+- **"Memory layout changes the result" ≠ "memory overlap".** Two independent
+  checks beat speculation: an in-allocator overlap detector (live-set keyed by
+  alloc-ptr + chunk + offset, **cleared on `dyn_tallocr` reset** or you get
+  cross-graph false positives) and **NaN-poisoning every node buffer before
+  compute**. If poison yields zero output-NaNs and the detector finds no overlap,
+  the buffer is clean and you're chasing the wrong thing — stop blaming the
+  allocator. F5: both came back clean; batch-1 was fully written but wrong.
+- **`ggml_set_output` as a "fix" is a tell, not a fix.** It only perturbs the
+  allocation; if protecting one tensor fixes it but protecting more re-breaks it,
+  you're shuffling a victim around a layout-sensitive read, not fixing a cause.
+- **Bisect toward the working repro, not away from it.** Once the standalone is
+  clean, transform the real backend *toward* it (strip features until the bug
+  vanishes) rather than piling more onto the repro — the gap that remains is the
+  cause. (Not done for F5; ~1.2× payoff didn't justify it. See HISTORY §203,
+  `repro_batch.cpp`.)
+
+## In-place device-KV decode graphs on Metal: three hazards (§176b+c, §203)
+
+Porting the Lk-bucketed device-resident KV decode (write KV in place via
+`ggml_set_rows`, read a fixed-Lk window, reuse a cached graph per bucket)
+to Parler surfaced three Metal-specific hazards. All three "compile and
+sometimes pass," which makes them nasty — they each cost a debugging round.
+
+1. **Write→read ordering needs an explicit edge.** Reading the KV window
+   from the bare cache tensor (`ggml_cont(ggml_view_2d(c->kv, …))`) has *no*
+   data-dependency on the `ggml_set_rows` that just wrote the current row.
+   Metal runs independent graph nodes concurrently, so the read races the
+   write — build-dependent garbage (looked deterministic within a build,
+   flipped 0↔1280 token mismatches across rebuilds). Fix: read from the
+   `set_rows` **result** tensor (`set_rows` records the dest as `src[2]`, so
+   viewing its result creates the edge). CPU never showed this (serial).
+
+2. **Don't reuse a sched allocation across `graph_compute`.** The vibevoice
+   §201 pattern (alloc once on a dedicated sched, skip realloc on the same
+   bucket) faults on Metal here (`setBuffer_impl` on a freed AGXBuffer) for
+   graphs that write external buffers. The portable idiom (kyutai §176s) is
+   reset+`alloc_graph` every step, reusing only the *built graph topology*.
+   Use a **dedicated** small sched for the step graph: reset+alloc on it is
+   cheap, whereas re-planning the large `ctx->sched` (full model graph) each
+   step is slower than the legacy path.
+
+3. **Rebuild cached step graphs per utterance.** Reusing call-N's cached
+   bucket graphs on call N+1 leaves the graph's compute tensors pointing at
+   the previous call's freed sched allocation; the next
+   `ggml_backend_tensor_set` memmoves into freed memory → SIGSEGV on the
+   *second* synthesize. Invalidate (free + rebuild) at the start of each
+   call; within a call the per-step reuse is preserved.
+
+**§215 addendum — orpheus refines hazard #2: a *fresh* dedicated step-sched
+fails to back input copies on GPU; use the warm prefill sched.** Orpheus
+shipped the same bucket on its own dedicated `ar_step_sched` and SIGSEGV'd on
+the *first* generated token (`AGXMetal setBuffer_impl`). Two diagnostic traps:
+(a) `GGML_SCHED_DEBUG=2` showing the graph-input copies (`MTL0#inputs_embeds#0`,
+`positions`, `causal_mask`) as `[ NULL ]` is a **red herring** — that print is
+*pre-allocation* state and the working multi-token prefill graph shows the exact
+same NULLs. (b) `lldb` put the real fault in `ggml_metal_op_norm` on **node #0**
+(the first RMS_NORM reading `inputs_embeds`) — i.e. *before* any set_rows/rope,
+so it's the input copy itself that's unbacked, not the KV path. The decisive
+A/B: routing the *identical* bucket graph through the already-warm prefill sched
+(`c->sched`, reserved by the multi-token prefill) backs the copies and produces
+a correct WAV, while the *cold* dedicated sched's first `alloc_graph` (which
+takes ggml-alloc's `reserve_n` path) does not. Fix: run the cached bucket graph
+on `c->sched` with reset+alloc each step (the per-step re-plan is cheap because
+the bucket topology is invariant → galloc fast-path; the §176s "don't re-plan
+the big sched" worry doesn't bite when the bucket *is* the graph). So hazard #2's
+"use a dedicated small sched" is not universal: parler's dedicated sched happens
+to work, orpheus's didn't — when a step-sched faults on its first GPU
+alloc+compute, reuse the warm prefill sched before chasing the NULL-copy print.
+On M1 the orpheus bucket is correct but ~30% *slower* than non-bucket (fixed-Lk
+over-read, same as parler), so it stays opt-in (`CRISPASR_ORPHEUS_BUCKET=1`).
+
+Also: fixed-Lk bucketing shifts FP rounding (the padded reduction), so it is
+not *guaranteed* bit-exact vs a dynamic-length path — but in practice the
+shift is tiny. Validated with `crispasr-diff` against the F32 PyTorch ground
+truth: at **F16 the bucket matched legacy AND ground truth 108/108 (100%)**
+over the gen_codes_20 window; the divergence only appears at **Q4_K**, where
+quantization noise (Q4_K is below parler's quality bar — legacy Q4_K greedy
+also degenerates to non-speech) gets amplified by greedy argmax. So validate
+such opts with the diff harness at F16, not ASR-roundtrip on a low quant.
+
+On **unified memory (M1)** the device-KV migration itself wins little
+(host↔device is a memcpy), so the first cut was *slower* than legacy at long
+sequences — the fixed-Lk path's overhead outweighed the (nil) transfer
+saving. What made it a clear win (~1.2–1.9× at 600 steps) was eliminating
+that overhead: (a) **don't `ggml_cont` the Lk KV window** — it's the
+contiguous leading block of the layer slice, so feed the view straight into
+reshape; the cont is a D×Lk copy *per layer per step* that grows with the
+bucket and dominates long utterances. (b) **reuse the sched allocation**
+across steps (reset+alloc only on a bucket switch). So the lesson isn't
+"device-KV is CUDA-only" — it's "the bucket's per-step *copies and
+re-planning* are the real cost on any backend; kill those and it wins even
+on unified memory." Reuse across `graph_compute` is fine once reads carry an
+explicit write→read edge (read the `set_rows` result) and cached graphs are
+rebuilt per utterance.
+
+## Backend-name guards must match the *registered* name, by prefix when aliased (#171, #174)
+
+A backend's CLI factory alias and the string `name()` returns are not the
+same namespace, and policy code keyed on `name()` keeps getting them wrong:
+
+- `qwen3-asr` (lang-sweep test plan) vs registered `qwen3`.
+- `granite-speech` vs registered `granite`.
+- `crispasr_tts_plan_chunks_for_backend()` skipped chunking for the literal
+  `"vibevoice"`, but the TTS backends register as `vibevoice-tts` /
+  `vibevoice-1.5b` / `vibevoice-tts-base` (bare `vibevoice` is the ASR
+  backend). Result: the server sentence-split every VibeVoice TTS request
+  while the CLI synthesised whole — a silent CLI/server divergence that
+  manifested as garbled multi-voice audio and a baffling "same input, 30 vs
+  100 chars" report (#171).
+
+Rules:
+1. Key policy on the value `backend->name()` actually returns at runtime, not
+   on a factory alias you remember typing. Print it and check.
+2. When a family has variants (`vibevoice`, `vibevoice-tts`,
+   `vibevoice-1.5b`, …) match by **prefix** (`name.rfind("vibevoice", 0) ==
+   0`), not equality — new variants then inherit the policy automatically.
+3. The test must use the **production** name. The #171 unit test asserted on
+   the bare `"vibevoice"` that production never passes, so it stayed green
+   through the whole regression. A test that can't see the bug is worse than
+   no test — it gives false confidence.
+
+Companion to the "session ABI reimplements the CLI" learning: both are "the
+CLI and its other consumers (server/bindings) silently diverge" bugs.
 
 ## Never pass `ggml_graph_get_tensor` directly to `ggml_backend_tensor_set` (#164)
 
@@ -7826,9 +8250,10 @@ normalizer before tokenization:
   model no longer sees the uppercase-heavy text that the Python MTL
   tokenizer would have normalized away.
 
-That closes the obvious `-l fr` / `-l ar` drift in the C++ path, but it
-does not yet implement Python's full Unicode NFKD / script-specific
-normalizers for zh/ja/he/ko/ru.
+That closes the obvious `-l fr` / `-l ar` drift in the C++ path. Full Unicode
+**NFKD** was added later (2026-06-21, see "NFKD resolution" below); the
+script-specific normalizers for zh/ja/he/ko/ru (cangjie / kakasi / dicta / jamo
+/ stress) are still unimplemented (they need external libs).
 
 ### Root cause — the published q4_k multilingual GGUF used the wrong tokenizer (2026-06-18)
 
@@ -7877,6 +8302,39 @@ fix. It does **not** prove French quality is solved; listening tests still
 reported heavy accent / imperfect pronunciation on some Q4_K French
 samples, so remaining work is model-semantics / upstream-text-prep parity,
 not "is `-l` wired at all?".
+
+### NFKD resolution — the upstream-text-prep parity gap was NFKD (2026-06-21, #170)
+
+The "upstream-text-prep parity" remaining work above was concrete: an external
+reporter (#170) found that with a correctly-paired multilingual GGUF, `-l ar` on
+**partial-diacritic** Arabic still prepended spurious onset letters
+(`أعْلَنَ`→"za3lana") that the Python reference did not. Root cause, proven
+through the real `grapheme_mtl` tokenizer (not guessed): the C++ normalizer did
+punc/lowercase but **skipped NFKD**, while upstream
+`MTLTokenizer.preprocess_text` runs `unicodedata.normalize("NFKD",
+text.lower())` before tokenizing.
+
+- For the working simple string `مرحبا بالعالم`, NFKD is a **no-op** → token ids
+  identical with/without NFKD → no bug (matches the issue: simple case worked).
+- For the hallucination string, NFKD **changes it** (131→137 codepoints): the
+  precomposed `أ` (U+0623) decomposes to base alef (U+0627) + combining hamza
+  (U+0654). Without NFKD the C++ tokenized `أ` as one rare grapheme id **2353**;
+  with NFKD upstream splits it into **1456, 1458**. Token 2353 is the
+  under-trained grapheme the T3 renders as the spurious consonant. That is why
+  *partial diacritics specifically* trigger it — أ إ آ ؤ ئ are the
+  NFKD-decomposable letters.
+
+Fix: `tools/gen_nfkd_table.py` emits exact NFKD decomposition + combining-class
+tables from `unicodedata`; `src/chatterbox_nfkd.h` applies them (Hangul
+decomposed arithmetically, the rest tabled; bit-exact vs `unicodedata` across
+Arabic / accented Latin / Hangul / ligatures). After the fix the C++ multilingual
+token ids are **byte-identical to upstream** for both the simple and the
+hallucination string (139/139, 2353 gone), validated through the formal
+crispasr-diff `t3_text_tokens` stage. **Text-prep code fix — no GGUF
+reconversion.** Lesson: a C++ TTS text path must replicate the upstream
+tokenizer's *entire* `preprocess_text` (NFKD + casefold + language hooks), not
+just punctuation — precomposed graphemes are the trap, and they only surface on
+inputs that actually contain them.
 
 ### Operational note — the regen variants already have merges
 
@@ -8903,6 +9361,46 @@ The harness: (1) dump reference per-stage with forward hooks, (2) teacher-force
 tokens via `FASTPITCH_FORCE_TOKENS=<file>`, (3) dump C++ per-stage via
 `FASTPITCH_DUMP_DIR=<dir>`, (4) compare with numpy cosine similarity. First
 divergent stage is the bug. Debug hooks: `FASTPITCH_DUMP_DIR`, `FASTPITCH_FORCE_TOKENS`.
+
+### GPU/CUDA crash — two Metal-masked bugs (§204, 2026-06-21)
+
+FastPitch synthesised correctly on M1 Metal but aborted on the Kaggle CUDA
+sweep. The give-away "passes on Metal, dies on CUDA" almost always means a
+backend bug that **unified memory hides** — on Apple silicon the CPU backend can
+read GPU buffers, so device-pointer mistakes are silent. Two distinct bugs:
+
+**Bug A — `sched_alloc_graph` then compute on the raw CPU backend.** When the
+GPU upgrade (§140) wired `ggml_backend_sched` into fastpitch, only the encoder
+and pitch-embed graphs were switched to `ggml_backend_sched_graph_compute`; the
+decoder and vocoder graphs were left calling
+`ggml_backend_graph_compute(ctx->backend_cpu, gf)` after a
+`ggml_backend_sched_alloc_graph`. With `use_gpu` the weights are in a GPU buffer,
+so the CPU backend dereferences device pointers — harmless on Metal, an illegal
+access on CUDA. **Rule:** a graph allocated via the scheduler must be computed
+via the scheduler. Grep any GPU-enabled backend for
+`ggml_backend_graph_compute(.*backend_cpu` following a `sched_alloc_graph`.
+
+**Bug B — `core_hifigan` ConvTranspose layout (channel-major vs time-first).**
+The whole `core_hifigan::forward()` pipeline is **time-major** `(T, C)` — every
+`ggml_conv_1d` there produces `ne0=time, ne1=channel`. But the col2im decomposed
+transpose-conv path (the `w_perm` branch, added in `a862f2de`) called
+`core_convt::convt1d_decomp`, which is **channel-major**: its first op is
+`mul_mat(w_perm[IC, K*OC], x)` and therefore needs `x->ne0 = IC`. Fed a
+time-major `x` (`ne0 = T`), it aborts on `ggml_can_mul_mat` — on **both** CPU and
+GPU. The fix is to use the time-first sibling `convt1d_decomp_tf` (transposes
+in, runs the channel-major decomp, transposes out). This is a *shared-header*
+bug: every `ups_w_perm` user is affected, and both FastPitch and SpeechT5 feed
+`mel_in = (T_mel, n_mel)`, so the one-line `hifigan.h` change repairs both.
+
+**Lesson:** when a `mul_mat`/conv asserts deep inside a shared vocoder, the wrong
+suspect is the model weights; the right one is which axis of the *input* is
+contiguous. `convt1d_decomp` (channel-major) and `convt1d_decomp_tf` (time-first)
+look interchangeable but assume opposite `ne0` conventions — pick by what the
+caller's pipeline actually produces (here, `ggml_conv_1d` ⇒ time-major).
+
+Validated: cstr/fastpitch-en-GGUF q8_0, GPU and CPU outputs byte-identical,
+verbatim ASR roundtrip. See `core/hifigan.h::conv_transpose_1d`,
+`fastpitch_tts.cpp` decoder/vocoder compute, HISTORY §204.
 
 ## SpeechT5 TTS decoder — what ACTUALLY fixed it (2026-06-02)
 
@@ -10162,3 +10660,402 @@ When a generated WAV clicks but a reference decoder does not, diff every
 post-decoder stage too: backend PCM, backend trim/fade, watermark/provenance
 mutation, then file serialization. A clean `tts_raw_audio` plus a broken WAV is
 not a model-runtime bug; it is post-processing.
+
+## VibeVoice TTS garbles only on AMD RDNA4: coopmat2 flash-attention (issue #171, 2026-06-19)
+
+### Problem
+
+After the tokenizer/scheduling fixes, the reporter (AMD Radeon RX 9700 XT,
+Vulkan, Ubuntu 26.04) still got garbled VibeVoice realtime TTS on short French
+texts — "Cependant", "Le wagon vert.", "Cependant, il a tort." — described as
+mixed voices, repeated fragments, "goes totally west". Longer texts mostly
+worked.
+
+### What it was NOT
+
+Reproduced locally on **Metal (M1)** and **Vulkan via MoltenVK (M1)** using the
+*exact same* `src/vibevoice.cpp` as the reporter's commit: all three texts
+ASR-roundtrip **verbatim** on both. So it is not the TTS loop logic, tokenizer,
+EOS threshold, or `n_frames` cap. The bug is backend-numerical and specific to
+the reporter's GPU.
+
+### Root cause
+
+ggml-vulkan picks `FA_COOPMAT2` for `ggml_flash_attn_ext` whenever
+`device->coopmat2` is advertised (ggml-vulkan.cpp ~L3095). The RX 9700 XT is
+RDNA4 — brand-new silicon whose RADV coopmat2 flash-attention shader miscomputes
+attention, yielding slightly-wrong TTS-LM hidden states. The binary EOS
+classifier (`sigmoid(fc2(relu(fc1(h)))) > 0.5`) is extremely sensitive to that
+drift, so it stops misfiring → the realtime model over-generates past the
+natural end → speaker identity drifts and fragments repeat. Short utterances
+break worst because they depend entirely on EOS firing early; long ones are
+re-anchored every 5-token text window. MoltenVK reports `matrix cores: none` →
+it uses the **scalar** FA path, which is why it (and Metal) are clean — so my
+local "correct" runs already validated the non-coopmat2 path end-to-end.
+
+### Fix / instrumentation
+
+`vibevoice_sdpa()` wraps the five TTS-LM attention sites; `VIBEVOICE_TTS_FLASH_ATTN=0`
+swaps fused FA for an explicit `softmax(QKᵀ·scale + mask)·V` (GQA via
+`ggml_mul_mat` broadcast + `ggml_soft_max_ext`), avoiding the FA shader. The
+σ-VAE decoder has **no attention** (pure conv/col2im), so `VIBEVOICE_VAE_BACKEND`
+isolates that half — the two env knobs bisect the TTS GPU graph. No-rebuild
+equivalents for the reporter: `GGML_VK_DISABLE_COOPMAT2=1` (FA path),
+`GGML_VK_DISABLE_COOPMAT=1`, `GGML_VK_DISABLE_F16=1`.
+
+### Takeaway
+
+When a TTS/LM model garbles on one specific GPU but is verbatim on every backend
+you can test, suspect a fused-kernel shader miscompile (flash-attention coopmat2
+on bleeding-edge AMD/Intel), not your graph. Keep an env-selectable non-fused
+fallback for fused ops so a reporter can bisect on hardware you don't have. EOS
+classifiers amplify tiny attention drift into gross over-generation.
+
+## read_tensor_f32 weight pre-cache for VITS-family TTS (2026-06-20)
+
+Piper and MeloTTS use CPU-scalar C++ for flow_inverse, wavenet, SDP,
+attention — each reads weights via `read_tensor_f32` which does
+`ggml_backend_tensor_get` + F16→F32 dequant. 39-48 calls per synthesis
+add up to 14-16% of total time. Fix: pre-populate
+`unordered_map<tensor*, vector<float>>` at init, check in
+`read_tensor_f32` via module-level context pointer. Cost: ~2× model RAM
+(30-100 MB range). Gated by `CRISPASR_PIPER_WEIGHT_CACHE` /
+`CRISPASR_MELOTTS_WEIGHT_CACHE`. Lesson: small helpers that look
+innocuous (`read_tensor_f32`) accumulate significant overhead when called
+40-50 times per synthesis.
+
+## Single-token embed graph elimination for LLM-ASR (2026-06-20)
+
+AR decode in LLM-ASR backends (funasr, glm_asr, etc.) called
+`embed_tokens({next_id})` per step, building a full ggml graph for a
+single GET_ROWS. Fix: n==1 fast path dequants one row directly. Gated
+by `CRISPASR_XXX_EMBED_FAST`. Lesson: not every ggml op needs a graph —
+single-row lookups are cheaper as direct tensor reads.
+
+## §176 runtime optimization audit methodology (2026-06-20)
+
+### Full code-read survey beats pattern-grep
+
+Dispatching 9 parallel research agents to read every runtime file
+(65+ backends) line-by-line found optimizations that pattern-grep would
+have missed: host-side KV caches masquerading as "caches" but actually
+re-uploading every step (SpeechT5, Dia, Parler), scalar LSTM loops that
+should be BLAS (Parakeet, Nemotron), unconditional debug fprintf in hot
+paths (Paraformer), and recursive FFT with O(N log N) heap allocs
+(core/fft.h). The audit produced 20 actionable items, 15 of which were
+completed in one session.
+
+### Mechanical optimization patterns that scale
+
+Four patterns covered 90% of the work:
+
+1. **arena_ctx pattern for encoder graph caching**: add `arena_ctx`
+   param to `build_graph_*`, cache the ggml_context + cgraph on the
+   runtime context struct, key by the input shape (T_mel, n_samples,
+   etc.). Applied to 16 backends in ~15 min each. The key insight: ggml
+   tensor descriptors survive `ggml_free(ctx0)` if backed by
+   `compute_meta`; for caching, use a **separate** meta buffer so
+   compute_meta stays available for other graphs.
+
+2. **Lk-bucketed AR decode graph cache**: pre-build T=1 decode graphs
+   at fixed KV lengths {512,1024,2048,4096}; pick the smallest bucket
+   >= n_past+1; use `kv_indices=positions` to make KV write position a
+   runtime input. Applied to 8 backends (Orpheus, OuteTTS, Zonos, TADA,
+   Chatterbox, CosyVoice3, VibeVoice, Qwen3-TTS).
+
+3. **Static context cache with mutex**: for support runtimes called
+   per-segment (VAD, LID, aligner, diarization), cache the loaded
+   context in a `static std::mutex + void* + std::string path` triple.
+   Same pattern as Silero VAD #132 fix.
+
+4. **thread_local scratch buffers**: for per-call heap allocs in shared
+   hot paths (FFT scratch, greedy decode probs vector, kaldi_fbank
+   frame buffer). `thread_local static` + lazy resize eliminates the
+   malloc/free per call.
+
+### Backends with host-side KV resist bucketing
+
+SpeechT5, Dia, Parler, Pocket-TTS, VoxCPM2 all use
+`std::vector<float>` KV caches that grow and re-upload every step.
+Bucket caching doesn't help because the KV data size changes every
+step regardless of graph topology. These need the §176c migration
+(device-resident 4D KV with ggml_view_4d + ggml_cpy writes) before
+bucketing is effective.
+
+### Embedding table size gates CPU cache feasibility
+
+Orpheus (vocab 157K × d 4096 = 2.4 GB), TADA (128K × 3072 = 1.5 GB),
+and OuteTTS (57K × 2048 = 449 MB) are too large for a full F32 CPU
+embedding cache on 8 GB machines. The n==1 direct-dequant fast path
+(§176o) is the right approach for large vocabs — one row at a time,
+no full table copy.
+
+### Graph/alloc caching only helps overhead-bound graphs — measure host build+alloc first (§208)
+
+Before porting a graph to a cached raw-`ggml_gallocr` single-backend path to kill
+per-step rebuild+alloc overhead, measure that overhead directly. For the chatterbox
+S3Gen CFM (3148-node batch-2 DiT, T_mel=484, F16-dequant on Metal): host-side
+`build_graph + sched_reset + sched_alloc_graph` = **~4–7 ms/step** out of **~1887
+ms/step** = **0.3%**. The per-step cost is raw Metal GEMM (compute-bound), so
+caching the graph + allocation — though architecturally cleaner (single backend,
+zero splits, graph reused, parity 0.999) — bought nothing. The §207 handover's
+"per-step is almost all overhead" assumption was never measured; a one-line
+`ggml_time_us()` around the build+alloc would have pre-empted the whole port.
+Heuristic: a graph-reuse/bucket cache pays off only when host-side
+build+alloc+(GPU↔CPU split copies) is a *meaningful* fraction of per-step wall
+time; for a big GPU-resident GEMM graph it is single-digit ms and the lever is a
+DUD (cf. the bucket-floor DUD in [[project_chatterbox_t3_decode_perf]]). The
+single-backend gallocr path is also a Bug-B-free reference: no sched, no
+cross-backend copy boundary, so CFG uncond cannot diverge.
+
+**§214 re-confirmation (chatterbox T3 B=2 decode).** Same trap, second data point:
+before bucketing the per-step-rebuilt B=2 T3 graph, `CHATTERBOX_BENCH_B2=1` split
+each step into build+alloc vs compute → **CPU 0.41 ms/step (0.8%)** of a 53 ms
+step, **GPU+F16 1.55 ms (0.7%)** of a 232 ms step. <1% on both → a cached/bucketed
+B2 graph is a DUD, and worse, it would risk reintroducing the §186 Lk-bucket
+`buffer is nil` Metal crash that the per-step rebuild *deliberately* sidesteps
+(the rebuild is what makes B2-on-GPU work at all). The instrumentation is shipped
+(gated `CHATTERBOX_BENCH_B2`) so the call is data-backed, not assumed. Corollary
+the same run surfaced: GPU per-step compute (232 ms) ≫ CPU (53 ms), so B=2 does
+**not** make T3-on-GPU beat the CPU default — B2's GPU value is purely *enabling*
+T3-on-GPU (sidestep the bucket crash) + the GPU+quant F16-dequant path.
+
+### RNNoise/resampler caching isn't worth breaking thread safety
+
+The miniaudio resamplers and RNNoise DenoiseState are per-call by
+design (the code comment says "multiple worker isolates can run
+concurrently"). The init/free overhead is ~microseconds (small
+malloc). Caching them as statics would break concurrent server use
+for negligible gain.
+
+### TADA TTS: prompt-phase time embeddings must be zero (not FM-predicted)
+
+During the prompt-phase prefill loop, C++ runs the FM network at every step
+to keep the KV state moving — but the resulting `pred_t_before`/`pred_t_after`
+must NOT be fed back as the time embedding for the next step while still in the
+`in_prefix` region.  Python's batch prefill zero-initialises the time tensor
+and only overwrites positions `shift+1..shift+n_t` with the actual prompt time
+values; all prefix positions (`feat_idx 0..prefix_len-1`) get zero time
+embeddings.
+
+**Bug pattern:** `cur_t_before = pred_t_before` in the `in_prefix` branch of the
+AR loop → non-zero time embeddings corrupt the KV state → divergent duration
+predictions → wrong phonemes ("Costella" instead of "Stella").
+
+**Fix:** `cur_t_before = 0; cur_t_after = 0;` for all in_prefix steps.
+`in_prompt` steps (feat_idx ≥ prefix_len) correctly use
+`ctx->prompt_time_before[prompt_feat_idx + 1]` which is indexed from 1 to
+match Python's `time_len_before[k]` alignment.
+
+**General principle:** for any TTS model with a prompt-phase prefill, verify
+that the EXACT same inputs (token, acoustic, time) are fed step-by-step as the
+model's batch prefill would use.  Run a diff harness that compares the hidden
+state after step 0, 1, prefix_len, and prefix_len+1 before chasing output
+divergence.
+
+### TADA TTS: time transition is one step earlier for time than for acoustic
+
+Python's TADA switches from reference-audio time → FM-predicted time one step
+earlier than it switches acoustic features.  Specifically:
+
+- **Acoustic** uses the reference prompt through `feat_idx < prompt_used_len`
+- **Time** (t_before/t_after) uses the reference prompt only through
+  `feat_idx < prompt_used_len - 1`; at `feat_idx = prompt_used_len - 1` the
+  time is already FM-predicted even though the acoustic is still from the
+  reference
+
+Python's condition: `step - shift_acoustic < prompt_time_len_before.shape[1] - 1`,
+where `shape[1] = prefix_len + n_prompt - transition_steps = prompt_used_len`.
+So `feat_idx < prompt_used_len - 1` for prompted time; predicted otherwise.
+
+**Bug pattern:** C++ `in_prompt` branch applied the same boundary for both
+acoustic and time (`feat_idx < prompt_used_len`), so the last `in_prompt` step
+used reference time where Python was already FM-predicted.  The single-step
+mismatch in `cur_t_before` at step `shift + prompt_used_len - 1` cascaded
+through all subsequent FM evaluations, inflating the last decoded
+`time_before` value from ~21 to 234 (= 4.68 s of trailing silence) and
+ballooning a 1.36 s synthesis to 9.90 s.
+
+**Fix:** `bool use_prompted_time = (feat_idx < prompt_used_len - 1)` inside
+the `in_prompt` branch.  Acoustic selection is unchanged; only the time
+variables (`tb`, `ta`, `cur_t_before`, `cur_t_after`) switch one step earlier.
+
+**Lesson:** when acoustic and time have separate "replay vs predict" boundaries,
+they must be tracked independently.  A single off-by-one in a time embedding
+several frames before the decoded zone can still corrupt all decoded frames via
+KV-state drift.
+
+### TADA TTS: `tada-ref.gguf` is both a prompt cache and a poor full diff oracle
+
+`tada-ref.gguf` contains the prompt tensors the runtime needs
+(`prompt_token_values`, `prompt_token_positions`, plus prompt transcript
+metadata).  That makes it a valid **voice prompt cache** for
+`tada_load_prompt()`.  It does **not** make every published `tada-ref.gguf`
+a trustworthy full end-to-end generated-output reference.  Stale refs can
+still contain prompt tensors that are useful for synthesis while their
+`codec_input`, `codec_pcm`, `time_before`, or generated acoustic tensors no
+longer match current Python/reference generation.
+
+**Bug pattern:** treating a passing codec-only diff against a stale ref as proof
+that generated timing is correct.  In issue #192, stale refs hid the real
+tempo problem because they did not force the harness to compare the generated
+`time_before` sequence and full acoustic matrix from the same Python run.
+
+**Fix:** keep runtime prompt loading scoped to prompt tensors, but make the
+TADA diff harness compare generated `acoustic_features` and generated
+`time_before` whenever those tensors exist in the reference archive.  For exact
+timing work, regenerate a fresh full ref from the original Python model/weights;
+do not infer timing correctness from prompt-only GGUFs.
+
+### TADA TTS: multilingual lives in prompt encoding, not generation
+
+The Python blueprint does multilingual TADA by selecting a language-specific
+aligner when building the prompt:
+
+- `Encoder.from_pretrained(codec_repo, subfolder="encoder", language="fr")`
+  loads `aligner-fr`
+- `Encoder(audio, text=[transcript], sample_rate=...)` forced-aligns the
+  reference audio to the supplied transcript
+- `model.generate(prompt=prompt, text=...)` then consumes only
+  `prompt.token_values`, `prompt.token_positions`, and `prompt.text`; it has no
+  separate generation-time language flag
+
+**Runtime implication:** `-l fr` cannot magically make a default English prompt
+French.  It can only select a pre-encoded sibling prompt such as
+`tada-ref-fr.gguf`.  Custom multilingual voices must first be converted with
+`models/convert-tada-ref-to-gguf.py --language fr --transcript ...`, which
+matches the blueprint's `aligner-fr` path.
+
+**Practical rule:** for TADA, fix language issues in the prompt-conversion
+pipeline, not in `tada_synthesize()`.  The C++ runtime should load the right
+prompt GGUF and then follow Python generation exactly.
+
+### CosyVoice3: fixed-shape graph reuse must not imply a maximum-size KV graph
+
+CosyVoice3 caches its single-token AR graph because rebuilding 24 Qwen2 layers
+per speech token is expensive. The graph shape includes the KV-cache length,
+so the original implementation used a fixed 4096-token cache to make every
+step reusable. On Metal this made a short request attend over thousands of
+unused slots at every step: a 17-token decode took about 6.8 s on an M1.
+
+Size KV storage and the cached graph from `prefill_tokens + max_new_tokens`
+before prefill. Direct prefill/step API calls still need a modest fallback,
+but they must preserve an already-sized cache instead of expanding it back to
+4096. With a 625-slot default CLI budget, the same decode took about 1.4 s and
+the final WAV was byte-identical.
+
+Two adjacent rules matter:
+
+- Plumb the CLI `-n/--max-new-tokens` value into the backend context; otherwise
+  the advertised cap neither limits generation nor controls KV sizing.
+- A cached ggml topology still needs scheduler reset/allocation before each
+  GPU execution. Reusing stale scheduler bindings caused the earlier Metal
+  second-token crash; right-sizing the topology does not change that rule.
+
+The remaining default-quality bottleneck is the 10-step DiT-CFM flow. Reducing
+`COSYVOICE3_FLOW_STEPS` trades quality for nearly linear speed. Do not silently
+change its default, and do not treat cold reads from an external SSD as
+inference time; use a resident server when measuring repeated synthesis.
+
+### CosyVoice3: batch CFG exactly as upstream, and lazy-load cloning encoders
+
+Upstream CFM stacks the conditional and unconditional branches into batch
+size 2 and evaluates the 22-layer DiT once per Euler step. The first C++ port
+ran two B=1 forwards, doubling graph launches and weight reads. A batch-aware
+DiT path must preserve the batch dimension through Q/K/V as
+`[head_dim, heads, time, batch]`; flattening batch into time would allow
+cross-branch attention unless a block-diagonal mask is added.
+
+The position-convolution input pipeline is still built once per branch, then
+the two `[dim,time,1]` results are concatenated on the batch dimension. The DiT
+stack, final AdaLN, and output projection run at B=2. On an M1 this reduced the
+10-step flow from roughly 4.6 s to 1.9–2.3 s. Both a short 10-step synthesis
+and longer bucket-crossing tests produced byte-identical WAVs versus separate
+CFG forwards. Keep `COSYVOICE3_CFG_BATCH=0` as a backend compatibility bisect.
+
+KV allocation and active attention length are separate concerns. Allocate
+storage for the full generation cap so K/V never has to be copied while
+growing, but build the cached T=1 graph against 256-token active buckets.
+Crossing a bucket rebuilds the topology against the same persistent storage.
+This cut the same short LM decode to about 0.5 s; a 319-token test crossed a
+bucket and remained byte-identical. `COSYVOICE3_KV_BUCKET=0` restores the full
+allocation shape for debugging.
+
+Finally, baked voices never use speech_tokenizer_v3 or CAMPPlus. Eagerly
+loading them added about 475 MiB and substantial external-SSD startup time.
+The CLI backend and session C ABI now discover their paths at initialization
+but load both under a mutex only when a `.wav` cloning request arrives. This
+must be lazy, not permanently disabled: a resident server or binding session
+can receive baked-voice requests first and a WAV-cloning request later.
+
+The contributing checklist's `Session.available_backends()` assertion also
+exposed a separate binding trap: the compiled backend CSV now exceeds 256
+bytes. Python and Rust used fixed 256-byte buffers and silently lost every
+backend after `kyutai-stt`, including CosyVoice3. The C ABI returns the full
+required length even when the supplied buffer truncates, so bindings must
+retry with `required + 1` bytes instead of assuming the backend list is small.
+
+## TADA encoder port: staged model loading on constrained RAM (§221)
+
+Porting the TADA encoder pipeline (aligner + WavEncoder + LocalAttentionEncoder)
+to C++ exposed several patterns for working with >1 GB PyTorch models on 8 GB
+RAM:
+
+**Staged loading defeats OOM.** The encoder and aligner together exceed 2 GB at
+float32. Loading both simultaneously OOM-kills on 8 GB. Solution: load the
+aligner first, run it, `del aligner; gc.collect()` to free ~1.3 GB, then load
+the encoder. RSS dropped from 705 MB → 463 MB at the free boundary, confirming
+pages were reclaimed. The same principle applies to any reference-dump script
+that needs multiple large models — never hold two in memory simultaneously.
+
+**CIFS-backed HF cache is 10–50× slower than local disk.** Model loading from
+`/mnt/akademie_storage/huggingface/hub` (CIFS) took 5–10 minutes vs ~6 seconds
+from `/mnt/volume1/tmp-overflow/` (local NVMe). For iterative debugging, copy
+safetensors to local storage first:
+```bash
+cp $HF_CACHE/models--HumeAI--tada-codec/snapshots/*/encoder/model.safetensors \
+   /mnt/volume1/tmp-overflow/tada-codec-local/encoder/
+```
+
+**transformers 5.x broke `from_pretrained` for custom PreTrainedModel
+subclasses.** The `all_tied_weights_keys` attribute was removed; models that
+inherit `PreTrainedModel` crash with `AttributeError` on load. Fix: monkey-patch
+a property with both getter and setter before the first `from_pretrained` call:
+```python
+if not hasattr(transformers.PreTrainedModel, 'all_tied_weights_keys'):
+    transformers.PreTrainedModel.all_tied_weights_keys = property(
+        lambda self: getattr(self, '_all_tied_weights_keys_store', None) or
+                     getattr(self, '_tied_weights_keys', None) or {},
+        lambda self, val: setattr(self, '_all_tied_weights_keys_store', val))
+```
+This must be a property with a setter (not just a getter), because HF code
+assigns to it during `_finalize_model_loading`.
+
+**ggml Conv1d padding differs between dilated and strided convs.** The TADA
+WavEncoder has two kinds of convolutions:
+- ResidualUnit dilated convs: `pad = dilation * (K-1) / 2` (symmetric, output=input length)
+- EncoderBlock stride convs: `pad = ceil(stride/2)`, matching PyTorch's
+  `Conv1d(kernel_size=2*stride, stride=stride, padding=math.ceil(stride/2))`
+
+Using the dilation formula for stride convs gives wrong padding (e.g. stride=6:
+formula gives p=5, correct is p=3). The `wn_conv1d` helper needs a
+`pad_override` parameter for stride convs.
+
+**ggml tensor layout: (d, T) channel-first reads back as (T, d) row-major.**
+When a ggml tensor has shape `ne[0]=d, ne[1]=T`, calling
+`ggml_backend_tensor_get` returns data in ne[0]-contiguous order, which IS
+`(T, d)` row-major — each frame's d features are contiguous. This matches
+Python's `(T, d)` numpy layout directly. Do NOT transpose dump tensors before
+the diff comparison; the ggml→CPU readback already produces the right layout.
+
+**TADA aligner is wav2vec2-large with "group" CNN norm (not "layer").** Despite
+wav2vec2-large documentation saying it uses LayerNorm on all CNN layers, the
+TADA aligner's checkpoint has InstanceNorm only on layer 0 and no norm on
+layers 1–6 (and no conv bias). The converter must detect this from the tensor
+names rather than assuming the architecture.
+
+**wav2vec2 pos_conv weight-norm shape varies.** Standard wav2vec2 stores
+pos_conv `original0` (g) as `[Cout, 1, 1]` (dim=0 norm). The TADA aligner
+stores it as `[1, 1, K]` (dim=2 norm). The materialization formula
+`w = g * v / ||v||` must detect which dimension was normed by finding which
+dims of g are size 1 while v is larger.

@@ -2800,6 +2800,24 @@ class CrispasrSession {
     }
   }
 
+  /// Number of flow-matching timing candidates ranked per token (TADA).
+  /// Higher = more reliable multilingual timing, slower. Returns silently
+  /// on backends that don't rank timing candidates (rc=-2 soft no-op).
+  void setTtsNumCandidates(int n) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_tts_num_candidates')) {
+      // Older libcrispasr without the symbol — silent no-op.
+      return;
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
+        int Function(Pointer<Void>, int)>(
+        'crispasr_session_set_tts_num_candidates');
+    final rc = fn(_handle, n);
+    if (rc != 0 && rc != -2) {
+      throw Exception('setTtsNumCandidates failed (rc=$rc)');
+    }
+  }
+
   /// Top-p nucleus sampling threshold (0.0..1.0). Honoured by
   /// chatterbox; other backends no-op.
   void setTopP(double topP) {
@@ -2809,6 +2827,28 @@ class CrispasrSession {
         int Function(Pointer<Void>, double)>('crispasr_session_set_top_p');
     final rc = fn(_handle, topP);
     if (rc != 0 && rc != -2) throw Exception('setTopP failed (rc=$rc)');
+  }
+
+  /// Top-k sampling cutoff (0 = disabled). Honoured by TADA; other
+  /// backends no-op.
+  void setTopK(int topK) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_top_k')) return;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
+        int Function(Pointer<Void>, int)>('crispasr_session_set_top_k');
+    final rc = fn(_handle, topK);
+    if (rc != 0 && rc != -2) throw Exception('setTopK failed (rc=$rc)');
+  }
+
+  /// Enable/disable sampling (false = greedy). Honoured by TADA; other
+  /// backends no-op.
+  void setDoSample(bool enable) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_do_sample')) return;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
+        int Function(Pointer<Void>, int)>('crispasr_session_set_do_sample');
+    final rc = fn(_handle, enable ? 1 : 0);
+    if (rc != 0 && rc != -2) throw Exception('setDoSample failed (rc=$rc)');
   }
 
   /// Min-p sampling threshold (0.0..1.0). Honoured by chatterbox.
@@ -2843,6 +2883,16 @@ class CrispasrSession {
         int Function(Pointer<Void>, double)>('crispasr_session_set_cfg_weight');
     final rc = fn(_handle, cfg);
     if (rc != 0 && rc != -2) throw Exception('setCfgWeight failed (rc=$rc)');
+  }
+
+  /// TADA flow-matching noise temperature (Python noise_temp, default 0.9).
+  void setTtsNoiseTemp(double noiseTemp) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_tts_noise_temp')) return;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Float),
+        int Function(Pointer<Void>, double)>('crispasr_session_set_tts_noise_temp');
+    final rc = fn(_handle, noiseTemp);
+    if (rc != 0 && rc != -2) throw Exception('setTtsNoiseTemp failed (rc=$rc)');
   }
 
   /// Emotion-exaggeration scalar (chatterbox). 0.5 default.

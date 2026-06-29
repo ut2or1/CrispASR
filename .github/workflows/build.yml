@@ -864,6 +864,17 @@ jobs:
           path: crispasr-${{ needs.determine-tag.outputs.tag_name }}-xcframework.zip
           name: crispasr-${{ needs.determine-tag.outputs.tag_name }}-xcframework.zip
 
+      # Attach the xcframework to the GitHub Release on tag pushes. release.yml
+      # has no iOS job, so this is the only place the Apple xcframework reaches
+      # the release page (prior releases shipped it as a CI artifact only).
+      - name: Attach xcframework to release
+        if: ${{ github.ref_type == 'tag' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.determine-tag.outputs.tag_name }}
+          files: crispasr-${{ needs.determine-tag.outputs.tag_name }}-xcframework.zip
+          fail_on_unmatched_files: false
+
   android:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
             github.event.inputs.run_type == 'full-ci' }}

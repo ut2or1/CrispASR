@@ -16,6 +16,8 @@
 #include "common.h"
 #include "common-ggml.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -285,6 +287,97 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     // talker.token_embd.weight at F16; block projections are safe to quantize.
     const bool is_orpheus = (arch.find("orpheus") != std::string::npos);
 
+    // TADA TTS: Llama-3.2-3B talker + per-token flow-matching head. The
+    // conditioning path and FM head are unusually precision-sensitive:
+    // small errors in acoustic/time embeddings and FM velocity predictions
+    // compound over Euler steps and CFG, changing predicted durations and
+    // codec-frame placement. Keep token embeddings, all TADA conditioning,
+    // and the FM head at source precision; quantize only the large talker
+    // block projection matrices.
+    const bool is_tada = (arch.find("tada-tts") != std::string::npos || arch.find("tada_tts") != std::string::npos);
+    const char* env_tada_all = std::getenv("CRISPASR_TADA_QUANT_ALL");
+    const bool tada_quant_all = is_tada && env_tada_all && *env_tada_all && *env_tada_all != '0';
+    if (is_tada && tada_quant_all) {
+        printf("%s: tada-tts - quantizing precision-sensitive tada.* tensors (experimental override)\n", __func__);
+    }
+    int tada_n_layers = 0;
+    int tada_keep_head = 0;
+    int tada_keep_tail = 0;
+    if (is_tada) {
+        int key = gguf_find_key(ctx_in, "tada.talker.n_layers");
+        if (key >= 0)
+            tada_n_layers = (int)gguf_get_val_u32(ctx_in, key);
+        if (const char* env_h = std::getenv("CRISPASR_TADA_KEEP_F16_HEAD"))
+            tada_keep_head = std::max(0, atoi(env_h));
+        if (const char* env_t = std::getenv("CRISPASR_TADA_KEEP_F16_TAIL"))
+            tada_keep_tail = std::max(0, atoi(env_t));
+        if (tada_quant_all) {
+            tada_keep_head = 0;
+            tada_keep_tail = 0;
+        }
+        if (!tada_quant_all && (tada_keep_head > 0 || tada_keep_tail > 0)) {
+            const int tail_start = std::max(0, tada_n_layers - tada_keep_tail);
+            if (tada_keep_head > 0 && tada_keep_tail > 0) {
+                printf("%s: tada-tts - keeping talker.blk.0-%d (head) + talker.blk.%d-%d (tail) at source precision "
+                       "(override with CRISPASR_TADA_KEEP_F16_HEAD/TAIL, full quant with CRISPASR_TADA_QUANT_ALL=1)\n",
+                       __func__, tada_keep_head - 1, tail_start, tada_n_layers - 1);
+            } else if (tada_keep_head > 0) {
+                printf("%s: tada-tts - keeping talker.blk.0-%d (head) at source precision "
+                       "(override with CRISPASR_TADA_KEEP_F16_HEAD/TAIL, full quant with CRISPASR_TADA_QUANT_ALL=1)\n",
+                       __func__, tada_keep_head - 1);
+            } else {
+                printf("%s: tada-tts - keeping talker.blk.%d-%d (tail) at source precision "
+                       "(override with CRISPASR_TADA_KEEP_F16_HEAD/TAIL, full quant with CRISPASR_TADA_QUANT_ALL=1)\n",
+                       __func__, tail_start, tada_n_layers - 1);
+            }
+        }
+    }
+
+    // dots.tts: Qwen2.5-1.5B LLM + 18L DiT flow-matching + 24L PatchEncoder.
+    // The DiT conditioning pathway (AdaLN, timestep MLP, input/final projections)
+    // must stay at source precision — quantization noise compounds through
+    // 16 Euler ODE steps × 18 layers × 2 (CFG) = 576 forward passes.
+    // Safe to quantize: LLM attn/ffn projections, DiT attn/ffn projections,
+    // PatchEncoder attn/ffn projections. Keep at source precision:
+    //   - dit.time_emb.* — timestep conditioning (compounds through ODE steps)
+    //   - dit.in_proj.* — DiT input projection
+    //   - dit.final_*.* — DiT output projection + AdaLN
+    //   - dit.blk.*.adaln.* — per-block AdaLN modulation
+    //   - hidden_proj.* — LLM→DiT condition projection
+    //   - latent_proj.* — latent→DiT input
+    //   - coordinate_proj.* — noise coordinate projection
+    //   - xvec_proj.* — speaker embedding projection
+    //   - eos_proj.* — EOS detection head
+    //   - llm.tok_emb.* — token embedding (sampling-critical)
+    //   - latent_stats.* — denormalization constants
+    //   - penc.in_proj/out_proj/ds_conv — PatchEncoder I/O
+    // Vocoder and speaker encoder are in separate GGUFs — quantize normally.
+    const bool is_dots_tts = (arch.find("dots-tts") != std::string::npos || arch.find("dots_tts") != std::string::npos);
+
+    // Parakeet RNNT: the transducer joint network (joint.{enc,pred,out}.weight)
+    // and decoder embedding are structurally sensitive to quantization noise.
+    // The joint network's blank/non-blank decision is a ~3001-way argmax where
+    // the blank token competes with every real token — quantization noise can
+    // flip frames from blank to non-blank, causing the RNNT greedy decoder to
+    // enter a non-terminating emission loop. TDT models are less affected
+    // because the duration head provides an independent advance mechanism.
+    // Default: keep joint.* and decoder.embed.* at source precision for RNNT
+    // models (n_tdt_durations==0). Override with CRISPASR_PARAKEET_QUANT_ALL=1.
+    const bool is_parakeet = (arch == "parakeet");
+    bool parakeet_is_rnnt = false;
+    if (is_parakeet) {
+        int key = gguf_find_key(ctx_in, "parakeet.n_tdt_durations");
+        if (key >= 0)
+            parakeet_is_rnnt = (gguf_get_val_u32(ctx_in, key) == 0);
+    }
+    const char* env_parakeet_all = std::getenv("CRISPASR_PARAKEET_QUANT_ALL");
+    const bool parakeet_quant_all = is_parakeet && env_parakeet_all && *env_parakeet_all && *env_parakeet_all != '0';
+    if (is_parakeet && parakeet_is_rnnt && !parakeet_quant_all) {
+        printf("%s: parakeet RNNT — keeping joint.* and decoder.embed.* at source precision "
+               "(override with CRISPASR_PARAKEET_QUANT_ALL=1)\n",
+               __func__);
+    }
+
     // First pass: determine which tensors will be quantized and compute
     // their target types. We need this BEFORE adding tensors to ctx_out
     // so that gguf_add_tensor computes correct offsets for the quantized
@@ -328,6 +421,14 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                sname == "cosyvoice3.flow.input_embd.w" || sname == "cosyvoice3.flow.spk_affine.w" ||
                sname == "cosyvoice3.s3tok.fsq.proj.w")) &&
             !is_f5tts &&
+            !(is_dots_tts &&
+              (sname.find("dots.dit.time_emb.") == 0 || sname.find("dots.dit.in_proj.") == 0 ||
+               sname.find("dots.dit.final_") == 0 || sname.find(".adaln.") != std::string::npos ||
+               sname.find("dots.hidden_proj.") == 0 || sname.find("dots.latent_proj.") == 0 ||
+               sname.find("dots.coordinate_proj.") == 0 || sname.find("dots.xvec_proj.") == 0 ||
+               sname.find("dots.eos_proj.") == 0 || sname.find("dots.llm.tok_emb.") == 0 ||
+               sname.find("dots.latent_stats.") == 0 || sname.find("dots.penc.in_proj.") == 0 ||
+               sname.find("dots.penc.out_proj.") == 0 || sname.find("dots.penc.ds_conv.") == 0)) &&
             !(is_qwen3_tts && (sname.find("speaker.") == 0 || sname.find("code_pred.token_embd") == 0 ||
                                sname.find("code_pred.output") == 0 || sname.find("code_pred.small_to_mtp") == 0 ||
                                sname.find("talker.token_embd") == 0 || sname.find("talker.text_proj") == 0 ||
@@ -346,7 +447,28 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                                 sname.find("depth.codebook.") == 0 || sname.find("preprocessor.") == 0)) &&
             !(is_mini_omni2 &&
               (sname.find("audio.") == 0 || sname.find("adapter.") == 0 || sname.find("llm.token_embd") == 0)) &&
-            !(is_orpheus && sname.find("talker.token_embd") == 0) && ([&]() {
+            !(is_orpheus && sname.find("talker.token_embd") == 0) &&
+            !(is_parakeet && parakeet_is_rnnt && !parakeet_quant_all &&
+              (sname.find("joint.") == 0 || sname.find("decoder.embed") == 0)) &&
+            !(is_tada && !tada_quant_all && (sname.find("talker.token_embd") == 0 || sname.find("tada.") == 0)) &&
+            ([&]() {
+                if (!is_tada || tada_quant_all || (tada_keep_head == 0 && tada_keep_tail == 0))
+                    return true;
+                if (sname.rfind("talker.blk.", 0) != 0)
+                    return true;
+                int idx = 0;
+                size_t p = strlen("talker.blk.");
+                while (p < sname.size() && sname[p] >= '0' && sname[p] <= '9') {
+                    idx = idx * 10 + (sname[p] - '0');
+                    p++;
+                }
+                if (p == strlen("talker.blk."))
+                    return true;
+                const bool in_head = idx < tada_keep_head;
+                const bool in_tail = tada_keep_tail > 0 && idx >= std::max(0, tada_n_layers - tada_keep_tail);
+                return !(in_head || in_tail);
+            }()) &&
+            ([&]() {
                 if (!is_omniasr_ctc || omniasr_quant_all ||
                     (omniasr_head_cutoff == 0 && omniasr_tail_cutoff >= omniasr_n_enc))
                     return true;

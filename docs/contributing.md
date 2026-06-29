@@ -44,6 +44,34 @@ Use `src/core/mel`, `src/core/ffn`, `src/core/attention`, and
 `src/core/gguf_loader` wherever they fit — they cover ~80 % of the
 boilerplate.
 
+**Add bench instrumentation.** Every runtime gets per-stage RAII timing
+gated by `YOURMODEL_BENCH=1`:
+
+```cpp
+static bool yourmodel_bench_enabled() {
+    static int v = -1;
+    if (v < 0) { const char* e = std::getenv("YOURMODEL_BENCH");
+                  v = (e && *e && *e != '0') ? 1 : 0; }
+    return v != 0;
+}
+struct yourmodel_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit yourmodel_bench_stage(const char* n)
+        : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~yourmodel_bench_stage() {
+        if (!yourmodel_bench_enabled()) return;
+        double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "  yourmodel_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
+```
+
+Place `yourmodel_bench_stage _b("stage_name");` at each pipeline stage
+(mel, encoder, decoder, vocoder, etc.). Zero overhead when the env var
+is unset (~1 ns cached getenv).
+
 ## 2. Write the backend adapter
 
 Create `examples/cli/crispasr_backend_yourmodel.cpp`:
@@ -203,6 +231,14 @@ Nine edit points, each mirroring the `CA_HAVE_CHATTERBOX` blocks:
    dispatch. This lets `set_ask()` override the default transcription
    instruction. Currently wired for: granite, voxtral, qwen3-asr,
    glm-asr, gemma4-e2b, mimo-asr.
+9b. **`params.language` wiring** — if the backend is an audio-LLM, also
+   inject a language hint into the prompt when `params.language` is set
+   and non-auto. Pattern: `else if (!params.language.empty() && params.language
+   != "auto") { sys_instruction = "Transcribe the speech in " + lang_name(params.language) + "."; }`.
+   For **English-only** models (moonshine-streaming, kyutai-stt), emit a
+   `fprintf(stderr, ...)` warning instead of silently ignoring the flag.
+   Currently wired for: granite (v3 + v4 templates), qwen3-asr, glm-asr,
+   moss-audio, mimo-asr; warned for moonshine-streaming, kyutai-stt.
 10. **`crispasr_session_set_speaker_id()`** — if the backend is a
     multi-speaker TTS model with integer-indexed speakers (e.g. melotts,
     piper, fastpitch). Add a dispatch block that bounds-checks against
@@ -349,6 +385,56 @@ PyTorch model loading OOMs easily on this machine. Patterns:
 - `del state_dict; gc.collect()` after `model.load_state_dict()`
 - Use `--stages mel_spectrogram,encoder_output` to skip LLM loading
   entirely when only testing the audio pipeline
+
+### GPU / CUDA correctness (it works on Metal ≠ it works on CUDA)
+
+Apple-silicon Metal uses unified memory, so the CPU backend can read GPU
+buffers. That hides two whole classes of bug that abort on CUDA — always
+sanity-check a GPU-enabled backend on a real discrete GPU (Kaggle T4/P100),
+not just M1.
+
+- **Compute a `sched`-allocated graph with the `sched`, never a raw backend.**
+  If you allocate with `ggml_backend_sched_alloc_graph(sched, gf)`, you MUST run
+  it with `ggml_backend_sched_graph_compute(sched, gf)`. Calling
+  `ggml_backend_graph_compute(backend_cpu, gf)` instead dereferences
+  GPU-resident weights on the CPU backend — a silent no-op on Metal, an illegal
+  access on CUDA. (FastPitch shipped this on its decoder + vocoder graphs while
+  the encoder graph was correct — §204.)
+- **`core_convt::convt1d_decomp` is channel-major; `convt1d_decomp_tf` is
+  time-first.** The decomposed ConvTranspose1d's first op is
+  `mul_mat(w_perm[IC, K*OC], x)`, which needs `x->ne0 = IC`. `core_hifigan` (and
+  any pipeline built from `ggml_conv_1d`) is **time-major** `(T, C)` — `ne0 = T`,
+  not `IC` — so it must use the `_tf` variant. The wrong one aborts on
+  `ggml_can_mul_mat` on *all* backends. When a `mul_mat`/conv asserts inside a
+  shared vocoder, suspect the input's contiguous axis, not the weights (§204).
+- **`ggml_backend_sched` + a weight-less first op corrupts the GPU graph.** If a
+  subgraph's leading op is weight-less (e.g. RMSNorm/LayerNorm before any matmul),
+  the scheduler (op_offload=false) places that op *and the leaf input* on the CPU
+  backend, then inserts a CPU→GPU copy of the activation to feed the next op — and
+  on the current ggml revision that cross-backend copy is **miscomputed**, so the
+  whole subgraph is garbage on GPU while CPU stays bit-correct. (Graphs whose
+  first op uses a weight keep the input on the GPU and are fine — that's why
+  encoders/adapters worked but the LFM2 backbone didn't, §206.) **Diagnose** with
+  `GGML_SCHED_DEBUG=2` — look for a leaf input on `[CPU]` and `#<backend>#...#0`
+  copy nodes. Gotcha: a standalone op test "on Metal" via the sched may silently
+  run on CPU for *both* the CPU and Metal runs, trivially matching and masking the
+  bug — confirm each op's real backend. **Fix:** when a whole subgraph is supported
+  on the active backend, compute it *directly* with `ggml_gallocr` +
+  `ggml_backend_graph_compute(ctx->backend, gf)` instead of the scheduler — a
+  single-backend graph never inserts the broken copy. (Pinning the input with
+  `set_tensor_backend` or `op_offload=true` did **not** help; only avoiding the
+  split did.) Fixed lfm2-audio (§206) and kugelaudio (§209), which share this bug.
+- **Mixing gallocr and sched when one graph has a Metal-unsupported op.** If most
+  graphs need the gallocr fix above but ONE uses an op the active backend can't run
+  (kugelaudio's VAE decoder uses `ggml_pad` — the causal-conv left-pad — which Metal
+  rejects), gallocr has no fallback and aborts (`unsupported op 'PAD'`). Keep that
+  one graph on `ggml_backend_sched` (which falls back to CPU for the unsupported op;
+  on CUDA `PAD` is supported, so it runs fully on GPU) and run the rest on gallocr.
+  This is safe as long as the sched-routed graph's *first* op uses a weight (input
+  lands on GPU) — only the leaf-input + weight-less-first-op combo triggers the
+  broken cross-backend copy; mid-graph CPU splits are fine. (A `ggml_concat`-of-a-
+  scaled-view "manual pad" to avoid `GGML_OP_PAD` fails when pad > input length —
+  you can't build zeros wider than the source view.)
 
 ## Watermarking tests
 

@@ -200,11 +200,14 @@ regression test against `samples/jfk.wav`:
   omniasr-LLM, gemma4-e2b, mimo-asr, vibevoice): audio features
   injected into LLM embedding space, KV-cached autoregressive
   decoding.
-- **Transducer** (parakeet): LSTM predictor + joint network,
-  frame-synchronous TDT decoding. Supports greedy (default),
-  label-looping beam search (`-bs N`), and MAES (Modified Adaptive
-  Expansion Search — `CRISPASR_PARAKEET_MAES=1 -bs N`), with per-beam
-  LSTM state snapshots and per-beam hotword trie tracking.
+- **Transducer** (parakeet, reazonspeech): LSTM predictor + joint
+  network, frame-synchronous TDT/RNNT decoding. Supports greedy
+  (default), label-looping beam search (`-bs N`), and MAES (Modified
+  Adaptive Expansion Search — `CRISPASR_PARAKEET_MAES=1 -bs N`), with
+  per-beam LSTM state snapshots and per-beam hotword trie tracking.
+  Models with `n_tdt_durations=0` auto-select the pure RNNT decode
+  path; local attention (`att_context_size`) is supported for long-form
+  models like ReazonSpeech.
 - **Codec + LM** (kyutai-stt): neural audio codec (RVQ) →
   token-based LM.
 - **TTS — codec / vocoder pipeline**:
@@ -876,6 +879,29 @@ HumeAI TADA-3B-ML (`HumeAI/tada-3b-ml`). Two GGUFs: backbone talker + codec.
 Models: `HumeAI/tada-3b-ml` (backbone Q4_K ~2.2 GB) + companion codec GGUF
 (~1 GB). Pass `--codec-model <codec.gguf>`.
 
+#### tada-encoder (voice reference creation)
+
+The encoder pipeline converts audio + transcript → aligned acoustic features
+for voice cloning. Ported to C++ in `src/tada_encoder.{h,cpp}`:
+
+- **Aligner**: wav2vec2-large (24L, 1024-d, 16 heads) fine-tuned with 128K-class
+  CTC head (Llama-3.2 tokenizer vocab). Resamples 24kHz→16kHz internally. Outputs
+  frame-level logits → DP alignment algorithm → `token_positions` + `token_masks`.
+- **WavEncoder**: DAC-style strided conv encoder. Conv1d(1→64, k=7) → 4×
+  EncoderBlock (strides [6,5,4,4], Snake1d activations, weight-normed convs,
+  3× ResidualUnit per block with dilations 1,3,9) → Snake1d → Conv1d(1024→1024).
+  Total 480× downsample: 24kHz → 50Hz.
+- **LocalAttentionEncoder**: 6-layer transformer, 1024-d, 8 heads, head_dim=128,
+  RoPE (θ=10000), GELU FFN (4096), v2 segment attention mask, post-norm. Input
+  augmented with `pos_emb(token_masks)` (Embedding(2, 1024)).
+- **hidden_linear**: Linear(1024→512).
+- **Post-processing**: zero non-token frames, add Gaussian noise (std=0.5),
+  gather at token positions, normalize by (mean=0, std=1.5).
+
+GGUFs at [cstr/tada-encoder-GGUF](https://huggingface.co/cstr/tada-encoder-GGUF):
+`tada-encoder-f16.gguf` (178 MB, shared encoder) + `tada-aligner-en.gguf`
+(1.1 GB, wav2vec2-large + CTC head, loaded by `wav2vec2_load()`).
+
 ### mini-omni2
 
 gpt-omni/mini-omni2 (`gpt-omni/mini-omni2`). Multimodal speech model
@@ -901,3 +927,65 @@ supporting ASR, TTS, and speech-to-speech.
 
 Models: single GGUF (F16 ~1.6 GB) converted from `lit_model.pth` + `small.pt`.
 For TTS/S2S, also needs SNAC codec GGUF (`--codec-model snac-24khz.gguf`).
+
+### reazonspeech
+
+ReazonSpeech NeMo v2 (reazon-research, Apache-2.0): 619M-param Japanese
+FastConformer-RNNT ASR model trained on the ReazonSpeech v2.0 corpus.
+
+```
+Audio → 80 log-mel (n_fft=512, Hann, per-feature z-norm)
+      → dw_striding 8× subsampling (5× Conv2d + Linear)
+      → 24 FastConformer blocks (rel_pos_local_attn, window=[128,128], 1 global token)
+      → RNNT joint network (enc→640, pred→640, ReLU, →3001)
+      → 2-layer LSTM predictor (embed(3001,640) + LSTM(640,640)×2)
+      → RNNT greedy decode (n_tdt_durations=0)
+```
+
+Key architectural points:
+- Reuses the `parakeet` runtime entirely — same GGUF arch tag, same C runtime
+- **Local attention** (`self_attention_model: rel_pos_local_attn`): each position
+  attends only to [q-128, q+128] plus 1 global token at position 0. Implemented
+  via an additive (T,T) mask in `core_conformer::build_block()`. For audio shorter
+  than ~20s (T_enc < 257), the window covers the full sequence = full attention.
+- **Pure RNNT** (no TDT duration head): `n_tdt_durations=0` triggers the dedicated
+  `parakeet_rnnt_decode()` / `parakeet_rnnt_beam_decode()` paths.
+- **Quantization**: RNNT joint network is structurally sensitive to quantization
+  noise (blank/non-blank argmax can flip). `crispasr-quantize` keeps
+  `joint.*` and `decoder.embed.*` at source precision for RNNT models by default
+  (override with `CRISPASR_PARAKEET_QUANT_ALL=1`). Q8_0 (704 MB) is the recommended
+  deployment quant; Q4_K (455 MB) works with the RNNT protection rule.
+- 3000-token SentencePiece unigram vocabulary, Japanese only.
+- **Parity**: transcript-identical to upstream NeMo Python / `reazonspeech`
+  package on gTTS Japanese test audio (verified on Kaggle, 2026-06-28).
+
+Models at `cstr/reazonspeech-nemo-v2-GGUF`: F16 (1240 MB), Q8_0 (704 MB), Q4_K (455 MB).
+
+### parakeet-ctc-1.1b-ja
+
+Community Japanese fine-tune of nvidia/parakeet-ctc-1.1b (grider-transwithai,
+Apache-2.0). 42-layer FastConformer-CTC, 1.1B params.
+
+```
+Audio → 80 log-mel (n_fft=512, Hann, per-feature z-norm)
+      → dw_striding 8× subsampling (5× Conv2d + Linear)
+      → 42 FastConformer blocks (rel_pos, full attention, xscaling)
+      → CTC head (Conv1d(1024 → 4001, k=1))
+      → CTC greedy decode
+```
+
+Key points:
+- Same architecture and runtime as the English parakeet-ctc-{0.6b,1.1b} models.
+  Uses the `canary-ctc` GGUF arch tag + `canary_ctc.cpp` runtime.
+- **Checkpoint selection**: the HF repo has two `.nemo` files. `parakeet-ja.nemo`
+  has **corrupt F32 weights** in layers 26-28 (NaN + values >1e38 in
+  `attn.v.weight` and `ff1.linear1.weight`). Only `parakeet-ja-gal.nemo` works.
+- **Quantization**: Q8_0 is the recommended deployment quant. Q4_K degrades on
+  the 42-layer CTC encoder (same finding as English parakeet-ctc-1.1b and
+  OmniASR-CTC — CTC argmax is structurally sensitive to accumulated
+  quantization noise across many layers).
+- 4000-token SentencePiece unigram vocabulary, Japanese only.
+- **Parity**: transcript-identical to upstream NeMo Python on gTTS Japanese
+  test audio (verified on Kaggle, 2026-06-28).
+
+Models at `cstr/parakeet-ctc-1.1b-ja-GGUF`: F16 (2.0 GB), Q8_0 (1.2 GB), Q4_K (631 MB).

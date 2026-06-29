@@ -156,6 +156,11 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # Driven by ORPHEUS_SNAC_T_SUPER (default 4) + ORPHEUS_SNAC_CODE
     # (default 0); see reference_backends/orpheus_snac.py.
     "orpheus":    "reference_backends.orpheus_snac",
+    # Orpheus talker (Llama-3.2-3B-FT): greedy codec-token stream for the
+    # AR-decode diff (§176b bucket). model_dir = the talker LM HF snapshot
+    # (e.g. unsloth/orpheus-3b-0.1-ft); audio arg unused. Driven by
+    # ORPHEUS_TEXT / ORPHEUS_SPEAKER; see reference_backends/orpheus_talker.py.
+    "orpheus-talker": "reference_backends.orpheus_talker",
     # Chatterbox TTS: T3 (Llama AR) → S3Gen (CFM) → HiFTGenerator.
     # model_dir = ResembleAI/chatterbox snapshot (or local with
     # t3_cfg.safetensors + s3gen.safetensors + ve.safetensors + conds.pt).
@@ -244,6 +249,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # model_dir = HumeAI/tada-3b-ml HF id or local snapshot.
     # Audio arg is unused (text-driven). Text from TADA_SYN_TEXT env var.
     "tada-tts":   "reference_backends.tada_tts",
+    # TADA encoder: Aligner + WavEncoder + LocalAttentionEncoder → voice reference.
+    # model_dir = HumeAI/tada-codec or local path. Audio arg is the reference audio.
+    # Text from TADA_ENCODER_TEXT, language from TADA_ENCODER_LANG env vars.
+    "tada-encoder": "reference_backends.tada_encoder",
     # Zyphra/Zonos-v0.1-transformer: GPT-style AR TTS with 9-codebook DAC.
     # model_dir = Zyphra/Zonos-v0.1-transformer HF id or local snapshot.
     # Audio arg is unused (text-driven). Text + seed from env vars:

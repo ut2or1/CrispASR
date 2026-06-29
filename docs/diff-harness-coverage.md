@@ -17,6 +17,23 @@ at `tools/reference_backends/<name>.py`, add an env spec at
 `examples/cli/crispasr_diff_main.cpp`. Then `tools/bootstrap_ref_env.sh
 <name>` + `python tools/dump_reference.py --backend <name> ...`.
 
+Reference dumps are archived to HuggingFace: each `<name>-ref.gguf`
+lives under `diff-harness-ref/` in that model's GGUF repo (e.g.
+`cstr/chatterbox-GGUF/diff-harness-ref/chatterbox-ref.gguf`,
+`cstr/canary-1b-v2-GGUF`, `cstr/zonos-v0.1-transformer-GGUF`; the
+`orpheus` backend's ref is the SNAC decoder, archived in
+`cstr/snac-24khz-GGUF`). Fetch one to run the harness without
+regenerating (which needs the model download + a per-backend env).
+
+The `chatterbox` backend also has a **deterministic `t3_text_tokens` stage**
+(#170) that checks the multilingual text tokenization (normalize + NFKD + BPE +
+`[lang]`) against the upstream `MTLTokenizer` with an exact integer-match. It
+needs only the tokenizer, not the full model: generate the ref with
+`tools/gen_chatterbox_text_token_ref.py --tokenizer grapheme_mtl.json --lang ar
+--text "..."` and run with `CHATTERBOX_LANG=ar CHATTERBOX_SYN_TEXT="..."
+crispasr-diff chatterbox <t3.gguf> <ref.gguf> <any.wav>`. The Arabic ref is
+archived at `cstr/chatterbox-GGUF/diff-harness-ref/`.
+
 | backend | ref module | archive | mtime | harness | deps |
 |---|---|---|---|---|---|
 | `canary` | `tools/reference_backends/canary.py` | — | — | yes | nemo, torch |
@@ -48,6 +65,7 @@ at `tools/reference_backends/<name>.py`, add an env spec at
 | `moss-audio` | `tools/reference_backends/moss_audio.py` | — | — | yes | safetensors, torch, transformers |
 | `nemotron` | `tools/reference_backends/nemotron.py` | — | — | yes | gguf, nemo, soundfile, torch, torchaudio |
 | `orpheus` | `tools/reference_backends/orpheus_snac.py` | — | — | yes | snac, torch |
+| `orpheus-talker` | `tools/reference_backends/orpheus_talker.py` | — | — | yes | torch, transformers |
 | `paraformer` | `tools/reference_backends/paraformer.py` | — | — | yes | funasr, torch |
 | `parakeet` | `tools/reference_backends/parakeet.py` | — | — | yes | nemo, torch |
 | `parakeet-maes` | `tools/reference_backends/parakeet_maes.py` | — | — | **no** | nemo, torch |
@@ -86,7 +104,7 @@ code starts working.
 - `granite-nle` — `tools/bootstrap_ref_env.sh granite-nle` then `python tools/dump_reference.py --backend granite-nle --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/granite-nle-ref.gguf`
 - `kokoro` — `tools/bootstrap_ref_env.sh kokoro` then `python tools/dump_reference.py --backend kokoro --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/kokoro-ref.gguf`
 - `kugelaudio` — `tools/bootstrap_ref_env.sh kugelaudio` then `python tools/dump_reference.py --backend kugelaudio --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/kugelaudio-ref.gguf`
-- `lfm2-audio` — `tools/bootstrap_ref_env.sh lfm2-audio` then `python tools/dump_reference.py --backend lfm2-audio --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/lfm2-audio-ref.gguf`
+- `lfm2-audio` — `tools/bootstrap_ref_env.sh lfm2-audio` then `python tools/dump_reference.py --backend lfm2-audio --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/lfm2-audio-ref.gguf`. A prebuilt JFK reference (audio-only backbone stages) is published at `cstr/crispasr-regression-fixtures` `lfm2-audio-1.5b/jfk_11s/ref.gguf`; run the GPU diff with `CRISPASR_DIFF_USE_GPU=1 ./build/bin/crispasr-diff lfm2-audio <q5k.gguf> <ref.gguf> samples/jfk.wav` (§206).
 - `lid-cld3` — `tools/bootstrap_ref_env.sh lid-cld3` then `python tools/dump_reference.py --backend lid-cld3 --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/lid-cld3-ref.gguf`
 - `lid-fasttext176` — `tools/bootstrap_ref_env.sh lid-fasttext176` then `python tools/dump_reference.py --backend lid-fasttext176 --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/lid-fasttext176-ref.gguf`
 - `lid-glotlid` — `tools/bootstrap_ref_env.sh lid-glotlid` then `python tools/dump_reference.py --backend lid-glotlid --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/lid-glotlid-ref.gguf`
@@ -98,9 +116,10 @@ code starts working.
 - `moss-audio` — `tools/bootstrap_ref_env.sh moss-audio` then `python tools/dump_reference.py --backend moss-audio --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/moss-audio-ref.gguf`
 - `nemotron` — `tools/bootstrap_ref_env.sh nemotron` then `python tools/dump_reference.py --backend nemotron --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/nemotron-ref.gguf`
 - `orpheus` — `tools/bootstrap_ref_env.sh orpheus` then `python tools/dump_reference.py --backend orpheus --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/orpheus-snac-ref.gguf`
+- `orpheus-talker` — talker (Llama-3.2-3B) AR-decode greedy codec stream. `ORPHEUS_TEXT/SPEAKER/REF_DTYPE` + `ORPHEUS_CUSTOM_OFFSET/COUNT` (match the GGUF), `--model-dir` = the talker LM HF snapshot (e.g. `unsloth/orpheus-3b-0.1-ft`). Run with `crispasr-diff orpheus-talker <talker.gguf> <ref.gguf> <audio>` (`ORPHEUS_DIFF_GPU=1` for the GPU AR loop; `ORPHEUS_DIFF_MAXGEN` caps it). Frozen ref at `hf.co/cstr/orpheus-3b-0.1-ft-GGUF/diff-harness-ref/orpheus-talker-ref.gguf`. Full build→quantize→diff→upload runs on Kaggle via `tools/kaggle/orpheus-talker-cuda/`.
 - `paraformer` — `tools/bootstrap_ref_env.sh paraformer` then `python tools/dump_reference.py --backend paraformer --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/paraformer-ref.gguf`
 - `parakeet` — `tools/bootstrap_ref_env.sh parakeet` then `python tools/dump_reference.py --backend parakeet --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/parakeet-ref.gguf`
-- `parler-tts` — `tools/bootstrap_ref_env.sh parler-tts` then `python tools/dump_reference.py --backend parler-tts --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/parler-tts-ref.gguf`
+- `parler-tts` — `tools/bootstrap_ref_env.sh parler-tts` then `python tools/dump_reference.py --backend parler-tts --model-dir <dir> --audio samples/jfk.wav --output parler-tts-ref.gguf` (PARLER_TEXT/PARLER_DESC/PARLER_SEED env set desc/text/seed; needs transformers 4.46.x — newer trips parler's config repr). Frozen ref archived at `hf.co/cstr/parler-tts-mini-v1.1-GGUF/parler-mini-v1.1-ref.gguf`. Run with `crispasr-diff parler-tts <model.gguf> <ref.gguf> <audio.wav>` (cap steps via `PARLER_DIFF_MAXGEN`). F16: legacy + bucket both 108/108 vs F32 ground truth.
 - `qwen3` — `tools/bootstrap_ref_env.sh qwen3` then `python tools/dump_reference.py --backend qwen3 --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/qwen3-ref.gguf`
 - `qwen3-tts` — `tools/bootstrap_ref_env.sh qwen3-tts` then `python tools/dump_reference.py --backend qwen3-tts --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/qwen3-tts-ref.gguf`
 - `qwen3-tts-cenc` — `tools/bootstrap_ref_env.sh qwen3-tts-cenc` then `python tools/dump_reference.py --backend qwen3-tts-cenc --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/qwen3-tts-cenc-ref.gguf`

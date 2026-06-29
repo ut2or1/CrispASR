@@ -127,8 +127,12 @@ ASR backends.
 | kokoro (TTS)        | ✓     | ✓     | —     | —     | Q5_K and below break the German backbone — ship F16 + Q8_0 only.         |
 | qwen3-tts           | ✓     | ✓     | ✓     | ✓     |                                                                          |
 | vibevoice (TTS)     | ✓     | ✓     | ✓     | ✓     | F16 + Q4_K shipped.                                                      |
-| chatterbox (TTS)    | ✓     | ✓     | ✓     | ✓     | Vocoder/F0/embeddings auto-skipped. F16 + Q8_0 + Q4_K shipped.           |
+| chatterbox (TTS)    | ✓     | ✓     | ✓     | ✓     | Vocoder/F0/embeddings auto-skipped. F16 + Q8_0 + Q4_K shipped. On **Metal** a quantized S3Gen CFM has its `s3.fd.*` weights dequantised to F16 at load and kept GPU-resident (Metal's q8 mat-vec kernel requantises activations to q8 and corrupts the CFM — NaN/garbage; F16 weights take the correct `mul_mm_f16_f32_hp` path at full GPU speed). F16 S3Gen and all CUDA are unaffected. `CRISPASR_S3GEN_UNET_CPU=1` forces the slower all-CPU route. |
 
 > The cells marked `—` are not just "untested" — they have a known
 > quality regression. See [`PERFORMANCE.md`](../PERFORMANCE.md) for
 > the full benchmark numbers and the per-quant WER deltas.
+>
+> **Chatterbox q8 on Apple Silicon:** the auto CFM→CPU route (above) makes the
+> q8 S3Gen flow-matcher correct but slower than F16-on-GPU on Metal. For fast
+> *and* correct synthesis on M1/M2, prefer the F16 S3Gen GGUF.

@@ -115,7 +115,7 @@ Requires `pip install gguf safetensors torch huggingface_hub`.
 ## Related models
 
 - [`cstr/lahgtna-chatterbox-v1-GGUF`](https://huggingface.co/cstr/lahgtna-chatterbox-v1-GGUF) — Arabic T3 variant (MIT, shares S3Gen)
-- [`cstr/orpheus-3b-base-GGUF`](https://huggingface.co/cstr/orpheus-3b-base-GGUF) — Llama-3.2 + SNAC TTS
+- [`cstr/orpheus-3b-0.1-ft-GGUF`](https://huggingface.co/cstr/orpheus-3b-0.1-ft-GGUF) — Llama-3.2 + SNAC TTS
 - [`cstr/qwen3-tts-0.6b-customvoice-GGUF`](https://huggingface.co/cstr/qwen3-tts-0.6b-customvoice-GGUF) — Qwen3-TTS with fixed speakers
 
 ## License

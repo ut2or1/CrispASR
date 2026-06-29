@@ -10,7 +10,12 @@
 #include "ggml.h"
 #include "gguf.h"
 
+#if defined(HAVE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#endif
+
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +27,46 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// The ECAPA encoder runs in a ggml graph (Metal), but the Attentive Statistical
+// Pooling head (ASP TDNN 128×9216×T + attention conv 3072×128×T) is hand-rolled
+// CPU scalar math — the dominant cost of LID inference. PLAN: Accelerate
+// cblas_sgemm. Set ECAPA_FORCE_SCALAR=1 to validate scalar == GEMM or run on
+// non-Apple.
+static bool ecapa_use_scalar() {
+#if defined(HAVE_ACCELERATE)
+    static const bool force_scalar = std::getenv("ECAPA_FORCE_SCALAR") != nullptr;
+    return force_scalar;
+#else
+    return true;
+#endif
+}
+
+// ===========================================================================
+// Bench instrumentation — `ECAPA_LID_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool ecapa_lid_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("ECAPA_LID_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct ecapa_lid_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit ecapa_lid_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~ecapa_lid_bench_stage() {
+        if (!ecapa_lid_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  ecapa_lid_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ===========================================================================
 // Model — stores ggml tensor pointers into the weight buffer
@@ -256,11 +301,17 @@ extern "C" struct ecapa_lid_context* ecapa_lid_init(const char* model_path, int 
     fprintf(stderr, "ecapa_lid: %d mels, %d classes, %d emb_dim, cls_type=%d, %zu labels\n", m.n_mels, m.n_classes,
             m.lin_neurons, m.cls_type, m.labels.size());
 
-    ctx->backend = ggml_backend_init_best();
+    // ECAPA-LID is a small model whose graph was designed for CPU + BLAS (see
+    // header) and was never validated on GPU — running the encoder on Metal
+    // produces garbage embeddings. Use the CPU backend: it's fast enough for a
+    // 43 MB model, is correct, and keeps the sched's last backend CPU (ggml
+    // asserts on a GPU-only sched). The ASP head is Accelerate-GEMM'd below.
+    ctx->backend = ggml_backend_cpu_init();
     if (!ctx->backend) {
         delete ctx;
         return nullptr;
     }
+    ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
 
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(model_path, ctx->backend, "ecapa-tdnn-lid", wl)) {
@@ -327,10 +378,15 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
         return it != ts.end() ? it->second : nullptr;
     };
 
+    ecapa_lid_bench_stage _bs_total("detect_total");
+
     // 1. Fbank on CPU
     std::vector<float> fbank;
     int T = 0;
-    compute_fbank(samples, n_samples, fbank, T, m.mel_fb_embedded, m.n_fft_orig, m.n_mels);
+    {
+        ecapa_lid_bench_stage _bs("feature_extraction");
+        compute_fbank(samples, n_samples, fbank, T, m.mel_fb_embedded, m.n_fft_orig, m.n_mels);
+    }
     if (T <= 0)
         return nullptr;
 
@@ -510,7 +566,8 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
     // Our CPU code expects [C, T]: data[c*T+t] — SAME layout! Just alias.
     std::vector<float>& mfa_ct = mfa_data;
 
-    // ASP on CPU (small computation, not worth ggml overhead)
+    // ASP on CPU. The TDNN + attention matmuls below are the LID hotspot.
+    const auto asp_t0 = std::chrono::steady_clock::now();
     std::vector<float> h_mean(C_mfa, 0), h_std(C_mfa, 0);
     for (int c = 0; c < C_mfa; c++) {
         float sum = 0, sum2 = 0;
@@ -537,6 +594,19 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
             std::vector<uint16_t> tmp(n);
             ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(uint16_t));
             ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t*>(tmp.data()), out.data(), n);
+        } else {
+            // Quantized (q8_0/q4_k/…): dequantize via the type's to_float.
+            // crispasr-quantize quantizes the CPU-read ASP/FC head weights;
+            // without this branch they read back as zeros → garbage embedding
+            // (this is why the q8_0 ecapa GGUF produced near-uniform output).
+            const struct ggml_type_traits* tr = ggml_get_type_traits(t->type);
+            if (tr && tr->to_float) {
+                std::vector<char> raw(ggml_nbytes(t));
+                ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+                tr->to_float(raw.data(), out.data(), n);
+            } else {
+                std::fill(out.begin(), out.end(), 0.0f);
+            }
         }
     };
 
@@ -549,17 +619,45 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
     read_f32(G("emb.asp.tdnn.bn.running_mean"), asp_bn_m);
     read_f32(G("emb.asp.tdnn.bn.running_var"), asp_bn_v);
 
-    // TDNN: [9216→128, k=1]
+    // TDNN: [9216→128, k=1]. Input is [mfa; mean⊗1; std⊗1] stacked to [9216, T].
     std::vector<float> asp_h(128 * T_mfa, 0);
-    for (int i = 0; i < 128; i++) {
-        for (int t = 0; t < T_mfa; t++) {
-            double s = asp_tdnn_b.empty() ? 0 : asp_tdnn_b[i];
-            for (int c = 0; c < C_mfa; c++) {
-                s += mfa_ct[c * T_mfa + t] * asp_tdnn_w[i * 9216 + c];
-                s += h_mean[c] * asp_tdnn_w[i * 9216 + C_mfa + c];
-                s += h_std[c] * asp_tdnn_w[i * 9216 + 2 * C_mfa + c];
+#if defined(HAVE_ACCELERATE)
+    if (!ecapa_use_scalar()) {
+        const int K = 3 * C_mfa; // 9216
+        std::vector<float> X((size_t)K * T_mfa);
+        std::memcpy(X.data(), mfa_ct.data(), (size_t)C_mfa * T_mfa * sizeof(float));
+        for (int c = 0; c < C_mfa; c++) {
+            float* rm = X.data() + (size_t)(C_mfa + c) * T_mfa;
+            float* rs = X.data() + (size_t)(2 * C_mfa + c) * T_mfa;
+            float vm = h_mean[c], vs = h_std[c];
+            for (int t = 0; t < T_mfa; t++) {
+                rm[t] = vm;
+                rs[t] = vs;
             }
-            asp_h[i * T_mfa + t] = (float)s;
+        }
+        // asp_h[128, T] = W[128, 9216] @ X[9216, T]
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, 128, T_mfa, K, 1.0f, asp_tdnn_w.data(), K, X.data(),
+                    T_mfa, 0.0f, asp_h.data(), T_mfa);
+        if (!asp_tdnn_b.empty())
+            for (int i = 0; i < 128; i++) {
+                float b = asp_tdnn_b[i];
+                float* row = asp_h.data() + (size_t)i * T_mfa;
+                for (int t = 0; t < T_mfa; t++)
+                    row[t] += b;
+            }
+    } else
+#endif
+    {
+        for (int i = 0; i < 128; i++) {
+            for (int t = 0; t < T_mfa; t++) {
+                double s = asp_tdnn_b.empty() ? 0 : asp_tdnn_b[i];
+                for (int c = 0; c < C_mfa; c++) {
+                    s += mfa_ct[c * T_mfa + t] * asp_tdnn_w[i * 9216 + c];
+                    s += h_mean[c] * asp_tdnn_w[i * 9216 + C_mfa + c];
+                    s += h_std[c] * asp_tdnn_w[i * 9216 + 2 * C_mfa + c];
+                }
+                asp_h[i * T_mfa + t] = (float)s;
+            }
         }
     }
     // BN + tanh
@@ -576,12 +674,28 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
     read_f32(G("emb.asp.conv.bias"), asp_conv_b);
 
     std::vector<float> attn(C_mfa * T_mfa, 0);
-    for (int c = 0; c < C_mfa; c++) {
-        for (int t = 0; t < T_mfa; t++) {
-            double s = asp_conv_b.empty() ? 0 : asp_conv_b[c];
-            for (int k = 0; k < 128; k++)
-                s += asp_h[k * T_mfa + t] * asp_conv_w[c * 128 + k];
-            attn[c * T_mfa + t] = (float)s;
+#if defined(HAVE_ACCELERATE)
+    if (!ecapa_use_scalar()) {
+        // attn[C_mfa, T] = W[C_mfa, 128] @ asp_h[128, T]
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, C_mfa, T_mfa, 128, 1.0f, asp_conv_w.data(), 128,
+                    asp_h.data(), T_mfa, 0.0f, attn.data(), T_mfa);
+        if (!asp_conv_b.empty())
+            for (int c = 0; c < C_mfa; c++) {
+                float b = asp_conv_b[c];
+                float* row = attn.data() + (size_t)c * T_mfa;
+                for (int t = 0; t < T_mfa; t++)
+                    row[t] += b;
+            }
+    } else
+#endif
+    {
+        for (int c = 0; c < C_mfa; c++) {
+            for (int t = 0; t < T_mfa; t++) {
+                double s = asp_conv_b.empty() ? 0 : asp_conv_b[c];
+                for (int k = 0; k < 128; k++)
+                    s += asp_h[k * T_mfa + t] * asp_conv_w[c * 128 + k];
+                attn[c * T_mfa + t] = (float)s;
+            }
         }
     }
     // Softmax over time
@@ -639,6 +753,12 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
         for (int k = 0; k < 6144; k++)
             s += pool[k] * fc_w[i * 6144 + k];
         emb[i] = (float)s;
+    }
+
+    if (std::getenv("ECAPA_TIMING")) {
+        double asp_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - asp_t0).count();
+        fprintf(stderr, "ecapa_lid: ASP head (T=%d) %.1f ms %s\n", T_mfa, asp_ms,
+                ecapa_use_scalar() ? "[scalar]" : "[gemm]");
     }
 
     // Classifier — two types:

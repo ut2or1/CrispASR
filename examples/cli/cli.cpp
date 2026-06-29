@@ -469,6 +469,28 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.speaker_threshold = std::stof(ARGV_NEXT);
     } else if (arg == "--diarize-embedder") {
         params.diarize_embedder = ARGV_NEXT;
+    } else if (arg == "--diarize-speakers") {
+        // Convenience opt-in for session-scoped speaker clustering: the
+        // best out-of-box diarization that identifies no one. Enables
+        // --diarize, the pyannote segmenter (proper speaker-turn
+        // boundaries), and the default embedder so segments get
+        // globally-stable per-recording "(speaker N)" labels. This is
+        // purely transient diarization quality — embeddings are computed
+        // per recording and discarded; nothing is persisted, no
+        // voiceprint database, no names. (For named profiles see the
+        // separate, deliberately opt-in --speaker-db / --enroll-speaker
+        // biometric path documented in docs/diarization-speakers.md.)
+        params.diarize = true;
+        if (params.diarize_method.empty())
+            params.diarize_method = "pyannote";
+        if (params.diarize_embedder.empty())
+            params.diarize_embedder = "auto";
+    } else if (arg == "--speaker-db-consent") {
+        // Affirms a lawful basis + explicit consent for the biometric
+        // named-profile path. Without it, --enroll-speaker / --speaker-db
+        // refuse to run (see crispasr_run.cpp). No-DB diarization
+        // (--diarize-speakers / --diarize-embedder) never needs this.
+        params.speaker_db_consent = true;
     } else if (arg == "--diarize-cluster-threshold") {
         params.diarize_cluster_threshold = std::stof(ARGV_NEXT);
     } else if (arg == "--diarize-max-speakers") {
@@ -524,6 +546,9 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
             params.tts_steps = 1;
         if (params.tts_steps > 100)
             params.tts_steps = 100;
+        // Also drive the native-knob path (f5 ode_steps, chatterbox cfm_steps),
+        // which reads tts_num_steps; previously only vibevoice honoured this.
+        params.tts_num_steps = params.tts_steps;
     } else if (arg == "--codec-model") {
         params.tts_codec_model = ARGV_NEXT;
         std::string auto_base;
@@ -538,6 +563,14 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.tts_ref_text = ARGV_NEXT;
     } else if (arg == "--ref-asr") {
         params.tts_ref_asr = ARGV_NEXT;
+    } else if (arg == "--make-ref") {
+        params.make_ref = true;
+    } else if (arg == "--make-ref-output") {
+        params.make_ref_output = ARGV_NEXT;
+    } else if (arg == "--make-ref-aligner") {
+        params.make_ref_aligner = ARGV_NEXT;
+    } else if (arg == "--make-ref-encoder") {
+        params.make_ref_encoder = ARGV_NEXT;
     } else if (arg == "--instruct") {
         params.tts_instruct = ARGV_NEXT;
     } else if (arg == "--voice-dir") {
@@ -576,6 +609,10 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.g2p_dict = ARGV_NEXT;
     } else if (arg == "--tts-trim-silence") {
         params.tts_trim_silence = true;
+    } else if (arg == "--tts-play") {
+        params.tts_play = true;
+    } else if (arg == "--tts-play-device") {
+        params.tts_play_device = std::stoi(ARGV_NEXT);
     } else if (arg == "--text") {
         params.text_input = ARGV_NEXT;
     } else if (arg == "--translate-max-tokens") {
@@ -613,6 +650,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.server_port = std::stoi(ARGV_NEXT);
     } else if (arg == "--ws-port") {
         params.server_ws_port = std::stoi(ARGV_NEXT);
+    } else if (arg == "--wyoming-port") {
+        params.wyoming_port = std::stoi(ARGV_NEXT);
     } else if (arg == "--api-keys") {
         params.server_api_keys = ARGV_NEXT;
     } else if (arg == "--stream-step") {
@@ -937,6 +976,15 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "Pass a .gguf path to load directly. When unset, --diarize-method pyannote labels are local to each "
             "forward pass (#107).\n",
             params.diarize_embedder.empty() ? "off" : params.diarize_embedder.c_str());
+    fprintf(stderr, "  --diarize-speakers                [opt-in ] convenience alias: enable --diarize + pyannote "
+                    "segmentation + session-scoped speaker clustering for stable per-recording (speaker N) labels. "
+                    "Transient only: identifies no one, no voiceprint database, no names stored. See "
+                    "docs/diarization-speakers.md\n");
+    fprintf(stderr,
+            "  --speaker-db-consent              [%-7s] REQUIRED to use the biometric named-profile path "
+            "(--enroll-speaker / --speaker-db). Affirms you have a lawful basis (GDPR Art. 9) and explicit "
+            "consent from every enrolled person. Not needed for --diarize-speakers / --diarize-embedder.\n",
+            params.speaker_db_consent ? "on" : "off");
     fprintf(stderr,
             "  --diarize-cluster-threshold X     [%-7.2f] cosine merge threshold for --diarize-embedder clustering "
             "(higher = more distinct clusters, lower = more merged)\n",
@@ -991,6 +1039,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "  --ws-port PORT                    [%-7d] server: real-time WebSocket ASR streaming port "
             "(-1 off, 0 = port+1)\n",
             params.server_ws_port);
+    fprintf(stderr,
+            "  --wyoming-port PORT               [%-7d] server: Wyoming protocol TCP port for Home "
+            "Assistant Assist (-1 off)\n",
+            params.wyoming_port);
     fprintf(stderr, "  --api-keys K1,K2                  [%-7s] comma-separated server API keys\n",
             params.server_api_keys.empty() ? "" : "(set)");
     fprintf(
@@ -1071,6 +1123,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.tts_ref_asr.empty() ? "whisper" : params.tts_ref_asr.c_str());
     fprintf(stderr, "             --instruct \"TEXT\"        natural-language voice/style description "
                     "(qwen3-tts: VoiceDesign = voice description; CustomVoice = style control)\n");
+    fprintf(
+        stderr,
+        "             --make-ref                create a TADA voice reference GGUF (with --voice <audio.wav>\n"
+        "                                                 --ref-text \"transcript\" [--make-ref-output path.gguf])\n");
     fprintf(stderr,
             "             --codec-model FNAME      codec / companion GGUF (defaults to sibling/cache/registry)\n");
     fprintf(stderr, "             --codec-quant Q          [%-7s] preferred quant for registry companion resolution\n",
@@ -1107,6 +1163,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.tts_steps);
     fprintf(stderr, "             --tts-trim-silence       [%-7s] trim leading silence from TTS output\n",
             params.tts_trim_silence ? "true" : "false");
+    fprintf(stderr, "             --tts-play               [%-7s] play synthesised audio on the local speaker\n",
+            params.tts_play ? "true" : "false");
+    fprintf(stderr, "             --tts-play-device N      [%-7d] speaker device index (-1 = default)\n",
+            params.tts_play_device);
     // Text-to-text translation (m2m100)
     fprintf(stderr, "\nText-to-text translation (m2m100) options:\n");
     fprintf(stderr, "             --text \"TEXT\"           translate TEXT and write result to stdout "

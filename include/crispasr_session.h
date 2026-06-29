@@ -280,11 +280,15 @@ CRISPASR_SESSION_API int crispasr_session_set_ask(crispasr_session* s, const cha
 CRISPASR_SESSION_API int crispasr_session_set_temperature(crispasr_session* s, float temperature, uint64_t seed);
 CRISPASR_SESSION_API int crispasr_session_set_tts_seed(crispasr_session* s, uint64_t seed);
 CRISPASR_SESSION_API int crispasr_session_set_tts_steps(crispasr_session* s, int steps);
+CRISPASR_SESSION_API int crispasr_session_set_tts_num_candidates(crispasr_session* s, int n);
 CRISPASR_SESSION_API int crispasr_session_set_g2p_dict(crispasr_session* s, const char* source);
 CRISPASR_SESSION_API int crispasr_session_set_top_p(crispasr_session* s, float top_p);
 CRISPASR_SESSION_API int crispasr_session_set_min_p(crispasr_session* s, float min_p);
 CRISPASR_SESSION_API int crispasr_session_set_repetition_penalty(crispasr_session* s, float r);
+CRISPASR_SESSION_API int crispasr_session_set_top_k(crispasr_session* s, int top_k);
+CRISPASR_SESSION_API int crispasr_session_set_do_sample(crispasr_session* s, int enable);
 CRISPASR_SESSION_API int crispasr_session_set_cfg_weight(crispasr_session* s, float cfg_weight);
+CRISPASR_SESSION_API int crispasr_session_set_tts_noise_temp(crispasr_session* s, float noise_temp);
 CRISPASR_SESSION_API int crispasr_session_set_exaggeration(crispasr_session* s, float exaggeration);
 CRISPASR_SESSION_API int crispasr_session_set_max_speech_tokens(crispasr_session* s, int n);
 CRISPASR_SESSION_API int crispasr_session_set_length_scale(crispasr_session* s, float scale);

@@ -38,9 +38,11 @@
 #include "crispasr_truecase_loader.h"    // shared --truecase-model resolution + apply (CLI parity)
 #include "crispasr_punctuation_policy.h" // crispasr_should_auto_enable_punctuation()
 
-#include "common-crispasr.h"     // read_audio_data
-#include "crispasr_chat.h"       // /v1/chat/completions
-#include "../server/ws_stream.h" // real-time WebSocket ASR streaming (--ws-port)
+#include "common-crispasr.h"           // read_audio_data
+#include "crispasr_chat.h"             // /v1/chat/completions
+#include "../server/ws_stream.h"       // real-time WebSocket ASR streaming (--ws-port)
+#include "../server/realtime_server.h" // vLLM Realtime API
+#include "wyoming.h"                   // Wyoming protocol for Home Assistant Assist (--wyoming-port)
 #include "crispasr_c2pa.h"
 #include "crispasr_tts_chunking.h"
 #include "crispasr_tts_disclaimer.h"
@@ -59,10 +61,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <condition_variable>
+#include <deque>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -1124,6 +1130,66 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         if (!prompt.empty())
             rp.prompt = prompt;
 
+        bool stream = form_bool(req, "stream", false);
+
+        if (stream && (backend->capabilities() & CAP_STREAMING)) {
+            std::string tmp_path =
+                write_temp_audio(audio_file.content.data(), audio_file.content.size(), audio_file.filename);
+            if (tmp_path.empty()) {
+                json_error(res, 500, "failed to create temporary file for audio");
+                return;
+            }
+
+            std::vector<float> pcmf32;
+            std::vector<std::vector<float>> pcmf32s;
+            if (!read_audio_data(tmp_path, pcmf32, pcmf32s, rp.diarize)) {
+                std::remove(tmp_path.c_str());
+                json_error(res, 400, "failed to decode audio (unsupported format or corrupt file)");
+                return;
+            }
+            std::remove(tmp_path.c_str());
+
+            if (pcmf32.empty()) {
+                json_error(res, 400, "audio file contains no samples");
+                return;
+            }
+
+            // Capture large vectors by value for the async provider
+            res.set_chunked_content_provider(
+                "text/event-stream", [pcmf32, rp, &backend, &model_mutex](size_t /*offset*/, httplib::DataSink& sink) {
+                    std::lock_guard<std::mutex> lock(model_mutex);
+                    std::string last_sent_text;
+
+                    backend->transcribe_streaming(
+                        pcmf32.data(), pcmf32.size(), 0, rp, [&](const std::string& partial, bool is_final) {
+                            if (!partial.empty() || is_final) {
+                                std::string diff;
+                                if (partial.size() > last_sent_text.size() &&
+                                    partial.compare(0, last_sent_text.size(), last_sent_text) == 0) {
+                                    diff = partial.substr(last_sent_text.size());
+                                } else {
+                                    diff = partial;
+                                }
+
+                                if (!diff.empty()) {
+                                    std::ostringstream js;
+                                    js << "data: {\"text\": \"" << crispasr_json_escape(diff) << "\"}\n\n";
+                                    std::string chunk = js.str();
+                                    sink.write(chunk.data(), chunk.size());
+                                    last_sent_text = partial;
+                                }
+                            }
+                            if (is_final) {
+                                std::string done = "data: [DONE]\n\n";
+                                sink.write(done.data(), done.size());
+                            }
+                        });
+                    sink.done();
+                    return false; // return false to signal end of stream
+                });
+            return;
+        }
+
         const bool need_timestamps =
             response_format == "verbose_json" || response_format == "srt" || response_format == "vtt";
         auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp, need_timestamps, punc_ctx.get(),
@@ -1512,6 +1578,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             rp.tts_top_k = body["top_k"].get<int>();
         if (body.contains("repetition_penalty") && body["repetition_penalty"].is_number())
             rp.tts_repetition_penalty = body["repetition_penalty"].get<float>();
+        if (body.contains("num_candidates") && body["num_candidates"].is_number_integer())
+            rp.tts_num_candidates = body["num_candidates"].get<int>();
+        if (body.contains("do_sample") && body["do_sample"].is_boolean())
+            rp.tts_do_sample = body["do_sample"].get<bool>() ? 1 : 0;
         if (body.contains("cfg_scale") && body["cfg_scale"].is_number())
             rp.tts_cfg_scale = body["cfg_scale"].get<float>();
         if (body.contains("num_steps") && body["num_steps"].is_number_integer())
@@ -1520,6 +1590,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             rp.tts_noise_scale = body["noise_scale"].get<float>();
         if (body.contains("noise_w") && body["noise_w"].is_number())
             rp.tts_noise_w = body["noise_w"].get<float>();
+        if (body.contains("noise_temp") && body["noise_temp"].is_number())
+            rp.tts_noise_temp = body["noise_temp"].get<float>();
         if (body.contains("exaggeration") && body["exaggeration"].is_number())
             rp.tts_exaggeration = body["exaggeration"].get<float>();
         if (body.contains("speaker_id") && body["speaker_id"].is_number_integer())
@@ -1570,69 +1642,162 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             const int silence_n = sr_out / 5;
             std::vector<short> silence_s16(silence_n, 0);
 
-            // Shared state between the main thread (which synthesizes under
-            // model_mutex) and the chunked provider callback. We synthesize
-            // all chunks first into a queue, then the provider drains it.
-            // (httplib's provider callback runs synchronously in the same
-            // thread, but this structure is clearer.)
-            std::vector<std::string> pcm_chunks;
-            {
-                std::lock_guard<std::mutex> lock(model_mutex);
-                // Prepend disclaimer as first chunk for voice-clone streams
-                if (is_voice_clone) {
-                    const auto& disc = crispasr_tts_get_disclaimer(backend.get(), rp);
-                    if (!disc.empty()) {
-                        pcm_chunks.push_back(crispasr_make_pcm_int16_le(disc.data(), (int)disc.size()));
-                        pcm_chunks.push_back(
-                            std::string((const char*)silence_s16.data(), silence_s16.size() * sizeof(short)));
+            // Producer/consumer streaming: a worker thread synthesizes under
+            // model_mutex and pushes int16 LE PCM chunks into a bounded queue;
+            // the chunked-content-provider (which httplib runs on the request
+            // thread) blocks on a condition variable and writes each chunk as
+            // it arrives. This lets the first chunk reach the client as soon
+            // as the backend emits it — for CAP_STREAMING backends that is
+            // after the first ~chunk_frames codec frames, not after the whole
+            // clip — so time-to-first-audio drops to roughly one chunk.
+            struct StreamQueue {
+                std::mutex m;
+                std::condition_variable cv;
+                std::deque<std::string> q;
+                bool done = false;
+                bool failed = false;
+                // Set by the provider when the client socket write fails (the
+                // client disconnected). The worker stops enqueuing so a detached
+                // synth does not keep growing the queue / holding model_mutex for
+                // audio nobody is reading.
+                bool cancelled = false;
+            };
+            auto sq = std::make_shared<StreamQueue>();
+
+            // Backpressure cap: the worker blocks once this many chunks are
+            // queued, so a slow/stalled consumer can't make memory grow unbounded
+            // (the previous "bounded queue" comment was aspirational — the deque
+            // had no cap). At ~30 KB/streaming-chunk this caps the queue at ~2 MB.
+            constexpr size_t kMaxQueueDepth = 64;
+
+            // Enqueue one encoded chunk with backpressure: block while the queue
+            // is at capacity, but bail immediately if the client has gone. Returns
+            // false when cancelled (caller should stop producing).
+            auto enqueue = [sq, kMaxQueueDepth](std::string&& data) -> bool {
+                std::unique_lock<std::mutex> lk(sq->m);
+                sq->cv.wait(lk, [&] { return sq->q.size() < kMaxQueueDepth || sq->cancelled; });
+                if (sq->cancelled)
+                    return false;
+                sq->q.push_back(std::move(data));
+                lk.unlock();
+                sq->cv.notify_one(); // wake the consumer
+                return true;
+            };
+
+            const bool true_streaming = (backend->capabilities() & CAP_STREAMING) != 0;
+
+            // Post-process one float PCM buffer (speed resample + watermark) and
+            // enqueue it as int16 LE. Runs on the worker thread.
+            // Captures by value only (it is copied into the detached worker
+            // thread, which outlives this handler scope — a `[&]` default would
+            // dangle).
+            auto push_pcm = [sq, sr_out, speed, enqueue](const float* pcm, int n_samples) {
+                if (!pcm || n_samples <= 0)
+                    return;
+                std::vector<float> chunk(pcm, pcm + n_samples);
+                if (speed != 1.0f) {
+                    const int in_n = (int)chunk.size();
+                    const int out_n = std::max(1, (int)((float)in_n / speed));
+                    std::vector<float> rs((size_t)out_n);
+                    for (int j = 0; j < out_n; j++) {
+                        const float s = (float)j * speed;
+                        const int s0 = (int)s;
+                        const int s1 = std::min(s0 + 1, in_n - 1);
+                        const float frac = s - (float)s0;
+                        rs[j] = chunk[s0] * (1.0f - frac) + chunk[s1] * frac;
                     }
+                    chunk = std::move(rs);
                 }
-                for (size_t i = 0; i < sentences.size(); i++) {
-                    std::vector<float> chunk = backend->synthesize(sentences[i], rp);
-                    if (chunk.empty())
-                        continue;
-                    // Apply speed resampling per chunk
-                    if (speed != 1.0f) {
-                        const int in_n = (int)chunk.size();
-                        const int out_n = std::max(1, (int)((float)in_n / speed));
-                        std::vector<float> rs((size_t)out_n);
-                        for (int j = 0; j < out_n; j++) {
-                            const float s = (float)j * speed;
-                            const int s0 = (int)s;
-                            const int s1 = std::min(s0 + 1, in_n - 1);
-                            const float frac = s - (float)s0;
-                            rs[j] = chunk[s0] * (1.0f - frac) + chunk[s1] * frac;
+                crispasr_wm_dispatch::embed(chunk.data(), (int)chunk.size(), sr_out);
+                enqueue(crispasr_make_pcm_int16_le(chunk.data(), (int)chunk.size()));
+            };
+
+            // Worker thread: synthesize all sentences, enqueueing chunks as
+            // they are produced. Captures by value the bits it needs so it
+            // outlives the handler scope (the provider keeps `sq` alive).
+            std::thread worker([&backend, &model_mutex, sentences, rp, is_voice_clone, silence_s16, true_streaming,
+                                push_pcm, enqueue, sq, t0]() {
+                auto is_cancelled = [&] {
+                    std::lock_guard<std::mutex> lk(sq->m);
+                    return sq->cancelled;
+                };
+                // The worker is detached: any exception escaping this lambda would
+                // call std::terminate and kill the whole server (and leave `done`
+                // unset → a hung request). Catch everything, mark the stream
+                // failed+done, and let the provider end it cleanly. (model_mutex is
+                // released by RAII during unwind.)
+                try {
+                    std::lock_guard<std::mutex> lock(model_mutex);
+                    // TEST-ONLY (CRISPASR_TEST_STREAM_THROW): force a worker
+                    // exception to verify the server survives it. Requires both the
+                    // env var AND the magic input, so it can never fire in prod.
+                    if (std::getenv("CRISPASR_TEST_STREAM_THROW")) {
+                        for (const auto& s : sentences)
+                            if (s == "__throw_test__")
+                                throw std::runtime_error("injected streaming worker exception (test)");
+                    }
+                    if (is_voice_clone) {
+                        const auto& disc = crispasr_tts_get_disclaimer(backend.get(), rp);
+                        if (!disc.empty()) {
+                            push_pcm(disc.data(), (int)disc.size());
+                            enqueue(std::string((const char*)silence_s16.data(), silence_s16.size() * sizeof(short)));
                         }
-                        chunk = std::move(rs);
                     }
-                    // Embed watermark per-chunk (survives re-encoding)
-                    crispasr_wm_dispatch::embed(chunk.data(), (int)chunk.size(), sr_out);
-                    pcm_chunks.push_back(crispasr_make_pcm_int16_le(chunk.data(), (int)chunk.size()));
-                    // Add silence gap between sentences (not after last)
-                    if (i + 1 < sentences.size()) {
-                        pcm_chunks.push_back(
-                            std::string((const char*)silence_s16.data(), silence_s16.size() * sizeof(short)));
+                    for (size_t i = 0; i < sentences.size(); i++) {
+                        // Client gone — stop before the next (possibly long) synth.
+                        if (is_cancelled())
+                            break;
+                        if (true_streaming) {
+                            backend->synthesize_streaming(
+                                sentences[i], rp,
+                                [&](const float* pcm, int n_samples, bool /*is_final*/) { push_pcm(pcm, n_samples); });
+                        } else {
+                            std::vector<float> chunk = backend->synthesize(sentences[i], rp);
+                            if (!chunk.empty())
+                                push_pcm(chunk.data(), (int)chunk.size());
+                        }
+                        if (i + 1 < sentences.size()) {
+                            enqueue(std::string((const char*)silence_s16.data(), silence_s16.size() * sizeof(short)));
+                        }
                     }
+                } catch (const std::exception& e) {
+                    fprintf(stderr, "crispasr-server: streaming worker exception: %s\n", e.what());
+                    std::lock_guard<std::mutex> lk(sq->m);
+                    sq->failed = true;
+                } catch (...) {
+                    fprintf(stderr, "crispasr-server: streaming worker unknown exception\n");
+                    std::lock_guard<std::mutex> lk(sq->m);
+                    sq->failed = true;
                 }
-            }
-            auto t1_s = std::chrono::steady_clock::now();
-            const double el = std::chrono::duration<double>(t1_s - t0).count();
-            fprintf(stderr, "crispasr-server: streaming %zu PCM chunks in %.2fs\n", pcm_chunks.size(), el);
+                {
+                    std::lock_guard<std::mutex> lk(sq->m);
+                    sq->done = true;
+                }
+                sq->cv.notify_one();
+                const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                fprintf(stderr, "crispasr-server: streaming synthesis finished in %.2fs\n", el);
+            });
+            worker.detach();
 
-            if (pcm_chunks.empty()) {
-                json_error(res, 500, "synthesis failed (backend returned empty audio)", "synthesis_failed");
-                return;
-            }
-
-            size_t chunk_idx = 0;
-            res.set_chunked_content_provider("audio/pcm", [pcm_chunks = std::move(pcm_chunks), chunk_idx](
-                                                              size_t /*offset*/, httplib::DataSink& sink) mutable {
-                if (chunk_idx >= pcm_chunks.size()) {
+            res.set_chunked_content_provider("audio/pcm", [sq](size_t /*offset*/, httplib::DataSink& sink) -> bool {
+                std::unique_lock<std::mutex> lk(sq->m);
+                sq->cv.wait(lk, [&] { return !sq->q.empty() || sq->done || sq->cancelled; });
+                if (sq->q.empty() && (sq->done || sq->cancelled)) {
+                    lk.unlock();
                     sink.done();
                     return true;
                 }
-                const auto& c = pcm_chunks[chunk_idx++];
-                sink.write(c.data(), c.size());
+                std::string c = std::move(sq->q.front());
+                sq->q.pop_front();
+                lk.unlock();
+                sq->cv.notify_one(); // release the worker's backpressure wait
+                if (!sink.write(c.data(), c.size())) {
+                    // Client disconnected — tell the worker to stop producing.
+                    std::lock_guard<std::mutex> lk2(sq->m);
+                    sq->cancelled = true;
+                    sq->cv.notify_all();
+                    return false;
+                }
                 return true;
             });
             return;
@@ -2346,6 +2511,18 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     // session API (crispasr_session_stream_*); clients send binary 16 kHz mono
     // float32 PCM and receive JSON partial/final text events. Whisper-only today.
     bool ws_started = false;
+    bool rt_started = false;
+    bool wyoming_started = false;
+    if (params.wyoming_port > 0) {
+        if (wyoming_start(backend.get(), model_mutex, params, params.wyoming_port) == 0) {
+            wyoming_started = true;
+            fprintf(stderr, "  TCP  %s:%d                  — Wyoming protocol (Home Assistant Assist STT+TTS)\n",
+                    host.c_str(), params.wyoming_port);
+        } else {
+            fprintf(stderr, "crispasr-server: warning: failed to start Wyoming server on port %d\n",
+                    params.wyoming_port);
+        }
+    }
     if (params.server_ws_port >= 0) {
         const int ws_port = params.server_ws_port == 0 ? port + 1 : params.server_ws_port;
         if (ws_stream_start(params.model.c_str(), ws_port, params.n_threads) == 0) {
@@ -2355,15 +2532,25 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         } else {
             fprintf(stderr, "crispasr-server: warning: failed to start WebSocket streaming on port %d\n", ws_port);
         }
+        const int rt_port = ws_port + 1; // vLLM Realtime API on ws_port + 1
+        if (realtime_server_start(backend.get(), model_mutex, params, rt_port) == 0) {
+            rt_started = true;
+            fprintf(stderr, "  WS   ws://%s:%d/v1/realtime     — vLLM Realtime API (JSON WebSocket)\n", host.c_str(),
+                    rt_port);
+        } else {
+            fprintf(stderr, "crispasr-server: warning: failed to start vLLM Realtime API on port %d\n", rt_port);
+        }
     }
     fprintf(stderr, "\n");
 
     svr.listen(host, port);
 
-    // Clean up cached VAD + LID contexts on shutdown (#132, #165). Both stay
-    // resident across requests; freed once here.
+    if (wyoming_started)
+        wyoming_stop();
     if (ws_started)
         ws_stream_stop();
+    if (rt_started)
+        realtime_server_stop();
     crispasr_vad_free_cache();
     crispasr_lid_free_cache();
 
