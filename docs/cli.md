@@ -479,6 +479,23 @@ The implicit-enable line goes to stderr (suppressed under
 `--no-prints`) so it doesn't perturb stdout subtitle parsing in
 upstream tools like SubtitleEdit.
 
+### Granite word-level timestamps and `--max-len` (#205)
+
+`--backend granite` (Granite Speech 4.1 PLUS variant) now requests
+word-level timestamps from the model whenever the output format needs
+them: `--max-len`, `-osrt`, `-ovtt`, or `--split-on-punct`. Previously,
+word timestamps were only generated for `--output-wts` and `-ojf`,
+causing `--max-len` to silently have no effect.
+
+```bash
+./build/bin/crispasr --backend granite \
+    -m granite-speech-4.1-2b-plus-q4_k.gguf \
+    -f audio.wav --max-len 50 -osrt
+```
+
+> **Note:** Qwen3 does not support word-level timestamps, so `--max-len`
+> segment splitting is not available with that backend.
+
 ## Sampling / decoding (whisper + LLM backends)
 
 | Flag | Meaning |
@@ -486,7 +503,7 @@ upstream tools like SubtitleEdit.
 | `-tp F`, `--temperature F` | Sampling temperature. `0` = pure argmax (default, bit-identical). `> 0` enables multinomial sampling for whisper, voxtral, voxtral4b, qwen3, granite |
 | `--seed N` | RNG seed for sampling. `0` = non-deterministic. Used by temperature-sampling ASR backends and TTS backends that sample; CLI values override backend-specific env seeds |
 | `-bo N`, `--best-of N` | Number of best candidates to keep when temperature > 0 (whisper + some AR backends) |
-| `-bs N`, `--beam-size N` | Beam search width. Default 5 for whisper, 1 (greedy) for other backends. 21 backends: whisper, parakeet, nemotron, canary, cohere, granite, qwen3, voxtral, voxtral4b, glm-asr, kyutai-stt, moonshine, moonshine-streaming, firered-asr, omniasr, gemma4-e2b, funasr, sensevoice, granite-nle, moss-audio, mimo-asr, m2m100, madlad/t5. Also lfm2-audio (stub). Not applicable to paraformer (NAR) |
+| `-bs N`, `--beam-size N` | Beam search width. Default 5 for whisper, 1 (greedy) for other backends. 21 backends: whisper, parakeet, nemotron, canary, cohere, granite, qwen3, voxtral, voxtral4b, glm-asr, kyutai-stt, moonshine, moonshine-streaming, firered-asr, omniasr, gemma4-e2b, funasr, sensevoice, granite-nle, moss-audio, moss-transcribe, higgs-stt, ark-asr, mimo-asr, m2m100, madlad/t5. Also lfm2-audio (stub). Not applicable to paraformer (NAR) |
 | `-tpi F`, `--temperature-inc F` | Whisper temperature-fallback increment |
 | `-nf`, `--no-fallback` | Disable temperature fallback (equivalent to `--temperature-inc 0`) |
 | `--frequency-penalty F` | Opt-in repeated generated-token penalty for autoregressive ASR backends (`0.0` disabled). Applied to generated output tokens before greedy/sampling selection. |

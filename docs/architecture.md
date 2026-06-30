@@ -180,12 +180,14 @@ regression test against `samples/jfk.wav`:
 | omniasr | wav2vec2 enc + CTC / LLM | ✔ | ✔ | CTC: — / LLM: ✔ | CPU | gguf_loader, kv_self_attn, swiglu |
 | gemma4-e2b | Conformer enc + Gemma4 LLM | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu |
 | mimo-asr | wav2vec2 enc + Qwen2 LM | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu |
+| ark-asr ⚠️*exp/WIP* | Whisper enc (partial RoPE) + Qwen2.5-3B LM | ✔ | — | CPU + GPU | GPU default (Metal-validated; `CRISPASR_ARKASR_CPU=1` forces CPU) | mel, ffn, gguf_loader, kv_self_attn, swiglu, bpe |
 | vibevoice | σ-VAE + Qwen2 (ASR) / TTS LM (synth) | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader |
 | kokoro | StyleTTS2 BERT + ProsodyPredictor + iSTFTNet | ✔ | — | — | CPU | gguf_loader, fft, ffn |
 | qwen3-tts | Qwen3 talker + 12 Hz codec + code-predictor | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu |
 | orpheus | Llama-3.2 talker + SNAC RVQ codec | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu |
 | chatterbox | T3 (Llama / GPT-2) + S3Gen (Conformer + UNet1D CFM + HiFTGen) | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu, fft |
 | zonos-tts | 26L GQA transformer + 9-codebook DAC @ 44.1 kHz; CFG; voice cloning from WAV | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, gated_mlp |
+| dots-tts | Qwen2.5-1.5B LLM + 24L VAESemanticEncoder + 18L DiT flow-matching head (CFG Euler) + BigVGAN @ 48 kHz; continuous-latent AR; CAM++ voice cloning; incremental streaming PatchEncoder | ✔ | mixed (DiT must stay F16; LLM+penc Q8) | ✔ | Metal | gguf_loader, kv_self_attn, swiglu, lstm, snake_beta, istft |
 | m2m100 | facebook/m2m100 12L+12L transformer (text-to-text translation; WMT21 4.7B variant via `--backend m2m100-wmt21`) | ✔ | — | ✔ (cross-attn) | CUDA / Metal | gguf_loader, kv_self_attn |
 | madlad / t5 | T5 encoder-decoder (MADLAD-400 12L+12L, gated-GELU, RMSNorm, bucketed rel-pos bias). Tokens match Python SP bit-by-bit; translation outputs match the HF reference. | ✔ | — | ✔ (cross-attn) | CUDA / Metal | gguf_loader, ffn |
 
@@ -470,6 +472,85 @@ into `~/.cache/crispasr/`; the runtime auto-discovers
 `mimo-tokenizer-q4_k.gguf` next to the LM. Override with `--codec-model
 PATH/mimo-tokenizer-q4_k.gguf` if you keep the tokenizer elsewhere.
 
+### ark-asr
+
+> ⚠️ **Experimental / WIP.** Validated verbatim on English + German (Q8_0, on
+> both GPU and CPU), but rough edges remain (see below). Single self-contained GGUF.
+
+[`AutoArk-AI/ARK-ASR-3B`](https://huggingface.co/AutoArk-AI/ARK-ASR-3B) — 19-language
+ASR = **Whisper-large-v3 encoder with partial interleaved RoPE** (rot_dim 32 of
+head_dim 64, θ=10000, applied to Q+K only; `k_proj` has no bias; the encoder's own
+final LayerNorm is dropped) + **MLP adapter** (LayerNorm → merge 4 consecutive
+frames → Linear 5120→4096 → GELU → Linear 4096→2048) + stock **Qwen2.5-3B decoder**
+(2048d, 36L, GQA 16Q/2KV, SwiGLU, RMSNorm, θ=1e6, tied embeddings). The
+`<|audio|>` (151663) placeholder embeddings are overwritten by the first
+N = `((mel_frames+1)//2)//4` adapter frames; mel is the stock WhisperFeatureExtractor
+recipe (128-bin, n_fft 400, hop 160). Convert with
+`models/convert-arkasr-to-gguf.py` (`--outtype f16|q8_0`); build Q4_K from the F16
+with `crispasr-quantize` (the ark-asr rule keeps encoder/adapter/embeddings F16).
+
+**Validated** against the original PyTorch model (`trust_remote_code`, bf16) via
+`crispasr-diff arkasr` on jfk: log-mel cos 0.999993, first decoder logits (Q8_0)
+cos 0.999646, audio-embeds mean cos 0.999445. Transcript verbatim (en + de).
+GGUFs published at [`cstr/ark-asr-3b-GGUF`](https://huggingface.co/cstr/ark-asr-3b-GGUF)
+(f16 / q8_0 / q4_k).
+
+**Single-pass whole-audio** (matches the reference): the RoPE encoder has no
+positional cap, so the whole clip is one encoder pass + one decode. Long audio
+falls back to internal 30 s chunking only above `CRISPASR_ARKASR_MAX_SINGLE_PASS_S`
+(default 300 s; 0 = never) to bound O(T²) encoder compute / decode length.
+The transcript-opening `.` token the model emits (the reference shows it too) is
+stripped in the output cleanup.
+
+**Known limitations (WIP):**
+- **Language steering is experimental.** ARK is promptless. Within the single-pass
+  window language is stable (the earlier per-30 s-chunk *translate-to-English*
+  drift was a chunking artifact, fixed by single-pass). Beyond the single-pass cap
+  the internal-chunk fallback can re-introduce it — pass `--vad` or raise the cap.
+  `-l <lang>` injects a best-effort "Transcribe the audio in <Language>."
+  instruction, but the model was not instruction-trained, so it is not a hard
+  guarantee. The default (no `-l`) is the validated promptless path.
+- **GPU per-token decode is not faster on Apple unified memory.** GPU is the
+  default and is verbatim-correct on Metal — prefill is ~5.6× faster, but the
+  single-token decode steps are bandwidth/dispatch-bound and roughly neutral
+  vs CPU (net ~1.7× overall on jfk). Force CPU with `CRISPASR_ARKASR_CPU=1`.
+  Discrete GPUs (CUDA) are not yet validated.
+- **GPU history:** an earlier port build emitted no tokens on GPU (suspected
+  weight-less-first-op cross-backend sched copy, mimo-asr PLAN #115 class); the
+  current flash-attn + KV path no longer reproduces it. Re-check with
+  `GGML_SCHED_DEBUG=2` if a regression resurfaces.
+- **No decode speedup from a step-graph cache.** Measured (gated
+  `CRISPASR_ARKASR_TIMING=1`): per-step graph build+alloc is only 0.3–0.5% of each
+  step (~0.45 ms vs ~120 ms compute) — decode is fully compute-bound on the 3B
+  forward, so a step-graph cache would save noise. Real decode speedups must come
+  from the matmuls (quant/threads/GPU), not graph reuse.
+### higgs-stt
+
+[`bosonai/higgs-audio-v3-stt`](https://huggingface.co/bosonai/higgs-audio-v3-stt):
+Whisper-large-v3 audio encoder → depthwise-temporal-conv projector →
+Qwen3-1.7B-Base decoder. A `<|AUDIO|>` placeholder in a ChatML prompt
+(`Transcribe the speech. Output only the spoken words in lowercase with no
+punctuation.`) is replaced by the projected audio embeddings; the LLM greedily
+decodes the transcript, then a `<think>…</think>` strip + n-gram-loop collapse
+(`ngram_loop_fix.py`) clean it up.
+
+**Chunked encoder (the load-bearing detail).** The model does *not* encode the
+clip as one padded 30 s Whisper window. It splits the waveform into
+`chunk_size_seconds` (4 s = 64000-sample) chunks — at inference `vad_cut`
+degenerates to a fixed `ceil(total / 64000)` split, last chunk = remainder —
+and encodes **each chunk independently** (chunk-local `embed_positions[:T_enc]`,
+within-chunk attention) through the Whisper tower + AvgPool + projector, then
+**concatenates** the per-chunk audio embeds. Encoding one global window
+corrupts the conditioning (every valid frame attends to ~1900 silence-pad
+frames) and derails the decoder mid-sentence. Each chunk is encoded at its true
+length — the per-chunk GlobalClipMax norm is dominated by speech, so this
+matches the reference's zero-padded+masked chunk for the valid frames, and the
+valid token count `(((L-1)/2+1 - 2)/2+1 - 1)/2+1` (conv2 s2 → avgpool s2 →
+temporal-conv s2) falls out exactly. The backend declares `CAP_INTERNAL_CHUNKING`
+so the whole clip decodes in a single AR pass (no CLI window-splitting); the
+tied `token_embd`/`output` lm_head stays F16 in every quant. Validated verbatim
+against `transcribe.py` (bf16) on jfk and a 45 s / 12-chunk clip.
+
 ### moss-audio
 
 32-layer Whisper-style audio encoder (1280d, 20 heads, 128-mel,
@@ -484,6 +565,25 @@ GatedMLP (1280→8192→2560) into the LM embedding space. These projections
 are injected as residual adds at LM blocks 0, 1, and 2, preserving
 multi-resolution audio features (low-level prosody/transients alongside
 high-level semantics) through the LM's early layers.
+
+### moss-transcribe
+
+Dedicated ASR sibling of moss-audio (same author). Uses the **stock
+Qwen3-Omni-MoE audio encoder**: 128-mel → 3×Conv2d(stride 2, 480ch) →
+`conv_out`(7680→1280, no bias) → sinusoidal positions → 32 pre-LN
+Whisper-style layers (1280d, 20 heads, FFN 5120) with **block-diagonal
+windowed attention** (windows of `n_window_infer/(2·n_window)`=8 conv
+chunks) → `ln_post` → `proj1`(1280→1280)+GELU → `proj2`(1280→2048). A
+**GatedMLP adapter** (2048→8192→2048, SiLU gate) maps encoder frames into
+the LM embedding space, where they are `masked_scatter`-spliced into the
+prompt at audio-placeholder positions. The decoder is a **Qwen3-1.7B** LM
+(28L, 2048d, 16Q/8KV, head_dim 128, QK-norm, SwiGLU 6144, RoPE θ=1M, tied
+embeddings). No DeepStack. Apache-2.0, ~2.4B params. The prompt follows
+`chat_template_default.py` (ChatML):
+`<|im_start|>user\n<|audio_start|>`·audio·`<|audio_end|><|im_end|>\n<|im_start|>assistant\n`
+→ transcript → `<|im_end|>`. The `user`/`assistant` framing is required —
+without it the model emits garbage instead of transcribing. ASR-only;
+output is lowercase, lightly punctuated.
 
 **Audio front-end:** 128-bin log-mel → 3×Conv2d (stride 2 each, 8×
 downsample total) → stem_proj Linear(7680, 1280) → sinusoidal position

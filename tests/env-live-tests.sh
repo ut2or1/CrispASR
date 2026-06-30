@@ -29,9 +29,13 @@ unset _whisper_cache _whisper_default
 # ── Beam search backends ──
 export CRISPASR_MODEL_GLM_ASR="${CRISPASR_MODEL_GLM_ASR:-$CRISPASR_MODELS_DIR/glm-asr-nano.gguf}"
 export CRISPASR_MODEL_QWEN3_ASR="${CRISPASR_MODEL_QWEN3_ASR:-$CRISPASR_MODELS_DIR/qwen3-asr-0.6b.gguf}"
+export CRISPASR_MODEL_HIGGS_STT="${CRISPASR_MODEL_HIGGS_STT:-$CRISPASR_MODELS_DIR/higgs-stt-q8_0.gguf}"
 export CRISPASR_MODEL_CANARY="${CRISPASR_MODEL_CANARY:-$CRISPASR_MODELS_DIR/canary-1b-v2.gguf}"
 export CRISPASR_MODEL_LFM2_EN="${CRISPASR_MODEL_LFM2_EN:-$CRISPASR_MODELS_DIR/lfm2-audio-1.5b-q5_k.gguf}"
 export CRISPASR_MODEL_LFM2_JP="${CRISPASR_MODEL_LFM2_JP:-$CRISPASR_MODELS_DIR/lfm2-audio-1.5b-jp-q5_k.gguf}"
+# dots.tts: F16 core (the CFG flow-match derails on full-q8) + vocoder companion.
+export CRISPASR_MODEL_DOTS_TTS="${CRISPASR_MODEL_DOTS_TTS:-$CRISPASR_MODELS_DIR/dots-tts-soar-f16.gguf}"
+export CRISPASR_MODEL_DOTS_TTS_VOCODER="${CRISPASR_MODEL_DOTS_TTS_VOCODER:-$CRISPASR_MODELS_DIR/dots-tts-soar-vocoder-f16.gguf}"
 export CRISPASR_MODEL_COHERE="${CRISPASR_MODEL_COHERE:-$CRISPASR_MODELS_DIR/cohere-transcribe.gguf}"
 
 # ── Paraformer ──
@@ -58,6 +62,13 @@ unset _chat_default
 # MOSS-Audio (OpenMOSS-Team/MOSS-Audio-4B-Instruct): audio understanding + ASR
 export CRISPASR_MODEL_MOSS_AUDIO="${CRISPASR_MODEL_MOSS_AUDIO:-$CRISPASR_MODELS_DIR/moss-audio-4b-instruct-q4_k.gguf}"
 
+# MOSS-Transcribe (OpenMOSS-Team/MOSS-Transcribe-preview-2B): ASR
+export CRISPASR_MODEL_MOSS_TRANSCRIBE="${CRISPASR_MODEL_MOSS_TRANSCRIBE:-$CRISPASR_MODELS_DIR/moss-transcribe-preview-2b-q4_k.gguf}"
+
+# ARK-ASR-3B (AutoArk-AI/ARK-ASR-3B): Whisper-large-v3 enc (partial RoPE) + Qwen2.5-3B LM.
+# ⚠️ experimental/WIP — CPU only. See PLAN.md §ARK.
+export CRISPASR_MODEL_ARK_ASR="${CRISPASR_MODEL_ARK_ASR:-$CRISPASR_MODELS_DIR/ark-asr-3b-q8_0.gguf}"
+
 # Mini-Omni2 (gpt-omni/mini-omni2): Whisper-small + Qwen2-0.5B
 export CRISPASR_MODEL_MINI_OMNI2="${CRISPASR_MODEL_MINI_OMNI2:-$CRISPASR_MODELS_DIR/mini-omni2-q4_k.gguf}"
 export CRISPASR_MODEL_SNAC="${CRISPASR_MODEL_SNAC:-$CRISPASR_MODELS_DIR/snac-24khz.gguf}"
@@ -68,6 +79,16 @@ export CRISPASR_MODEL_NEMOTRON_F16="${CRISPASR_MODEL_NEMOTRON_F16:-$CRISPASR_MOD
 
 # ── LFM2-Audio ──
 export CRISPASR_MODEL_LFM2="${CRISPASR_MODEL_LFM2:-$CRISPASR_MODELS_DIR/lfm2-audio-1.5b-q5_k.gguf}"
+
+# ── TADA TTS (talker + TADA codec companion) ──
+export CRISPASR_MODEL_TADA="${CRISPASR_MODEL_TADA:-$CRISPASR_MODELS_DIR/tada-tts-1b-q4_k.gguf}"
+export CRISPASR_MODEL_TADA_CODEC="${CRISPASR_MODEL_TADA_CODEC:-$CRISPASR_MODELS_DIR/tada-codec-f16.gguf}"
+
+# ── KugelAudio (7B audio understanding) ──
+export CRISPASR_MODEL_KUGELAUDIO="${CRISPASR_MODEL_KUGELAUDIO:-$CRISPASR_MODELS_DIR/kugelaudio-0-open-f16.gguf}"
+
+# ── MeloTTS (VITS2) ──
+export CRISPASR_MODEL_MELOTTS="${CRISPASR_MODEL_MELOTTS:-$CRISPASR_MODELS_DIR/melotts-en-v2-f16.gguf}"
 
 # ── Dia TTS ──
 export CRISPASR_MODEL_DIA="${CRISPASR_MODEL_DIA:-$CRISPASR_MODELS_DIR/dia-1.6b-q4_k.gguf}"

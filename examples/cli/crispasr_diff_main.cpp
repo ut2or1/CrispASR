@@ -37,6 +37,7 @@
 
 #include "voxtral.h"
 #include "voxtral4b.h"
+#include "higgs_stt.h"
 #include "qwen3_asr.h"
 #include "qwen3_tts.h"
 #include "kokoro.h"
@@ -47,6 +48,7 @@
 #include "cohere.h"
 #include "gemma4_e2b.h"
 #include "mimo_asr.h"
+#include "ark_asr.h"
 #include "mimo_tokenizer.h"
 #include "core/snac.h"
 #include "chatterbox.h"
@@ -67,12 +69,14 @@
 #include "parler_tts.h"
 #include "melotts.h"
 #include "moss_audio.h"
+#include "moss_transcribe.h"
 #include "lfm2_audio.h"
 #include "mini_omni2.h"
 #include "nemotron.h"
 #include "tada_codec.h"
 #include "tada_encoder.h"
 #include "tada_tts.h"
+#include "dots_tts.h"
 #if __has_include("kugelaudio.h")
 #include "kugelaudio.h"
 #define CA_HAVE_KUGELAUDIO 1
@@ -270,6 +274,26 @@ static StageResult voxtral_encoder(voxtral_context* ctx, const float* samples, i
     free(mel);
     if (!enc) {
         r.note = "voxtral_run_encoder returned null";
+        return r;
+    }
+    r.shape = {N_enc, pdim};
+    r.data.assign(enc, enc + (size_t)N_enc * pdim);
+    free(enc);
+    r.ok = true;
+    return r;
+}
+
+// ---- higgs-stt ----
+
+static StageResult higgs_encoder(higgs_stt_context* ctx, const float* samples, int n_samples) {
+    StageResult r;
+    // Chunked encode (4 s chunks, per-chunk Whisper tower + projector,
+    // concatenated) — matches higgs_stt_transcribe and the reference's
+    // model._apply_audio_tower_whisper. A single padded 30 s window is wrong.
+    int N_enc = 0, pdim = 0;
+    float* enc = higgs_stt_encode_audio(ctx, samples, n_samples, &N_enc, &pdim);
+    if (!enc) {
+        r.note = "higgs_stt_encode_audio returned null";
         return r;
     }
     r.shape = {N_enc, pdim};
@@ -1033,6 +1057,32 @@ int main(int argc, char** argv) {
     const std::string ref_path = argv[3];
     const std::string audio_path = argv[4];
 
+    // dots-tts: self-contained per-stage parity checks (no audio needed). The
+    // reference is the isolated component dump from
+    // tools/reference_backends/dots_tts_reference.py.
+    if (backend_name == "dots-tts") {
+        int rp = dots_tts_penc_diff(model_path.c_str(), ref_path.c_str(), /*verbosity=*/2);
+        int rd = dots_tts_dit_diff(model_path.c_str(), ref_path.c_str(), /*verbosity=*/2);
+        int rf = dots_tts_flowmatch_diff(model_path.c_str(), ref_path.c_str(), /*verbosity=*/2);
+        return (rp == 0 && rd == 0 && rf == 0) ? 0 : 1;
+    }
+    if (backend_name == "dots-tts-llm") {
+        // model_path = core GGUF (q8 is fine for the LLM), ref_path = llm-ref GGUF.
+        return dots_tts_llm_diff(model_path.c_str(), ref_path.c_str(), /*verbosity=*/2);
+    }
+    if (backend_name == "dots-tts-voc") {
+        // model_path = vocoder GGUF, ref_path = voc-ref GGUF.
+        return dots_tts_vocoder_diff(model_path.c_str(), ref_path.c_str(), /*verbosity=*/2);
+    }
+    if (backend_name == "dots-tts-act") {
+        // ref_path = act-ref GGUF (self-contained; model_path ignored).
+        return dots_tts_act_diff(ref_path.c_str(), /*verbosity=*/2);
+    }
+    if (backend_name == "dots-tts-spk") {
+        // model_path = speaker encoder GGUF, ref_path = spk-ref GGUF.
+        return dots_tts_spk_diff(model_path.c_str(), ref_path.c_str(), /*verbosity=*/2);
+    }
+
     // Load the reference archive.
     crispasr_diff::Ref ref;
     if (!ref.load(ref_path)) {
@@ -1105,6 +1155,30 @@ int main(int argc, char** argv) {
         }
 
         voxtral_free(ctx);
+    } else if (backend_name == "higgs-stt") {
+        auto cp = higgs_stt_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        higgs_stt_context* ctx = higgs_stt_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load higgs-stt model\n");
+            return 4;
+        }
+
+        // Chunked Whisper tower + projector, concatenated over 4 s chunks —
+        // the boundary the runtime reproduces (subsumes mel correctness). The
+        // single-window mel/encoder stages were the wrong model and are gone.
+        auto enc_r = higgs_encoder(ctx, samples.data(), (int)samples.size());
+        if (enc_r.ok) {
+            auto rep = ref.compare("audio_embeds", enc_r.data.data(), enc_r.data.size());
+            print_row("audio_embeds", rep, COS_THRESHOLD);
+            record(rep);
+        } else {
+            printf("[ERR ] audio_embeds            %s\n", enc_r.note.c_str());
+            n_fail++;
+        }
+
+        higgs_stt_free(ctx);
     } else if (backend_name == "voxtral4b") {
         auto cp = voxtral4b_context_default_params();
         cp.n_threads = 4;
@@ -2953,6 +3027,61 @@ int main(int argc, char** argv) {
             print_row("dbg_extracted_sum", rep, COS_THRESHOLD);
         }
         mimo_asr_free(ctx);
+
+    } else if (backend_name == "ark-asr" || backend_name == "arkasr") {
+        // ARK-ASR-3B: compute mel + encoder/adapter + prefill logits from the
+        // raw audio and diff against the Python reference (PLAN §ARK). Three
+        // boundaries localise any bug: mel (frontend), audio_embeds (conv stem
+        // + partial RoPE + adapter), first_logits (Qwen2 decoder + injection).
+        auto cp = ark_asr_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        cp.use_gpu = std::getenv("ARKASR_GPU") != nullptr;
+        ark_asr_context* ctx = ark_asr_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load ark-asr model '%s'\n", model_path.c_str());
+            return 4;
+        }
+        {
+            int nm = 0, T = 0;
+            float* mel = ark_asr_compute_mel(ctx, samples.data(), (int)samples.size(), &nm, &T);
+            if (mel) {
+                auto rep = ref.compare("mel_spectrogram", mel, (size_t)nm * T);
+                print_row("mel_spectrogram", rep, COS_THRESHOLD);
+                record(rep);
+                free(mel);
+            } else {
+                printf("[ERR ] mel_spectrogram        extract returned null\n");
+                n_fail++;
+            }
+        }
+        {
+            int h = 0, N = 0;
+            float* emb = ark_asr_run_encoder(ctx, samples.data(), (int)samples.size(), &h, &N);
+            if (emb) {
+                auto rep = ref.compare("audio_embeds", emb, (size_t)h * N);
+                print_row("audio_embeds", rep, COS_THRESHOLD);
+                record(rep);
+                free(emb);
+            } else {
+                printf("[ERR ] audio_embeds           extract returned null\n");
+                n_fail++;
+            }
+        }
+        {
+            int v = 0;
+            float* lg = ark_asr_prefill_logits(ctx, samples.data(), (int)samples.size(), &v);
+            if (lg) {
+                auto rep = ref.compare("first_logits", lg, (size_t)v);
+                print_row("first_logits", rep, COS_THRESHOLD);
+                record(rep);
+                free(lg);
+            } else {
+                printf("[ERR ] first_logits           extract returned null\n");
+                n_fail++;
+            }
+        }
+        ark_asr_free(ctx);
 
     } else if (backend_name == "granite" || backend_name == "granite-4.1") {
         auto cp = granite_speech_context_default_params();
@@ -5706,6 +5835,93 @@ int main(int argc, char** argv) {
         }
 
         moss_audio_free(ctx);
+    } else if (backend_name == "moss-transcribe") {
+        auto cp = moss_transcribe_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 1;
+        moss_transcribe_context* ctx = moss_transcribe_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load moss-transcribe model\n");
+            return 4;
+        }
+
+        // ---- mel_spectrogram ----
+        int n_mels = 0, T_mel = 0;
+        float* mel = moss_transcribe_compute_mel(ctx, samples.data(), (int)samples.size(), &n_mels, &T_mel);
+        if (mel) {
+            auto rep = ref.compare("mel_spectrogram", mel, (size_t)n_mels * T_mel);
+            print_row("mel_spectrogram", rep, COS_THRESHOLD);
+            record(rep);
+        } else {
+            printf("[ERR ] mel_spectrogram         (compute failed)\n");
+            n_fail++;
+        }
+
+        // ---- encoder_output → adapter_output → LM prefill ----
+        if (mel) {
+            int T_enc = 0, d_enc = 0;
+            float* enc = moss_transcribe_run_encoder(ctx, mel, n_mels, T_mel, &T_enc, &d_enc);
+            free(mel);
+            if (enc) {
+                auto rep = ref.compare("encoder_output", enc, (size_t)T_enc * d_enc);
+                print_row("encoder_output", rep, COS_THRESHOLD);
+                record(rep);
+
+                int adapt_T = 0, adapt_d = 0;
+                float* adapted = moss_transcribe_run_adapter(ctx, enc, T_enc, d_enc, &adapt_T, &adapt_d);
+                free(enc);
+                if (adapted) {
+                    auto ra = ref.compare("adapter_output", adapted, (size_t)adapt_T * adapt_d);
+                    print_row("adapter_output", ra, COS_THRESHOLD);
+                    record(ra);
+
+                    // ---- LM prefill: build prompt, embed, splice audio, run ----
+                    const int d_llm = adapt_d;
+                    std::vector<int32_t> ids((size_t)T_enc + 16);
+                    int n_prompt = moss_transcribe_build_prompt(ctx, T_enc, ids.data(), (int)ids.size());
+                    if (n_prompt > 0) {
+                        ids.resize(n_prompt);
+                        float* emb = moss_transcribe_embed_tokens(ctx, ids.data(), n_prompt);
+                        if (emb) {
+                            int aidx = 0;
+                            for (int pos = 0; pos < n_prompt; pos++)
+                                if (ids[pos] == 0 && aidx < T_enc) {
+                                    memcpy(emb + (size_t)pos * d_llm, adapted + (size_t)aidx * d_llm,
+                                           (size_t)d_llm * sizeof(float));
+                                    aidx++;
+                                }
+                            if (ref.has("prefill_inputs_embeds")) {
+                                auto re = ref.compare("prefill_inputs_embeds", emb, (size_t)n_prompt * d_llm);
+                                print_row("prefill_inputs_embeds", re, COS_THRESHOLD);
+                                record(re);
+                            }
+                            moss_transcribe_kv_init(ctx, n_prompt + 16);
+                            int vocab = 0;
+                            float* logits = moss_transcribe_run_llm_kv(ctx, emb, n_prompt, 0, nullptr, &vocab);
+                            free(emb);
+                            if (logits) {
+                                auto rl = ref.compare("prefill_logits_step0", logits, (size_t)vocab);
+                                print_row("prefill_logits_step0", rl, COS_THRESHOLD);
+                                record(rl);
+                                int am = 0;
+                                for (int i = 1; i < vocab; i++)
+                                    if (logits[i] > logits[am])
+                                        am = i;
+                                printf("  C++ first-token argmax = %d  ('%s')\n", am,
+                                       moss_transcribe_token_text(ctx, am) ? moss_transcribe_token_text(ctx, am) : "?");
+                                free(logits);
+                            }
+                        }
+                    }
+                    free(adapted);
+                }
+            } else {
+                printf("[ERR ] encoder_output         (encoder failed)\n");
+                n_fail++;
+            }
+        }
+
+        moss_transcribe_free(ctx);
     } else if (backend_name == "melotts") {
         // MeloTTS (VITS2): text-driven TTS. The reference archive
         // contains intermediate activations (enc_output, enc_mean,

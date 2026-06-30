@@ -49,6 +49,10 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF/resolve/main/parakeet-tdt-0.6b-v3-q4_k.gguf", "~467 MB", nullptr, nullptr},
     {"canary", "canary-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/canary-1b-v2-GGUF/resolve/main/canary-1b-v2-q4_k.gguf", "~600 MB", nullptr, nullptr},
+    // AutoArk-AI/ARK-ASR-3B: Whisper-RoPE encoder + Qwen2.5-3B decoder (19-lang).
+    // NOTE: GGUF repo to be published (PLAN §ARK) — placeholder URL.
+    {"ark-asr", "ark-asr-3b-q4_k.gguf",
+     "https://huggingface.co/cstr/ark-asr-3b-GGUF/resolve/main/ark-asr-3b-q4_k.gguf", "~2.2 GB", nullptr, nullptr},
     // LiquidAI LFM2.5-Audio-1.5B: FastConformer + LFM2 hybrid
     // conv+attention backbone. ASR (+ TTS/speech-to-speech planned).
     // English base model — Q5_K recommended (Q4_K too aggressive for EN).
@@ -92,6 +96,10 @@ constexpr Entry k_registry[] = {
     {"qwen3-1.7b", "qwen3-asr-1.7b-q4_k.gguf",
      "https://huggingface.co/cstr/qwen3-asr-1.7b-GGUF/resolve/main/qwen3-asr-1.7b-q4_k.gguf",
      "~1.3 GB", nullptr, nullptr},
+    // higgs-audio-v3-stt: Whisper-large-v3 encoder + Qwen3-1.7B decoder (Apache-2.0).
+    {"higgs-stt", "higgs-stt-q4_k.gguf",
+     "https://huggingface.co/cstr/higgs-audio-v3-stt-GGUF/resolve/main/higgs-stt-q4_k.gguf",
+     "~2.3 GB", nullptr, nullptr},
     // Mega-ASR: Qwen3-ASR-1.7B with the upstream robustness LoRA merged
     // offline. It uses the standard qwen3 backend at runtime; the upstream
     // router is not required for this always-on robust path.
@@ -236,6 +244,9 @@ constexpr Entry k_registry[] = {
     {"moss-audio", "moss-audio-4b-instruct-q4_k.gguf",
      "https://huggingface.co/cstr/MOSS-Audio-4B-Instruct-GGUF/resolve/main/moss-audio-4b-instruct-q4_k.gguf", "~3.8 GB",
      nullptr, nullptr},
+    {"moss-transcribe", "moss-transcribe-preview-2b-q4_k.gguf",
+     "https://huggingface.co/cstr/MOSS-Transcribe-preview-2B-GGUF/resolve/main/moss-transcribe-preview-2b-q4_k.gguf",
+     "~1.6 GB", nullptr, nullptr},
     {"omniasr", "omniasr-ctc-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/omniASR-CTC-1B-v2-GGUF/resolve/main/omniasr-ctc-1b-v2-q4_k.gguf", "~658 MB", nullptr, nullptr},
     {"omniasr-300m", "omniasr-ctc-300m-v2-q4_k.gguf",
@@ -474,26 +485,26 @@ constexpr Entry k_registry[] = {
      "~1.7 GB",
      "tada-codec-f16.gguf",
      "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-codec-f16.gguf",
-     "~1 GB"},
+     "~250 MB"},
     {"tada-tts-1b", "tada-tts-1b-q4_k.gguf",
      "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-tts-1b-q4_k.gguf",
      "~1.7 GB",
      "tada-codec-f16.gguf",
      "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-codec-f16.gguf",
-     "~1 GB"},
+     "~250 MB"},
     {"tada-1b", "tada-tts-1b-f16.gguf",
      "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-tts-1b-f16.gguf",
      "~3.1 GB",
      "tada-codec-f16.gguf",
      "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-codec-f16.gguf",
-     "~1 GB"},
+     "~250 MB"},
     // TADA-3B-ML (HumeAI/tada-3b-ml): Llama-3.2-3B + flow matching + TADA codec.
     {"tada", "tada-tts-3b-ml-f16.gguf",
      "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/tada-tts-3b-ml-f16.gguf",
      "~6.6 GB",
      "tada-codec-f16.gguf",
      "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/tada-codec-f16.gguf",
-     "~1 GB"},
+     "~250 MB"},
     // lex-au's German Orpheus-3B fine-tune. Already published as a Q8_0
     // GGUF on HF (`lex-au/Orpheus-3b-German-FT-Q8_0.gguf`, 3.52 GB) — the
     // repo name itself ends in `.gguf`, lex-au's convention. License
@@ -928,8 +939,18 @@ constexpr ExtraCompanion k_tada_3b_extras[] = {
     {nullptr, nullptr},
 };
 
+// dots.tts: the CAM++ speaker encoder (15 MB) rides along so that `--voice`
+// voice cloning works after `-m auto --auto-download` — discover_speaker()
+// finds it as a sibling of the core model. Negligible vs the 4.6 GB core.
+constexpr ExtraCompanion k_dots_tts_extras[] = {
+    {"dots-tts-soar-spk-f16.gguf",
+     "https://huggingface.co/cstr/dots-tts-soar-GGUF/resolve/main/dots-tts-soar-spk-f16.gguf"},
+    {nullptr, nullptr},
+};
+
 constexpr ExtraList k_extras[] = {
     {"kokoro", k_kokoro_extras},
+    {"dots-tts", k_dots_tts_extras},
     {"vibevoice-tts", k_vibevoice_tts_extras},
     {"cosyvoice3-tts", k_cosyvoice3_tts_extras},
     {"qwen3-tts", k_qwen3_tts_base_extras},

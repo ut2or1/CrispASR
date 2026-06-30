@@ -334,15 +334,17 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     }
 
     // dots.tts: Qwen2.5-1.5B LLM + 18L DiT flow-matching + 24L PatchEncoder.
-    // The DiT conditioning pathway (AdaLN, timestep MLP, input/final projections)
-    // must stay at source precision — quantization noise compounds through
-    // 16 Euler ODE steps × 18 layers × 2 (CFG) = 576 forward passes.
-    // Safe to quantize: LLM attn/ffn projections, DiT attn/ffn projections,
-    // PatchEncoder attn/ffn projections. Keep at source precision:
-    //   - dit.time_emb.* — timestep conditioning (compounds through ODE steps)
-    //   - dit.in_proj.* — DiT input projection
-    //   - dit.final_*.* — DiT output projection + AdaLN
-    //   - dit.blk.*.adaln.* — per-block AdaLN modulation
+    // The ENTIRE DiT (velocity field predictor) must stay at source precision:
+    // it runs in a CFG flow-matching loop (16 Euler ODE steps × 18 layers × 2
+    // CFG = 576 forwards) where per-step q8 noise compounds and DERAILS
+    // generation (validated: q8 DiT blocks → flow-match cos 0.994 → no-EOS
+    // runaway / garbled audio). So keep ALL dots.dit.* at F16, not just the
+    // conditioning pathway — the attn/ffn block weights matter too. The LLM
+    // (cos 0.999 on q8, dots-tts-llm diff) and PatchEncoder (cos 0.9999 on q8)
+    // blocks quantize safely, so q8 LLM + q8 penc + F16 DiT gives a ~2 GB core
+    // with an accurate flow-match (mixed-quant footprint default). Keep at
+    // source precision:
+    //   - dots.dit.* — the whole flow-matching head (blocks + AdaLN + in/final/time)
     //   - hidden_proj.* — LLM→DiT condition projection
     //   - latent_proj.* — latent→DiT input
     //   - coordinate_proj.* — noise coordinate projection
@@ -353,6 +355,19 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     //   - penc.in_proj/out_proj/ds_conv — PatchEncoder I/O
     // Vocoder and speaker encoder are in separate GGUFs — quantize normally.
     const bool is_dots_tts = (arch.find("dots-tts") != std::string::npos || arch.find("dots_tts") != std::string::npos);
+    // ARK-ASR-3B: keep the tied embedding/lm_head (dec.embed.weight) and the
+    // whole Whisper encoder + adapter (mel-sensitive, small vs the 36L decoder)
+    // at F16; quantize only the decoder attn/ffn projections.
+    const bool is_arkasr = (arch.find("arkasr") != std::string::npos);
+
+    // higgs-audio-v3-stt: Whisper encoder + Qwen3-1.7B decoder with TIED
+    // input/output embeddings (token_embd.weight == output.weight). Both the
+    // embedding lookup and the lm_head share these rows, so quantization noise
+    // there directly perturbs every logit — keep them at source precision (the
+    // attention/FFN blocks quantize normally). The learned audio.embed_positions
+    // has no "weight" suffix so it is already skipped by the is_weight test, and
+    // the conv stacks are 3-D (skipped by ok_dims).
+    const bool is_higgs = (arch == "higgs-stt");
 
     // Parakeet RNNT: the transducer joint network (joint.{enc,pred,out}.weight)
     // and decoder embedding are structurally sensitive to quantization noise.
@@ -410,6 +425,13 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             // MOSS-Audio: keep encoder + adapter + deepstack at F16
             !(arch == "moss_audio" &&
               (sname.find("enc.") == 0 || sname.find("adapter.") == 0 || sname.find("deepstack.") == 0)) &&
+            // MOSS-Transcribe: keep encoder + adapter at F16
+            // MOSS-Transcribe: keep the audio encoder + adapter at F16, and the
+            // TIED token embedding at F16 — `llm.embed.weight` doubles as the
+            // output head (lm_head = embed), so quantizing it to q4_k corrupts
+            // both the input embeddings and every output logit.
+            !(arch == "moss_transcribe" &&
+              (sname.find("enc.") == 0 || sname.find("adapter.") == 0 || sname == "llm.embed.weight")) &&
             !(sname.find("cls.") == 0 && ggml_nelements(t) < 65536) && (sname.find("enc_proj.") != 0) &&
             (sname.find("lm_head.") != 0) && (sname.find("tok_emb.") != 0) && (sname.find("lang_emb.") != 0) &&
             !(is_chatterbox && (sname.find("s3.v.") == 0 || sname.find("conds.") == 0 || sname.find("ve.") == 0 ||
@@ -421,14 +443,12 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                sname == "cosyvoice3.flow.input_embd.w" || sname == "cosyvoice3.flow.spk_affine.w" ||
                sname == "cosyvoice3.s3tok.fsq.proj.w")) &&
             !is_f5tts &&
-            !(is_dots_tts &&
-              (sname.find("dots.dit.time_emb.") == 0 || sname.find("dots.dit.in_proj.") == 0 ||
-               sname.find("dots.dit.final_") == 0 || sname.find(".adaln.") != std::string::npos ||
-               sname.find("dots.hidden_proj.") == 0 || sname.find("dots.latent_proj.") == 0 ||
-               sname.find("dots.coordinate_proj.") == 0 || sname.find("dots.xvec_proj.") == 0 ||
-               sname.find("dots.eos_proj.") == 0 || sname.find("dots.llm.tok_emb.") == 0 ||
-               sname.find("dots.latent_stats.") == 0 || sname.find("dots.penc.in_proj.") == 0 ||
-               sname.find("dots.penc.out_proj.") == 0 || sname.find("dots.penc.ds_conv.") == 0)) &&
+            !(is_dots_tts && (sname.find("dots.dit.") == 0 || sname.find(".adaln.") != std::string::npos ||
+                              sname.find("dots.hidden_proj.") == 0 || sname.find("dots.latent_proj.") == 0 ||
+                              sname.find("dots.coordinate_proj.") == 0 || sname.find("dots.xvec_proj.") == 0 ||
+                              sname.find("dots.eos_proj.") == 0 || sname.find("dots.llm.tok_emb.") == 0 ||
+                              sname.find("dots.latent_stats.") == 0 || sname.find("dots.penc.in_proj.") == 0 ||
+                              sname.find("dots.penc.out_proj.") == 0 || sname.find("dots.penc.ds_conv.") == 0)) &&
             !(is_qwen3_tts && (sname.find("speaker.") == 0 || sname.find("code_pred.token_embd") == 0 ||
                                sname.find("code_pred.output") == 0 || sname.find("code_pred.small_to_mtp") == 0 ||
                                sname.find("talker.token_embd") == 0 || sname.find("talker.text_proj") == 0 ||
@@ -448,6 +468,8 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             !(is_mini_omni2 &&
               (sname.find("audio.") == 0 || sname.find("adapter.") == 0 || sname.find("llm.token_embd") == 0)) &&
             !(is_orpheus && sname.find("talker.token_embd") == 0) &&
+            !(is_arkasr && (sname.find("dec.embed.") == 0 || sname.find("enc.") == 0 || sname.find("adapter.") == 0)) &&
+            !(is_higgs && (sname == "token_embd.weight" || sname == "output.weight")) &&
             !(is_parakeet && parakeet_is_rnnt && !parakeet_quant_all &&
               (sname.find("joint.") == 0 || sname.find("decoder.embed") == 0)) &&
             !(is_tada && !tada_quant_all && (sname.find("talker.token_embd") == 0 || sname.find("tada.") == 0)) &&

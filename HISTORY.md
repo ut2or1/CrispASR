@@ -6,6 +6,374 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #205f 2026-06-30 Granite long-audio: chunk-context drops slices + spaceless rebuild (REAL no-spaces fix)
+
+Reproduced the reporter's two remaining complaints on the actual 2.5-min sample
+(auto-downloaded granite-speech-4.1-2b-plus-q4_k-mini since the model disk is
+detached). Both traced to the CLI long-audio path, not the model:
+
+1. **Words concatenated without spaces.** When chunk-context is active (>1 slice,
+   non-VAD), the dispatcher rebuilds each segment's text by concatenating
+   `word.text` with NO separator (crispasr_run.cpp), assuming the
+   whisper/parakeet convention where word.text carries a leading space. Granite's
+   `[T:N]`-parsed words are bare ("on", "mccloud's"), so they collapsed to
+   "previouslyonmccloud's". Fixed the rebuild to insert a space unless the word
+   already starts with one or the boundary is CJK (preserves the 617cd02 JA
+   kana-spacing fix; no change for leading-space backends). The earlier #205e
+   `[^\[\s]+` regex was necessary but not sufficient — `parse_ts` produced the
+   right words, the dispatcher then re-joined them spaceless.
+
+2. **Misses whole passages (~1:55).** The plus model's native `[T:N]` word
+   timestamps don't line up with the overlap-save slice boundaries, so the
+   word-level trim kept only the few words whose stamp fell in-range and dropped
+   the rest — a 2.5-min clip collapsed from ~150 s of audio to ~36 s of text
+   (gaps 30–80 s and 83–138 s). This is the exact failure that already put
+   cohere/voxtral/qwen3 on the chunk-context opt-out list; added "granite" too.
+   Now the bare slices transcribe fully (recovered 112–124 s, the missing 1:55
+   passage). Plus a small cleanup: a near-empty chunk that emits only "_ [T:179]"
+   has the residual tag/silence stripped.
+
+Validated (granite-plus-mini, M1/Metal, reporter's 2.5-min wav): default `-ojf`
+now spaced + full coverage (666 chars vs base 524 vs the broken 430); jfk
+`--max-len`/timestamps unchanged; 751/751 unit tests (added a granite assertion to
+the chunk-context gate test). Note: q4_k-mini, not the reporter's q4_k — the
+fixes are path-level so they apply to both, but the exact transcript quality will
+differ.
+
+## #205e 2026-06-30 Granite-plus timestamps: fix spaceless text on run-on [T:] pairs
+
+Reporter (AppleSheeple) confirmed `--max-len` works on `main` but flagged that the
+plus model's text comes out word-concatenated ("ifyougotsomethingtosay"). Root
+cause: the `[T:N]` parser's word capture was `(\S+)`, which is greedy *across* the
+`[`. The model card spaces its pairs ("hello [T:45] world [T:82]") and jfk parses
+fine, but on continuous dialogue the plus model emits run-on pairs with no spaces
+("if[T:7962]you[T:7970]got") — there `\S+` swallows the whole run plus the
+embedded tags into a single token, and the rebuilt text loses every space.
+
+Fix: capture the word as `([^\[\s]+)` (non-space, non-`[`), so each word splits at
+the bracket whether or not the model spaces the pairs. Verified by simulation that
+the spaced form is byte-identical (no regression) and the run-on form now splits
+into `if / you / got` → text "if you got". Runtime confirmation on the reporter's
+2.5-min sample is pending (model lives on an external disk that's currently
+detached); the change is a strict regex-robustness improvement.
+
+## #205d 2026-06-30 Granite: keyword biasing (KWB) + incremental decoding (prefix_text)
+
+Wires up the last two granite-speech capabilities from the model card.
+
+- **Keyword List Biasing (KWB).** `--hotwords a,b,c` now appends ` Keywords: a,b,c`
+  to the ASR-family instruction (model card's KWB prompt), biasing recognition
+  toward those terms. Applies to plain / language / timestamp / SAA modes; skipped
+  for translation and fully-custom `--ask` prompts.
+- **Incremental decoding.** New `--prefix-text TEXT` seeds the start of the
+  assistant turn so the model continues from a previously-decoded transcript
+  instead of re-decoding it (model card's `prefix_text` field); the output is the
+  continuation only. Threaded into both chat templates.
+
+Both are applied in `transcribe()` and the streaming override — which also brings
+the streaming path's prompt builder up to the #205c template (system turn +
+`is_plus → control-token`); it had drifted to a system-less user-only prefix.
+
+Validated (M1/Metal, jfk.wav): `--prefix-text "And so, my fellow Americans, ask
+not what your country"` → continuation "can do for you, ask what you can do for
+your country."; `--hotwords … --max-len 30` composes with timestamps; plain /
+timestamps unregressed; 747/747 unit tests. (Keyword-biasing quality gain needs
+audio with rare terms to show; the wiring matches the model card.)
+
+## #205c 2026-06-30 Granite-plus: byte-exact chat template (system turn) + combined SAA/timestamps
+
+Finishing #205b properly, by comparing against `transformers.apply_chat_template`
+(rendered from the real ibm-granite/granite-speech-4.1-2b-plus tokenizer). Two gaps
+remained:
+
+1. **Missing system turn.** The model card's chat template ALWAYS prepends a
+   default system message — the exact rendered prompt is
+   `<|start_of_role|>system<|end_of_role|>You are a helpful assistant. Please ensure
+   responses are professional, accurate, and safe.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|><|audio|>…`.
+   Our v3 prefix started at the *user* turn, so the prompt was not what the model
+   was trained on. Added the system turn → the C++ prompt is now byte-for-byte
+   what transformers emits. (Confirmed via the same tokenizer that
+   granite-speech-4.1-2b *base* genuinely renders `USER: <|audio|>X\n ASSISTANT:`,
+   so the legacy path for non-plus is correct — base and plus really do use
+   different templates.)
+
+2. **Combined SAA + timestamps leaked raw `[T:N]` tags.** The speaker-split block
+   returned early without ever running the timestamp parser, so `-osrt --diarize`
+   emitted `(speaker 0) and [T:56] so [T:95] …`. Refactored the `[T:N]` parser into
+   a shared lambda that threads the mod-1000 rollover state, and applied it inside
+   each speaker turn → clean text + real per-word times.
+
+Validated (M1/Metal, jfk.wav): plus plain / `--max-len` / `--output-json-full`
+(real `t0`/`t1`) / `--diarize` / `--diarize --max-len` (clean speaker+word output)
+all correct; non-plus granite & qwen3 `--max-len` text-split unchanged; 746/746
+unit tests. (Open: keyword-biasing / incremental-decoding capabilities are not
+wired to the CLI — feature work, not a regression.)
+
+## moss-transcribe 2026-06-30 MOSS-Transcribe-preview-2B ASR backend (Qwen3-Omni encoder + Qwen3-1.7B)
+
+Port of `OpenMOSS-Team/MOSS-Transcribe-preview-2B` (~2.4 B, Apache-2.0): the stock
+transformers Qwen3-Omni-MoE audio encoder (128-mel → 3×Conv2d stride-2 → `conv_out`
+7680→1280 no-bias → sinusoidal pos → 32 pre-LN layers, 1280d/20h/FFN 5120,
+block-diagonal **windowed** attention → `ln_post` → `proj1`+GELU → `proj2`→2048) +
+a Gated-MLP adapter (2048→8192→2048) + a Qwen3-1.7B LM (QK-norm, SwiGLU, RoPE
+θ=1e6, **tied embeddings**) with masked-scatter audio-token injection. ~90 % of the
+runtime reuses the sibling `moss-audio` backend and `core/{mel,attention,ffn,bpe,
+gguf_loader}`; only the encoder head and the windowed attention are new. No DeepStack.
+
+THE BUG — the entire pipeline was structurally correct yet the output was garbage
+("Verm -100 years from now …"). The canonical inference loads
+`chat_template_default.py`, which frames the audio in ChatML
+(`<|im_start|>user\n<|audio_start|>`·audio·`<|audio_end|><|im_end|>\n<|im_start|>assistant\n`).
+I had used the bare legacy audio layout, so the model never received the
+`assistant` cue and hallucinated. The diff harness localized it precisely: mel cos
+1.0, `enc_layer_0` cos 1.0 (conv + windowed attention structurally exact), and the
+first decode-token argmax MATCHED the PyTorch reference — yet both emitted "Verm",
+because the reference *also* used the legacy layout. **Matching-but-both-wrong is
+the signature that the engine is correct and the harness input (the prompt) is the
+bug** (see LEARNINGS). After switching `build_prompt` to the template (and fixing an
+undersized prompt buffer — `T_enc+8` vs the needed `T_enc+10` — that had silently
+truncated the output to empty), C++ and the bf16 reference both decode jfk.wav
+verbatim: *"and so my fellow americans ask not what your country can do for you ask
+what you can do for your country."* q4_k and q8_0 are both verbatim.
+
+Two more correctness notes: the mel must drop the trailing Whisper STFT frame
+(`stft[..., :-1]` → `n_samples/hop` frames; `core_mel` produces one extra, so the
+audio-token count drifts by one if not truncated); and the README's `MelConfig`
+(128 bins / n_fft 400) overrides the file's 80/640 defaults — the latter are a red
+herring contradicting the encoder's `conv_out` sizing.
+
+Validated on a 16 GB M1 where the full 2.4 B PyTorch reference OOMs (>12 GB and
+crashed the box twice): a **two-phase low-memory reference dumper** loads only the
+encoder+adapter (f32, ~2.6 GB) for the audio stages, frees them, then loads only the
+Qwen3-1.7B LM standalone (`Qwen3Model`, bf16, ~3.4 GB) + a tied `lm_head` via
+`F.linear(h, embed_w)` for the prefill/decode stages — never the monolithic
+`MossForCausalLM` at once (see LEARNINGS). Full wiring per `docs/contributing.md`
+(runtime `src/moss_transcribe.{h,cpp}`, converter, CLI adapter + factory, c_api,
+registry, quantize keeping enc/adapter/tied-embed at F16, Go LDFLAGS, live test,
+`crispasr-diff` branch + reference backend). Shipped `9f3c5ede`; q4_k (2.63 GB) on
+`cstr/MOSS-Transcribe-preview-2B-GGUF` (card `22818f7a`). f16/q8_0 held back for
+bandwidth.
+
+## #205 2026-06-30 `--max-len` for text-only backends + granite-plus timestamp-mode derail
+
+Reporter: `--max-len` had no effect on granite / qwen3 (worked on whisper/cohere).
+Root cause: `crispasr_make_disp_segments` could only split when a segment carried
+word-level timings; granite/qwen3 (and granite-plus in plain mode) return
+text-only segments, so `--max-len` (and `-osrt`/`-ovtt`/`--split-on-punct`) were
+no-ops. Fix: when a segment has text but no usable words and `max_len > 0`, split
+the TEXT itself — greedy word-packing to ≤ max_len bytes (over-long tokens /
+space-less scripts broken at UTF-8 codepoint boundaries), timestamps interpolated
+by cumulative char length; composes with `--split-on-punct`
+(`examples/cli/crispasr_output.cpp`).
+
+Second issue (granite **plus**): the model's word-timestamp instruction
+("After each word add a timestamp tag … hello [T:45]") derailed the decoder into a
+repetition loop ("thank you thank you …") — garbage for every output that
+triggered it. ROOT CAUSE (found by comparing the model card prompt): the plus
+model needs IBM's **control-token chat template**
+(`<|start_of_role|>user<|end_of_role|>…<|end_of_text|><|start_of_role|>assistant…`),
+but it was routed to the legacy granite-4.0 `USER:/ASSISTANT:` wrapper. The
+discriminator `audio_token_index < 50000` misses it because granite-speech-4.1-2b-plus
+shares granite-4.0's `audio_token_index == 100352`. Plain transcription survives
+the wrong wrapper, but the demanding timestamp/SAA instructions don't — confirmed
+at max_new=200 (so not a long-decode bug): the model even emitted correctly-rising
+[T:N] tags but with "thank you" content, i.e. it had the audio duration but
+ignored its content. FIX: `use_v3_template = (audio_token_index < 50000) ||
+is_plus`, and build the user instruction once for both templates. The plus model
+now emits real word-level timestamps and speaker tags. (Supersedes the interim
+`CRISPASR_GRANITE_WORD_TS` opt-out from the first cut.) The text-only splitter
+above is still what powers `--max-len` on non-plus granite / qwen3 (which carry no
+word timings).
+
+Validated (M1/Metal, jfk.wav): plus `--max-len 30`/`-osrt` → correct transcript
+with real word-accurate splits (0.33/3.88/6.69/9.31 s, matching parakeet) — was a
+"thank you" loop; plus `--output-json-full` → 22 words with real `t0`/`t1`; plus
+plain unregressed; non-plus granite & qwen3 `--max-len` → text-split SRT; parakeet
+`--max-len` word-timed (no regression); 746/746 unit tests (updated the test that
+pinned the old no-split-without-words behaviour).
+
+## §210 2026-06-30 Granite CUDA-graph bucketed decode (PR #207) + Metal raw-gallocr allocate-once
+
+External PR #207 (sims1253) brought **CUDA-graph capture** to granite-speech's
+LLM decode: the single-token step now runs a cached, shape-stable graph (KV read
+pinned to a fixed `Lk` bucket via `set_rows`+runtime index), plus in-graph
+`argmax` and a fused F16 embed lookup, so the ~280 GEMV launches/token replay as
+one `cudaGraphLaunch` → ~9-13× RTFx on RTX 5090, bit-identical transcripts. Also
+flips `GGML_CUDA_GRAPHS_DEFAULT=ON` (arch-gated sm_80+) and denies capture for
+k-quant `GET_ROWS` (its host sync is illegal mid-capture). Reviewed + tested on
+M1 Metal before merge (the path is gated on `use_gpu`, so it runs on Metal too,
+not just CUDA): `ctest -R granite` 9/9, jfk + fleurs_60s byte-identical between
+the bucket (GPU) and legacy (CPU) paths. Merged to main with one follow-up fix
+(`c5035969`): the argmax-fused greedy loop wrote KV at row `n_past` into the
+fixed `[0,bucket)` view without bounding `n_past` against the bucket → OOB when
+the `min(prompt+max_new+1, 4096)` clamp engages and EOS isn't hit; now stops at
+the bucket ceiling (== the hard context limit) and the per-step helpers are
+self-safe.
+
+Metal follow-up (`862dbeca`): since the bucketed graph is shape-stable and Metal
+has no capture, allocate it **once** via a persistent `ggml_gallocr` on the
+single GPU backend and reuse it every step (`granite_dec_use_gallocr`), skipping
+the per-step `sched_reset`+`sched_alloc_graph`. Default-on for non-capture
+backends, `CRISPASR_GRANITE_DEC_GALLOCR=0` opts out; CUDA/HIP and CPU-split keep
+the sched. Byte-identical, ctest 9/9. Measured (M1, Q4_K,
+`CRISPASR_GRANITE_DEC_PROFILE=1`): the win is modest on a quiet box (sched alloc
+~3 ms/step → ~0.02 ms) but large under memory pressure (alloc balloons to
+68-236 ms). The dominant ~100 ms/step was assumed to be Metal per-op dispatch
+that indirect command buffers (the Metal analog of CUDA-graph capture) would fix.
+
+**ICB follow-up → measured DUD.** Before building the (large, invasive) ICB
+refactor, added `CRISPASR_METAL_PROFILE` to `ggml_metal_graph_compute` to split
+each step into host encode+commit vs GPU execute+sync. Result (granite-4.1-2b
+Q4_K, jfk, 27 decode steps): host encode = **1.2 ms (1.8 %)**, GPU = **64 ms
+(98 %)**, total 66 ms (cross-checks dec-profile's 70 ms). So the "dispatch floor"
+is **GPU-side** (weight-bandwidth-bound Q4_K GEMVs reading ~1.5 GB/token), not
+host launch — ICB's ceiling is ~1.2 ms ≈ 1.8 % even if free, and it has a hard
+blocker (every op binds args via `setBytes`, which `MTLIndirectComputeCommand`
+can't do). CUDA graphs win 9-13× here because the RTX 5090 is *CPU-launch-bound*;
+M1 is *GPU-bound* — opposite regime, same trick, opposite verdict. Decided by
+measuring the host/GPU ratio, not by assuming. Full write-up + table in
+[[LEARNINGS]] §210; `CRISPASR_METAL_PROFILE` kept as the reusable host-vs-GPU
+probe. ICB is closed, not open. Real M1-decode levers are GPU-side (quant
+bandwidth, kernel fusion).
+
+## #208b 2026-06-30 Parakeet long-audio: overlapping-window merge (supersedes silence-split)
+
+Follow-up to #208 (below). Validating "lose no words" on >2-min en/de/ja exposed
+that **parakeet single-pass silently DROPS whole sections of long audio** — the
+TDT decoder loses track past ~30 s, so a single full-length pass on a 296 s clip
+emitted only 338 words where the audio has ~620. This is **not** a quantization
+artifact: the F16 model is *worse* (255 words) than Q4_K (338). It is also not
+unique to parakeet — whisper-large-v3-turbo dropped a section too (it lost one of
+two genuinely-repeated FLEURS passages; verified by transcribing the two time
+windows independently — the audio really says it twice, so parakeet was *right*
+and whisper was the one losing words). The original #208 silence-split path
+inherited the drop (its pieces ran up to the 300 s cap).
+
+Fix: replaced `parakeet_session_longform` (silence-cut + hard-t0 commit) with
+`parakeet_session_chunked_merge` — transcribe in short **overlapping** windows
+(default 20 s, 8 s overlap; the decoder is reliable at that length), splice
+consecutive windows at the overlap midpoint *continuing from the last committed
+word's end* (no boundary drop), then an adjacent-dedup pass removes any
+jitter-doubled seam word. Non-JA long audio uses it; JA stays on the streamed
+encoder; audio ≤ one window is a single exact pass. Knobs:
+`CRISPASR_PARAKEET_CHUNK_SECONDS` / `_CHUNK_OVERLAP`;
+`CRISPASR_PARAKEET_STREAM_THRESHOLD` now forces one exact pass up to N s
+(escape hatch for NeMo-exact bit-repro on known-clean audio).
+
+Validated (Q4_K v3, M1/Metal): **jfk×12 (132 s, exact ground truth = 264 words):
+264/264, byte-exact, no drop/dup even with identical sentences every 11 s**;
+German 296 s: **99.6 % word retention** vs reliable single-pass (D=2); English
+296 s: 653 vs single-pass 338 (recovers the dropped + genuinely-repeated
+sections); Japanese 240 s: 346 vs 320. 746/746 unit tests green. See
+[[LEARNINGS]].
+
+## #208 2026-06-30 Parakeet session API: bounded long-audio + repeated-call collapse fixed
+
+Reporter: the session/Rust `Session::transcribe` always ran Parakeet through the
+unchunked full-length encoder (`parakeet_transcribe_ex` → one O(T²) FastConformer
+graph), so long audio "hangs" for minutes on Metal. Fixed in the session dispatch
+(`transcribe_single`, `src/crispasr_c_api.cpp`) by mirroring the CLI adapter's
+bounded long-form path: non-JA (vocab > 4096) above a memory-safe cap (300 s,
+`CRISPASR_PARAKEET_STREAM_THRESHOLD`) → NeMo-exact single-pass + silence-split
+(`parakeet_session_longform`, ported from the CLI's `transcribe_longform`, one
+session segment per piece); JA-only → the overlapping streamed encoder; short
+audio → the exact single pass (byte-identical to before). Added option-1 explicit
+entry points `crispasr_session_transcribe_chunked[_lang]` + Rust
+`Session::transcribe_chunked[_with_language]` for batch callers that want to force
+the bounded path / size the window (inert on non-Parakeet backends).
+
+**Bigger find while validating:** the §176s **encoder graph cache**
+(`cached_enc_gf`, reused when `T_mel` matches) is NOT re-entrant with the shared
+`ggml_backend_sched` — reusing the cached cgraph across `sched_reset` /
+`sched_alloc_graph` leaves compute tensors with stale buffers, so the **2nd and
+every later** same-`T_mel` encode shifts (jfk enc std 0.020 → 0.014) and the TDT
+decoder collapses to all-blank → **empty transcript**. This silently broke every
+repeated encode: long-lived sessions (the server!), the streamed/chunked paths,
+and the new silence-split path; it hid because the CLI does one encode per process.
+Fixed by making the rebuild-every-call path the default and gating the cache
+opt-in behind `CRISPASR_PARAKEET_ENC_CACHE=1` (`src/parakeet.cpp`) until it is
+reimplemented re-entrantly. Validated on `parakeet-tdt-0.6b-v3-q4_k` (M1/Metal):
+plain transcribe ×N verbatim, chunked 0 / 5 s verbatim, 60 s silence-split path
+bounded (4.1 s) and non-empty; 739/739 unit tests green. See [[LEARNINGS]].
+
+## §192 2026-06-29 TADA Vulkan — REPEAT-f16 abort unblocked; FM time-dim divergence localized (superseded below)
+
+On branch `fix/tada-vulkan-repeat-f16` (worktree `/Volumes/backups/code/tada-vk-stash`).
+Continues the #192 native-Vulkan work (CPU-fallback default + `TADA_MAX_EXPANDED_FRAMES`
+guard + gated `CRISPASR_TADA_VULKAN_NATIVE=1` direct-gallocr path already shipped to main).
+
+**Shipped on the branch (commit `0c519efa`) — the REPEAT-f16 unblock.** The gated
+native path was dead for *everyone*, not just MoltenVK: the talker's GQA head-expansion
+does `ggml_repeat_4d` directly on the **F16** KV cache, and Vulkan has no `REPEAT f16→f16`
+pipeline — so it aborts with `Missing op: REPEAT for f16 to f16` (confirmed on RADV by
+contributor BergmannAtmet *and* locally on MoltenVK). Fix: a per-call `force_kv_read_f32`
+in `core_attn::KvSelfAttnParams` (OR'd with the global `CRISPASR_KV_READ_F32`) that casts
+K/V up to F32 *before* the GQA repeat, lowering it to a supported F32 REPEAT. TADA sets it
+only when `c->vulkan_native`; Metal/CPU keep the F16 fast path (field defaults false → no
+behaviour change anywhere else). The native path now **runs end-to-end** on MoltenVK;
+"Hello world." round-trips verbatim through ASR.
+
+**Not fixed — execution unblocked ≠ correct output.** On non-trivial text the native
+Vulkan path still diverges: "I went to school and back in four hours" (seed 1) gives
+**522 expanded frames / 9.68 s / empty ASR (garbage)** vs CPU's **155 frames / verbatim**.
+"Hello world." only survives because it's too short for the divergence to compound through
+the autoregressive `cur_acoustic` feedback. Localized (by code reading) to the **FM head's
+time-dimension output**: durations are decoded from the latent `[ad..lat)` slice (duration
+CFG=1.0); the acoustic dims were validated (`speech_rms 426→1.14`) but the **time dims were
+never separately validated**, and they're what blows up.
+
+**Dead end (committed `126eb41a`, reverted `79c1cff9`).** Hypothesis "disable FM B=2 on
+Vulkan" — DISPROVEN once the machine was stable: FM-B2 ON and OFF both give the identical
+522-frame runaway. The 148/191/522-frame variance that looked like a signal was
+**disk-pressure noise** (`/Volumes/backups` at 100% → SIGBUS on mmap + nondeterministic
+runs). Reverting also keeps the batched-CFG win on Metal/CPU/CUDA.
+
+**Remaining work** (PLAN §192-followup): per-op diff-harness debugging of the FM time-dim
+path on Vulkan vs CPU. — **Superseded:** the FM localization was wrong; see the next entry
+(the codec was the actual culprit, now fixed).
+
+## §192 2026-06-29 (later) TADA Vulkan garbled output FIXED — it was the CODEC, not the FM
+
+Same branch. The "FM time-dimension divergence" localization above was a **red herring**.
+
+**Decisive A/B.** Ran the failing sentence on **Metal** native vs **Vulkan** native: both
+produced **bit-identical** durations (`time_before = [38,2,9,6,8,8,5,10,9,5,211]`) and 522
+frames — the talker + FM + gray-code duration decode AGREE across GPUs. Metal rendered them
+intelligibly ("I went to school in back in four hours"); Vulkan rendered **empty** audio.
+So the divergence is entirely in audio rendering = the **codec** (`tada_codec.cpp`).
+Per-stage `TADA_CODEC_DUMP` (Vulkan vs CPU, identical 522-frame features) pinned it: the
+attention encoder MATCHES, but the DAC decoder front-end explodes — `dump_dac_in` (the
+`in_conv` Conv1d → im2col+mul_mat) hits rms ~37 / range ±800 on Vulkan vs ~0.85 on CPU
+(~43×), distorting the output (the final Tanh masks the range). Size-dependent (short
+"Hello world" renders fine on Vulkan). **NOT** a `ggml_backend_sched` cross-backend bug
+(single Vulkan split, no offload — `GGML_SCHED_DEBUG` confirmed), **NOT** missing kernels
+(ggml-vulkan has conv_transpose_1d/col2im/im2col; the codec has no ISTFT), **NOT** precision,
+and **NOT even a conv kernel bug** — a standalone repro of conv_1d/im2col/the full wn_conv1d
+at the codec's exact dims and T=522 is bit-correct on MoltenVK, and capping
+`GGML_VK_FORCE_MAX_ALLOCATION_SIZE` doesn't help. It's a graph-scale gallocr/aliasing-class
+corruption in the *large* real codec graph, unreproducible in a minimal harness.
+
+**Disproven en route** (so the next reader doesn't repeat it): forcing F32 FM weights on
+Vulkan left output **bit-identical** (MoltenVK `mul_mm` downconverts src0 to f16 regardless
+— see LEARNINGS §192); running the **whole FM head on CPU** also left it bit-identical; and
+`GGML_VK_DISABLE_F16=1` only moved a cond cosine 0.99919→0.99966 and didn't change the
+durations. The FM was never the problem — its gray-code time bits already matched CPU at
+the records that mattered.
+
+**Fix (commit 1cc02fef; explanation corrected in a follow-up commit).** When the codec's
+GPU backend is Vulkan, run the whole codec on the **CPU backend**
+(`tada_codec_init_from_file_impl`). The codec is a one-shot decode (not the AR loop) and its
+input features are bit-identical Metal-vs-Vulkan (Metal renders them correctly), so CPU
+rendering is faithful. Talker/FM keep the native-Vulkan path. Debug override:
+`CRISPASR_TADA_CODEC_VULKAN_NATIVE=1`. Open follow-up: op-level repros rule out the conv
+kernels, so the GPU-native path needs either a chunked codec decode (under the breaking
+length) or graph-scale gallocr debugging — best on RADV, not MoltenVK.
+
+**Validation.** Native Vulkan now ASR-round-trips intelligibly on "four hours" (seed 1, ==
+Metal), "the quick brown fox…" (seed 1), and "four hours" (seed 2); deterministic across
+re-runs; CPU output **byte-identical** to before (fix is Vulkan-backend-gated). Still gated,
+default still CPU-fallback — ask BergmannAtmet (RADV) to confirm before flipping the default.
+
 ## §221 2026-06-27 tada-encoder — voice reference creation ported to C++/ggml
 
 Ported the TADA encoder pipeline (Aligner + WavEncoder + LocalAttentionEncoder

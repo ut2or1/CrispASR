@@ -25,6 +25,7 @@ add_executable(${TARGET}
     crispasr_backend_granite_nle.cpp
     crispasr_backend_voxtral.cpp
     crispasr_backend_voxtral4b.cpp
+    crispasr_backend_higgs_stt.cpp
     crispasr_backend_qwen3.cpp
     crispasr_backend_fastconformer_ctc.cpp
     crispasr_backend_wav2vec2.cpp
@@ -58,7 +59,9 @@ add_executable(${TARGET}
     crispasr_backend_gemma4_e2b.cpp
     crispasr_backend_omniasr.cpp
     crispasr_backend_mimo_asr.cpp
+    crispasr_backend_ark_asr.cpp
     crispasr_backend_moss_audio.cpp
+    crispasr_backend_moss_transcribe.cpp
     crispasr_backend_funasr.cpp
     crispasr_backend_paraformer.cpp
     crispasr_backend_sensevoice.cpp
@@ -183,6 +186,7 @@ target_link_libraries(crispasr-diff PRIVATE
     granite_nle
     voxtral
     voxtral4b
+    higgs_stt
     qwen3_asr
     qwen3_tts
     orpheus
@@ -195,7 +199,9 @@ target_link_libraries(crispasr-diff PRIVATE
     gemma4_e2b
     mimo_tokenizer
     mimo_asr
+    ark_asr
     moss_audio
+    moss_transcribe
     voxcpm2_tts
     funasr
     paraformer
@@ -204,6 +210,7 @@ target_link_libraries(crispasr-diff PRIVATE
     csm-tts
     parler-tts
     mini-omni2
+    dots-tts
     crispasr-diff-lib
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
@@ -277,6 +284,7 @@ target_link_libraries(${TARGET} PRIVATE
     granite_nle
     voxtral
     voxtral4b
+    higgs_stt
     qwen3_asr
     qwen3_tts
     orpheus
@@ -306,6 +314,7 @@ target_link_libraries(${TARGET} PRIVATE
     paraformer
     sensevoice
     moss_audio
+    moss_transcribe
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
     $<$<BOOL:${WIN32}>:winhttp>

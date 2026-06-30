@@ -230,7 +230,7 @@ Nine edit points, each mirroring the `CA_HAVE_CHATTERBOX` blocks:
    prompt)` setter to the runtime, and forward `s->ask` in the transcribe
    dispatch. This lets `set_ask()` override the default transcription
    instruction. Currently wired for: granite, voxtral, qwen3-asr,
-   glm-asr, gemma4-e2b, mimo-asr.
+   glm-asr, gemma4-e2b, mimo-asr, higgs-stt.
 9b. **`params.language` wiring** — if the backend is an audio-LLM, also
    inject a language hint into the prompt when `params.language` is set
    and non-auto. Pattern: `else if (!params.language.empty() && params.language
@@ -238,7 +238,7 @@ Nine edit points, each mirroring the `CA_HAVE_CHATTERBOX` blocks:
    For **English-only** models (moonshine-streaming, kyutai-stt), emit a
    `fprintf(stderr, ...)` warning instead of silently ignoring the flag.
    Currently wired for: granite (v3 + v4 templates), qwen3-asr, glm-asr,
-   moss-audio, mimo-asr; warned for moonshine-streaming, kyutai-stt.
+   moss-audio, mimo-asr, higgs-stt; warned for moonshine-streaming, kyutai-stt.
 10. **`crispasr_session_set_speaker_id()`** — if the backend is a
     multi-speaker TTS model with integer-indexed speakers (e.g. melotts,
     piper, fastpitch). Add a dispatch block that bounds-checks against
@@ -435,6 +435,24 @@ not just M1.
   broken cross-backend copy; mid-graph CPU splits are fine. (A `ggml_concat`-of-a-
   scaled-view "manual pad" to avoid `GGML_OP_PAD` fails when pad > input length —
   you can't build zeros wider than the source view.)
+- **Host-syncing ops crash a CUDA-graph-captured graph.** `ggml` can capture and
+  replay an LLM decode step as a single `cudaGraphLaunch` (CUDA-graph capture, on
+  by default via `GGML_CUDA_GRAPHS_DEFAULT`, arch-gated to sm_80+; disable with
+  `GGML_CUDA_DISABLE_GRAPHS=1`), but only if *every* op in the graph is
+  capture-safe. `get_rows_cuda_kquant` copies the index tensor D2H and calls
+  `cudaStreamSynchronize` to read it on the host before launching its per-row
+  dequant kernels — a host sync is illegal inside capture, so a graph containing
+  GET_ROWS on a k-quant source crashes. F16/F32/legacy-quant GET_ROWS use the
+  capture-safe `k_get_rows` path and are unaffected. (This bit
+  `granite-speech-4.1-2b-q4_k.gguf`'s quantized token embedding under capture —
+  §210.) **Fix:** deny CUDA-graph capture for graphs with k-quant GET_ROWS
+  (`ggml_cuda.cu`), and keep the k-quant path on the legacy per-call rebuild. The
+  same rule applies to any future op that host-syncs (e.g. reads a shape/extent on
+  the host before dispatching) — it cannot live in a captured graph; route it
+  through the non-captured path instead. **Related:** even on a topology-stable
+  captured graph you must still `ggml_backend_sched_reset` + `sched_alloc_graph`
+  per step — ggml's capture bookkeeping rejects the documented reuse-shortcut
+  (`ggml-backend.h:285`) with `CUDA error: invalid argument` mid-decode.
 
 ## Watermarking tests
 

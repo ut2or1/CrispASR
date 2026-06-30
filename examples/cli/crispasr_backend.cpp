@@ -17,6 +17,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_granite_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_granite_nle_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_voxtral_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_voxtral4b_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_higgs_stt_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_qwen3_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_fastconformer_ctc_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_wav2vec2_backend();
@@ -41,7 +42,9 @@ std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_streaming_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_gemma4_e2b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_omniasr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_mimo_asr_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_ark_asr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moss_audio_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_moss_transcribe_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_funasr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_paraformer_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_sensevoice_backend();
@@ -101,6 +104,9 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_voxtral_backend();
     if (name == "voxtral4b")
         return crispasr_make_voxtral4b_backend();
+    if (name == "higgs-stt" || name == "higgs_stt" || name == "higgs-audio-v3-stt" || name == "higgs-audio-stt" ||
+        name == "higgsaudiostt")
+        return crispasr_make_higgs_stt_backend();
     if (name == "qwen3" || name == "qwen3-1.7b" || name == "qwen3_1.7b" || name == "qwen3_17b" || name == "mega-asr" ||
         name == "mega_asr" || name == "megaasr")
         return crispasr_make_qwen3_backend();
@@ -180,8 +186,12 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_omniasr_backend();
     if (name == "mimo-asr" || name == "mimo_asr" || name == "mimoasr")
         return crispasr_make_mimo_asr_backend();
+    if (name == "ark-asr" || name == "ark_asr" || name == "arkasr" || name == "ark")
+        return crispasr_make_ark_asr_backend();
     if (name == "moss-audio" || name == "moss_audio" || name == "mossaudio")
         return crispasr_make_moss_audio_backend();
+    if (name == "moss-transcribe" || name == "moss_transcribe" || name == "mosstranscribe")
+        return crispasr_make_moss_transcribe_backend();
     if (name == "funasr" || name == "fun-asr" || name == "fun-asr-nano" || name == "fun-asr-mlt-nano")
         return crispasr_make_funasr_backend();
     if (name == "paraformer" || name == "paraformer-zh" || name == "paraformer-en")
@@ -226,6 +236,7 @@ std::vector<std::string> crispasr_list_backends() {
         "qwen3",
         "qwen3-1.7b",
         "mega-asr",
+        "higgs-stt",
         "fastconformer-ctc",
         "wav2vec2",
         "hubert",
@@ -274,7 +285,9 @@ std::vector<std::string> crispasr_list_backends() {
         "omniasr-llm",
         "omniasr-llm-1b",
         "mimo-asr",
+        "ark-asr",
         "moss-audio",
+        "moss-transcribe",
         "funasr",
         "fun-asr-mlt-nano",
         "paraformer",
@@ -475,6 +488,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "voxtral4b";
     if (contains_ci("voxtral"))
         return "voxtral";
+    if (contains_ci("higgs") && (contains_ci("stt") || contains_ci("audio")))
+        return "higgs-stt";
     // Distinguish parakeet-CTC standalones (parakeet-ctc-0.6b /
     // parakeet-ctc-1.1b — same FastConformer encoder + CTC head as the
     // stt_en_fastconformer_ctc family) from parakeet-TDT (transducer)
@@ -503,6 +518,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "wav2vec2";
     if (contains_ci("vibevoice"))
         return "vibevoice";
+    if (contains_ci("ark-asr") || contains_ci("arkasr") || contains_ci("ark_asr"))
+        return "ark-asr";
     if (contains_ci("kugelaudio"))
         return "kugelaudio";
     if (contains_ci("fireredpunc"))
@@ -657,6 +674,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "m2m100";
             else if (a == "voxtral")
                 result = "voxtral";
+            else if (a == "higgs-stt" || a == "higgs_stt" || a == "higgs-audio-v3-stt")
+                result = "higgs-stt";
             else if (a == "voxtral4b" || a == "voxtral-4b" || a == "voxtral_4b")
                 result = "voxtral4b";
             else if (a == "granite-speech" || a == "granite_speech" || a == "granitespeech")
@@ -695,8 +714,12 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "fireredpunc";
             else if (a == "mimo_asr" || a == "mimo-asr")
                 result = "mimo-asr";
+            else if (a == "arkasr" || a == "ark-asr" || a == "ark_asr")
+                result = "ark-asr";
             else if (a == "moss_audio" || a == "moss-audio")
                 result = "moss-audio";
+            else if (a == "moss_transcribe" || a == "moss-transcribe")
+                result = "moss-transcribe";
             else if (a == "funasr" || a == "fun_asr" || a == "fun-asr")
                 result = "funasr";
             else if (a == "paraformer")

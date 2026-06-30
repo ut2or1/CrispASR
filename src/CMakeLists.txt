@@ -254,6 +254,11 @@ if (CRISPASR_OPUS)
                 # Using `PkgConfig::OPUSFILE` was also populating compiler flags. So we append
                 # those separately now.
                 target_compile_options(crispasr-lib PRIVATE ${OPUSFILE_CFLAGS})
+                # The bare `-l` names above carry no search path, so on prefixes
+                # the linker doesn't scan by default (Homebrew /opt/homebrew/lib,
+                # MacPorts, custom roots) the link fails with "library 'opusfile'
+                # not found". Add pkg-config's library dirs so they resolve.
+                target_link_directories(crispasr-lib PRIVATE ${OPUSFILE_STATIC_LIBRARY_DIRS})
                 target_link_libraries(crispasr-lib PRIVATE ${OPUSFILE_STATIC_LIBRARIES})
                 set(_crispasr_opus_ok ON)
                 message(STATUS "CrispASR: .opus via system opusfile ${OPUSFILE_VERSION} (pkg-config)")
@@ -261,9 +266,13 @@ if (CRISPASR_OPUS)
         endif()
     endif()
 
-    if (NOT _crispasr_opus_ok)
-        # Static fallback. libogg + libopus ship upstream CMake; opusfile is
-        # autotools-only, so compile its (HTTP-free) core sources directly.
+    if (NOT _crispasr_opus_ok AND CRISPASR_OPUS_FETCH)
+        # Static fallback — ONLY when explicitly requested. opusfile is left
+        # unavailable (build proceeds without .opus) when it is neither found via
+        # pkg-config nor force-built via -DCRISPASR_OPUS_FETCH=ON, so a missing
+        # system opusfile never fails the build or triggers a surprise network
+        # fetch. libogg + libopus ship upstream CMake; opusfile is autotools-only,
+        # so compile its (HTTP-free) core sources directly.
         include(FetchContent)
         # Suppress Opus/Ogg test targets without clobbering the global
         # BUILD_TESTING that CTest relies on (include(CTest) runs later
@@ -484,10 +493,19 @@ if (WIN32)
     target_link_libraries(crispasr-lib PUBLIC winhttp mfplat mfreadwrite mfuuid ole32)
 endif()
 
-if (ANDROID)
+if (ANDROID AND CRISPASR_MEDIA_NDK)
     # mediandk: AMediaExtractor/AMediaCodec NDK API used by crispasr_audio.cpp
     # for hardware-accelerated AAC/MP3 decode (API 21+).
-    target_link_libraries(crispasr-lib PUBLIC mediandk)
+    # Not available on Termux — auto-detect the library before linking.
+    include(CheckLibraryExists)
+    check_library_exists(mediandk AMediaExtractor_new "" HAVE_MEDIANDK)
+    if (HAVE_MEDIANDK)
+        target_link_libraries(crispasr-lib PUBLIC mediandk)
+        target_compile_definitions(crispasr-lib PUBLIC CRISPASR_HAVE_MEDIA_NDK)
+        message(STATUS "Android Media NDK: enabled (libmediandk found)")
+    else()
+        message(STATUS "Android Media NDK: disabled (libmediandk not found — Termux?)")
+    endif()
 endif()
 
 if (CRISPASR_COREML)
@@ -1027,6 +1045,26 @@ if(GGML_CUDA)
     target_link_libraries(voxtral4b PUBLIC ggml-cuda)
 endif()
 
+add_library(higgs_stt STATIC
+            higgs_stt.h
+            higgs_stt.cpp
+            )
+target_include_directories(higgs_stt PUBLIC . ../include)
+target_compile_features   (higgs_stt PUBLIC cxx_std_17)
+set_target_properties(higgs_stt PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (higgs_stt PUBLIC ggml ggml-base Threads::Threads crispasr-core crisp_audio)
+if(NOT MSVC)
+    target_compile_options(higgs_stt PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(higgs_stt PRIVATE GGML_USE_METAL)
+    target_link_libraries(higgs_stt PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(higgs_stt PRIVATE GGML_USE_CUDA)
+    target_link_libraries(higgs_stt PUBLIC ggml-cuda)
+endif()
+
 add_library(granite_speech STATIC
             granite_speech.h
             granite_speech.cpp
@@ -1202,6 +1240,18 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# ark_asr — AutoArk-AI/ARK-ASR-3B (Whisper-RoPE encoder + Qwen2.5-3B decoder)
+# ---------------------------------------------------------------------------
+add_library(ark_asr STATIC ark_asr.h ark_asr.cpp)
+set_target_properties(ark_asr PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(ark_asr PUBLIC .)
+target_compile_features   (ark_asr PUBLIC cxx_std_17)
+target_link_libraries     (ark_asr PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(ark_asr PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # moss_audio — OpenMOSS-Team/MOSS-Audio-4B-Instruct (Whisper encoder + DeepStack + Qwen3 LLM)
 # ---------------------------------------------------------------------------
 add_library(moss_audio STATIC moss_audio.h moss_audio.cpp)
@@ -1211,6 +1261,18 @@ target_compile_features   (moss_audio PUBLIC cxx_std_17)
 target_link_libraries     (moss_audio PUBLIC crispasr-core ggml ggml-base ggml-cpu)
 if(NOT MSVC)
     target_compile_options(moss_audio PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# moss_transcribe — OpenMOSS-Team/MOSS-Transcribe-preview-2B (Qwen3-Omni audio encoder + Qwen3-1.7B LLM)
+# ---------------------------------------------------------------------------
+add_library(moss_transcribe STATIC moss_transcribe.h moss_transcribe.cpp)
+set_target_properties(moss_transcribe PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(moss_transcribe PUBLIC .)
+target_compile_features   (moss_transcribe PUBLIC cxx_std_17)
+target_link_libraries     (moss_transcribe PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(moss_transcribe PRIVATE -O3)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -2013,6 +2075,9 @@ endif()
 if (TARGET qwen3_asr)
     target_link_libraries(crispasr-lib PUBLIC qwen3_asr)
 endif()
+if (TARGET higgs_stt)
+    target_link_libraries(crispasr-lib PUBLIC higgs_stt)
+endif()
 if (TARGET cohere)
     target_link_libraries(crispasr-lib PUBLIC cohere)
 endif()
@@ -2027,6 +2092,9 @@ if (TARGET canary_ctc)
 endif()
 if (TARGET voxtral)
     target_link_libraries(crispasr-lib PUBLIC voxtral)
+endif()
+if (TARGET higgs_stt)
+    target_link_libraries(crispasr-lib PUBLIC higgs_stt)
 endif()
 if (TARGET voxtral4b)
     target_link_libraries(crispasr-lib PUBLIC voxtral4b)
@@ -2093,11 +2161,17 @@ endif()
 if (TARGET mimo_tokenizer)
     target_link_libraries(crispasr-lib PUBLIC mimo_tokenizer)
 endif()
+if (TARGET ark_asr)
+    target_link_libraries(crispasr-lib PUBLIC ark_asr)
+endif()
 if (TARGET mimo_asr)
     target_link_libraries(crispasr-lib PUBLIC mimo_asr)
 endif()
 if (TARGET moss_audio)
     target_link_libraries(crispasr-lib PUBLIC moss_audio)
+endif()
+if (TARGET moss_transcribe)
+    target_link_libraries(crispasr-lib PUBLIC moss_transcribe)
 endif()
 if (TARGET qwen3_tts)
     target_link_libraries(crispasr-lib PUBLIC qwen3_tts)

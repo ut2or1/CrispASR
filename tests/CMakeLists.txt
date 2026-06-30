@@ -496,6 +496,26 @@ catch_discover_tests(test-nemotron
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test - ark-asr — live integration tests for ARK-ASR-3B (experimental/WIP)
+add_executable(test-ark-asr
+    test_ark_asr_live.cpp
+)
+target_include_directories(test-ark-asr PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-ark-asr PRIVATE
+    Catch2::Catch2WithMain
+    ark_asr
+)
+catch_discover_tests(test-ark-asr
+    TEST_SPEC "[ark-asr]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── test - lfm2-audio — live integration tests for LFM2-Audio ASR + TTS
 add_executable(test-lfm2-audio
     test_lfm2_audio_live.cpp
@@ -563,6 +583,26 @@ catch_discover_tests(test-mini-omni2
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test - higgs-stt — live integration tests for higgs-audio-v3-stt ASR
+add_executable(test-higgs-stt
+    test_higgs_stt_live.cpp
+)
+target_include_directories(test-higgs-stt PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-higgs-stt PRIVATE
+    Catch2::Catch2WithMain
+    higgs_stt
+)
+catch_discover_tests(test-higgs-stt
+    TEST_SPEC "[higgs-stt]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── test - moss-audio — live integration tests for MOSS-Audio-4B audio understanding
 add_executable(test-moss-audio
     test_moss_audio_live.cpp
@@ -577,6 +617,26 @@ target_link_libraries(test-moss-audio PRIVATE
 )
 catch_discover_tests(test-moss-audio
     TEST_SPEC "[moss-audio]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test - moss-transcribe — live ASR integration test for MOSS-Transcribe-preview-2B
+add_executable(test-moss-transcribe
+    test_moss_transcribe_live.cpp
+)
+target_include_directories(test-moss-transcribe PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-moss-transcribe PRIVATE
+    Catch2::Catch2WithMain
+    moss_transcribe
+)
+catch_discover_tests(test-moss-transcribe
+    TEST_SPEC "[moss-transcribe]"
     PROPERTIES
         LABELS live
         SKIP_RETURN_CODE 4
@@ -665,6 +725,26 @@ catch_discover_tests(test-cosyvoice3-params
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;cosyvoice3"
 )
+
+# ─── test-dots-tts-params — Catch2 unit tests for dots_tts_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+if (TARGET dots-tts)
+add_executable(test-dots-tts-params
+    test-dots-tts-params.cpp
+)
+target_include_directories(test-dots-tts-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-dots-tts-params PRIVATE
+    Catch2::Catch2WithMain
+    dots-tts
+    chatterbox
+)
+catch_discover_tests(test-dots-tts-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;dots-tts"
+)
+endif()
 
 # ─── test-funasr-params — Catch2 unit tests for funasr_context_params defaults
 # and null-guard coverage. No GGUF required. ───────────────────────────────────
@@ -919,6 +999,23 @@ target_link_libraries(test-melotts-params PRIVATE
 catch_discover_tests(test-melotts-params
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;melotts"
+)
+
+# ─── test-kugelaudio-params — Catch2 unit tests for kugelaudio_context_params
+# defaults and null-guard coverage. No GGUF required. ──────────────────────────
+add_executable(test-kugelaudio-params
+    test-kugelaudio-params.cpp
+)
+target_include_directories(test-kugelaudio-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-kugelaudio-params PRIVATE
+    Catch2::Catch2WithMain
+    kugelaudio
+)
+catch_discover_tests(test-kugelaudio-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;kugelaudio"
 )
 
 # ─── test-mimoasr-params — Catch2 unit tests for mimo_asr_context_params defaults
@@ -2438,3 +2535,42 @@ add_test(NAME test-release-workflow
 set_tests_properties(test-release-workflow PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 30)
+
+# ─── test_diarized_json — Catch2 unit tests for the diarized_json formatter
+# (issue #206) and max_len display segment splitting (issue #205).
+# Pure functions, no backend dependency.
+add_executable(test_diarized_json
+    test_diarized_json.cpp
+    ${PROJECT_SOURCE_DIR}/examples/cli/crispasr_output.cpp
+)
+target_include_directories(test_diarized_json PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test_diarized_json PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test_diarized_json
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;diarized-json;max-len"
+)
+
+# ─── test-server-diarized-json — live: /v1/audio/transcriptions with
+# response_format=diarized_json (issue #206). Boots whisper server, validates
+# speaker labels, type field, start/end timestamps. SKIPs without model.
+add_test(NAME test-server-diarized-json
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-server-diarized-json.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-server-diarized-json PROPERTIES
+    LABELS "live;server;diarized-json"
+    TIMEOUT 300)
+
+# ─── test-granite-maxlen — live: --max-len splitting on granite-speech
+# (issue #205). Runs CLI with --max-len and verifies segments are split.
+# SKIPs without a granite-speech PLUS GGUF.
+add_test(NAME test-granite-maxlen
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-granite-maxlen.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-granite-maxlen PROPERTIES
+    LABELS "live;granite;max-len"
+    TIMEOUT 300)

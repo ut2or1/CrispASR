@@ -72,6 +72,10 @@
 #include "qwen3_asr.h"
 #define CA_HAVE_QWEN3 1
 #endif
+#if __has_include("higgs_stt.h")
+#include "higgs_stt.h"
+#define CA_HAVE_HIGGS_STT 1
+#endif
 #if __has_include("cohere.h")
 #include "cohere.h"
 #define CA_HAVE_COHERE 1
@@ -220,9 +224,17 @@
 #include "mimo_asr.h"
 #define CA_HAVE_MIMO_ASR 1
 #endif
+#if __has_include("ark_asr.h")
+#include "ark_asr.h"
+#define CA_HAVE_ARK_ASR 1
+#endif
 #if __has_include("moss_audio.h")
 #include "moss_audio.h"
 #define CA_HAVE_MOSS_AUDIO 1
+#endif
+#if __has_include("moss_transcribe.h")
+#include "moss_transcribe.h"
+#define CA_HAVE_MOSS_TRANSCRIBE 1
 #endif
 #if __has_include("glm_asr.h")
 #include "glm_asr.h"
@@ -1236,10 +1248,14 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "cohere";
     else if (strcmp(arch, "qwen3-asr") == 0 || strcmp(arch, "qwen3asr") == 0)
         backend = "qwen3";
+    else if (strcmp(arch, "higgs-stt") == 0)
+        backend = "higgs-stt";
     else if (strcmp(arch, "voxtral") == 0)
         backend = "voxtral";
     else if (strcmp(arch, "voxtral4b") == 0)
         backend = "voxtral4b";
+    else if (strcmp(arch, "arkasr") == 0)
+        backend = "ark-asr";
     else if (strcmp(arch, "granite-speech") == 0)
         backend = "granite";
     else if (strcmp(arch, "granite_nle") == 0 || strcmp(arch, "granite-nle") == 0)
@@ -1281,6 +1297,8 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "madlad";
     else if (strcmp(arch, "moss_audio") == 0 || strcmp(arch, "moss-audio") == 0)
         backend = "moss-audio";
+    else if (strcmp(arch, "moss_transcribe") == 0 || strcmp(arch, "moss-transcribe") == 0)
+        backend = "moss-transcribe";
     else if (strcmp(arch, "kugelaudio") == 0 || strcmp(arch, "kugelaudio-tts") == 0)
         backend = "kugelaudio";
     else if (strcmp(arch, "zonos") == 0 || strcmp(arch, "zonos-tts") == 0)
@@ -1465,6 +1483,16 @@ struct crispasr_session {
     std::string hotwords;
     float hotwords_boost = 1.5f;
 
+    // Issue #208: explicit chunked-encode override for the Parakeet backend.
+    // crispasr_session_transcribe_chunked[_lang] sets these for the duration
+    // of a single call (restored by a scope guard) to force the bounded
+    // long-form path (overlapping-window merge for non-JA, streamed encoder
+    // for JA) with caller-chosen window sizes, bypassing the length-based
+    // auto-selection in transcribe_single. -1 = unset. chunk == 0 (when
+    // forced) means "keep the per-model defaults".
+    int parakeet_force_chunk_seconds = -1;
+    int parakeet_force_overlap_seconds = -1;
+
     // Exactly one of these pointers is non-null based on `backend`.
     whisper_context* whisper_ctx = nullptr;
 #ifdef CA_HAVE_PARAKEET
@@ -1484,6 +1512,9 @@ struct crispasr_session {
 #endif
 #ifdef CA_HAVE_QWEN3
     qwen3_asr_context* qwen3_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_HIGGS_STT
+    higgs_stt_context* higgs_ctx = nullptr;
 #endif
 #ifdef CA_HAVE_COHERE
     cohere_context* cohere_ctx = nullptr;
@@ -1638,8 +1669,14 @@ struct crispasr_session {
 #ifdef CA_HAVE_MIMO_ASR
     mimo_asr_context* mimo_asr_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_ARK_ASR
+    ark_asr_context* ark_asr_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_MOSS_AUDIO
     moss_audio_context* moss_audio_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_MOSS_TRANSCRIBE
+    moss_transcribe_context* moss_transcribe_ctx = nullptr;
 #endif
 };
 
@@ -1879,6 +1916,21 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         p.flash_attn = g_open_flash_attn_tls;
         s->qwen3_ctx = qwen3_asr_init_from_file(model_path, p);
         if (!s->qwen3_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_HIGGS_STT
+    if (s->backend == "higgs-stt" || s->backend == "higgs_stt" || s->backend == "higgs-audio-v3-stt") {
+        higgs_stt_context_params p = higgs_stt_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        p.flash_attn = g_open_flash_attn_tls;
+        s->higgs_ctx = higgs_stt_init_from_file(model_path, p);
+        if (!s->higgs_ctx) {
             delete s;
             return nullptr;
         }
@@ -2393,7 +2445,10 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
             delete s;
             return nullptr;
         }
-        // Auto-resolve vocoder GGUF next to the model
+        // Auto-resolve vocoder + speaker-encoder GGUFs next to the model. The
+        // speaker encoder is optional (only needed for voice cloning via
+        // crispasr_session_set_voice); load it eagerly so set_voice just applies
+        // the reference WAV.
         {
             std::string mp = model_path ? model_path : "";
             auto sep = mp.find_last_of("/\\");
@@ -2405,6 +2460,15 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
                 if (f) {
                     fclose(f);
                     dots_tts_set_vocoder_path(s->dots_tts_ctx, cp.c_str());
+                    break;
+                }
+            }
+            for (const char* name : {"dots-tts-soar-spk-f16.gguf", "dots-tts-soar-spk.gguf", "dots-tts-spk-f16.gguf"}) {
+                std::string cp = dir + "/" + name;
+                FILE* f = fopen(cp.c_str(), "rb");
+                if (f) {
+                    fclose(f);
+                    dots_tts_set_speaker_path(s->dots_tts_ctx, cp.c_str());
                     break;
                 }
             }
@@ -2742,6 +2806,21 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_ARK_ASR
+    if (s->backend == "ark-asr" || s->backend == "ark_asr" || s->backend == "arkasr" || s->backend == "ark") {
+        s->backend = "ark-asr";
+        ark_asr_context_params p = ark_asr_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->ark_asr_ctx = ark_asr_init_from_file(model_path, p);
+        if (!s->ark_asr_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_MOSS_AUDIO
     if (s->backend == "moss-audio" || s->backend == "moss_audio" || s->backend == "mossaudio") {
         s->backend = "moss-audio";
@@ -2751,6 +2830,21 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         p.use_gpu = g_open_use_gpu_tls;
         s->moss_audio_ctx = moss_audio_init_from_file(model_path, p);
         if (!s->moss_audio_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_MOSS_TRANSCRIBE
+    if (s->backend == "moss-transcribe" || s->backend == "moss_transcribe" || s->backend == "mosstranscribe") {
+        s->backend = "moss-transcribe";
+        moss_transcribe_context_params p = moss_transcribe_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->moss_transcribe_ctx = moss_transcribe_init_from_file(model_path, p);
+        if (!s->moss_transcribe_ctx) {
             delete s;
             return nullptr;
         }
@@ -2909,6 +3003,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #ifdef CA_HAVE_QWEN3
     list += ",qwen3";
 #endif
+#ifdef CA_HAVE_HIGGS_STT
+    list += ",higgs-stt";
+#endif
 #ifdef CA_HAVE_COHERE
     list += ",cohere";
 #endif
@@ -3038,8 +3135,14 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #ifdef CA_HAVE_MIMO_ASR
     list += ",mimo-asr";
 #endif
+#ifdef CA_HAVE_ARK_ASR
+    list += ",ark-asr";
+#endif
 #ifdef CA_HAVE_MOSS_AUDIO
     list += ",moss-audio";
+#endif
+#ifdef CA_HAVE_MOSS_TRANSCRIBE
+    list += ",moss-transcribe";
 #endif
 #ifdef CA_HAVE_QWEN3
     // mega-asr is a Qwen3-ASR variant (LoRA merged offline) — dispatch
@@ -3372,6 +3475,182 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
     return best;
 }
 
+#ifdef CA_HAVE_PARAKEET
+// Issue #208 / #89: silence-cut finder + non-JA long-form splitter, ported
+// from the CLI adapter (examples/cli/crispasr_backend_parakeet.cpp) so the
+// session path bounds the FastConformer encode on long audio instead of
+// building one O(T^2) full-length graph.
+
+// Normalize a word for boundary-dedup comparison: lowercase + drop ASCII
+// punctuation. Non-ASCII bytes (JA / accented text) are kept verbatim.
+static std::string parakeet_norm_word(const char* s) {
+    std::string o;
+    for (const char* p = s; *p; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x80) {
+            if (std::isalnum(c))
+                o += (char)std::tolower(c);
+        } else {
+            o += (char)c;
+        }
+    }
+    return o;
+}
+
+// Long-audio transcription that loses no words and adds no duplicates.
+//
+// Parakeet's bidirectional FastConformer encoder + TDT decoder silently
+// DROP whole sections when fed more than ~30 s in one pass — the decoder
+// loses track across topic / silence changes (reproducible even at 60 s on
+// content that shifts topic). A single full-length pass therefore omits
+// large spans of speech. We instead transcribe the audio in short
+// OVERLAPPING windows, each well within the reliable range, and merge them:
+//
+//   * window i covers [pos, pos+chunk]; the next starts `overlap` before the
+//     previous window's end, so every instant is covered and every seam
+//     region by two windows.
+//   * consecutive windows are spliced at the MIDPOINT of their overlap, so
+//     each boundary word comes from the window that saw it with the most
+//     surrounding context — no section is dropped at a seam.
+//   * a final adjacent-duplicate pass removes the at-most-one word that
+//     timestamp jitter can double at a splice (genuine immediate repeats,
+//     which are >~0.3 s apart, are kept).
+//
+// Result: one merged segment whose word set is the union of all windows
+// (nothing dropped) with no boundary duplication.
+static void parakeet_session_chunked_merge(parakeet_context* ctx, const float* samples, int n_samples,
+                                           int chunk_samples, int overlap_samples,
+                                           std::vector<crispasr_session_seg>& out) {
+    const int SR = 16000;
+    if (chunk_samples < SR)
+        chunk_samples = SR; // 1 s floor
+    if (overlap_samples < 0)
+        overlap_samples = 0;
+    if (overlap_samples >= chunk_samples)
+        overlap_samples = chunk_samples / 3;
+    const int stride = std::max(SR / 2, chunk_samples - overlap_samples);
+
+    struct MWord {
+        std::string text;
+        int64_t t0, t1;
+        float p;
+    };
+    std::vector<MWord> merged;
+    int64_t prev_end_cs = -1;
+
+    for (int pos = 0; pos < n_samples; pos += stride) {
+        const int end = std::min(n_samples, pos + chunk_samples);
+        const int64_t pos_cs = (int64_t)((double)pos / SR * 100.0);
+        parakeet_result* r = parakeet_transcribe_ex(ctx, samples + pos, end - pos, pos_cs);
+        if (r) {
+            if (merged.empty()) {
+                for (int i = 0; i < r->n_words; ++i)
+                    merged.push_back({r->words[i].text, r->words[i].t0, r->words[i].t1,
+                                      r->words[i].p > 0.0f ? r->words[i].p : 1.0f});
+            } else {
+                // Splice at the midpoint of the overlap [pos_cs, prev_end_cs]:
+                // drop merged's tail past the midpoint (the new window saw it
+                // with more right-context), then CONTINUE from the end of the
+                // last word still committed — take new words that end after it
+                // (t1 > cont). Continuing by the committed word's end, rather
+                // than a strict `t0 >= mid` cut, avoids dropping the one word
+                // that can straddle the midpoint. Any resulting near-duplicate
+                // is removed by the adjacent-dedup pass below.
+                const int64_t mid_cs = (pos_cs + prev_end_cs) / 2;
+                while (!merged.empty() && merged.back().t0 >= mid_cs)
+                    merged.pop_back();
+                const int64_t cont_cs = merged.empty() ? mid_cs : merged.back().t1;
+                for (int i = 0; i < r->n_words; ++i) {
+                    if (r->words[i].t1 > cont_cs)
+                        merged.push_back({r->words[i].text, r->words[i].t0, r->words[i].t1,
+                                          r->words[i].p > 0.0f ? r->words[i].p : 1.0f});
+                }
+            }
+            prev_end_cs = (int64_t)((double)end / SR * 100.0);
+            parakeet_result_free(r);
+        }
+        if (end >= n_samples)
+            break;
+    }
+
+    // Adjacent-duplicate removal (jitter safety at splices).
+    std::vector<MWord> dedup;
+    dedup.reserve(merged.size());
+    for (auto& w : merged) {
+        if (!dedup.empty()) {
+            const auto& prev = dedup.back();
+            if (llabs(w.t0 - prev.t0) < 30 &&
+                parakeet_norm_word(prev.text.c_str()) == parakeet_norm_word(w.text.c_str()))
+                continue;
+        }
+        dedup.push_back(std::move(w));
+    }
+    if (dedup.empty())
+        return;
+
+    crispasr_session_seg seg;
+    std::string text;
+    seg.words.reserve(dedup.size());
+    for (auto& w : dedup) {
+        if (!text.empty())
+            text += ' ';
+        text += w.text;
+        crispasr_session_seg::word sw;
+        sw.text = w.text;
+        sw.t0 = w.t0;
+        sw.t1 = w.t1;
+        sw.p = w.p;
+        seg.words.push_back(std::move(sw));
+    }
+    seg.text = std::move(text);
+    seg.t0 = dedup.front().t0;
+    seg.t1 = dedup.back().t1;
+    out.push_back(std::move(seg));
+}
+#endif
+
+// Issue #208: explicit chunked-encode transcribe for batch callers.
+//
+// Forces the Parakeet backend through the bounded long-form path (overlapping
+// short-window transcribe-and-merge for non-JA models, streamed encoder for
+// the JA-only model) regardless of audio length, so long files transcribe in
+// bounded time AND recover the sections a single full-length pass drops.
+// `chunk_seconds <= 0` keeps the per-model defaults; otherwise it sets the
+// non-JA window length / the JA streamed window. `overlap_seconds < 0` uses
+// the default.
+//
+// For every NON-Parakeet backend the chunk parameters are inert and this is
+// exactly equivalent to crispasr_session_transcribe_lang — callers can use
+// the chunked entry point uniformly without backend-specific branching.
+CA_EXPORT crispasr_session_result* crispasr_session_transcribe_chunked_lang(crispasr_session* s, const float* pcm,
+                                                                            int n_samples, int chunk_seconds,
+                                                                            int overlap_seconds, const char* language) {
+    if (!s || !pcm || n_samples <= 0)
+        return nullptr;
+    // Set the per-call override and restore it on every exit path so a
+    // forced-chunked call never leaks into later auto-path transcribes.
+    const int saved_chunk = s->parakeet_force_chunk_seconds;
+    const int saved_overlap = s->parakeet_force_overlap_seconds;
+    s->parakeet_force_chunk_seconds = chunk_seconds > 0 ? chunk_seconds : 0;
+    s->parakeet_force_overlap_seconds = overlap_seconds >= 0 ? overlap_seconds : -1;
+    struct ChunkGuard {
+        crispasr_session* s;
+        int chunk, overlap;
+        ~ChunkGuard() {
+            s->parakeet_force_chunk_seconds = chunk;
+            s->parakeet_force_overlap_seconds = overlap;
+        }
+    } guard{s, saved_chunk, saved_overlap};
+    return crispasr_session_transcribe_lang(s, pcm, n_samples, language);
+}
+
+// Language-default convenience wrapper for the chunked entry point.
+CA_EXPORT crispasr_session_result* crispasr_session_transcribe_chunked(crispasr_session* s, const float* pcm,
+                                                                       int n_samples, int chunk_seconds,
+                                                                       int overlap_seconds) {
+    return crispasr_session_transcribe_chunked_lang(s, pcm, n_samples, chunk_seconds, overlap_seconds, nullptr);
+}
+
 static crispasr_session_result* transcribe_single(crispasr_session* s, const float* pcm, int n_samples,
                                                   const char* language) {
     const std::string lang = (language && *language) ? language : "en";
@@ -3552,7 +3831,82 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
     }
 #ifdef CA_HAVE_PARAKEET
     if (s->backend == "parakeet" && s->parakeet_ctx) {
-        parakeet_result* pr = parakeet_transcribe_ex(s->parakeet_ctx, pcm, n_samples, 0);
+        // Issue #208: the session path used to call parakeet_transcribe_ex,
+        // routing the WHOLE buffer through one full-length FastConformer
+        // encode. Two problems on long audio: (1) the encoder's
+        // relative-position self-attention is O(T^2) in T_enc, so the single
+        // graph grinds for minutes on Metal (looks like a hang); (2) far worse
+        // for accuracy, the TDT decoder silently DROPS whole sections of
+        // speech once the input exceeds ~30 s — it loses track across topic /
+        // silence changes (reproducible even at 60 s), so a single pass omits
+        // large spans of words.
+        //
+        // Fix: transcribe long audio in short OVERLAPPING windows that stay in
+        // the model's reliable range and merge them
+        // (parakeet_session_chunked_merge) — every section is covered, seams
+        // are spliced at the overlap midpoint, and a dedup pass removes any
+        // jitter-doubled boundary word. JA-only models (single-pass collapses
+        // on long audio, #89) use the overlapping streamed encoder instead.
+        // Audio up to one window is a single exact pass (unchanged).
+        const int SR = 16000;
+        // JA-model detection matches the CLI adapter (is_ja_model_).
+        const bool is_ja = parakeet_n_vocab(s->parakeet_ctx) <= 4096;
+        int chunk_s = 20;       // non-JA overlapping-window length (s)
+        int overlap_s = 8;      // window overlap (s)
+        int stream_chunk_s = 0; // JA streamed window (s); 0 = library per-model default
+        int stream_overlap_s = 2;
+        int single_pass_max_s = 0; // escape hatch: force one exact pass up to N s (0 = off)
+        if (const char* e = getenv("CRISPASR_PARAKEET_CHUNK_SECONDS"))
+            chunk_s = std::max(4, atoi(e));
+        if (const char* e = getenv("CRISPASR_PARAKEET_CHUNK_OVERLAP"))
+            overlap_s = std::max(0, atoi(e));
+        if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_CHUNK"))
+            stream_chunk_s = std::max(2, atoi(e));
+        if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_OVERLAP"))
+            stream_overlap_s = std::max(0, atoi(e));
+        if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_THRESHOLD"))
+            single_pass_max_s = std::max(0, atoi(e));
+
+        // Explicit per-call chunked request (issue #208 option 1, via
+        // crispasr_session_transcribe_chunked[_lang]) forces the bounded path
+        // regardless of length and sizes the window (chunk_seconds → window
+        // length / JA streamed window; overlap_seconds → window overlap).
+        const bool force_chunked = s->parakeet_force_chunk_seconds >= 0;
+        if (force_chunked) {
+            if (s->parakeet_force_chunk_seconds > 0) {
+                chunk_s = std::max(4, s->parakeet_force_chunk_seconds);
+                stream_chunk_s = s->parakeet_force_chunk_seconds;
+            }
+            if (s->parakeet_force_overlap_seconds >= 0) {
+                overlap_s = s->parakeet_force_overlap_seconds;
+                stream_overlap_s = s->parakeet_force_overlap_seconds;
+            }
+        }
+
+        // A single exact pass is used only for audio that fits in one window
+        // (or up to the explicit single_pass_max_s escape hatch). Anything
+        // longer is chunked, since the decoder drops sections past ~one window.
+        const int64_t chunk_samp = (int64_t)chunk_s * SR;
+        bool use_single_pass;
+        if (force_chunked)
+            use_single_pass = false;
+        else if (single_pass_max_s > 0)
+            use_single_pass = (int64_t)n_samples <= (int64_t)single_pass_max_s * SR;
+        else
+            use_single_pass = (int64_t)n_samples <= chunk_samp;
+
+        // non-JA long audio → overlapping-window merge (no dropped sections,
+        // no boundary duplicates). Emits one merged segment.
+        if (!use_single_pass && !is_ja) {
+            parakeet_session_chunked_merge(s->parakeet_ctx, pcm, n_samples, chunk_s * SR, overlap_s * SR, r->segments);
+            return r;
+        }
+
+        // JA long audio → streamed; short audio → the exact single pass.
+        parakeet_result* pr =
+            (!use_single_pass && is_ja)
+                ? parakeet_transcribe_streamed(s->parakeet_ctx, pcm, n_samples, 0, stream_chunk_s, stream_overlap_s)
+                : parakeet_transcribe_ex(s->parakeet_ctx, pcm, n_samples, 0);
         if (!pr) {
             delete r;
             return nullptr;
@@ -3687,6 +4041,40 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
     if ((s->backend == "mini-omni2" || s->backend == "mini_omni2" || s->backend == "miniomni2") && s->mini_omni2_ctx) {
         mini_omni2_set_ask(s->mini_omni2_ctx, s->ask.empty() ? nullptr : s->ask.c_str());
         char* text = mini_omni2_transcribe(s->mini_omni2_ctx, pcm, n_samples);
+        if (!text) {
+            delete r;
+            return nullptr;
+        }
+        crispasr_session_seg seg;
+        seg.text = text;
+        seg.t0 = 0;
+        seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        free(text);
+        r->segments.push_back(std::move(seg));
+        return r;
+    }
+#endif
+#ifdef CA_HAVE_HIGGS_STT
+    if ((s->backend == "higgs-stt" || s->backend == "higgs_stt" || s->backend == "higgs-audio-v3-stt") &&
+        s->higgs_ctx) {
+        // Whole-file chunked encode + ChatML greedy decode lives in
+        // higgs_stt_transcribe(). `set_ask` overrides the user-turn prompt:
+        // an explicit `s->ask` (custom task) wins; otherwise a per-call /
+        // sticky language injects a "Transcribe the speech in <lang>." hint;
+        // empty restores the default. Mirrors the CLI adapter.
+        if (!s->ask.empty()) {
+            higgs_stt_set_ask(s->higgs_ctx, s->ask.c_str());
+        } else {
+            const std::string eff_lang = lang_set ? lang : s->source_language;
+            if (!eff_lang.empty() && eff_lang != "auto") {
+                const std::string instr = "Transcribe the speech in " + ca_iso_to_english_lang(eff_lang) +
+                                          ". Output only the spoken words in lowercase with no punctuation.";
+                higgs_stt_set_ask(s->higgs_ctx, instr.c_str());
+            } else {
+                higgs_stt_set_ask(s->higgs_ctx, nullptr);
+            }
+        }
+        char* text = higgs_stt_transcribe(s->higgs_ctx, pcm, n_samples);
         if (!text) {
             delete r;
             return nullptr;
@@ -4627,6 +5015,24 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             need_free = true;
         }
 #endif
+#ifdef CA_HAVE_ARK_ASR
+        if (!text && s->backend == "ark-asr" && s->ark_asr_ctx) {
+            // EXPERIMENTAL language steering: ask > -l instruction > promptless.
+            if (!s->ask.empty()) {
+                ark_asr_set_ask(s->ark_asr_ctx, s->ask.c_str());
+            } else {
+                const std::string eff_lang = lang_set ? lang : s->source_language;
+                if (!eff_lang.empty() && eff_lang != "auto") {
+                    const std::string instr = "Transcribe the audio in " + ca_iso_to_english_lang(eff_lang) + ".";
+                    ark_asr_set_ask(s->ark_asr_ctx, instr.c_str());
+                } else {
+                    ark_asr_set_ask(s->ark_asr_ctx, nullptr);
+                }
+            }
+            text = ark_asr_transcribe(s->ark_asr_ctx, pcm, n_samples);
+            need_free = true;
+        }
+#endif
 #ifdef CA_HAVE_SENSEVOICE
         if (!text && s->backend == "sensevoice" && s->sensevoice_ctx) {
             if (s->beam_size > 1)
@@ -4791,6 +5197,13 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
                 }
             }
             text = moss_audio_process(s->moss_audio_ctx, pcm, n_samples, prompt);
+            need_free = true;
+        }
+#endif
+#ifdef CA_HAVE_MOSS_TRANSCRIBE
+        if (!text && s->moss_transcribe_ctx) {
+            // ASR-only (promptless legacy layout); language/ask hints are ignored.
+            text = moss_transcribe_transcribe(s->moss_transcribe_ctx, pcm, n_samples);
             need_free = true;
         }
 #endif
@@ -5524,6 +5937,16 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
 #ifdef CA_HAVE_ZONOS
     if (s->zonos_ctx) {
         return zonos_tts_set_voice(s->zonos_ctx, path);
+    }
+#endif
+#ifdef CA_HAVE_DOTS_TTS
+    if (s->dots_tts_ctx) {
+        // Voice cloning from a reference WAV (the speaker encoder was loaded at
+        // open). Caller is responsible for consent (the CLI/server layer gates
+        // it). ref_text is unused — dots.tts conditions on the CAM++ x-vector.
+        if (!ends_with_wav(path))
+            return -2;
+        return dots_tts_set_voice_prompt(s->dots_tts_ctx, path);
     }
 #endif
 #ifdef CA_HAVE_QWEN3_TTS
@@ -6529,6 +6952,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
     if (s->qwen3_ctx)
         qwen3_asr_free(s->qwen3_ctx);
 #endif
+#ifdef CA_HAVE_HIGGS_STT
+    if (s->higgs_ctx)
+        higgs_stt_free(s->higgs_ctx);
+#endif
 #ifdef CA_HAVE_COHERE
     if (s->cohere_ctx)
         cohere_free(s->cohere_ctx);
@@ -6706,9 +7133,17 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
     if (s->mimo_asr_ctx)
         mimo_asr_free(s->mimo_asr_ctx);
 #endif
+#ifdef CA_HAVE_ARK_ASR
+    if (s->ark_asr_ctx)
+        ark_asr_free(s->ark_asr_ctx);
+#endif
 #ifdef CA_HAVE_MOSS_AUDIO
     if (s->moss_audio_ctx)
         moss_audio_free(s->moss_audio_ctx);
+#endif
+#ifdef CA_HAVE_MOSS_TRANSCRIBE
+    if (s->moss_transcribe_ctx)
+        moss_transcribe_free(s->moss_transcribe_ctx);
 #endif
     delete s;
 }

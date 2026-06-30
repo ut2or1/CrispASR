@@ -78,6 +78,215 @@ test-all-backends.py passes 18/18 transcribe + 51/54 feature tests (3 stream ski
 
 ---
 
+## #201 follow-up — generate a TADA voice ref from audio+transcript at query time (OPEN)
+
+The switch-voice half of #201 shipped (commit `a5cd7510`): the server reloads a
+prebaked `tada-ref-*.gguf` per request, no restart. The remaining half from the
+reporter is **on-the-fly ref generation** — accept raw audio (+ transcript) at
+inference time and bake the reference server-side, instead of requiring an
+offline `--make-ref` pass first.
+
+Today a `.wav` passed to `voice` is rejected (CLI adapter + session ABI both
+`return -2`/warn) because the make-ref pipeline isn't loaded in the server.
+
+**Approach:** the make-ref pipeline already exists in C++ (`src/tada_encoder.{h,cpp}`
++ wav2vec2 aligner runtime; CLI `--make-ref` drives it via wav2vec2 aligner → BPE
+tokenization → DP alignment → WavEncoder → LocalAttentionEncoder → ref GGUF in
+memory). To expose it at query time:
+1. Load the encoder + aligner GGUFs in the TADA backend `init()` when configured
+   (new flags, e.g. `--make-ref-encoder` / `--make-ref-aligner`, already parsed
+   for the CLI path — reuse them). Keep them optional: only pay the ~1.3 GB
+   (178 MB encoder + 1.1 GB aligner) when ref-baking is enabled.
+2. In `synthesize()` / the server handler, when `voice` is a `.wav`, run the
+   in-memory make-ref to produce prompt_values/positions and feed them straight
+   into the context (skip the GGUF round-trip), or bake a temp ref GGUF and
+   `tada_load_prompt` it. Requires a transcript — take it from a `ref_text`
+   request field (the consent gate + `consent_attestation` already exist for
+   `.wav` voices on `/v1/audio/speech`).
+3. Cache the baked ref keyed by (audio hash, transcript) so repeat requests with
+   the same clip don't re-run the aligner.
+
+**Files:** `examples/cli/crispasr_backend_tada.cpp` (init load + synthesize bake),
+`examples/cli/crispasr_server.cpp` (`ref_text` field + `.wav` voice path),
+`src/tada_tts.{h,cpp}` (a `tada_make_ref_from_pcm` entry that returns prompt
+state without a GGUF), `src/tada_encoder.*` (reuse). Aligner is language-specific
+(`tada-aligner-<lang>.gguf`) — must match the audio language.
+
+**Effort:** Medium-large. The pipeline is ported and CLI-proven; the work is
+wiring it into the server lifecycle + per-request path + caching, plus the
+~1.3 GB memory cost gate. Lower priority than the switch-voice half (shipped),
+which already covers the common "I baked refs, let me pick one live" workflow.
+Tracked on #201 (left open for this).
+
+---
+
+## §192 follow-up — native-Vulkan TADA garbled output FIXED (codec on CPU)
+
+**FIXED 2026-06-29** (branch `fix/tada-vulkan-repeat-f16`). The garbled/empty
+native-Vulkan output was **the codec, not the FM head** — the prior "FM
+time-dimension divergence" localization was a red herring. Now: native Vulkan
+"I went to school and back in four hours" (seed 1) → intelligible, **identical to
+Metal**; +2 sentences +seed2 all ASR-round-trip cleanly; deterministic; CPU
+output byte-identical to before (fix is Vulkan-gated). Still gated
+(`CRISPASR_TADA_VULKAN_NATIVE=1`), default remains CPU-fallback — ask reporter
+(BergmannAtmet, RADV) to confirm before flipping the default.
+
+**Actual root cause (the FM premise was wrong; the codec is the culprit).** A/B'd
+Metal vs Vulkan native on the same input: both produce **bit-identical** durations
+(`time_before = [38,2,9,6,8,8,5,10,9,5,211]`) and 522 frames — the talker + FM +
+duration decode AGREE across GPUs. Metal renders them intelligibly; Vulkan
+rendered empty audio. So the divergence is purely in **audio rendering = the
+codec** (`tada_codec.cpp`). Pinned down with per-stage `TADA_CODEC_DUMP` (Vulkan
+vs CPU, identical 522-frame features): the **attention encoder MATCHES** across
+backends (`dump_attn`, `dump_layer0` identical), but the **DAC decoder front-end
+explodes** — `dump_dac_in` (the `in_conv` Conv1d → im2col+mul_mat) jumps to
+rms ~37 / range ±800 on Vulkan vs rms ~0.85 / ±8 on CPU (~43×), propagating to the
+output; the final `Tanh` masks the range but the audio is distorted. It is
+**size-dependent**: short inputs ("Hello world") render *correctly* on Vulkan
+(per-stage dump bit-comparable to CPU), and only break past some sequence length.
+
+**NOT what earlier notes claimed (each verified, not assumed).** It is **not** a
+`ggml_backend_sched` cross-backend-copy bug — `GGML_SCHED_DEBUG=2` shows the codec
+runs as a *single Vulkan split*, no CPU offload, no cross-backend copies. It is
+**not** missing Vulkan kernels — ggml-vulkan has `conv_transpose_1d`/`col2im_1d`/
+`im2col`/`mul_mat`/`flash_attn_ext`, and the codec uses **no ISTFT** (DAC *conv*
+decoder). It is **not** precision — F32 weights change nothing (MoltenVK
+downconverts src0→f16); and the real in_conv weight is tiny (absmax 0.068), so no
+overflow. It is **not even a conv/im2col kernel bug** — a standalone repro of
+`conv_1d` / `im2col` / the full `wn_conv1d` (transpose+cont→conv→reshape+transpose)
+at the codec's exact dims and T=522 is **bit-correct** on MoltenVK, and capping
+`GGML_VK_FORCE_MAX_ALLOCATION_SIZE` doesn't help. So it's a **graph-scale
+gallocr/aliasing-class corruption** in the large real codec graph — the in_conv
+output is wrong despite a correct input (`dump_attn` matches) — that only bites at
+length and isn't reproducible in a minimal harness. (Also disproven for the FM red
+herring: F32 FM weights and whole-FM-on-CPU both left output bit-identical;
+`time_before` already matched across backends.)
+
+**Fix.** When the codec's GPU backend is Vulkan, run the whole codec on the CPU
+backend (`src/tada_codec.cpp`, `tada_codec_init_from_file_impl`). The codec is a
+one-shot decode (not the AR loop) and its input features are bit-identical
+Metal-vs-Vulkan (Metal renders them correctly), so CPU rendering is faithful. The
+talker/FM keep their native-Vulkan path. Opt back into the broken native codec
+with `CRISPASR_TADA_CODEC_VULKAN_NATIVE=1` (debug only). **Open follow-up (to keep
+the codec on GPU):** the op-level repros rule out the conv kernels, so the
+remaining lever is the graph-scale corruption — best chased on RADV (real
+hardware, where the talker/FM native path is also pending validation) with a
+ggml-vulkan gallocr/graph dump, not MoltenVK. A **chunked codec decode** (decode in
+time-windows under the breaking length, where short inputs are proven correct) is
+the pragmatic GPU-native workaround and sidesteps the root cause entirely.
+
+**Chunked-decode design — DEFERRED, low priority (not queued; design-only).**
+Decision 2026-06-29: do **not** implement this now. The codec-on-CPU fix already
+solves #192 (validated, shipped, default). The codec is a one-shot decode, *not*
+the AR bottleneck, so a GPU-native codec buys little; the corruption is
+MoltenVK-only locally while the reporter is on RADV (it may not even reproduce
+there). Net: high implementation+validation complexity (window seams, absolute
+RoPE bookkeeping, empirical sample-trim — the codec emits `n_frames*480 − ~6`
+samples, non-exact) for a marginal, driver-specific payoff. Pick this up only if
+a RADV user actually needs the codec on GPU. Design preserved below for whoever
+does.
+
+Add `tada_codec_decode` a chunked wrapper, gated (e.g. `CRISPASR_TADA_CODEC_CHUNK=<N>`,
+default off; auto-on for the Vulkan-native codec). The codec upsamples 480×
+(strides 4·4·5·6) and is feed-forward; the only cross-frame coupling is (a) the
+block attention (each frame attends to its block + the previous block) and (b) the
+conv receptive field across the 4 decoder blocks. So decode is chunkable with a
+context margin:
+  - Split the `n_frames` features into windows of `N` (start ~192, below the
+    observed break; tune by bisecting the threshold between 93 ok and 522 broken).
+  - For window `[a,b)`, run the existing `build_decode_graph` on the *extended*
+    slice `[a-CTX, b+CTX)` (clamped), `CTX` ≈ 64 frames to cover both the conv
+    receptive field and the prev-block attention reach.
+  - **RoPE positions must be absolute**: set `codec_pos[i] = (a-CTX)+i`, not 0-based,
+    so attention matches the full decode for the kept region.
+  - Build the block mask from the *sliced* `token_masks[a-CTX : b+CTX]` (block ids
+    are relative-safe — the mask only encodes same/prev block).
+  - Keep only the PCM for `[a,b)`: trim `CTX*480` samples from each side (except at
+    the true sequence start/end); concatenate windows.
+  - Validate: ASR-roundtrip vs the CPU codec, and check for boundary clicks (peak
+    discontinuity at window seams); widen `CTX` / add a short crossfade if needed.
+Risk: a conv vocoder can click at seams; the CTX-trim should prevent it but needs
+the ASR + waveform check. Keep CPU-codec as the default fallback until validated.
+
+**Caveat — MoltenVK can't fully validate GPU numerics.** MoltenVK's `mul_mm` /
+`mul_mat_vec` downconvert src0 to f16 regardless of stored dtype (storing F32 FM
+weights changed nothing; `GGML_VK_DISABLE_F16=1` barely moved cond cosine,
+0.99919→0.99966). So the talker `cond` is ~0.9997 vs CPU on MoltenVK — fine here
+(durations/candidates still agree with Metal), but a reminder that exact CPU
+parity isn't achievable on MoltenVK. On RADV (f32-native matmul) the talker is
+more precise; the codec-on-CPU fix is the operative change regardless.
+
+**Preconditions (hard-won — see LEARNINGS §192).** (1) Build with
+`-DGGML_METAL=OFF` and verify the `backend=Vulkan0` log line — Metal silently
+wins otherwise. (2) **Free the disk first** — benchmarking with `/Volumes/backups`
+near-full gives SIGBUS + nondeterministic frame counts that masquerade as a
+signal. (3) Re-run each config twice for determinism before forming a hypothesis.
+
+---
+
+## Recent-backend audit — wiring gaps + easy wins (last 10 backends) — CLOSED
+
+Audit of the 10 most recently added backends (moss-transcribe, higgs-stt,
+ark-asr, dots-tts, nemotron, mini-omni2, lfm2-audio, tada, kugelaudio, melotts).
+Core wiring (CLI factory, c_api `available_backends`, registry, Go LDFLAGS,
+README, the auto-generated feature matrix) was complete for all 10. Follow-ups,
+all now closed:
+
+**Completeness gaps:**
+- [x] **kugelaudio test** — added `tests/test-kugelaudio-params.cpp` (5/5 green).
+- [x] **env-live-tests entries** for `tada`, `kugelaudio`, `melotts` — added the
+  `CRISPASR_MODEL_*` exports.
+- [~] **melotts diff-harness "registration"** — NOT a real gap. `melotts.py` uses
+  the **standalone** reference-dumper pattern (run directly), which is the *majority*
+  convention: 20 of the reference dumpers are standalone (bark, csm, dia, fastpitch,
+  piper, speecht5, vibevoice, tada_codec_diff, …) and only a handful use the
+  `dump()` + `REGISTERED_BACKENDS` path. `melo` isn't even installed. Left as-is.
+
+**Beam search (DONE — validated token-identical greedy↔beam-2 on jfk.wav):**
+- [x] **higgs-stt** — `core_beam_decode::run_with_probs` (multi-EOS: im_end +
+  endoftext), `CAP_BEAM_SEARCH` + `higgs_stt_set_beam_size`. q4_k greedy == beam-2
+  verbatim.
+- [x] **ark-asr** — runtime beam loop (adapter already plumbed `beam_size`),
+  `CAP_BEAM_SEARCH`. `ark_run_decoder` already handles multi-token suffixes, so the
+  replay is a one-liner. q4_k greedy == beam-2 verbatim (CPU).
+- *Not candidates:* mini-omni2 (interleaved multi-stream), nemotron (RNN-T has its
+  own beam), TTS backends (n/a).
+
+**Optimization notes (NOT easy wins — recorded so they're not mistaken for low-hanging fruit):**
+- Graph caching of the encoder/decode graph is a KNOWN trap: §176s cache is not
+  re-entrant with a shared sched (2nd reuse collapses to empty), and the
+  chatterbox/CFM graph-cache was a measured DUD (host build+alloc ≈ 0.3% of a
+  compute-bound step). Measure `ggml_time_us()` on build+alloc BEFORE porting.
+- `flash_attn_ext` is absent in tada / melotts (small attention — marginal).
+- ark-asr is CPU-only; Metal-validating it is a real win but carries the usual
+  sched/precision risk — not "easy."
+
+---
+
+## moss-transcribe follow-ups (OPEN, LOW)
+
+The `moss-transcribe` backend (`OpenMOSS-Team/MOSS-Transcribe-preview-2B`) shipped
+`9f3c5ede` — q4_k verbatim on jfk.wav, validated against the PyTorch reference via
+`crispasr-diff`. See HISTORY (`## moss-transcribe`) and LEARNINGS. Remaining optional
+work:
+
+- **Publish f16 + q8_0** to `cstr/MOSS-Transcribe-preview-2B-GGUF` (q4_k + card are
+  live; f16/q8_0 were held back for WLAN bandwidth). Re-stage from
+  `/Volumes/backups/ai/moss-transcribe-preview-2b-{f16,q8_0}.gguf` and
+  `hf upload-large-folder` into the existing repo; both already produce the verbatim
+  transcript locally (q8_0 even keeps the trailing period).
+- **GPU validation beyond Metal.** Metal (default) and CPU both verbatim; CUDA/Vulkan
+  untested. The LM reuses `core_attn::kv_self_attn` (covered by the §192/#200 Vulkan
+  F16-GQA guard), so the encoder's windowed `flash_attn_ext` + the conv front-end are
+  the parts to check on CUDA.
+- **Multilingual eval.** Authors report 4.87 % avg WER; only English (jfk) validated
+  here. The model is zh/en — spot-check a Chinese clip.
+- **Encoder precision.** Encoder/adapter run F16 (cos ~0.98 vs the f32 reference);
+  byte-exact at layer 0, so this is pure F16 weight precision, not a bug. An f32
+  encoder path is not worth it (decode is verbatim), but noted for completeness.
+
+---
+
 ## Priority ordering
 
 | Priority | Item | Effort | Status |
@@ -227,6 +436,116 @@ Shared infra: factor the F16-dequant-of-matmul-weights helper (currently
 duplicated in `ensure_t3_b2_f16_weights` + s3gen `dequant_cfm_f16`) into a
 `core_*` helper if a third backend needs it — but only on the third consumer, per
 the "don't extract single-consumer helpers" rule.
+
+---
+
+## §210 follow-up — shape-stable bucketed decode for the remaining LLM/AR backends (CUDA-graph capture) (OPEN, CONDITIONAL)
+
+PR #207 made **granite-speech**'s single-token LLM decode a *cached, shape-stable*
+graph (fixed-`Lk` KV bucket written via `ggml_set_rows` at a runtime index, in-graph
+`ggml_argmax`, fused F16 embed), which unlocks **two** wins:
+- **CUDA-graph capture** — the ~1.4k-op step replays as one `cudaGraphLaunch`,
+  ~9–13× on the decode (RTX 5090). Engages **automatically** in ggml-cuda for any
+  capturable, shape+pointer-stable graph routed through the sched — no per-backend
+  CUDA code.
+- **Metal gallocr allocate-once** (`granite_dec_use_gallocr`) — reserve one
+  `ggml_gallocr` against the cached graph, reuse every step (skip per-step
+  `sched_reset`+`sched_alloc_graph`).
+
+The question: which other LLM/AR-decoder backends would benefit? Survey done
+2026-06-30 (see [[LEARNINGS]] §210; the gating property is shape-stability —
+`fixed-KV bucket` vs growing `Lk = n_past + T`).
+
+### ⚠️ READ FIRST — the honest cost/benefit (don't mass-port)
+
+1. **The headline (CUDA-graph) win is gated to Ampere+ (sm_80+)** — see
+   `ggml/src/ggml-cuda/ggml-cuda.cu:4329` (`< GGML_CUDA_CC_AMPERE` →
+   `disable_due_to_gpu_arch`). The project's usual CUDA test GPUs — **T4 (sm_75),
+   P100 (sm_60) — are gated OUT.** Only RTX 5090 / A100-class actually benefit.
+2. **On Metal there is NO throughput win.** §210 measured the M1 granite decode at
+   host-encode **1.8 %** / GPU **98 %** — it's GPU-bound (weight-bandwidth-bound
+   Q4_K GEMVs), so the shape-stable rewrite buys only memory-pressure robustness
+   (alloc balloon 68–236 ms → ~0) on Metal, not speed. The real Metal/Apple-Silicon
+   lever is GPU-side (kernel fusion, lower-bandwidth quant), not graph replay.
+3. **Each port is a MANUAL graph rewrite + byte-identical diff-harness validation**
+   — not mechanical, and **NOT delegable to agents** (runtime graph code, per
+   [[feedback_no_agents_for_runtime_graphs]]). Budget one focused session per
+   backend.
+
+**Therefore: port a backend ONLY when it's actually deployed on Ampere+ CUDA
+servers, and measure first** (`CRISPASR_METAL_PROFILE` for the host/GPU split;
+confirm the GGML_LOG_DEBUG "disabling CUDA graphs due to …" line does NOT fire on
+an Ampere+ GPU). For smaller LLM decoders the host-encode fraction may be larger
+than granite's 1.8 %, which would change the calculus — so don't assume, measure.
+
+### Templates (copy these — already shape-stable)
+
+- **`src/granite_speech.cpp`**: `granite_build_argmax_decode` (~L2474, fixed
+  `bucket_len`, in-graph argmax, fused F16 embed when `token_embd` non-quant),
+  `granite_dec_use_gallocr` (~L2362, gates gallocr vs sched: gallocr on Metal/CPU,
+  **sched on CUDA so capture still fires**).
+- **`src/mimo_asr.cpp`**: did it independently — cached `step_t1_gf` +
+  `step_t1_fixed_kv_len` (L211), `set_rows` scatter-write at runtime `kv_indices`
+  (L958, L1026), skip-plan reuse "update inputs only, no reset/alloc"
+  (L1507–1522). Good second reference for the set_rows path.
+
+### Already done (no work): `granite_speech`, `mimo_asr`, `dots_tts` (Metal gallocr, `ec74c5a0`).
+
+### Candidates — growing-shape (`Lk = n_past + T`) + naive per-step rebuild + `sched_reset`/`alloc`
+
+ASR-LLM (prioritized by likely server deployment):
+1. **voxtral** — `src/voxtral.cpp`, `Lk` at L1019; per-step graph rebuild +
+   `sched_reset`+`sched_alloc_graph` at L1159/L1192/L1244.
+2. **qwen3_asr** — `src/qwen3_asr.cpp`, `Lk` at L1210.
+3. **voxtral4b** — `src/voxtral4b.cpp`, `Lk` at L1411 (decode via
+   `core_greedy_decode`).
+4. **gemma4_e2b** — `src/gemma4_e2b.cpp`, `Lk` at L995 (decode via
+   `core_greedy_decode::run_with_probs_cb`, ~L1631).
+5. **glm_asr** — `src/glm_asr.cpp`, `Lk` at L1322.
+6. **higgs_stt** — `src/higgs_stt.cpp`, `Lk` at L1061 (Qwen3-1.7B decoder).
+7. **ark_asr** — `src/ark_asr.cpp`, `ark_build_decoder_graph` (L643) /
+   `ark_run_decoder` (L729), `Lk` at L674 (Qwen2.5-3B decoder).
+8. **lfm2_audio** — `src/lfm2_audio.cpp`, `Lk` at L933; already on a gallocr (L875,
+   the §206 weight-less-first-op fix) but growing-shape, so not yet capturable.
+
+TTS AR decoders (LOWER priority — heavy per-step compute = even more GPU-bound, so
+the Metal payoff is ~nil and even the CUDA payoff is diluted by larger per-step
+GPU time): `csm_tts`, `indextts`, `bark_tts`, `moss_audio`, `mini_omni2` are naive
+growing-shape. `qwen3_tts`, `chatterbox` (T3), `tada_tts`, `parler_tts`,
+`vibevoice` already have per-backend perf work (`set_rows`/gallocr present) — audit
+individually before touching.
+
+### Per-backend recipe (mirror granite)
+
+1. Allocate KV at `kv_max_ctx` once; pick a fixed `bucket_len` (≤ cache cap).
+2. Rewrite the step graph to a fixed `[0, bucket_len)` KV view; write the new
+   token's K/V via `ggml_set_rows` at runtime index `n_past` (not a growing
+   `ggml_view` sized to `n_past`). Mask is `(bucket_len, 1)`, set host-side each
+   step. Topology must be byte-identical across steps.
+3. Move argmax in-graph (`ggml_argmax`); keep `logits` as a graph output for
+   callers needing the vocab.
+4. Make the embed **capturable**: if `token_embd` is k-quant, the in-graph
+   `GET_ROWS` host-syncs and disables capture — either fuse a F16 embed (granite)
+   or pass a pre-computed F32 embed input (granite's `fused_embed` branch).
+5. Cache the cgraph; gate gallocr-vs-sched like `granite_dec_use_gallocr` (gallocr
+   on Metal/CPU, sched on CUDA/HIP so capture engages; force sched if a CPU layer
+   split exists). Add an env opt-out.
+6. Bound `n_past < bucket_len` (granite's OOB guard, `c5035969`).
+
+### Validation gate (mandatory, per [[feedback_methodology]])
+
+- **Byte-identical transcript** vs the legacy path on jfk + fleurs_60s (the granite
+  gate). This is the correctness bar — no merge without it.
+- **Measure** before/after: `CRISPASR_METAL_PROFILE` (host vs GPU µs split) and a
+  per-step compute-µs accumulator like `CRISPASR_GRANITE_DEC_PROFILE`. On a real
+  Ampere+ GPU, confirm capture engages (no "disabling CUDA graphs" debug line) and
+  A/B the decode RTFx.
+- M1 wall time is noise (§210) — gate on the instrumented per-step quantity, not
+  end-to-end wall.
+
+**Effort:** ~1 focused session per backend (graph rewrite + diff-harness parity +
+profile). Do the highest-deployment ASR backend first; stop if its measured CUDA
+A/B on Ampere+ doesn't justify the next.
 
 ---
 
@@ -6092,3 +6411,127 @@ key files under `sglang_omni/models/higgs_tts/`):
 
 **Testing:** 9.3 GB model requires Kaggle GPU kernel (won't fit 8 GB VPS).
 
+
+## §ARK — ARK-ASR-3B support (⚠️ EXPERIMENTAL / WIP; branch feat/arkasr-3b)
+
+**STATUS 2026-06-29**: ⚠️ **experimental / WIP** — wired through CLI, session C
+ABI, model registry, and docs; shipped to main + GGUF published
+(cstr/ark-asr-3b-GGUF). Core ASR VALIDATED on **both GPU and CPU**: jfk.wav →
+verbatim English; De-Abwasch 79 s → verbatim German. CLI: `crispasr -m
+ark-asr-3b-q8_0.gguf --backend ark-asr -f audio.wav`. **GPU is now the default**
+(Metal-validated; force CPU with `CRISPASR_ARKASR_CPU=1`).
+
+Done: full wiring per docs/contributing.md (C API, adapter, factory, CMake lib+cli,
+registry, session ABI + symbols in libcrispasr.dylib + available_backends, live
+test, docs). Bindings audited: ASR dispatch is automatic (verified ark-asr in
+python Session.available_backends()); added ark-asr to the python set_ask
+docstring enumeration; dart/go/rust/java/ruby/wasm need no change (illustrative
+lists + generic set_ask docstrings; no new setter). `-l` injection (§9b). GGUFs
+published cstr/ark-asr-3b-GGUF
+(f16 7 GB / q8_0 4 GB / q4_k 3.3 GB, all verbatim) + HF model card.
+
+**Diff harness RUN** (vs PyTorch bf16 reference, jfk): log-mel cos 0.999993,
+first_logits (q8_0) cos 0.999646, audio_embeds mean cos 0.999445 (one low-mag
+frame at 0.953 = q8 noise, harmless — logits pass). Pipeline matches the blueprint.
+
+Both perf follow-ups settled by measurement (gated `CRISPASR_ARKASR_TIMING=1`):
+- **(a) step-graph cache = DUD** — per-step build+alloc is 0.3–0.5% of each step
+  (~0.45 ms vs ~120 ms compute); decode is fully compute-bound on the 3B forward.
+- **(b) GPU "no tokens" no longer reproduces** — GPU is verbatim on M1 Metal,
+  ~5.6× faster prefill, ~neutral per-token decode, ~1.7× overall. Default. CUDA unvalidated.
+
+**Language drift FIXED** by matching the reference's single-pass whole-audio
+(commit: CAP_UNBOUNDED_INPUT + single-pass ark_asr_transcribe). The drift was a
+chunking artifact (independent 30 s windows re-detected language); the RoPE encoder
+has no positional cap, so the reference encodes the whole clip in one pass. De-Abwasch
+79 s now verbatim German throughout. Long audio > `CRISPASR_ARKASR_MAX_SINGLE_PASS_S`
+(default 300 s) falls back to internal chunking (drift can return there → use --vad).
+Also strip the model's leading `.` transcript-opening token in output cleanup.
+
+Cross-chunk language conditioning DONE: the >cap chunked fallback now seeds each
+window's assistant turn with the previous chunk's transcript tail (32 tokens) so
+the model continues in the same language instead of re-detecting/translating per
+window. Validated: De-Abwasch with forced 30 s chunking
+(CRISPASR_ARKASR_MAX_SINGLE_PASS_S=30) → German throughout (chunk 2 previously
+translated to English). Opt out with CRISPASR_ARKASR_NO_CHUNK_CONTEXT=1.
+
+Open (minor): CUDA validation (only Metal validated). Nice-to-have, not a blocker.
+
+Port of [AutoArk-AI/ARK-ASR-3B](https://huggingface.co/AutoArk-AI/ARK-ASR-3B):
+a 19-language ASR model = **Whisper-large-v3 encoder with partial RoPE** +
+**MLP adapter (merge-4)** + **Qwen2.5-3B decoder** with audio-token injection.
+On-policy distilled (THUNLP/OPD). BF16 safetensors, 8.14 GB, trust_remote_code.
+
+### Architecture (from config.json + modeling_*.py, mirrored in `.arkasr-ref/`)
+
+**Audio encoder** (`WhisperSpecialEncoder`, modeling_audio.py):
+- Standard Whisper conv stem: `conv1` k=3 s=1 p=1, `conv2` k=3 s=2 p=1, both GELU.
+  Input 128 mel bins → d_model 1280. 3000 mel frames → 1500 encoder frames.
+- 32 pre-norm encoder layers: `self_attn_layer_norm` → attn → +res →
+  `final_layer_norm` → fc1(5120) → gelu → fc2 → +res. 20 heads, head_dim 64.
+  q/v/out_proj have bias; **k_proj has NO bias** (Whisper convention).
+- **Partial interleaved RoPE** applied to Q and K (`WhisperRoPESdpaAttention`):
+  `RotaryEmbedding(dim = head_dim//2 = 32)`, base=10000, rope_ratio=1. Rotates
+  **only the first 32 of 64 head dims** (dims 32..63 pass through unchanged),
+  adjacent-pair (interleaved) rotation = ggml `GGML_ROPE_TYPE_NORMAL` n_dims=32.
+  See [[feedback-x-transformers-partial-rope]]. Non-causal, no attention mask.
+- **No final encoder layer_norm** — `whisper.layer_norm = nn.Identity()`.
+
+**Adapter** (`AudioMLPAdapter`):
+- `layer_norm` = LayerNorm(1280) over encoder output (this replaces the dropped
+  encoder LN).
+- merge_factor=4: reshape (B,1500,1280) → (B,375,5120) (concat 4 consecutive
+  frames). If T%4≠0 truncate to multiple of 4.
+- `adapting` = Linear(5120→4096) → GELU → Linear(4096→2048).
+- Output: 375 audio embeddings (2048-dim) for a full 30 s clip.
+
+**Decoder**: stock Qwen2.5-3B — hidden 2048, 36 layers, GQA 16 heads / 2 KV
+(head_dim 128), intermediate 11008 SwiGLU(silu), RMSNorm eps 1e-6, rope_theta
+1e6, vocab 151936, **tied embeddings** (lm_head = embed_tokens). Reuse the
+existing Qwen2 graph (cosyvoice3-LM / qwen3_asr / mimo_asr).
+
+**Audio injection**: `audio_token_id` 151663 placeholders in the embedded
+prompt are overwritten by the first N adapter frames, where
+`N = ((mel_frames+1)//2)//4` computed from the *real* (unpadded) audio length.
+Encoder runs on the 30 s-padded mel; the first N merged frames map to real audio
+(right-padding), the rest are dropped.
+
+### Prompt / decode recipe (from processing_arkasr.py)
+Token stream (add_special_tokens=False, no newlines):
+`<|user|>`(151665) `<|begin_of_audio|>`(151666) `<|audio|>`×N(151663)
+`<|end_of_audio|>`(151667) `<|assistant|>`(151668)
+Greedy decode (HF default greedy; max 256 new tokens), stop at EOS
+`<|im_end|>`(151645). bad_words: block all special tokens except EOS. Tokenizer
+is Qwen2 GPT-2 byte-level BPE, vocab 151936 + added specials (added_tokens.json).
+Mel: WhisperFeatureExtractor — feature_size 128, n_fft 400, hop 160,
+sampling_rate 16000, chunk_length 30 (n_samples 480000, nb_max_frames 3000),
+dither 0.0. >30 s audio → chunk into 30 s windows.
+
+### Implementation checklist (per docs/contributing.md)
+1. [ ] `models/convert-arkasr-to-gguf.py` — lazy safetensors → GGUF F16, embed
+       Qwen2 BPE vocab+merges + special tokens, hparams under `arkasr.*` +
+       `arkasr.whisper.*`, `general.architecture="arkasr"`. (agent-scaffolded)
+2. [ ] `src/ark_asr.{h,cpp}` — C runtime: GGUF load, mel, whisper+RoPE encoder
+       graph, adapter, Qwen2 decoder w/ KV-cache greedy decode, BPE detok. (ME)
+3. [ ] `examples/cli/crispasr_backend_ark_asr.cpp` — CLI adapter.
+4. [ ] Register: `crispasr_backend.cpp` factory + `detect_backend_from_gguf`
+       (filename "ark"/"arkasr" + arch "arkasr"); `crispasr_model_registry.cpp`.
+5. [ ] `src/CMakeLists.txt` + `examples/cli/CMakeLists.txt` library + link.
+6. [ ] `src/crispasr_c_api.cpp` — 9 edit points (session ABI mirrors CLI,
+       see [[project-session-abi-reimplements-cli]]).
+7. [ ] `examples/crispasr-quantize/main.cpp` — keep norms/bias F32; F16+Q8_0+Q4_K.
+8. [ ] Diff harness: `tools/reference_backends/arkasr.py` + register in
+       `tools/dump_reference.py` + `crispasr_diff_main.cpp` branch. (agent-scaffold)
+9. [ ] `tests/` live test + `tests/env-live-tests.sh`.
+10.[ ] README / docs / bindings docstrings.
+
+### Validation methodology
+crispasr-diff stage cosines vs PyTorch reference at: mel, encoder (per-layer +
+final), adapter, decoder embed-with-audio-injected, per-layer hidden, logits.
+Then ASR-roundtrip an English + a German FLEURS clip (verbatim text gate).
+
+### BLOCKER — disk/compute for validation
+Both local volumes are ~full (`/Volumes/backups` 7.5 GB free, `/Users` 9.9 GB).
+The 8.14 GB safetensors + ~6 GB F16 GGUF do not fit. Scaffolding + graph code is
+done on the M1; **download + conversion + diff validation must run on the VPS**
+(`/mnt/storage`, `/mnt/akademie_storage`) or after freeing local space.

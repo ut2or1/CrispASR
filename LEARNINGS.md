@@ -10,6 +10,330 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## When the engine and the PyTorch reference produce the SAME wrong output, the engine is right — the harness input (usually the prompt) is the bug (moss-transcribe)
+
+The MOSS-Transcribe port passed every numerical diff stage — mel cos 1.0,
+`enc_layer_0` cos 1.0 (so conv front-end + windowed attention were bit-exact), and
+the first decode-token **argmax matched the reference** — but the transcript was
+garbage ("Verm -100 years from now …"). The instinct is "the diff passes, so where's
+the bug?". The answer: the bug was in *what we fed the model*, and both the C++
+runtime and the Python reference fed it the same wrong thing, so they agreed with
+each other while both being wrong. I had built the prompt as the bare audio layout
+`[<|im_start|>, <|audio_start|>, audio…, <|audio_end|>]`; the real model wants the
+`chat_template_default.py` ChatML framing
+(`<|im_start|>user\n<|audio_start|>`·audio·`<|audio_end|><|im_end|>\n<|im_start|>assistant\n`).
+Without the `assistant` cue the model never enters transcribe mode and hallucinates.
+
+Lessons: (1) a diff harness validates the *engine*, not the *task setup* — if the
+reference reuses the runtime's (wrong) prompt/preprocessing, a clean diff proves
+nothing about the prompt. Cross-check the prompt against the model's
+`chat_template*` / processor, not just the layer activations. (2) "C++ == reference,
+both wrong" is a *positive* signal: it rules out the compute graph and points at the
+shared input. Compare to the granite-plus case (#205) where the timing was right but
+the content was wrong → wrong chat template; same family of bug. (3) A second,
+unrelated foot-gun stacked on top: the prompt buffer was sized `T_enc+8` but the
+template needs `T_enc+10`, so `build_prompt` returned −1 and the transcribe silently
+produced *empty* output — size prompt scratch generously and check the return.
+
+## Stage the PyTorch reference load — encoder and LM as separate standalone modules, never the monolithic `*ForCausalLM` (moss-transcribe)
+
+On a 16 GB box the obvious `MossForCausalLM(config)` + `load_state_dict` reference
+OOMs at >12 GB **and crashed the machine twice** — the default-dtype init allocates
+the whole 2.4 B model in float32 (~9.6 GB) before any bf16 weights load, and even a
+bf16 in-place stream peaks ~5 GB on top of everything else. The fix is to never
+hold the whole model: the diff stages are independent, so dump them in phases.
+Phase A instantiates *only* `Qwen3OmniMoeAudioEncoder` + the adapter (`MossGatedMLP`)
+standalone (~0.6 B, ~2.6 GB f32), streams just the `model.audio_model.*` /
+`model.audio_adapter.*` tensors into them (the 1.7 B LM weights are never read), runs
+the encoder, saves the adapter output, and frees everything. Phase B then loads
+*only* `Qwen3Model` standalone (bf16, ~3.4 GB) with a tied `lm_head` reconstructed as
+`F.linear(hidden, embed_tokens.weight)`, splices the saved Phase-A output into the
+prompt embeds, and runs the prefill + a manual greedy loop. Peak ≈ max(phase) ≈
+3.4 GB instead of >12 GB. Two gotchas in Phase B's manual decode: build the model
+under `torch.set_default_dtype(torch.bfloat16)` (else the float32 init spikes), and
+pass `cache_position` on every cached step — omitting it gives wrong RoPE positions
+and the *reference* derails into a "Y. Y. Y." runaway that looks exactly like a
+quantization failure but is a decode-loop bug in the harness, not the model.
+
+## Parakeet single-pass DROPS whole sections of long audio — chunk-and-merge, and pick the reference clip carefully (#208b)
+
+Parakeet's TDT decoder loses track once the input runs past ~30 s: a single
+full-length pass on a 296 s clip emitted **338** words where the audio holds
+~620 (it silently skips whole sentences/sections, not a few words at the edges).
+Three traps while diagnosing this:
+1. **It is not a quantization problem.** The F16 model dropped *more* (255) than
+   Q4_K (338). Don't reach for "the quant is lossy" — A/B a higher-precision
+   build before blaming the quant.
+2. **whisper is not automatically ground truth.** whisper-large-v3-turbo also
+   dropped a section here, and its word count (501) looked authoritative — but
+   the clip genuinely *repeats* a passage (a sloppy FLEURS concat) and whisper
+   emitted it once. Transcribing the two time windows *independently* (short
+   single-pass, fully reliable) proved the audio says it twice → parakeet's
+   "duplicate" was correct and whisper was the one losing words. When two ASR
+   models disagree ~40-68 % on a clip, suspect the *clip* (adversarial / repeated
+   / concatenated content), and verify with short-window crops before trusting
+   either as a reference.
+3. **WER vs another model is the wrong yardstick for "did *my* pipeline lose
+   words".** It's dominated by model disagreement. Use a clip with *exact*
+   ground truth instead: concatenating jfk.wav ×12 (132 s, known 264-word
+   transcript) gave a precise, model-agnostic measure — the merge scored 264/264
+   even with an identical sentence every 11 s (time-based splice, so repeated
+   text doesn't confuse it).
+
+Fix pattern (`parakeet_session_chunked_merge`): short **overlapping** windows
+(20 s / 8 s overlap), splice at the overlap midpoint **continuing from the last
+committed word's end** (continuing by `t0 >= mid` instead drops the one word that
+straddles the midpoint — measured as a ~3.7 % loss vs single-pass on clean
+German; `t1 > cont` fixed it to 99.6 %), then an adjacent-dedup pass for
+jitter-doubled seam words. Net: ≥99 % retention on clean audio AND recovery of
+the sections a single pass drops on long/adversarial audio.
+
+## A cached cgraph is NOT re-entrant with ggml_backend_sched — the 2nd reuse silently corrupts (#208)
+
+§176s cached the built Parakeet encoder graph (`cached_enc_gf`) and reused it
+whenever `T_mel` matched, to skip the rebuild. With the shared
+`ggml_backend_sched` this is wrong: `ggml_backend_sched_reset` +
+`ggml_backend_sched_alloc_graph` on the *same* cgraph object does not clear the
+cached compute tensors' `buffer`/`data` from the previous allocation, so the
+**second and every later** encode of that `T_mel` reads partially-stale memory.
+The failure is not a crash or NaN — the encoder output **shifts** (jfk enc std
+0.020 → 0.014, a valid-looking but wrong tensor) and the TDT decoder then emits
+only blanks → **empty transcript**. It hid for months because the CLI runs one
+encode per `T_mel` per process; it only bites a **long-lived context** that
+encodes ≥2 times: a server/session making repeated `transcribe` calls, the
+streamed/chunked long-audio encoders (same-size chunks), and silence-split
+long-form. Diagnosis was a 3-line A/B: call `transcribe` ×3 on one session →
+1st verbatim, 2nd/3rd empty; gating the cache off made all 3 verbatim. Lessons:
+(1) graph-build caching that hands a reused cgraph to a sched needs the tensors'
+backend assignment reset (or a dedicated reserved gallocr per cached graph, the
+"single-backend raw-gallocr" pattern) — you cannot just stash the cgraph;
+(2) validate any perf cache with a **repeated-call** test, not a single run — a
+one-shot CLI invocation can never surface a 2nd-use corruption; (3) "works in the
+CLI, empty from the binding" smells like cross-call context state, not a binding
+bug. Fixed by defaulting to rebuild-every-call and gating the cache opt-in
+(`CRISPASR_PARAKEET_ENC_CACHE=1`). See [[HISTORY]] #208.
+
+## On Metal a cached decode graph is dispatch-bound, not alloc-bound — measure the step's parts, don't trust wall time (§210, PR #207)
+
+PR #207 made granite-speech's single-token LLM decode run a cached, shape-stable
+graph (fixed `Lk` bucket) so **CUDA-graph capture** engages (~9-13× on RTX 5090,
+bit-identical). The natural follow-up on Metal — which has no capture — is the
+[[HISTORY]] #208 lesson applied as a *speedup*: hand the reused cgraph a
+**dedicated reserved `ggml_gallocr` on the single GPU backend, allocate once, and
+reuse it every step** with `ggml_backend_graph_compute`, skipping the per-step
+`ggml_backend_sched_reset`+`sched_alloc_graph` that capture forces. It's correct
+(byte-identical, `granite_dec_use_gallocr` gates it: gallocr unless CUDA/HIP or a
+CPU layer-split; CUDA keeps the sched so capture still fires) and strictly less
+work — but **measuring it taught the real lesson twice over**:
+
+1. **M1 end-to-end wall time is unusable for a perf A/B.** Identical-config runs
+   swung 1.7× (3385↔5752 ms decode) purely from background macOS load
+   (`softwareupdated` at 90%, `ANECompilerService`, `cloudd`) and leftover
+   zombie procs from a timed-out batch. The fix is to **instrument the specific
+   quantity** — accumulate per-step *alloc* µs vs *compute* µs into the ctx
+   (env-gated `CRISPASR_GRANITE_DEC_PROFILE`) — which is deterministic and
+   attributable regardless of total noise. Don't A/B two configs on wall time;
+   measure the one thing your change touches, inside the step.
+
+2. **The alloc you're removing is tiny; the decode is dispatch-bound.** On a
+   quiet machine the sched per-step alloc is only ~3 ms (it *balloons* to
+   68-236 ms under memory pressure — the real robustness win on a 16 GB box),
+   while the dominant ~100 ms/step is **Metal per-op dispatch of the ~280-op
+   graph** — exactly the launch-bound cost CUDA capture eliminates and that
+   gallocr does **not** touch. `CRISPASR_METAL_N_CB` (1/2/4) made no difference,
+   and disabling concurrency/fusion only made it slower (they already help).
+   The natural hypothesis was that **indirect command buffers**
+   (`MTLIndirectCommandBuffer` — encode the fixed-shape step once, replay, the
+   Metal analog of CUDA-graph capture) would remove this floor. **It would not —
+   see the measured DUD below.** Note the contrast with the chatterbox-CFM
+   gallocr **DUD** ([[HISTORY]]): there alloc was ~0.3% of a compute-heavy UNet
+   step → no win; here per-token compute is small so alloc is a *large* fraction
+   under load → gallocr helps. Same trick, opposite verdict — decided by the
+   compute/alloc ratio, which you can only know by measuring (#1). See
+   [[HISTORY]] §210.
+
+### ICB graph replay on Metal is a measured DUD — the M1 decode is GPU-bound, not host-launch-bound (§210 follow-up)
+
+Before committing to the (large, invasive) ICB refactor of vendored ggml-metal,
+I ran the §210 lesson on itself: **measure the part the change touches before
+building it.** ICB's entire value is collapsing the *host-side* per-step re-encode
+(280→1446 `setComputePipelineState`/`setBytes`/`setBuffer`/`dispatchThreadgroups`
+objc calls) into one `executeCommandsInBuffer` replay. So the only number that
+matters is: *what fraction of the step is host encode?*
+
+Added `CRISPASR_METAL_PROFILE` to `ggml_metal_graph_compute`
+(`ggml-metal-context.m`): it splits each graph_compute into **encode_us** (all
+ops encoded + all command buffers committed — the host work ICB removes) vs
+**gpu_us** (a forced `waitUntilCompleted` after commit — GPU execute + submit/sync,
+which ICB cannot touch). granite-4.1-2b-q4_k, jfk.wav, Metal, gallocr path,
+27 decode steps (cold step 0 dropped):
+
+| part | median | share | what ICB does to it |
+|---|---|---|---|
+| **host encode+commit** | **1.19 ms** | **1.8 %** | collapses to ~one encode |
+| **GPU execute + sync** | **64 ms** | **98 %** | unchanged (same kernels, same bandwidth) |
+| total/step | 66.3 ms | — | cross-checks the dec-profile compute (70 ms) |
+
+**Verdict: ICB ceiling is ~1.2 ms of ~66 ms ≈ 1.8 %, even if it were free and
+removed 100 % of host encode.** Not worth a multi-thousand-line refactor of
+vendored upstream Metal code (and it has a hard blocker anyway — every op binds
+its args via `[encoder setBytes:atIndex:0]`, which `MTLIndirectComputeCommand`
+does **not** support; ICB can only `setKernelBuffer`, so each op's arg struct
+would need a GPU-resident buffer slot — see `ggml-metal-device.m:548`).
+
+**Why the §210 "dispatch-bound" framing was half-right.** The ~100 ms *is* spent
+mostly outside alloc, but it is **GPU-side**, not host-side dispatch. The 1446-node
+graph's cost is per-layer Q4_K GEMVs reading ~1.5 GB of weights once per token —
+**weight-bandwidth-bound on the M1 GPU** (~64 ms ≈ 1.5 GB at a fraction of the
+~68 GB/s base-M1 bandwidth, as single-token GEMV achieves). Host encode of all
+1446 ops is only 1.2 ms and already overlaps GPU via `n_cb`. The encode time is
+*rock-stable* across steps (1.0–2.0 ms) while gpu_us carries all the background-load
+variance (55–107 ms) — further proof the bottleneck is the GPU, not the CPU encode.
+
+**Why CUDA graphs win 9–13× on the same model but ICB wouldn't.** Opposite regime.
+On an RTX 5090 the GPU finishes each tiny single-token kernel faster than the CPU
+can launch the next → **CPU-launch-bound**, so capturing the launch sequence is a
+huge win. On M1 the GPU is the bottleneck and CPU encode is 1.8 % → **GPU-bound**,
+so the Metal analog (ICB) has nothing to remove. Same graph, same trick, opposite
+verdict — decided by the host-encode/GPU-compute ratio, which (again) you only
+know by measuring. The real M1-decode levers are GPU-side: lower-bandwidth quant,
+or fusing the many small GEMV/elementwise ops into fewer larger kernels — **not**
+ICB. `CRISPASR_METAL_PROFILE` is kept (env-gated, off by default) as the reusable
+probe for any future "is this Metal graph host- or GPU-bound?" question.
+
+### Would other backends benefit from the granite shape-stable-decode rewrite? Mostly only on Ampere+ CUDA (§210 survey)
+
+The two wins PR #207 + the Metal follow-up gave granite (CUDA-graph capture; Metal
+gallocr allocate-once) **both require the same prerequisite**: the per-step decode
+graph must be *shape-stable* — a fixed-`Lk` KV bucket written via `ggml_set_rows`
+at a runtime index, so the topology is byte-identical every step. The naive
+anti-pattern (most backends) is a KV view sized `Lk = n_past + T`, which grows
+every token → no capture, no allocate-once. Surveyed every LLM/AR-decoder backend
+(2026-06-30) for which side of that line they're on:
+
+- **Already shape-stable** (get both wins): `granite_speech` (PR #207),
+  **`mimo_asr`** — independently: cached `step_t1_gf` + `fixed_kv_len` + `set_rows`
+  scatter + skip-plan reuse (`mimo_asr.cpp:211,958,1507-1522`); `dots_tts` has the
+  Metal gallocr allocate-once (`ec74c5a0`).
+- **Growing-shape + naive per-step rebuild** (candidates): `voxtral`, `voxtral4b`,
+  `qwen3_asr`, `gemma4_e2b`, `glm_asr`, `higgs_stt`, `ark_asr` (all `Lk = n_past+T`);
+  `lfm2_audio` (growing but already on a gallocr for the §206 fix); naive TTS
+  decoders `csm_tts`, `indextts`, `bark_tts`, `moss_audio`, `mini_omni2`.
+
+**The catch (why this is *conditional*, not a roadmap to mass-port):** the headline
+CUDA-graph win is **arch-gated to Ampere+ (sm_80+)** (`ggml-cuda.cu:4329`), so the
+project's usual CUDA test GPUs **T4 (sm_75) and P100 (sm_60) get nothing** — only
+RTX 5090 / A100-class do. And on **Metal there is no throughput win at all** (this
+decode is GPU-bound, per the measurement above) — only memory-pressure robustness.
+So porting the granite pattern to N other backends is a per-backend manual graph
+rewrite (set_rows bucket + in-graph argmax + capturable/fused embed + diff-harness
+parity) for a payoff that materializes only on Ampere+ NVIDIA. Do it **targeted,
+on deployment demand, measured first** — not as a sweep. CUDA-graph capture itself
+is automatic once the graph is capturable (no k-quant `GET_ROWS`, no split buffer,
+no problematic `MUL_MAT_ID`) and shape+pointer-stable; no per-backend CUDA code is
+needed, just the shape-stable rewrite. Actionable port plan + per-backend file:line
+anchors + recipe in [[PLAN]] §210 follow-up.
+
+## A "garbled GPU output" bug can live entirely downstream — A/B the GPUs before localizing (§192)
+
+The #192 native-Vulkan TADA garbage was localized (by a prior handover) to the
+"FM head's time-dimension divergence" and a whole work plan was written around
+per-op FM diffing. That was **wrong**. The decisive test was a one-line A/B:
+generate the same sentence on **Metal** vs **Vulkan** native. Both produced
+**bit-identical durations and frame counts** (`time_before` matched exactly) —
+proving the talker + FM + duration decode AGREE across GPUs — yet Metal's audio
+was intelligible and Vulkan's was empty. So the divergence was purely in audio
+**rendering = the codec**. Per-stage `TADA_CODEC_DUMP` (Vulkan vs CPU, identical
+features) localized it precisely: the codec's attention encoder MATCHES across
+backends, but the **DAC decoder front-end explodes** — `dump_dac_in` (an
+`in_conv` Conv1d → im2col+mul_mat) hits rms ~37 / range ±800 on Vulkan vs ~0.85
+on CPU (~43×). It is **size-dependent** (short inputs render fine; only longer
+sequences break). Crucially it is **NOT a conv kernel bug** — a standalone repro of
+`conv_1d`/`im2col`/the full `wn_conv1d` at the codec's exact dims and T=522 is
+bit-correct on MoltenVK, and capping `GGML_VK_FORCE_MAX_ALLOCATION_SIZE` doesn't
+help — so it's a graph-scale gallocr/aliasing-class corruption in the *large* real
+graph, unreproducible in a minimal harness. Fix: run the whole codec on CPU when
+the GPU is Vulkan. **Beware the two wrong explanations I went through
+first** (both plausible, both false — verify, don't assume): (a) "it's a
+`ggml_backend_sched` cross-backend-copy bug" — NO, `GGML_SCHED_DEBUG=2` shows the
+codec is a *single Vulkan split*, no offload, no copies; (b) "Vulkan lacks the
+conv/ISTFT kernels" — NO, ggml-vulkan has conv_transpose_1d/col2im/im2col/
+flash_attn, and the codec has no ISTFT at all (it's a DAC conv decoder).
+**Lessons:** (1) when two GPU backends exist, A/B them first — if they agree with
+each other but disagree with CPU-rendered output, the bug is in the
+backend-specific *rendering*, not the shared upstream math; (2) inherit a
+handover's *localization* skeptically — re-run its cheapest disproving test
+before building on it (the FM premise was wrong — F32 FM weights and whole-FM-on-
+CPU both left output bit-identical); (3) localize with the per-stage magnitude
+dump before naming a cause — `dump_dac_in` rms 0.85→37 named the op in one run,
+after two hand-wavy mechanisms wasted effort. (4) `grep` the actual op list +
+`supports_op` before claiming "no kernel"; check `GGML_SCHED_DEBUG=2` before
+claiming "cross-backend copy".
+
+## Precomputed attention masks in a GGUF are dead weight if the runtime rebuilds them (§192)
+
+The `tada-codec-fixed-f16.gguf` was **1.0 GB**, and **805 MB of it (76%)** was six
+`codec.attn.blk.*.self_attn._precomputed_mask` tensors — `(8192, 8192)` F16
+block-attention masks, one per layer. The C++ codec never binds them: it rebuilds
+`attn_mask` from `token_masks` per decode (`tada_codec.cpp build_decode_graph`).
+So they were loaded into RAM (and shipped/downloaded) for nothing. Dropping them
+(converter skip + a one-shot strip of the existing file) gives a **250 MB** codec
+with **byte-identical** output (`cmp` clean, ASR verbatim). Lessons: (1) when a
+"quantize it" footprint ask comes in, first **inventory the tensors by size** —
+the biggest line items may be non-weight tables you can delete outright, which
+beats any quant (and here the conv weights couldn't quantize anyway: DAC conv
+kernels store `kernel_size=7/3/1` as ne[0], below the Q8_0/Q4_K min block size of
+32/256). (2) A precomputed mask/positional table is only worth storing if the
+runtime actually reads it — grep the loader's bind step before trusting a fat
+GGUF. (3) Quantization shrinks *weights* only; activations stay f32, so it does
+nothing for the compute-buffer growth on long inputs.
+
+## MoltenVK `mul_mm`/`mul_mat_vec` downconvert src0 to f16 regardless of stored dtype (§192)
+
+Storing FM weights as F32 instead of F16 on MoltenVK changed the matmul output by
+**exactly zero** — the shader downconverts src0 to its `FLOAT_TYPE` (f16) anyway,
+so f32-stored and f16-stored weights round identically. Even
+`GGML_VK_DISABLE_F16=1` only nudged a hidden-state cosine 0.99919→0.99966. So on
+MoltenVK you **cannot** reach CPU-exact GPU numerics by changing weight dtype;
+the only way to match CPU for a precision-critical sub-graph is to run it on the
+CPU backend. (On RADV, f32 matmuls accumulate in f32, so this is a MoltenVK
+quirk, not universal — but don't try to "validate a GPU f32 fix" on MoltenVK.)
+
+## Vulkan has no `REPEAT f16→f16` — cast K/V to F32 *before* the GQA repeat (§192)
+
+GQA decoders expand KV heads with `ggml_repeat_4d` on the cached K/V. When the
+cache is F16 (the default), that's an `f16→f16` REPEAT — which **Vulkan has no
+pipeline for**, on RADV *and* MoltenVK alike (`Missing op: REPEAT for f16 to
+f16`). It aborts the whole graph. The fix isn't a new kernel: cast K/V up to F32
+*before* the repeat (`core_attn::KvSelfAttnParams::force_kv_read_f32`, OR'd with
+the global `CRISPASR_KV_READ_F32`) so it lowers to a supported F32 REPEAT.
+Gate it to the Vulkan path; Metal/CPU keep the F16 fast path. **Caveat learned
+the hard way:** unblocking the *abort* is not the same as fixing *correctness* —
+the graph then ran but still produced garbage on longer text (a separate
+numerical divergence). "It runs now" ≠ "it's right now."
+
+## On macOS, GGML_METAL is default-ON and silently wins over Vulkan (§192)
+
+A build configured with `-DGGML_VULKAN=ON` but Metal left at its default still
+has Metal, and `--gpu-backend vulkan` will quietly run **MTL0**, not Vulkan. I
+spent a cycle "confirming a Vulkan fix" that was actually executing on Metal
+(where the bug doesn't exist). Always build the Vulkan test tree with
+`-DGGML_METAL=OFF`, and **read the `backend=Vulkan0` vs `backend=MTL0` log
+line** before trusting any Vulkan A/B. The original `crispasr-vk-build` had
+Metal OFF; a freshly-configured worktree build did not.
+
+## Never benchmark on a near-full disk — SIGBUS + nondeterminism masquerade as a code signal (§192)
+
+With `/Volumes/backups` at 100% (a few GB free), TADA-Vulkan runs threw
+intermittent **SIGBUS** (failed `mmap` of model files) and gave
+**nondeterministic** frame counts for *identical* invocations (148 vs 191 vs
+522). That noise looked exactly like a real A/B signal and sent me down a dead
+end ("disable FM B=2 fixes the drift" — it doesn't; ON and OFF both give the
+same 522-frame runaway once the disk is freed). Lesson: a parity/A-B result that
+won't reproduce across repeats is an *environment* alarm, not a finding — check
+`df` and re-run the same config twice **before** forming a hypothesis. Confirmed
+fixes only after the disk was freed and runs were deterministic.
+
 ## Always A/B against the *upstream reference*, not just your own option matrix (§216)
 
 Parakeet long-form shipped a "streamed" (chunked-encode + single-decode) default
