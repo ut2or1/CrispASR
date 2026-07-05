@@ -13,7 +13,9 @@
 // across all four consumers above.
 
 #include "crispasr_session.h"
+#include "core/win_compat.h"
 #include "core/bpe.h"
+#include "core/gpu_backend_pref.h" // crispasr_set_gpu_backend_pref (#214)
 
 #include <atomic>
 #include <cstdint>
@@ -147,6 +149,10 @@
 #if __has_include("chatterbox.h")
 #include "chatterbox.h"
 #define CA_HAVE_CHATTERBOX 1
+#endif
+#if __has_include("bananamind_tts.h")
+#include "bananamind_tts.h"
+#define CA_HAVE_BANANAMIND_TTS 1
 #endif
 #if __has_include("outetts.h")
 #include "outetts.h"
@@ -1493,6 +1499,18 @@ struct crispasr_session {
     int parakeet_force_chunk_seconds = -1;
     int parakeet_force_overlap_seconds = -1;
 
+    // Issue #208: per-session progress callback for long-form (chunked)
+    // transcription. Fired once per finished window from the chunked merge
+    // path with (processed_samples, total_samples). nullptr = disabled.
+    crispasr_progress_callback progress_cb = nullptr;
+    void* progress_ud = nullptr;
+
+    // Per-segment streaming callback — fired for every committed segment
+    // at the end of each transcribe call. Defaults to _default_segment_cb
+    // which feeds the global polling buffer for Dart FFI.
+    crispasr_segment_callback segment_cb = nullptr;
+    void* segment_ud = nullptr;
+
     // Exactly one of these pointers is non-null based on `backend`.
     whisper_context* whisper_ctx = nullptr;
 #ifdef CA_HAVE_PARAKEET
@@ -1602,6 +1620,9 @@ struct crispasr_session {
 #ifdef CA_HAVE_CHATTERBOX
     chatterbox_context* chatterbox_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_BANANAMIND_TTS
+    bananamind_tts_context* bananamind_tts_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_OUTETTS
     outetts_context* outetts_ctx = nullptr;
 #endif
@@ -1706,6 +1727,55 @@ struct crispasr_session_result {
     std::vector<crispasr_session_seg> segments;
     std::string backend;
 };
+
+// ── Streamed-segment polling buffer (Dart FFI path) ─────────────────────
+// The default segment callback pushes segments here; Dart polls via
+// crispasr_get_streamed_segment_count / crispasr_drain_streamed_segments.
+static std::mutex g_seg_mutex;
+static std::vector<crispasr_session_seg> g_streamed_segments;
+static std::atomic<int> g_seg_count{0};
+
+static void _default_segment_cb(const char* text, int64_t t0, int64_t t1, int /*idx*/, void* /*ud*/) {
+    std::lock_guard<std::mutex> lk(g_seg_mutex);
+    crispasr_session_seg seg;
+    seg.text = text;
+    seg.t0 = t0;
+    seg.t1 = t1;
+    g_streamed_segments.push_back(std::move(seg));
+    g_seg_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+CA_EXPORT int crispasr_get_streamed_segment_count(void) {
+    return g_seg_count.load(std::memory_order_relaxed);
+}
+
+CA_EXPORT crispasr_session_result* crispasr_drain_streamed_segments(void) {
+    std::lock_guard<std::mutex> lk(g_seg_mutex);
+    if (g_streamed_segments.empty())
+        return nullptr;
+    auto* r = new crispasr_session_result;
+    r->segments = std::move(g_streamed_segments);
+    g_streamed_segments.clear();
+    g_seg_count.store(0, std::memory_order_relaxed);
+    return r;
+}
+
+CA_EXPORT void crispasr_reset_streamed_segments(void) {
+    std::lock_guard<std::mutex> lk(g_seg_mutex);
+    g_streamed_segments.clear();
+    g_seg_count.store(0, std::memory_order_relaxed);
+}
+
+// Fire the session's segment callback for every segment in `r`.
+// Called from the public transcribe entry points after the result is built.
+static void _fire_segment_callbacks(crispasr_session* s, crispasr_session_result* r) {
+    if (!s || !r || !s->segment_cb)
+        return;
+    for (int i = 0; i < (int)r->segments.size(); ++i) {
+        const auto& seg = r->segments[i];
+        s->segment_cb(seg.text.c_str(), seg.t0, seg.t1, i, s->segment_ud);
+    }
+}
 
 // Per-token data fed into emit_words_from_tokens. Backends with their own
 // token-prob APIs project into this shape so the word-grouping logic stays
@@ -1813,6 +1883,12 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
     s->model_path = model_path;
     s->backend = backend_name;
     s->n_threads = n_threads > 0 ? n_threads : 4;
+
+    // Register the default segment callback so the Dart polling buffer
+    // is populated out of the box. Users can override via
+    // crispasr_session_set_segment_callback after open.
+    s->segment_cb = _default_segment_cb;
+    s->segment_ud = nullptr;
 
     if (s->backend == "whisper") {
         whisper_context_params cparams = whisper_context_default_params();
@@ -2303,6 +2379,22 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_BANANAMIND_TTS
+    if (s->backend == "bananamind-tts" || s->backend == "bananamind_tts" || s->backend == "bananamind" ||
+        s->backend == "banana-tts") {
+        s->backend = "bananamind-tts";
+        bananamind_tts_params p = bananamind_tts_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->bananamind_tts_ctx = bananamind_tts_init_from_file(model_path, p);
+        if (!s->bananamind_tts_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_TADA
     if (s->backend == "tada" || s->backend == "tada-tts" || s->backend == "tada-1b" || s->backend == "tada-tts-1b" ||
         s->backend == "tada-3b" || s->backend == "tada-3b-ml") {
@@ -2311,11 +2403,13 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         p.n_threads = s->n_threads;
         p.verbosity = g_open_verbosity_tls > 0 ? g_open_verbosity_tls : 1;
         p.use_gpu = g_open_use_gpu_tls;
-        // Mirror the CLI default: rank several flow-matching timing
-        // candidates per token so multilingual output is reliable (the
-        // lib default of 1 reproduces a single noise draw, which can
-        // collapse durations). Override with TADA_NUM_CANDIDATES.
-        p.num_acoustic_candidates = 4;
+        // num_acoustic_candidates INHERITS the library default (1) from
+        // tada_context_default_params() above — do NOT re-hardcode it here. The
+        // upstream default is 1; a redundant override is exactly how #192 shipped
+        // a 4 (best-of-N with the reconstruction scorer mangles "…four hours" →
+        // "…and forth"). Keeping a single source of truth means the defaults-audit
+        // test (which checks the library default) also guards this path. Opt in
+        // to >1 with TADA_NUM_CANDIDATES for A/B only.
         if (const char* env = std::getenv("TADA_NUM_CANDIDATES"); env && *env) {
             int n = atoi(env);
             if (n >= 1)
@@ -2892,6 +2986,14 @@ CA_EXPORT crispasr_session* crispasr_session_open(const char* model_path, int n_
 // `backend` may be "" / NULL to delegate to GGUF arch detection
 // (same path as `crispasr_session_open`).
 // ─────────────────────────────────────────────────────────────────
+
+// Issue #214 — process-global GPU backend preference. Call before any
+// session open to force a specific GPU backend (e.g. "vulkan" when both
+// CUDA and Vulkan are compiled in).
+CA_EXPORT void crispasr_set_gpu_backend(const char* name) {
+    crispasr_set_gpu_backend_pref(name);
+}
+
 struct crispasr_open_params_v1 {
     int abi_version; // = 1 or 2
     int n_threads;
@@ -3071,6 +3173,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_CHATTERBOX
     list += ",chatterbox";
+#endif
+#ifdef CA_HAVE_BANANAMIND_TTS
+    list += ",bananamind-tts";
 #endif
 #ifdef CA_HAVE_TADA
     list += ",tada,tada-1b,tada-tts-1b,tada-3b-ml";
@@ -3443,6 +3548,7 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
     if (n_runs <= 1) {
         crispasr_session_result* r = transcribe_single(s, pcm, n_samples, language);
         apply_session_punc_model(s, r);
+        _fire_segment_callbacks(s, r);
         return r;
     }
 
@@ -3472,6 +3578,7 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
         }
     }
     apply_session_punc_model(s, best);
+    _fire_segment_callbacks(s, best);
     return best;
 }
 
@@ -3520,7 +3627,8 @@ static std::string parakeet_norm_word(const char* s) {
 // (nothing dropped) with no boundary duplication.
 static void parakeet_session_chunked_merge(parakeet_context* ctx, const float* samples, int n_samples,
                                            int chunk_samples, int overlap_samples,
-                                           std::vector<crispasr_session_seg>& out) {
+                                           std::vector<crispasr_session_seg>& out,
+                                           crispasr_progress_callback prog_cb = nullptr, void* prog_ud = nullptr) {
     const int SR = 16000;
     if (chunk_samples < SR)
         chunk_samples = SR; // 1 s floor
@@ -3569,6 +3677,13 @@ static void parakeet_session_chunked_merge(parakeet_context* ctx, const float* s
             prev_end_cs = (int64_t)((double)end / SR * 100.0);
             parakeet_result_free(r);
         }
+        // Issue #208: report progress after each finished window. `end` is the
+        // last input sample this window covered, so it is monotonically
+        // non-decreasing and reaches n_samples on the final window. Mirror it
+        // into the module-level atomic so pollers (Dart FFI) also see it.
+        g_progress.store((int)((int64_t)end * 100 / n_samples), std::memory_order_relaxed);
+        if (prog_cb)
+            prog_cb(end, n_samples, prog_ud);
         if (end >= n_samples)
             break;
     }
@@ -3649,6 +3764,24 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_chunked(crispasr_
                                                                        int n_samples, int chunk_seconds,
                                                                        int overlap_seconds) {
     return crispasr_session_transcribe_chunked_lang(s, pcm, n_samples, chunk_seconds, overlap_seconds, nullptr);
+}
+
+// Issue #208: register a per-session progress callback for long-form
+// (chunked) transcription. See crispasr_session.h for the contract.
+CA_EXPORT void crispasr_session_set_progress_callback(crispasr_session* s, crispasr_progress_callback cb,
+                                                      void* user_data) {
+    if (!s)
+        return;
+    s->progress_cb = cb;
+    s->progress_ud = cb ? user_data : nullptr;
+}
+
+CA_EXPORT void crispasr_session_set_segment_callback(crispasr_session* s, crispasr_segment_callback cb,
+                                                     void* user_data) {
+    if (!s)
+        return;
+    s->segment_cb = cb ? cb : _default_segment_cb;
+    s->segment_ud = cb ? user_data : nullptr;
 }
 
 static crispasr_session_result* transcribe_single(crispasr_session* s, const float* pcm, int n_samples,
@@ -3831,6 +3964,136 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
     }
 #ifdef CA_HAVE_PARAKEET
     if (s->backend == "parakeet" && s->parakeet_ctx) {
+        // Issue #89 (JA long audio): mirror of the CLI default — energy-minima
+        // slices at most `cap_s` long (the JA encoder collapses past ~12 s of
+        // context on real speech), one exact single pass per slice, then a
+        // gap-fill second pass re-transcribing any span >=1 s the first pass
+        // left empty inside a slice (the encoder blanks an utterance whenever
+        // enough context follows it; the same span decodes verbatim in
+        // isolation). See examples/cli/crispasr_run.cpp gap-fill for the
+        // measured numbers (97/97/96 % recall vs 53-62 % streamed).
+        auto transcribe_ja_sliced = [&](const float* audio, int n, int sr, int cap_s) -> crispasr_session_seg {
+            int64_t min_gap_cs = 100;
+            if (const char* e = getenv("CRISPASR_GAP_FILL_MIN_CS"))
+                min_gap_cs = std::max((int64_t)30, (int64_t)atoi(e));
+            bool gap_fill = true;
+            if (const char* e = getenv("CRISPASR_GAP_FILL"))
+                gap_fill = atoi(e) != 0;
+            constexpr int64_t kEdgePadCs = 20;
+            constexpr int64_t kCoverSlopCs = 30;
+
+            const auto slices = crispasr_energy_chunk_slices(audio, n, sr, cap_s, 2.0f);
+            std::vector<crispasr_session_seg::word> words;
+            auto run_window = [&](int w0, int w1, int64_t t0_cs, std::vector<crispasr_session_seg::word>& out) {
+                parakeet_result* pr = parakeet_transcribe_ex(s->parakeet_ctx, audio + w0, w1 - w0, t0_cs);
+                if (!pr)
+                    return;
+                for (int i = 0; i < pr->n_words; ++i) {
+                    crispasr_session_seg::word w;
+                    w.text = pr->words[i].text;
+                    w.t0 = pr->words[i].t0;
+                    w.t1 = pr->words[i].t1;
+                    w.p = pr->words[i].p > 0.0f ? pr->words[i].p : 1.0f;
+                    out.push_back(std::move(w));
+                }
+                parakeet_result_free(pr);
+            };
+            for (size_t si = 0; si < slices.size(); ++si) {
+                const auto& sl = slices[si];
+                std::vector<crispasr_session_seg::word> sw;
+                run_window(sl.start, sl.end, sl.t0_cs, sw);
+                // Gap-fill rounds within this slice.
+                for (int round = 0; gap_fill && round < 2; ++round) {
+                    std::vector<std::pair<int64_t, int64_t>> merged;
+                    {
+                        std::vector<std::pair<int64_t, int64_t>> cov;
+                        for (const auto& w : sw)
+                            cov.push_back({w.t0, std::max(w.t1, w.t0 + 1)});
+                        std::sort(cov.begin(), cov.end());
+                        for (auto& iv : cov) {
+                            if (!merged.empty() && iv.first <= merged.back().second + kCoverSlopCs)
+                                merged.back().second = std::max(merged.back().second, iv.second);
+                            else
+                                merged.push_back(iv);
+                        }
+                    }
+                    std::vector<std::pair<int64_t, int64_t>> gaps;
+                    int64_t cursor = sl.t0_cs;
+                    for (auto& iv : merged) {
+                        if (iv.first - cursor >= min_gap_cs)
+                            gaps.push_back({cursor, iv.first});
+                        cursor = std::max(cursor, iv.second);
+                    }
+                    if (sl.t1_cs - cursor >= min_gap_cs)
+                        gaps.push_back({cursor, sl.t1_cs});
+                    if (gaps.empty())
+                        break;
+                    bool recovered = false;
+                    for (auto& g : gaps) {
+                        const int64_t win0_cs = std::max(sl.t0_cs, g.first - kEdgePadCs);
+                        const int64_t win1_cs = std::min(sl.t1_cs, g.second + kEdgePadCs);
+                        const int w0 = std::max(0, (int)(win0_cs * sr / 100));
+                        const int w1 = std::min(n, (int)(win1_cs * sr / 100));
+                        if (w1 - w0 < sr / 4)
+                            continue;
+                        std::vector<crispasr_session_seg::word> fw;
+                        run_window(w0, w1, win0_cs, fw);
+                        for (auto& w : fw) {
+                            const int64_t mid = (w.t0 + w.t1) / 2;
+                            if (mid < g.first - kCoverSlopCs || mid >= g.second + kCoverSlopCs)
+                                continue;
+                            bool covered = false;
+                            for (const auto& iv : merged)
+                                if (mid >= iv.first && mid < iv.second) {
+                                    covered = true;
+                                    break;
+                                }
+                            if (!covered) {
+                                sw.push_back(std::move(w));
+                                recovered = true;
+                            }
+                        }
+                    }
+                    if (!recovered)
+                        break;
+                    std::sort(sw.begin(), sw.end(),
+                              [](const crispasr_session_seg::word& a, const crispasr_session_seg::word& b) {
+                                  return a.t0 < b.t0;
+                              });
+                }
+                for (auto& w : sw)
+                    words.push_back(std::move(w));
+                if (s->progress_cb)
+                    s->progress_cb((int)si + 1, (int)slices.size(), s->progress_ud);
+            }
+            std::sort(
+                words.begin(), words.end(),
+                [](const crispasr_session_seg::word& a, const crispasr_session_seg::word& b) { return a.t0 < b.t0; });
+            crispasr_session_seg seg;
+            for (const auto& w : words) {
+                if (w.text.empty())
+                    continue;
+                if (!seg.text.empty()) {
+                    const unsigned char prev_last = (unsigned char)seg.text.back();
+                    const unsigned char cur_first = (unsigned char)w.text[0];
+                    // CJK boundaries take no space (>= 0xE0 lead byte = 3-byte
+                    // UTF-8: kana / CJK / hangul); latin words usually carry a
+                    // leading space from the tokenizer already.
+                    if (cur_first != ' ' && prev_last < 0xE0 && cur_first < 0xE0)
+                        seg.text += ' ';
+                }
+                seg.text += w.text;
+            }
+            if (!seg.text.empty() && seg.text[0] == ' ')
+                seg.text.erase(0, 1);
+            if (!words.empty()) {
+                seg.t0 = words.front().t0;
+                seg.t1 = words.back().t1;
+            }
+            seg.words = std::move(words);
+            return seg;
+        };
+
         // Issue #208: the session path used to call parakeet_transcribe_ex,
         // routing the WHOLE buffer through one full-length FastConformer
         // encode. Two problems on long audio: (1) the encoder's
@@ -3898,11 +4161,28 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         // non-JA long audio → overlapping-window merge (no dropped sections,
         // no boundary duplicates). Emits one merged segment.
         if (!use_single_pass && !is_ja) {
-            parakeet_session_chunked_merge(s->parakeet_ctx, pcm, n_samples, chunk_s * SR, overlap_s * SR, r->segments);
+            g_progress.store(0, std::memory_order_relaxed); // issue #208: pollers see "started"
+            parakeet_session_chunked_merge(s->parakeet_ctx, pcm, n_samples, chunk_s * SR, overlap_s * SR, r->segments,
+                                           s->progress_cb, s->progress_ud);
+            g_progress.store(-1, std::memory_order_relaxed); // back to idle
             return r;
         }
 
-        // JA long audio → streamed; short audio → the exact single pass.
+        // JA long audio → capped-slice single-pass + gap-fill (issue #89
+        // mirror of the CLI default; CRISPASR_PARAKEET_VAD_SLICE_CAP=0
+        // reverts to the old streamed path, an explicit chunked request via
+        // crispasr_session_transcribe_chunked keeps the caller's sizing).
+        int ja_cap_s = 12;
+        if (const char* e = getenv("CRISPASR_PARAKEET_VAD_SLICE_CAP"))
+            ja_cap_s = std::max(0, atoi(e));
+        if (!use_single_pass && is_ja && ja_cap_s > 0 && !force_chunked) {
+            g_progress.store(0, std::memory_order_relaxed);
+            r->segments.push_back(transcribe_ja_sliced(pcm, n_samples, SR, ja_cap_s));
+            g_progress.store(-1, std::memory_order_relaxed);
+            return r;
+        }
+
+        // JA long audio (streamed fallback); short audio → the exact single pass.
         parakeet_result* pr =
             (!use_single_pass && is_ja)
                 ? parakeet_transcribe_streamed(s->parakeet_ctx, pcm, n_samples, 0, stream_chunk_s, stream_overlap_s)
@@ -6428,6 +6708,18 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
         return chatterbox_synthesize(s->chatterbox_ctx, text, out_n_samples);
     }
 #endif
+#ifdef CA_HAVE_BANANAMIND_TTS
+    if (s->bananamind_tts_ctx) {
+        float* pcm = nullptr;
+        int sr = 0;
+        int n = bananamind_tts_synthesize(s->bananamind_tts_ctx, text, &pcm, &sr);
+        if (n > 0 && pcm) {
+            *out_n_samples = n;
+            return pcm;
+        }
+        return nullptr;
+    }
+#endif
 #ifdef CA_HAVE_TADA
     if (s->tada_ctx) {
         return tada_synthesize(s->tada_ctx, text, out_n_samples);
@@ -7052,6 +7344,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_CHATTERBOX
     if (s->chatterbox_ctx)
         chatterbox_free(s->chatterbox_ctx);
+#endif
+#ifdef CA_HAVE_BANANAMIND_TTS
+    if (s->bananamind_tts_ctx)
+        bananamind_tts_free(s->bananamind_tts_ctx);
 #endif
 #ifdef CA_HAVE_TADA
     if (s->tada_ctx)

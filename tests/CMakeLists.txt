@@ -92,6 +92,46 @@ set_tests_properties(${TEST_TARGET} PROPERTIES
     LABELS "medium;en;live"
     TIMEOUT 300)
 
+# ── weight-reader (core_cpu::to_f32) + Mimi-codec live transcript checks ──
+# Auto-download real models and assert the jfk transcript, so the quantized-safe
+# CPU reads and the opt-in Mimi causal path are guarded end-to-end (not just
+# "ran without crashing"). PASS_REGULAR_EXPRESSION matches a punctuation-robust
+# substring present regardless of the codec attention mode.
+
+# paraformer exercises the CIF predictor read (read_f32 → core_cpu::to_f32).
+set(TEST_TARGET test-paraformer-jfk-live)
+add_test(NAME ${TEST_TARGET}
+    COMMAND $<TARGET_FILE:crispasr-cli>
+    --backend paraformer --auto-download -f ${PROJECT_SOURCE_DIR}/samples/jfk.mp3)
+set_tests_properties(${TEST_TARGET} PROPERTIES
+    LABELS "live;asr;weight-read"
+    TIMEOUT 600
+    PASS_REGULAR_EXPRESSION "do for your country")
+
+# kyutai-stt (Mimi codec) — default causal+sliding-window attention.
+set(TEST_TARGET test-kyutai-stt-jfk-live)
+add_test(NAME ${TEST_TARGET}
+    COMMAND $<TARGET_FILE:crispasr-cli>
+    --backend kyutai-stt --auto-download -f ${PROJECT_SOURCE_DIR}/samples/jfk.mp3)
+set_tests_properties(${TEST_TARGET} PROPERTIES
+    LABELS "live;asr;mimi"
+    TIMEOUT 600
+    PASS_REGULAR_EXPRESSION "what you can do for your country")
+
+# kyutai-stt with the old full non-causal path (CRISPASR_MIMI_NONCAUSAL=1 opt-out).
+# On short audio (jfk, <250 frames) it ties the causal default; this guards that the
+# bisection opt-out still transcribes. (The causal default's win only shows on audio
+# > mimi_context frames — see LEARNINGS; that A/B is run manually with a 3x sample.)
+set(TEST_TARGET test-kyutai-stt-mimi-noncausal-jfk-live)
+add_test(NAME ${TEST_TARGET}
+    COMMAND $<TARGET_FILE:crispasr-cli>
+    --backend kyutai-stt --auto-download -f ${PROJECT_SOURCE_DIR}/samples/jfk.mp3)
+set_tests_properties(${TEST_TARGET} PROPERTIES
+    LABELS "live;asr;mimi"
+    TIMEOUT 600
+    ENVIRONMENT "CRISPASR_MIMI_NONCAUSAL=1"
+    PASS_REGULAR_EXPRESSION "what you can do for your country")
+
 set(TEST_TARGET test-crispasr-cli-large)
 add_test(NAME ${TEST_TARGET}
     COMMAND $<TARGET_FILE:crispasr-cli>
@@ -218,6 +258,46 @@ catch_discover_tests(test-params
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit"
 )
+
+# ─── test - cpu-ops-to-f32 — Catch2 unit tests for core_cpu::to_f32 ───────────────
+# The quantized-safe CPU weight reader. Verifies F32/F16/Q8_0/Q4_K round-trip so a
+# quantized weight is dequantized (not read as garbage / over-read). Header-only
+# helper; links ggml for quantize + backend tensor_get.
+add_executable(test-cpu-ops-to-f32
+    test-cpu-ops-to-f32.cpp
+)
+target_include_directories(test-cpu-ops-to-f32 PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-cpu-ops-to-f32 PRIVATE
+    Catch2::Catch2WithMain
+    ggml
+)
+catch_discover_tests(test-cpu-ops-to-f32
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-vibevoice-quant-carveout — regression guard for issue #171 ──────────
+# Asserts crispasr-quantize keeps the VibeVoice diffusion prediction head and
+# connectors/EOS (pred.*, at_conn.*, se_conn.*, tts_eos.*, tts_types.*) at source
+# precision while quantizing the LM backbone + VAE decoder — the split that
+# prevents a quantized diffusion head from decoding a "music"/hum onset. Runs the
+# built binary on a tiny committed fixture GGUF; skips gracefully if the example
+# tool isn't built.
+# crispasr-quantize lives in examples/, which is added AFTER tests/ — so guard on
+# the build option (the $<TARGET_FILE:> generator expression resolves after all
+# subdirectories are processed, so the forward reference is fine).
+if(CRISPASR_BUILD_EXAMPLES)
+    add_test(NAME test-vibevoice-quant-carveout
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test-vibevoice-quant-carveout.sh
+            $<TARGET_FILE:crispasr-quantize>
+            ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/vibevoice-quant-carveout.gguf)
+    set_tests_properties(test-vibevoice-quant-carveout PROPERTIES
+        LABELS "unit;gh;regression-171"
+        TIMEOUT 120)
+endif()
 
 # ─── test - stream - finalize — Catch2 unit tests for the streaming
 # `final.text` stitcher used by `--stream-json` finalize_utterance.
@@ -562,6 +642,32 @@ catch_discover_tests(test-snac
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test-align-only — unit + live tests for standalone CTC alignment (issue #217)
+add_executable(test-align-only
+    test_align_only.cpp
+)
+target_include_directories(test-align-only PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-align-only PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+catch_discover_tests(test-align-only
+    TEST_SPEC "[unit][align]"
+    PROPERTIES
+        LABELS unit
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+catch_discover_tests(test-align-only
+    TEST_SPEC "[live][align]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── test - mini-omni2 — live integration tests for Mini-Omni2 ASR + TTS + S2S
 add_executable(test-mini-omni2
     test_mini_omni2_live.cpp
@@ -637,6 +743,26 @@ target_link_libraries(test-moss-transcribe PRIVATE
 )
 catch_discover_tests(test-moss-transcribe
     TEST_SPEC "[moss-transcribe]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test - parakeet-ja-longform — issue #89 regression guard (session ABI coverage)
+add_executable(test-parakeet-ja-longform
+    test_parakeet_ja_longform_live.cpp
+)
+target_include_directories(test-parakeet-ja-longform PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-parakeet-ja-longform PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+catch_discover_tests(test-parakeet-ja-longform
+    TEST_SPEC "[parakeet-ja-longform]"
     PROPERTIES
         LABELS live
         SKIP_RETURN_CODE 4
@@ -1017,6 +1143,26 @@ catch_discover_tests(test-kugelaudio-params
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;kugelaudio"
 )
+
+# ─── params/null-guard unit tests for backends the wiring audit flagged as
+# missing a test (tools/check-backend-wiring.py). No GGUF required. ─────────────
+add_executable(test-voxcpm2-tts-params test-voxcpm2-tts-params.cpp)
+target_include_directories(test-voxcpm2-tts-params PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-voxcpm2-tts-params PRIVATE Catch2::Catch2WithMain voxcpm2_tts)
+catch_discover_tests(test-voxcpm2-tts-params
+    TEST_SPEC "[unit]" PROPERTIES LABELS "unit;voxcpm2-tts")
+
+add_executable(test-firered-asr-params test-firered-asr-params.cpp)
+target_include_directories(test-firered-asr-params PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-firered-asr-params PRIVATE Catch2::Catch2WithMain firered-asr)
+catch_discover_tests(test-firered-asr-params
+    TEST_SPEC "[unit]" PROPERTIES LABELS "unit;firered-asr")
+
+add_executable(test-moonshine-streaming-params test-moonshine-streaming-params.cpp)
+target_include_directories(test-moonshine-streaming-params PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-moonshine-streaming-params PRIVATE Catch2::Catch2WithMain moonshine_streaming crispasr-core)
+catch_discover_tests(test-moonshine-streaming-params
+    TEST_SPEC "[unit]" PROPERTIES LABELS "unit;moonshine-streaming")
 
 # ─── test-mimoasr-params — Catch2 unit tests for mimo_asr_context_params defaults
 # and null-guard coverage. No GGUF required. ───────────────────────────────────
@@ -1680,6 +1826,23 @@ target_link_libraries(test-lcs-dedup-driver PRIVATE
 catch_discover_tests(test-lcs-dedup-driver
     TEST_SPEC "[lcs-dedup]"
     PROPERTIES LABELS "unit;lcs;lcs-dedup"
+)
+
+# ─── test-ngram-loop-fix — Catch2 unit tests for core_ngram::fix_loops, the
+# shared greedy-n-gram-loop collapse used by higgs-audio-v3-stt and
+# moss-transcribe to clean degenerate repeated-phrase output (issue #218).
+add_executable(test-ngram-loop-fix
+    test-ngram-loop-fix.cpp
+)
+target_include_directories(test-ngram-loop-fix PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-ngram-loop-fix PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-ngram-loop-fix
+    TEST_SPEC "[ngram-loop]"
+    PROPERTIES LABELS "unit;ngram-loop"
 )
 
 # ─── test-lcs-c-abi — pin the public C ABI surface for the LCS dedup.

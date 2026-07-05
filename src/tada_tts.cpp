@@ -9,6 +9,7 @@
 #include "core/attention.h"
 #include "core/ffn.h"
 #include "core/bpe.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -19,6 +20,7 @@
 #include <cassert>
 #include <cctype>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1799,12 +1801,89 @@ static bool fm_solve_rank_candidates(tada_context* c, const float* all_noise, in
         }
     }
 
+    // Candidate selection (#192). The reconstruction ("likelihood") scorer above
+    // looks at the ACOUSTIC dims only, so it is blind to — and can even PREFER —
+    // a candidate whose gray-code *duration* is an outlier (good acoustics, bad
+    // timing). That is exactly how best-of-N picked a token with a 43-frame gap
+    // and derailed "…four hours" into "…and forth", making cand>1 worse than a
+    // single draw. So the DEFAULT selector is duration_median (a Python-provided
+    // scorer): decode each candidate's per-token duration (time_before +
+    // time_after) and keep the one closest to the median of the N. Per token the
+    // candidates share the same text, so the median duration is the robust pick
+    // and drops the FM noise lottery's timing outliers — which is the whole
+    // point of drawing >1 candidate. Measured: cand=4 likelihood → "and forth";
+    // cand=4 duration_median → verbatim "four hours".
+    // cand>1 candidate selection (#192). IMPORTANT: cand>1 is an inherently
+    // unstable per-token lottery — no scorer beats cand=1 on all inputs (that
+    // is why cand=1 is the default num_acoustic_candidates). Measured on
+    // 1b/q4_k, best-of-4:
+    //   likelihood       reconstruction (acoustic) only — picks a timing
+    //                    outlier: "four hours" -> "and forth".
+    //   duration_median  closest-to-median duration only — fixes "four hours"
+    //                    but can pick an acoustically bad draw elsewhere
+    //                    ("hello world" -> "elleworld").
+    //   hybrid           duration-inlier then best reconstruction — fixes
+    //                    "hello world"/"count" but not "four hours".
+    // The cand>1 DEFAULT is duration_median: it repairs the #192 reported case
+    // and the FM noise lottery's timing collapse (the whole reason to draw >1),
+    // which is what cand>1 is for. CRISPASR_TADA_SCORER=likelihood|hybrid A/Bs
+    // the others. For guaranteed-best quality, use cand=1 (the default).
+    static const int s_scorer = []() {
+        const char* e = std::getenv("CRISPASR_TADA_SCORER");
+        if (e && strcmp(e, "likelihood") == 0)
+            return 1;
+        if (e && strcmp(e, "hybrid") == 0)
+            return 0;
+        return 2; // duration_median (cand>1 default)
+    }();
+
+    const int nbits = (int)c->hp.num_time_bits;
+    std::vector<int> dur(N);
+    for (int cnd = 0; cnd < N; cnd++) {
+        const float* s = states.data() + (size_t)cnd * lat;
+        dur[cnd] = decode_gray_code(s + ad, nbits) + decode_gray_code(s + ad + nbits, nbits);
+    }
+    std::vector<int> sorted_dur = dur;
+    std::sort(sorted_dur.begin(), sorted_dur.end());
+    const int median = sorted_dur[N / 2];
+
     int best = 0;
-    double best_err = err[0];
-    for (int cnd = 1; cnd < N; cnd++) {
-        if (err[cnd] < best_err) {
-            best_err = err[cnd];
-            best = cnd;
+    if (s_scorer == 2) {
+        // Pure duration_median: closest to median (ties → lower recon error).
+        int best_gap = INT_MAX;
+        double best_err = 3.4e38;
+        for (int cnd = 0; cnd < N; cnd++) {
+            int g = std::abs(dur[cnd] - median);
+            if (g < best_gap || (g == best_gap && err[cnd] < best_err)) {
+                best_gap = g;
+                best_err = err[cnd];
+                best = cnd;
+            }
+        }
+    } else {
+        // Likelihood (s_scorer==1) over all candidates, or hybrid (default):
+        // best recon error among duration inliers (|dur-median| within a tight
+        // band that drops a ~43-vs-~13 gap but keeps normal variation).
+        const int band = std::max(6, median);
+        double best_err = 3.4e38;
+        best = -1;
+        for (int cnd = 0; cnd < N; cnd++) {
+            if (s_scorer == 0 && std::abs(dur[cnd] - median) > band)
+                continue;
+            if (err[cnd] < best_err) {
+                best_err = err[cnd];
+                best = cnd;
+            }
+        }
+        if (best < 0) { // degenerate: all outside band — take closest-to-median
+            int best_gap = INT_MAX;
+            for (int cnd = 0; cnd < N; cnd++) {
+                int g = std::abs(dur[cnd] - median);
+                if (g < best_gap) {
+                    best_gap = g;
+                    best = cnd;
+                }
+            }
         }
     }
     std::copy(states.data() + (size_t)best * lat, states.data() + (size_t)(best + 1) * lat, best_out);
@@ -1981,7 +2060,7 @@ struct tada_context* tada_init_from_file(const char* path_model, struct tada_con
         return nullptr;
     }
     ggml_backend_cpu_set_n_threads(c->backend_cpu, params.n_threads);
-    c->backend = params.use_gpu ? ggml_backend_init_best() : c->backend_cpu;
+    c->backend = params.use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
     if (!c->backend)
         c->backend = c->backend_cpu;
 
@@ -2718,12 +2797,30 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     // Starts at prefill_len when batched prefill ran, otherwise at 0.
     const int loop_start = do_batch_prefill ? prefill_len : 0;
 
-    // Main AR loop: runs until EOS or max_tokens.
-    // After the batched prefill, the loop starts at prefill_len and continues
-    // until EOS is predicted. The initial all_ids contains the fixed input
-    // tokens; the loop extends it one token at a time as the model generates.
+    // Match Python's _generate() behaviour (#192): run for exactly
+    // num_prompt steps, never auto-regressively generate text tokens,
+    // never stop early on EOS.  Python's generate() calls _generate with
+    // num_steps = input_ids.shape[-1] + num_extra_steps where num_extra_steps
+    // defaults to 0, and input_ids already carries shift (5) trailing EOTs
+    // baked in by _add_bos_eos (num_eos_tokens == shift_acoustic).  Those
+    // trailing EOTs *are* the text→acoustic tail: they run the extra decode
+    // steps that flush acoustic features for the final real tokens.  So the
+    // faithful default is extra_steps = 0 (total_steps == num_prompt).  An
+    // earlier fix added extra = shift here on top of the already-present EOTs,
+    // over-generating by 5 steps and appending trailing junk frames after the
+    // last word (ASR "…four hours" → "…for out").  The real bug it chased was
+    // the early EOS-stop below (now removed), not a missing tail.
+    // CRISPASR_TADA_EXTRA_STEPS overrides (default 0 = exact Python).
+    static const int s_extra_steps = []() {
+        const char* e = std::getenv("CRISPASR_TADA_EXTRA_STEPS");
+        return e && e[0] ? atoi(e) : -1;
+    }();
+    const int extra_steps = (s_extra_steps >= 0) ? s_extra_steps : 0;
+    const int total_steps = num_prompt + extra_steps;
+
+    // Main AR + FM loop: runs for exactly total_steps steps.
     bool done = false;
-    for (int step = loop_start; step < (int)all_ids.size() && !done; step++) {
+    for (int step = loop_start; step < total_steps && !done; step++) {
         if ((int)acoustic_features.size() >= max_tokens)
             break;
 
@@ -2914,19 +3011,18 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
             fm_dump_records.push_back(std::move(fm_rec));
         }
 
-        // Next token prediction. Greedy by default (library); the CLI/C-ABI
-        // enable upstream sampling (repetition penalty + temperature + top-k/
-        // top-p). After the last fixed-input token, push generated tokens to
-        // all_ids so the loop extends until EOS.
+        // Auto-regressive text generation — matches Python exactly (#192).
+        // Python samples the next token at every step >= len(input_ids)-1,
+        // appends it to input_ids, and uses it as input for the next step.
+        // It NEVER stops on EOS — the loop runs for the full num_steps.
+        // The generated token feeds back into the LLM, affecting the hidden
+        // state that conditions the FM.  Removing this (feeding fixed EOTs
+        // instead) produces different hidden states and worse acoustics.
         if (need_logits && tr.logits) {
             int next = tada_sample_token(ctx->params, tr.logits, (int)hp.vocab_size, all_ids, pad_id, sampler_rng);
-            if (next == eot) {
-                if (ctx->params.verbosity >= 1)
-                    fprintf(stderr, "tada: EOS at step %d\n", step);
-                done = true; // stop after this step's acoustic state is updated
-            } else {
-                all_ids.push_back(next);
-            }
+            all_ids.push_back(next);
+            if (next == eot && ctx->params.verbosity >= 1)
+                fprintf(stderr, "tada: text head predicts EOS at step %d (continuing)\n", step);
         }
         free(tr.logits);
 

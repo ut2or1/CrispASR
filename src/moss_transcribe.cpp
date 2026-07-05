@@ -11,11 +11,13 @@
 // LM retargeted to Qwen3-1.7B; lm_head tied to the token embedding table.
 
 #include "moss_transcribe.h"
+#include "core/win_compat.h"
 
 #include "core/beam_decode.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -41,6 +43,8 @@
 #include "core/attention.h"
 #include "core/mel.h"
 #include "core/bpe.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/ngram_loop_fix.h"   // core_ngram::fix_loops (issue #218)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -228,6 +232,16 @@ struct moss_transcribe_context {
     int n_threads = 4;
     std::string model_path;
     int beam_size = 1;
+
+    // Encoder attention path. flash_attn_ext is fast on CPU/Metal/CUDA but
+    // segfaults on Vulkan during graph/command-pool cleanup (issue #215, both
+    // NVIDIA and AMD) — its split-k / mask-opt resource path mismanages command
+    // buffers on the Vulkan backend. On Vulkan we fall back to the manual
+    // mul_mat + soft_max_ext + mul_mat path (mathematically identical, the same
+    // op sequence the LLM decode already runs safely on Vulkan). Overridable:
+    //   CRISPASR_MOSS_TRANSCRIBE_ENC_FLASH=1  → force flash_attn_ext everywhere
+    //   CRISPASR_MOSS_TRANSCRIBE_ENC_MANUAL=1 → force the manual path everywhere
+    bool enc_use_flash = true;
 };
 
 // ===========================================================================
@@ -239,6 +253,13 @@ static ggml_tensor* try_get(moss_transcribe_model& m, const char* name) {
 }
 static ggml_tensor* require(moss_transcribe_model& m, const char* name) {
     return core_gguf::require(m.tensors, name, "moss_transcribe");
+}
+
+static bool backend_is_vulkan(ggml_backend_t b) {
+    if (!b)
+        return false;
+    const char* name = ggml_backend_name(b);
+    return name && std::strncmp(name, "Vulkan", 6) == 0;
 }
 
 // Conv2d stride-2 downsampling output length (kernel 3, pad 1).
@@ -670,8 +691,22 @@ static ggml_cgraph* moss_transcribe_build_encoder_xf_graph(moss_transcribe_conte
         K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
         V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
 
-        ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, attn_mask, attn_scale, 0.0f, 0.0f);
-        attn = ggml_reshape_2d(ctx0, attn, d, T_enc);
+        ggml_tensor* attn;
+        if (ctx->enc_use_flash) {
+            // flash_attn_ext output: (hd, n_h, T) → reshape to (d, T).
+            attn = ggml_flash_attn_ext(ctx0, Q, K, V, attn_mask, attn_scale, 0.0f, 0.0f);
+            attn = ggml_reshape_2d(ctx0, attn, d, T_enc);
+        } else {
+            // Manual masked-softmax attention (Vulkan-safe, issue #215). Produces
+            // the identical (hd, n_h, T) → (d, T) layout as flash_attn_ext above.
+            // Q,K,V are (hd, T, n_h) contiguous.
+            ggml_tensor* scores = ggml_mul_mat(ctx0, K, Q);                           // (T_k, T_q, n_h)
+            scores = ggml_soft_max_ext(ctx0, scores, attn_mask, attn_scale, 0.0f);    // mask over T_k
+            ggml_tensor* V_perm = ggml_cont(ctx0, ggml_permute(ctx0, V, 1, 0, 2, 3)); // (T_k, hd, n_h)
+            attn = ggml_mul_mat(ctx0, V_perm, scores);                                // (hd, T_q, n_h)
+            attn = ggml_cont(ctx0, ggml_permute(ctx0, attn, 0, 2, 1, 3));             // (hd, n_h, T_q)
+            attn = ggml_reshape_2d(ctx0, attn, d, T_enc);
+        }
 
         ggml_tensor* attn_out = ggml_add(ctx0, ggml_mul_mat(ctx0, blk.attn_o_w, attn), blk.attn_o_b);
         x = ggml_add(ctx0, residual, attn_out);
@@ -743,13 +778,25 @@ extern "C" float* moss_transcribe_run_encoder(struct moss_transcribe_context* ct
 
     std::vector<float> hidden((size_t)d * T_enc, 0.0f); // (d, T_enc) ne-order (d fast)
 
-    // Build/cache conv-stem graph (fixed chunk_T).
-    if (!ctx->cached_conv_gf) {
-        ctx->cached_conv_meta.assign(ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(4096, false), 0);
-        ggml_init_params aip = {ctx->cached_conv_meta.size(), ctx->cached_conv_meta.data(), true};
-        ctx->cached_conv_ctx = ggml_init(aip);
-        ctx->cached_conv_gf = moss_transcribe_build_conv_graph(ctx, chunk_T, ctx->cached_conv_ctx);
+    // Build the conv-stem graph fresh on every encoder invocation (#215).
+    // The graph is still reused across the per-chunk loop below, which is
+    // safe: the chunk allocs are identical, so the sched's gallocr never
+    // regrows in between. Caching it ACROSS invocations is a use-after-free:
+    // the larger xf/adapter/decode graphs regrow the shared sched's gallocr,
+    // freeing the ggml_backend_buffer structs this graph's tensors still
+    // point to, and the next sched_alloc_graph reads them (ASan:
+    // heap-use-after-free in ggml_backend_sched_backend_from_buffer). On
+    // native Vulkan the stale pointers instead corrupt the driver heap and
+    // fault later, at vkResetCommandPool — the #215 RADV/NVIDIA segfault.
+    if (ctx->cached_conv_ctx) {
+        ggml_free(ctx->cached_conv_ctx);
+        ctx->cached_conv_ctx = nullptr;
+        ctx->cached_conv_gf = nullptr;
     }
+    ctx->cached_conv_meta.assign(ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(4096, false), 0);
+    ggml_init_params aip = {ctx->cached_conv_meta.size(), ctx->cached_conv_meta.data(), true};
+    ctx->cached_conv_ctx = ggml_init(aip);
+    ctx->cached_conv_gf = moss_transcribe_build_conv_graph(ctx, chunk_T, ctx->cached_conv_ctx);
 
     int out_off = 0;
     for (int c = 0; c < num_chunks; c++) {
@@ -1429,6 +1476,25 @@ static char* moss_transcribe_impl(struct moss_transcribe_context* ctx, const flo
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "moss_transcribe: %zu tokens: \"%s\"\n", generated.size(), result.substr(0, 120).c_str());
 
+    // Collapse degenerate greedy n-gram loops (issue #218). Greedy decode
+    // occasionally falls into a repeated-phrase attractor ("Hey, hey, hey, ..."
+    // / "run hey hey hey run ...") and emits it up to max_new; upstream MOSS has
+    // no post-process for this, so we clean the text here. The transform is a
+    // no-op on non-degenerate transcripts (only immediate n-gram repeats beyond
+    // the cap are trimmed), so it leaves clean slices byte-identical. Opt out
+    // with CRISPASR_MOSS_TRANSCRIBE_NO_LOOPFIX=1 for raw upstream-parity output
+    // (e.g. token/text diff-harness comparisons against the Python reference).
+    {
+        const char* no_fix = std::getenv("CRISPASR_MOSS_TRANSCRIBE_NO_LOOPFIX");
+        if (!(no_fix && no_fix[0] == '1')) {
+            std::string fixed = core_ngram::fix_loops(result);
+            if (fixed != result && ctx->params.verbosity >= 1)
+                fprintf(stderr, "moss_transcribe: collapsed n-gram loop(s) (%zu → %zu chars)\n", result.size(),
+                        fixed.size());
+            result = std::move(fixed);
+        }
+    }
+
     char* out = (char*)malloc(result.size() + 1);
     memcpy(out, result.c_str(), result.size() + 1);
     return out;
@@ -1464,14 +1530,44 @@ extern "C" struct moss_transcribe_context* moss_transcribe_init_from_file(
     ctx->n_threads = params.n_threads;
     ctx->model_path = path_model;
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
     ctx->backend_cpu = ggml_backend_cpu_init();
     if (ctx->backend_cpu)
         ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+
+    // #215 resolved: the native-Vulkan (RADV/NVIDIA) segfault was a use-after-free
+    // in run_encoder's conv-stem graph cached across encoder invocations (see the
+    // comment there); the GPU is the default again on all Vulkan drivers.
+    // CRISPASR_MOSS_TRANSCRIBE_FORCE_CPU=1 remains as an escape hatch.
+    {
+        const char* force_cpu = std::getenv("CRISPASR_MOSS_TRANSCRIBE_FORCE_CPU");
+        if (force_cpu && force_cpu[0] == '1')
+            ctx->backend = ctx->backend_cpu;
+    }
     if (ggml_backend_is_cpu(ctx->backend))
         ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+
+    // Encoder attention path (issue #215). On Vulkan the encoder uses the manual
+    // soft_max_ext attention rather than flash_attn_ext (avoids the FA split-k /
+    // mask-opt resource path; it is the same op sequence the LM decode runs).
+    {
+        const char* force_flash = std::getenv("CRISPASR_MOSS_TRANSCRIBE_ENC_FLASH");
+        const char* force_manual = std::getenv("CRISPASR_MOSS_TRANSCRIBE_ENC_MANUAL");
+        if (force_flash && force_flash[0] == '1') {
+            ctx->enc_use_flash = true;
+        } else if (force_manual && force_manual[0] == '1') {
+            ctx->enc_use_flash = false;
+        } else {
+            ctx->enc_use_flash = !backend_is_vulkan(ctx->backend);
+        }
+        if (!ctx->enc_use_flash && backend_is_vulkan(ctx->backend)) {
+            fprintf(stderr, "moss_transcribe: Vulkan backend detected — encoder using manual "
+                            "soft_max_ext attention (flash_attn_ext segfaults on Vulkan, issue #215; "
+                            "set CRISPASR_MOSS_TRANSCRIBE_ENC_FLASH=1 to override)\n");
+        }
+    }
 
     if (!moss_transcribe_load_model(ctx->model, ctx->vocab, path_model, ctx->backend)) {
         fprintf(stderr, "moss_transcribe: failed to load model from %s\n", path_model);
@@ -1486,6 +1582,7 @@ extern "C" struct moss_transcribe_context* moss_transcribe_init_from_file(
         if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
             backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
     return ctx;

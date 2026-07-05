@@ -23,6 +23,7 @@
 #include "tada_encoder.h"
 #include "wav2vec2-ggml.h"
 #include "core/bpe.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/gguf_loader.h"
 
 #include "ggml.h"
@@ -275,15 +276,8 @@ static void precompute_inv_alphas(tada_encoder_context* c) {
 
     for (auto& p : pairs) {
         int64_t n = ggml_nelements(p.src);
-        std::vector<float> a(n), inv(n);
-        if (p.src->type == GGML_TYPE_F16) {
-            std::vector<ggml_fp16_t> tmp(n);
-            ggml_backend_tensor_get(p.src, tmp.data(), 0, n * sizeof(ggml_fp16_t));
-            for (int64_t i = 0; i < n; i++)
-                a[i] = ggml_fp16_to_fp32(tmp[i]);
-        } else {
-            ggml_backend_tensor_get(p.src, a.data(), 0, n * sizeof(float));
-        }
+        std::vector<float> a = core_cpu::to_f32(p.src); // F32/F16/quantized-safe
+        std::vector<float> inv(n);
         for (int64_t i = 0; i < n; i++)
             inv[i] = 1.0f / (a[i] + 1e-12f);
         ggml_backend_tensor_set(*p.dst, inv.data(), 0, n * sizeof(float));
@@ -938,6 +932,44 @@ int tada_encoder_encode(tada_encoder_context* ctx, const char* aligner_gguf, con
     int V = (int)aligner.hparams.vocab_size;
     int T_ctc = (int)(logits.size() / V);
 
+    // Diagnostic: free (text-less) greedy CTC decode of the aligner logits, to
+    // probe whether this alignment model doubles as a CTC ASR / word-timestamp
+    // model. Gated by CRISPASR_TADA_CTC_ASR=1. The aligner is trained for FORCED
+    // alignment, so this is exploratory — but the logits are a full distribution
+    // over the Llama-3.2 BPE vocab per frame, so argmax+collapse gives a
+    // transcript hypothesis (and per-token frame indices = timecodes).
+    if (const char* e = std::getenv("CRISPASR_TADA_CTC_ASR"); e && e[0] == '1') {
+        // blank id: wav2vec2 CTC uses the pad token as blank.
+        int blank = 0;
+        {
+            gguf_init_params mp = {true, nullptr};
+            if (gguf_context* g = gguf_init_from_file(aligner_gguf, mp)) {
+                int k = gguf_find_key(g, "wav2vec2.pad_token_id");
+                if (k >= 0)
+                    blank = (int)gguf_get_val_u32(g, k);
+                gguf_free(g);
+            }
+        }
+        std::vector<int32_t> ids;
+        std::vector<int> frames;
+        int prev = -1;
+        for (int t = 0; t < T_ctc; t++) {
+            const float* row = logits.data() + (size_t)t * V;
+            int am = (int)(std::max_element(row, row + V) - row);
+            if (am != blank && am != prev)
+                ids.push_back(am), frames.push_back(t);
+            prev = am;
+        }
+        std::string txt = core_bpe::detokenize(aligner.vocab, ids.data(), ids.size());
+        fprintf(stderr, "[tada-ctc-asr] blank=%d frames=%d decoded %zu tokens\n[tada-ctc-asr] TEXT: %s\n", blank, T_ctc,
+                ids.size(), txt.c_str());
+        // Timecodes: first ~12 tokens with their frame index (wav2vec2 frame rate).
+        fprintf(stderr, "[tada-ctc-asr] timecodes (token@frame):");
+        for (size_t i = 0; i < ids.size() && i < 12; i++)
+            fprintf(stderr, " '%s'@%d", core_bpe::token_bytes_to_utf8(aligner.vocab[ids[i]]).c_str(), frames[i]);
+        fprintf(stderr, "\n");
+    }
+
     // Step 3: Tokenize transcript using BPE from the aligner GGUF
     // The aligner GGUF embeds tokenizer.ggml.tokens + tokenizer.ggml.merges
     // (same Llama-3.2 vocab used by tada_tts.cpp).
@@ -1062,8 +1094,21 @@ int tada_encoder_encode(tada_encoder_context* ctx, const char* aligner_gguf, con
                 (int)std::count(token_masks.begin(), token_masks.end(), 1), T_mask, T_enc);
 
     // Step 6: Run encoder with positions
-    return tada_encoder_encode_with_positions(ctx, audio_24k, n_samples_24k, token_masks.data(), T_mask,
-                                              positions_1idx.data(), N, result);
+    int rc6 = tada_encoder_encode_with_positions(ctx, audio_24k, n_samples_24k, token_masks.data(), T_mask,
+                                                 positions_1idx.data(), N, result);
+    // Expose the aligned BPE token ids + decoded text (1:1 with token_positions)
+    // for the --align / forced-alignment path. align_tokens[i] was aligned to
+    // frame positions[i]; result.token_positions[i] mirrors that.
+    if (rc6 == 0) {
+        result.token_ids = align_tokens;
+        result.token_texts.clear();
+        result.token_texts.reserve(align_tokens.size());
+        for (int32_t id : align_tokens)
+            result.token_texts.push_back((id >= 0 && (size_t)id < aligner.vocab.size())
+                                             ? core_bpe::token_bytes_to_utf8(aligner.vocab[id])
+                                             : std::string());
+    }
+    return rc6;
 }
 
 float* tada_encoder_extract_stage(tada_encoder_context* ctx, const float* audio_24k, int n_samples_24k,

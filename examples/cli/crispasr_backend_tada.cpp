@@ -110,13 +110,14 @@ public:
             cp.temperature = p.temperature;
         cp.seed = p.seed;
 
-        // TADA's per-token flow-matching duration head is noise-sensitive: a
-        // single unlucky noise draw can collapse token durations (rushed,
-        // unintelligible speech). Generate several candidates per step and keep
-        // the best by reconstruction score (Python num_acoustic_candidates).
-        // Default to 4 for robust multilingual output; override with
-        // TADA_NUM_CANDIDATES (1 = fastest, reproduces a single noise draw).
-        cp.num_acoustic_candidates = 4;
+        // num_acoustic_candidates INHERITS the library default (1) from
+        // tada_context_default_params() above — do NOT re-hardcode it. Upstream
+        // InferenceOptions default is 1; the reconstruction ("likelihood") scorer
+        // used to rank >1 candidates scores acoustic dims only and can PREFER a
+        // duration outlier, so best-of-N mangled "…four hours" → "…and forth"
+        // (#192, N=4). A redundant override here is exactly how that 4 (and a
+        // parallel session's 8) shipped; inheriting the tested library default
+        // keeps one source of truth. Opt in to >1 with TADA_NUM_CANDIDATES.
         if (const char* env = std::getenv("TADA_NUM_CANDIDATES"); env && *env) {
             int n = atoi(env);
             if (n >= 1)
@@ -198,27 +199,38 @@ public:
                             "Pass --codec-model PATH or place tada-codec.gguf next to model.\n");
         }
         std::string prompt_path;
-        if (!p.tts_voice.empty() && p.tts_voice != "default" && p.tts_voice != "auto") {
+        // In --make-ref / --align mode the --voice <wav> is the input to the
+        // aligner pipeline, not a synth voice prompt — the make-ref/align handler
+        // (crispasr_run.cpp) consumes it, so don't load it or fail on the .wav.
+        if (!p.make_ref && !p.align && !p.tts_voice.empty() && p.tts_voice != "default" && p.tts_voice != "auto") {
             // Check for .wav — not yet supported; user needs a tada-ref.gguf
             const std::string& v = p.tts_voice;
             bool is_wav = v.size() >= 4 && (v.substr(v.size() - 4) == ".wav" || v.substr(v.size() - 4) == ".WAV");
             if (is_wav) {
-                fprintf(stderr, "crispasr[tada]: --voice with a .wav file is not yet supported directly.\n"
-                                "  Convert your audio to a reference GGUF first:\n"
-                                "    python models/convert-tada-ref-to-gguf.py \\\n"
-                                "      --audio your_voice.wav \\\n"
-                                "      --transcript \"Exact words spoken in the audio.\" \\\n"
-                                "      --output tada-ref-custom.gguf\n"
-                                "  For non-English audio add: --language fr  (ar/ch/de/es/fr/it/ja/pl/pt)\n"
-                                "  Then: --voice tada-ref-custom.gguf\n");
+                // Direct .wav cloning isn't wired into the synth path yet; the
+                // voice reference must be a tada-ref.gguf. Build one from the
+                // .wav with the built-in make-ref pipeline (no Python needed):
+                fprintf(stderr,
+                        "crispasr[tada]: --voice with a .wav is not supported directly at synth time.\n"
+                        "  Build a reference GGUF from it once with the CLI --make-ref pipeline:\n"
+                        "    crispasr -m <tada-model.gguf> --make-ref \\\n"
+                        "      --voice %s --ref-text \"Exact words spoken in the audio.\" \\\n"
+                        "      --make-ref-output tada-ref-custom.gguf\n"
+                        "    (needs tada-encoder-*.gguf + tada-aligner-*.gguf next to the model,\n"
+                        "     or pass --make-ref-encoder/--make-ref-aligner)\n"
+                        "  Then synthesize with: --voice tada-ref-custom.gguf\n",
+                        v.c_str());
+                return false; // explicit voice couldn't be honored — fail loudly, don't use default
             } else {
                 prompt_path = crispasr_resolve_model_cli(p.tts_voice, p.backend, p.no_prints, p.cache_dir,
                                                          p.auto_download, p.model_quant);
-                if (prompt_path.empty() && !p.no_prints)
+                if (prompt_path.empty()) {
                     fprintf(stderr,
-                            "crispasr[tada]: --voice '%s' not found. "
-                            "Pass the path to a tada-ref.gguf file.\n",
+                            "crispasr[tada]: --voice '%s' could not be resolved. Pass the path to a "
+                            "tada-ref.gguf (or build one from a .wav with --make-ref).\n",
                             p.tts_voice.c_str());
+                    return false; // explicit voice couldn't be honored — fail loudly, don't use default
+                }
             }
         } else if (const char* env = getenv("TADA_PROMPT_CACHE"); env && *env) {
             prompt_path = env;
@@ -351,7 +363,7 @@ private:
     int def_top_k_ = 0;
     float def_rep_penalty_ = 1.1f;
     bool def_do_sample_ = true;
-    int def_num_candidates_ = 4;
+    int def_num_candidates_ = 1;
     // Resolved acoustic-FM defaults ("slow vs fast" axis, #197).
     int def_num_fm_steps_ = 10;
     float def_acoustic_cfg_ = 1.6f;

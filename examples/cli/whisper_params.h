@@ -289,6 +289,23 @@ struct whisper_params {
     std::string make_ref_aligner; // aligner GGUF path (auto-discovered if empty)
     std::string make_ref_encoder; // encoder GGUF path (auto-discovered if empty)
 
+    // Forced alignment / word timestamps via the TADA aligner (reuses the
+    // make-ref encoder+aligner). Input: --voice <audio> + --ref-text "<text>".
+    bool align = false;
+    std::string align_output;         // output path (default: stdout)
+    std::string align_format = "srt"; // srt | json | plain
+
+    // Issue #217: standalone CTC forced alignment mode.
+    // Input: audio file + text (--ref-text or --text-file).
+    // Runs the CTC aligner (canary-ctc / wav2vec2 / qwen3-fa) without
+    // requiring an ASR model or transcription step.
+    bool align_only = false;
+    std::string text_file; // path to .txt or .srt (text extracted, timestamps stripped)
+    // Output granularity: "word" = one entry per aligned word; "segment" =
+    // one entry per input SRT cue (or per non-empty .txt line), re-timed
+    // from the word alignment; "auto" = segment for .srt input, word otherwise.
+    std::string align_granularity = "auto"; // auto | word | segment
+
     // AudioSeal neural watermark model (optional upgrade from spread-spectrum).
     // When set, loads the GGUF and uses it for watermark embed/detect
     // instead of the built-in spread-spectrum watermark.

@@ -18,6 +18,7 @@
 #include "core/attention.h"
 #include "core/beam_decode.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -335,7 +336,7 @@ extern "C" struct kyutai_stt_context* kyutai_stt_init_from_file(const char* path
     sctx->params = params;
     sctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    sctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    sctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!sctx->backend)
         sctx->backend = ggml_backend_cpu_init();
     sctx->backend_cpu = ggml_backend_cpu_init();
@@ -658,6 +659,21 @@ static ggml_tensor* build_mimi_transformer(ggml_context* ctx, const std::vector<
     int T = (int)x->ne[1];
     int dim = (int)x->ne[0]; // 512
 
+    // Causal + sliding-window (mimi_context) self-attention is the DEFAULT — it
+    // matches moshi's streaming Mimi (the RoPE is already labelled "causal" and
+    // mimi_context=250 is loaded for exactly this). WER A/B (2026-07, 3× jfk =
+    // ~412 frames > 250): the old full non-causal attention TRUNCATED the tail
+    // (~25% of content dropped once the sequence exceeds the window), while
+    // causal transcribed all of it; on short audio (<250 frames) the two tie.
+    // CRISPASR_MIMI_NONCAUSAL=1 restores the old full-attention path (bisection).
+    // Filled by the caller after alloc.
+    ggml_tensor* attn_mask = nullptr;
+    if (!std::getenv("CRISPASR_MIMI_NONCAUSAL")) {
+        attn_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, T, T); // [Lk, Lq]
+        ggml_set_name(attn_mask, "mimi_causal_mask");
+        ggml_set_input(attn_mask);
+    }
+
     // Build position indices for RoPE
     ggml_tensor* positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
     // Set positions 0..T-1 (will be filled at compute time via backend)
@@ -700,8 +716,9 @@ static ggml_tensor* build_mimi_transformer(ggml_context* ctx, const std::vector<
         K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
         V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
 
-        // Flash attention — non-causal for encoder (no mask)
-        ggml_tensor* attn = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, 1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
+        // Flash attention — non-causal by default; causal+windowed if the mask
+        // was built (CRISPASR_MIMI_CAUSAL).
+        ggml_tensor* attn = ggml_flash_attn_ext(ctx, Q, K, V, attn_mask, 1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
         // attn is [head_dim, T, n_heads] → reshape to [dim, T]
         attn = ggml_reshape_2d(ctx, attn, dim, T);
 
@@ -876,6 +893,20 @@ static bool mimi_encode(kyutai_stt_context* sctx, const float* pcm_24k, int n_sa
     // Set input data
     ggml_tensor* pcm_t = ggml_graph_get_tensor(gf, "pcm_input");
     ggml_backend_tensor_set(pcm_t, pcm_24k, 0, n_samples * sizeof(float));
+
+    // Fill the optional Mimi causal+sliding-window mask (CRISPASR_MIMI_CAUSAL).
+    // attend iff key k <= query q AND (q - k) < mimi_context. F16, [Lk, Lq].
+    if (ggml_tensor* mimi_mask = ggml_graph_get_tensor(gf, "mimi_causal_mask")) {
+        const int Tm = (int)mimi_mask->ne[1];
+        const int window = hp.mimi_context > 0 ? hp.mimi_context : Tm;
+        std::vector<ggml_fp16_t> md((size_t)Tm * Tm, ggml_fp32_to_fp16(0.0f));
+        const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+        for (int q = 0; q < Tm; q++)
+            for (int k = 0; k < Tm; k++)
+                if (k > q || (q - k) >= window)
+                    md[(size_t)q * Tm + k] = ninf;
+        ggml_backend_tensor_set(mimi_mask, md.data(), 0, md.size() * sizeof(ggml_fp16_t));
+    }
 
     if (ggml_backend_sched_graph_compute(sctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "kyutai_stt: mimi encoder compute failed\n");

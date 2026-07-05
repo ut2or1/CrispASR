@@ -6,6 +6,248 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-07-04 #220 chatterbox T3 CUDA illegal-memory-access — reset+alloc bucket sched per step
+
+Reporter hit `CUDA error: an illegal memory access was encountered` on an
+RTX 3090 Ti (`crispasr:main-cuda`, v0.8.8) for every chatterbox request; CPU
+worked. Root cause: the §186 Lk-bucketed T3 decode allocated its step scheduler
+once per bucket then only re-ran `graph_compute` each step (the M1
+"reuse-shortcut"). ggml-cuda keys a captured CUDA-graph executable on the split
+graph's `uid` and, on a uid match, replays it verbatim with capture-time device
+pointers; the reuse-shortcut never mints a new uid, so decode step ~2 replays a
+stale capture → illegal access (the CUDA twin of the Vulkan #170 T3 segfault).
+The bug is capture-independent: a Kaggle P100 (sm_60, no CUDA-graph capture)
+reproduced the identical `illegal memory access` at `ggml_backend_cuda_synchronize`
+on the old path, while the fix produced audio that ASR-round-tripped to the exact
+input text (== CPU reference). sm_80+ capture is only an extra aggravator (the
+"CUDA Graph id N reused" stale-replay the reporter's log showed).
+
+Fix (commit c78b187b): on a non-Metal GPU backend, `sched_reset` +
+`sched_alloc_graph` the bucket step sched every step — the granite/outetts
+CUDA-graph-bucket pattern (docs/contributing.md §210). New split uid per step →
+`cudaGraphExecUpdate` refreshes the pointers, cached cgraph keeps `nodes[0]`
+stable so capture still engages and T3 stays on GPU (no CPU fallback). Metal
+keeps the cheaper alloc-once reuse; old path A/B-gated via
+`CRISPASR_CHATTERBOX_T3_BUCKET_REUSE=1`. See LEARNINGS "A once-allocated-then-
+reused bucket step graph is a CUDA-graph-capture hazard".
+
+## 2026-07-04 #221 issue #89 hardening (regression guard, server mirror, Vulkan, q4 guard)
+
+Follow-through batch (PLAN #221) making the #89 fix durable:
+
+- **221a regression guard** — `tests/test_parakeet_ja_longform_live.cpp`
+  (label `live`): reazon baseball fixture ×3 (42.2 s) through the session ABI
+  must keep 3× 岡本, reach the third repetition, and clear a byte floor.
+  `CRISPASR_MODEL_PARAKEET_JA` + `CRISPASR_FIXTURE_PARAKEET_JA` in
+  env-live-tests.sh.
+- **221b server mirror** — the OpenAI-compatible server's own slice loop had
+  neither the 12 s cap nor gap-fill (JA → 30 s chunks → streamed, ~58 %).
+  Gap-fill extracted to `examples/cli/crispasr_gap_fill.h` (shared with the
+  CLI dispatcher, code unchanged); server applies the backend slice cap +
+  per-slice gap-fill. E2E: `/v1/audio/transcriptions` with baseball ×3 → 3/3.
+- **221c Vulkan sanity** — MoltenVK build, yt_60s default flags: **95.1 %
+  recall / 94.2 % precision** vs whisper GT (Metal: 97.2) — the fix transfers
+  to the reporter's AMD/Vulkan backend class.
+- **221d q4 guard** — load-time warning when the JA model has q4-class joint
+  weights (TDT repetition loop; suggests `--parakeet-decoder ctc` or q8_0);
+  registry `parakeet-ja` auto-download now fetches the **q8_0** (TDT
+  byte-identical to F16, half the size).
+
+Operational note: the external SSD died mid-work (I/O errors); everything
+committed was already on origin, the model/fixtures were re-fetched from HF
+and the VPS (`/mnt/akademie_storage/test-audio/ja/`), and work moved to an
+internal worktree. The old audit artifacts under
+`/Volumes/backups/code/issue89-parakeet-stash/.local/` are gone with the disk.
+
+## 2026-07-04 #89 parakeet-ja long-form — VAD slice cap + per-slice single-pass (56 % → 80 % recall)
+
+Issue #89 audit: the reporter's default run (`parakeet-tdt-0.6b-ja`, no flags)
+recalled only **56 %** of spoken content on his 60 s clip / 54 % on 120 s
+(char-bigram recall vs a whisper-large-v3-turbo reference; precision ~92-97 %,
+i.e. what came out was right — half the speech was silently missing). Every
+available path (auto-VAD default, firered VAD, streamed, chunk-30) sat in a
+53-60 % band. §216 had fixed non-JA to NeMo-exact but left JA as-is.
+
+**Blueprint comparison (NeMo 2.7.3, original `nvidia/parakeet-tdt_ctc-0.6b-ja`
+checkpoint, same audio).** Our port is *bit-faithful*: NeMo plain transcribe
+scores 11.2 % (42 chars — char-identical to our single-pass), NeMo
+local-attention `[128,128]` 45.6 % (157 chars — char-identical to ours via the
+already-implemented `parakeet.att_context_*` mask), NeMo CTC-branch single-pass
+1 % (= ours after reconverting the GGUF **with** the hybrid model's CTC head —
+the published GGUF lacks it; `--parakeet-decoder ctc` silently fell back to
+TDT). NeMo's own recommended long-form path (buffered `BatchedFrameASRTDT`)
+scores **14.7 %** (4 s/8 s) and **51.3 %** (stock 1.6 s/4 s) on this clip. The
+collapse is **encoder-level** (CTC head over the same features also dies
+single-pass) and input-specific (clean TTS audio doesn't trigger it) — a model
+pathology, not a port bug.
+
+**What actually loses the content on the VAD path:** silero merges continuous
+podcast speech into 40 s+ slices — far past the JA encoder's ~12 s safe
+window — and the old equal-part post-split cut mid-word (both neighbours drop
+the boundary words). Additionally the JA backend decoded *every* slice via the
+streamed path (threshold 0), never single-pass.
+
+**Fix (3 pieces, all env-gated, old paths intact):**
+- `crispasr_vad.cpp` post-split now cuts at **energy minima** (±2 s search,
+  100 ms RMS window, reusing `audio_chunking::split_at_energy_minima`) instead
+  of equal parts.
+- New backend hook `vad_slice_cap_seconds()` (JA=12, others 0;
+  `CRISPASR_PARAKEET_VAD_SLICE_CAP`): the dispatcher re-splits VAD slices down
+  to the cap when the user didn't pass an explicit `--chunk-seconds`.
+- JA `CRISPASR_PARAKEET_STREAM_THRESHOLD` default 0 → **12**: capped slices now
+  decode **single-pass (NeMo-exact)** instead of streamed.
+- Bonus gate: `CRISPASR_PARAKEET_ATT_CONTEXT="L,R"` — runtime equivalent of
+  NeMo's `change_attention_model("rel_pos_local_attn")`, wired to the existing
+  mask support in `core/fastconformer.h` (verified char-identical to NeMo at
+  [128,128]; not a win on this model — 46-67 % — but the A/B gate is free).
+
+**Session-ABI mirror (same day).** `crispasr_c_api.cpp`'s parakeet session
+path (bindings / server) still routed JA long audio through the streamed
+encoder (~58 % recall). Mirrored the CLI policy at the `s->parakeet_ctx`
+site: `crispasr_energy_chunk_slices` at the 12 s cap (no VAD model needed on
+the session path — energy minima only), one exact pass per slice, the same
+two-round gap-fill, words merged into the session's single-segment shape
+with CJK-aware text rebuild. yt_60s via the session harness: **94.8 %
+recall / 89.2 % prec** (CLI: 97.2 — silero VAD bounds beat pure energy
+slicing slightly). `CRISPASR_PARAKEET_VAD_SLICE_CAP=0` reverts to streamed;
+an explicit `crispasr_session_transcribe_chunked` keeps the caller's sizing.
+
+**Gap-fill second pass (same day, follow-up for >95 % coverage).** Even with
+capped single-pass slices the encoder sometimes emits *nothing* for a
+multi-second span inside a slice — it blanks an utterance whenever enough
+context follows it, though the same span transcribes verbatim in isolation
+(the reporter's clip's first 4.6 s: perfect alone, skipped inside any ≥8 s
+window; NeMo behaves identically). `crispasr_gap_fill_slice()` in
+`crispasr_run.cpp`: after the per-slice transcribe, spans ≥1 s with no
+emitted words are re-transcribed in isolation and words landing inside the
+gap (and not restating covered content) are merged back. Runs inside
+`process_slice`, so all output paths (sequential / parallel / progressive)
+get it; gated on `vad_slice_cap_seconds() > 0` (JA parakeet only today),
+`CRISPASR_GAP_FILL=0` disables, `CRISPASR_GAP_FILL_MIN_CS` tunes (min-gap 60
+measured strictly worse than 100 — more variant noise, much slower).
+Phonetic (hiragana-reading) char-bigram recall vs whisper-large-v3-turbo:
+yt_60s 64.2 → **97.2 %**, yt_120s 61.3 → **96.9 %**, first300 → **95.9 %**,
+precision 90-93 %. Ceiling check: an independent SenseVoice-small run scores
+the same recall (97.2/96.8 %) at far lower precision (78 %) — we are at the
+inter-model agreement ceiling; the residual is kana/kanji hearing variants,
+not missing speech. The katakana rendering of the clip's English brand name
+(スピークジャパニーズ…) is correct JA-model output that a latin-script
+reference can't credit — use reading-normalized scoring for JA coverage.
+
+**Validated** (default flags, latin-stripped char-bigram recall vs whisper GT):
+yt_60s 62.3 → **79.6 %**, yt_120s 57.5 → **81.0 %**, precision held; cap sweep
+8/10/12 confirms 12 best. Residual loss is dominated by the clip's
+English-heavy intro utterance ("Speak Japanese Naturally Podcast…"), which the
+JA model skips whenever the window extends past it — even NeMo emits it only
+letter-by-letter. **Non-JA regression: none** — v3 q8_0 on EN/DE FLEURS
+60 s/300 s byte-identical before/after; reazon-baseball ×3 keeps 3/3 岡本;
+777/777 unit tests. Follow-ups: mirror the cap policy into the session ABI
+(`crispasr_c_api.cpp` reimplements the CLI dispatch) and upload the
+CTC-head-bearing JA GGUF so `--parakeet-decoder ctc` works.
+
+## 2026-07 CPU weight-read hardening + Mimi codec causal default
+
+Audit follow-up to the CrispEmbed quantized-weight-read fixes; two threads.
+
+**Weight readers.** Added `core_cpu::to_f32` (`src/core/cpu_ops.h`): a GPU-safe CPU weight
+reader that dequantizes F32/F16/any block-quantized type via `ggml_backend_tensor_get` + the
+`to_float` trait (sized by `ggml_nbytes`). Replaced the recurring "handle F32/F16, no quantized
+`else`" pattern — which silently garbles, or over-reads and asserts, a quantized weight — across
+paraformer (CIF), parakeet (ctc), piper (emb), cohere, openvoice2, dots_tts, moonshine_streaming,
+omniasr, tada_encoder/codec, canary (conv_dw BN-fold), mimo_tokenizer (codebook), sensevoice
+(query-embed), pocket_tts (cache miss). All inert in shipped GGUFs (these weights ship F16);
+defensive against re-quant. Unit test `test-cpu-ops-to-f32` (F32/F16/Q8_0/Q4_K round-trip).
+**Not routed:** wav2vec2 conv_w — 3-D (never quantized) and its old code was a correct zero-copy
+F32 fast path on a per-transcription loop; routing it would only add copies.
+
+**Mimi codec causal default.** The Mimi (Kyutai) codec transformer ran full non-causal attention
+(`flash_attn_ext` mask=nullptr), diverging from moshi's streaming-causal Mimi (sliding_window=250;
+`mimi_context=250` was loaded but dead). A >250-frame WER A/B (3× jfk ≈ 412 frames) showed the
+non-causal path **truncates the tail** (~25% of content dropped once the sequence exceeds the
+window); causal+window captured all of it; on short audio (<250 frames) the two tie. So
+`kyutai_stt` now **defaults to causal+sliding-window**, old path behind `CRISPASR_MIMI_NONCAUSAL=1`.
+`csm_tts` has the identical gate and now **also defaults to causal** — a TTS→ASR A/B (~256 decoder
+frames, `T_up = 2× 128` codec frames) gave causal 9.3% WER vs non-causal 12.0% (a win, though far
+smaller than STT's, since non-causal TTS stayed intelligible rather than truncating). Opt out with
+`CRISPASR_MIMI_NONCAUSAL=1`.
+Verified on Metal + CUDA (Tesla P100). → LEARNINGS.
+
+## #171 2026-07-03 VibeVoice TTS server "3rd-request garbage" — voice-KV stride leak
+
+Reporter (logiclove, RDNA4 / RADV GFX1201) saw VibeVoice-realtime-0.5b TTS degrade in
+**server** mode: 1st/2nd request clean, 3rd (and any short request after a longer one)
+produced garbage / mixed voices / wrong length. The CLI was always clean. `GGML_VK_DISABLE_COOPMAT2`,
+`VIBEVOICE_TTS_FLASH_ATTN=0`, `VIBEVOICE_VAE_BACKEND=cpu` (even all together) did **not** fix it —
+so it was never the RDNA4 coopmat2 shader, it was a **host-side cross-request state leak**.
+
+Reproduced on **Metal** (owner had only tested via CLI = fresh process each time): send the
+same French sentence as request #1 vs after several other sentences → **different** audio
+(different length ⇒ different EOS frame). Since the diffusion RNG reseeds to 42 every call and
+all caches clear per call, that divergence had to be a stale pointer/stride.
+
+Root cause in `copy_voice_kv` (realtime voice path, `vibevoice_synthesize`): the per-head
+destination stride into the **persistent** `ctx->kv_k/kv_v` was `hd * max_ctx * el`, using
+**this call's local `max_ctx`**. But the KV cache is only reallocated when it needs to *grow*
+(`kv_max_ctx < max_ctx` guard); a short request that follows a longer one **reuses** the larger
+allocation whose real `ne[1] == ctx->kv_max_ctx > max_ctx`. So the voice prompt for heads ≥1 was
+written at the wrong offsets → corrupted speaker conditioning on every request after a longer one.
+The server's startup **warmup** synth grows `kv_max_ctx`, so even the first real short request was
+already corrupted. Explains all four observations (CLI clean, server 3rd garbage, coopmat-off
+no help, same-sentence-back-to-back fine — equal `max_ctx`).
+
+Fix (1 line): use the tensor's real per-head stride `dst_k->nb[2]` — which is exactly what the
+attention read side already uses. Validation: fixed server output is now **byte-identical (PCM)**
+to the fresh-CLI ground truth for the adversarial long-then-short ordering, and re-sending an
+earlier sentence is byte-identical to its first synthesis. Base 1.5B/7B path is unaffected (no
+`copy_voice_kv`). No GGUF reconversion — recompile only.
+
+## #192 2026-07-01 TADA CPU quality (last-word / tempo), cand>1 viability, `.wav` voice cloning + `--align`
+
+Closed out the CPU-side complaints in #192 and shipped the voice-cloning + forced-alignment
+features. Ground truth was the real `HumeAI/tada-3b-ml` run offline via
+`.codex-scratch/issue192/run_tada_python_original.py` (HF_HOME=`.cache/huggingface.bak`).
+
+1. **Last-word clip / crammed tempo — two divergences from the reference.**
+   (a) The CLI/c_api defaulted `num_acoustic_candidates=4`; upstream `InferenceOptions`
+   default is **1**. The C++ best-of-N ranker used the reconstruction ("likelihood") scorer,
+   which scores the **acoustic dims only** and is therefore blind to — and sometimes *prefers*
+   — a candidate with an outlier gray-code **duration**. On "I went to school and back in four
+   hours" that pushed a 43-frame gap into one token → ASR "…and forth"; N=1 → verbatim "…four
+   hours" across seeds. Defaulted back to 1 (`10a116e0`). A parallel session had pushed the
+   opposite (`75ee3d9d`, cand 4→8); that mangles 1b/q4_k too — cand=1 supersedes it.
+   (b) `8ddf2bb8` ran `num_prompt + shift(5)` steps; the reference runs exactly `num_prompt`
+   (the 5 trailing EOTs are already baked in by `_add_bos_eos`). The extra 5 appended trailing
+   junk frames → "…for out". Default `extra_steps=0`; `CRISPASR_TADA_EXTRA_STEPS` overrides.
+
+2. **cand>1 made viable (`a0a0432a`).** Added duration-aware selection to `fm_solve_rank_candidates`
+   and defaulted cand>1 to **`duration_median`** (a Python-provided scorer): pick the candidate
+   whose per-token duration is closest to the median. Fixes cand=4/8 "four hours" across seeds.
+   `CRISPASR_TADA_SCORER=likelihood|hybrid` A/Bs. No scorer beats cand=1 on all inputs
+   (duration_median can mispick "hello world"), so cand=1 stays the recommended default and
+   cand>1 is opt-in via `TADA_NUM_CANDIDATES`. German re-validated (cand=1 coherent — the old
+   "cand=1 garbage" claim was a harness-artifact-era artifact).
+
+3. **`.wav` voice cloning works end-to-end (`01772a3f`).** Root cause of empty synth:
+   `convert-tada-aligner-to-gguf.py` silently dropped `tokenizer.ggml.merges` (called an absent
+   `get_merges()` in `try/except:pass`), so C++ `core_bpe` byte-fell-back (26-char transcript →
+   26 tokens vs ~6 BPE) — the ref's acoustic-token count mismatched the runtime's BPE prompt
+   tokenization → prompt phase swallowed the input. Parse `tokenizer.json` `model.merges` (280147
+   merges). Also fixed the `--make-ref` input-file guard (`cli.cpp`) and made `--voice` fail loudly
+   on unresolved refs / `.wav` (was silently using the default voice). Auto-download the
+   encoder/aligner from the model repo (`41e46c7d`), `--language auto`→en (`bc87d360`).
+
+4. **All 10 language aligners published (q8_0).** `tada-aligner-{en(both repos),ar,ch,de,es,fr,it,ja,pl,pt}`
+   on `cstr/tada-tts-3b-ml-GGUF`; `en` also on the 1b repo. Aligner **q8_0 is bit-identical to f16**
+   for alignment (positions max|Δ|=0 frames, token_values cos=1.0 — the F32 `lm_head` that drives
+   the CTC alignment is preserved; only the wav2vec2 encoder layers quantize; 1.19 GB → 906 MB).
+
+5. **New `--align` verb (`fcbc8718`).** The aligner is a wav2vec2 CTC model over the Llama-3.2 BPE
+   vocab; exposed forced alignment as word timestamps:
+   `crispasr --backend tada-3b-ml -m … --auto-download --align --voice a.wav --ref-text "…" --align-format srt|json|plain`.
+   Reuses the make-ref encoder/aligner resolution; groups BPE tokens→words (space-marker boundary);
+   `position/50fps = seconds`. Free (text-less) CTC decode does **not** work — argmax is all-blank
+   (`CRISPASR_TADA_CTC_ASR` probe) → it is a *forced* aligner, not a recogniser.
+
 ## #205f 2026-06-30 Granite long-audio: chunk-context drops slices + spaceless rebuild (REAL no-spaces fix)
 
 Reproduced the reporter's two remaining complaints on the actual 2.5-min sample
@@ -154,6 +396,205 @@ registry, quantize keeping enc/adapter/tied-embed at F16, Go LDFLAGS, live test,
 `cstr/MOSS-Transcribe-preview-2B-GGUF` (card `22818f7a`). f16/q8_0 held back for
 bandwidth.
 
+### #215 2026-07-02 moss-transcribe Vulkan segfault — encoder `flash_attn_ext` → manual attention
+
+Reporter: moss-transcribe segfaults on **Vulkan** (both NVIDIA and AMD, q8_0 and
+q4_k) during encoder execution — stack `ggml_vk_command_pool_cleanup →
+ggml_vk_graph_cleanup → ggml_backend_sched_compute_splits`, faulting inside the
+vendor driver (`libvulkan_radeon.so` / `libnvidia-eglcore`). Root cause: the
+encoder is the only graph using `ggml_flash_attn_ext` (the LLM decode uses the
+manual `core_attn::kv_self_attn` soft_max_ext path, which runs on Vulkan fine).
+The Vulkan FA path's split-k / mask-opt resource management (extra prealloc
+buffers, semaphores, descriptor sets, a separate reduce pipeline) mishandles
+command-buffer lifecycle → the corruption only surfaces at pool cleanup. Both
+FA shaders correctly bounds-check the unpadded `T_enc×T_enc` block-diagonal mask,
+so it is not a simple mask OOB — it is the same graph-scale Vulkan resource class
+as TADA #192, but op-specific here.
+
+Fix: on Vulkan the encoder uses a manual `mul_mat + soft_max_ext + mul_mat`
+attention (identical `(hd, n_h, T)` layout as flash), keeping the encoder
+GPU-resident while avoiding the crashing op. Auto-selected when the backend name
+starts with "Vulkan"; overridable with `CRISPASR_MOSS_TRANSCRIBE_ENC_FLASH=1`
+(force flash, e.g. to retest a fixed driver) or `CRISPASR_MOSS_TRANSCRIBE_ENC_MANUAL=1`
+(force manual anywhere, for A/B). Verified: manual ≡ flash encoder output on CPU
+(`crispasr-diff` cos identical to 5 decimals), jfk.wav transcribes verbatim on
+CPU and on MoltenVK-Vulkan under both paths. The native NVIDIA/AMD segfault is
+not reproducible on MoltenVK (Metal-translation layer never exercises the vendor
+command-pool path).
+
+Follow-up: the sibling `moss-audio` (Qwen3-Omni) encoder has the byte-identical
+`flash_attn_ext` attention block (same `(hd,T,n_h)` Q/K/V layout, scale, F16 mask,
+reshape), so it got the same guard — auto-manual on Vulkan, `CRISPASR_MOSS_AUDIO_ENC_FLASH=1`
+/ `…_ENC_MANUAL=1` overrides, baked into the §176s cached encoder graph. The change
+touches only the Vulkan path (flash stays default on CPU/Metal/CUDA — zero regression
+risk to any working config), and the manual≡flash identity is already proven on this
+exact code shape via moss-transcribe. No moss-audio omni model was available locally
+for an end-to-end A/B, so it is verified by code-pattern equivalence + clean compile,
+not a fresh diff run — worth a jfk A/B once the omni GGUF is on hand.
+
+### #215b 2026-07-03 real GPU fix — the async command-pool bug; disable Vulkan async
+
+Reporter (AppleSheeple) confirmed the manual-attention guard did NOT fix the crash:
+it still segfaults with **multiple slices** (`jfk` looped 3× via
+`ffmpeg -stream_loop 2`). So `flash_attn_ext` was never the cause. Root cause found
+by reading ggml-vulkan: `ggml_vk_queue_command_pools_cleanup` resets the compute
+command pool once `buffers_in_use() >= 10` (`cleanup_frequency`), and it is called
+from the synchronous buffer-transfer helpers (`ggml_vk_buffer_write_2d` /
+`_read`, i.e. every `ggml_backend_tensor_set/get`). In **async** mode
+(`device->support_async`, default on non-Intel) `ggml_backend_vk_graph_compute`
+does NOT synchronize before returning (deferred to the sched split boundary), so
+command buffers from prior graph computes stay `in_use` and pending. moss runs one
+small graph per ~1 s of audio (mel `tensor_set` → conv `graph_compute` → conv
+`tensor_get`, per 100-mel-frame chunk), so after ~10 chunks the next chunk's
+`tensor_set` calls `command_pool_cleanup → vkResetCommandPool` while earlier chunks'
+buffers are still executing on the GPU → the native RADV/NVIDIA driver faults.
+That is exactly the "multiple slices" trigger (need ≥10 accumulated buffers). Not
+reproducible on MoltenVK — Metal auto-manages command-buffer lifetime, so
+"reset while pending" is simply not a failure mode there (which is why single-jfk
+*and* jfk×3 run clean locally under every flash/manual combination).
+
+Fix: keep moss ON the GPU but disable Vulkan async — `setenv("GGML_VK_DISABLE_ASYNC",
+"1", 0)` before `crispasr_init_gpu_backend()` (the env is read at device creation).
+With async off, every `graph_compute` fully drains the GPU before returning, so a
+later `command_pool_cleanup` only ever resets buffers whose work is already done →
+`vkResetCommandPool` is safe. CUDA/Metal ignore the env; `overwrite=0` respects an
+explicit user value; opt back into async with `CRISPASR_MOSS_TRANSCRIBE_VULKAN_ASYNC=1`
+/ `CRISPASR_MOSS_AUDIO_VULKAN_ASYNC=1`. Cost: ~10-15% slower than native async (vs.
+no GPU at all with the earlier CPU fallback — reverted). Same class as upstream
+ggml-org/llama.cpp#17302; worth an upstream fix to the async command-buffer
+lifecycle (then this env can be dropped). Verified on the local MoltenVK build:
+async on vs off produce byte-identical transcripts, moss stays on Vulkan, jfk×3
+verbatim. The crash-gone confirmation needs real RADV/NVIDIA hardware (reporter).
+The encoder manual-attn path (#215a) and the diff harness `CRISPASR_DIFF_USE_GPU=1`
+toggle for moss-transcribe are retained.
+
+### #215c 2026-07-03 the proper ggml-vulkan fix — drain the queue before pool reset
+
+The #215b async-disable is our conservative default; the real bug is in ggml-vulkan
+and now fixed at the root. `ggml_vk_command_pool_cleanup` calls `vkResetCommandPool`,
+whose precondition is that no command buffer in the pool is still pending (its own
+comment: "Requires command buffers to be done"). In async mode `graph_compute`
+returns without synchronizing, so buffers stay pending and a later reset (from
+`graph_cleanup` at a sched split, or `queue_command_pools_cleanup` at
+`buffers_in_use>=10`) faults the native driver. Fix: drain the pool's own queue
+(`p.q->queue.waitIdle()` under `queue_mutex`) before the reset — a no-op on the
+already-synchronized path, blocking only when a reset would be UB. `vk_command_pool`
+already carries `q`, and no caller holds `queue_mutex`, so no deadlock. This is a
+local patch to vendored ggml (marked "MUST RE-APPLY on ggml sync"); the clean
+upstream draft + reference patch live in `tools/upstream-prs/21-vulkan-async-command-
+pool-reset.{md,patch}` (file at ggml-org/llama.cpp once confirmed on native HW).
+Verified on MoltenVK: async on + guard transcribes jfk and jfk×3 verbatim with no
+perf regression (the `waitIdle` is a no-op when idle).
+
+### #215e 2026-07-03 ROOT CAUSE: cached conv graph across slices = use-after-free; GPU restored
+
+Found by working the bug from the correctness side instead of chasing the crash
+site. Vulkan validation layers run on MoltenVK (no native HW needed): core +
+**precise sync validation** on jfk3 = clean, so the API usage is valid — the crash
+must live in code paths the M1 never takes. The big one is UMA: discrete GPUs use
+the staging/transfer machinery the crash implicates. Added a
+`GGML_VK_FORCE_NON_UMA=1` debug knob to vendored ggml-vulkan (pretend-discrete on
+UMA) — and with it, **jfk3 segfaulted on the M1**, same shape as the reporter's
+crash: slice 1 clean, slice 2 conv chunk 0 dies. The macOS crash report showed the
+truth: NULL deref in `ggml_backend_sched_backend_from_buffer` during
+`sched_alloc_graph` — and an ASan build then proved it under the **default**
+config: **heap-use-after-free**, read in `ggml_backend_sched_backend_from_buffer`
+(ggml-backend.cpp:878), freed by `ggml_gallocr_reserve_n_impl` (gallocr regrow),
+allocated by the same in an earlier `sched_alloc_graph`.
+
+Mechanism: `run_encoder` cached the conv-stem cgraph across encoder invocations.
+Slice 1 allocs it (tensor->buffer set to the gallocr's buffers); the larger
+xf/adapter/decode graphs then **regrow** the shared sched's gallocr, freeing those
+`ggml_backend_buffer` structs; slice 2's first conv-chunk `sched_alloc_graph`
+walks the cached graph and reads the freed structs to pick backends. On macOS the
+freed chunk is occasionally recycled → clean NULL segfault (which is why it never
+reproduced locally); on Linux glibc the chunk retains plausible garbage → the
+sched proceeds and uses stale vk_buffer handles → destroyed VkBuffer/VkDeviceMemory
+usage tramples the driver heap → the fault surfaces at the *next* driver call —
+`vkResetCommandPool`, on a provably idle queue, exactly the reporter's backtrace.
+Explains every observation: needs ≥2 slices, q8_0 AND q4_k, RADV AND NVIDIA, CPU
+fine, MoltenVK "fine". Same class as the parakeet §176s lesson (enc graph cache
+NOT re-entrant with a shared sched) and most likely TADA #192.
+
+Fix: rebuild the conv graph at every `moss_transcribe_run_encoder` entry (reuse
+across the intra-call chunk loop stays — identical allocs, no regrow in between,
+so §176s-style savings are kept); same invalidation at `moss_audio_run_encoder`
+entry. Reverted the #215d platform-gated CPU fallback — GPU is default again on
+native Vulkan; `CRISPASR_MOSS_{TRANSCRIBE,AUDIO}_FORCE_CPU=1` kept as escape
+hatches (the `*_VULKAN_NATIVE` envs are gone). Kept: #215a manual encoder
+attention on Vulkan (re-testing flash there is a separate follow-up now that the
+repro harness exists).
+
+Verified: fixed build × 3 runs of jfk3 under `GGML_VK_FORCE_NON_UMA=1` + full
+Vulkan validation — zero crashes, zero hazards, verbatim transcript; ASan build
+on jfk3 default — zero reports (was: 1 UAF per multi-slice run). AUDIT
+FOLLOW-UP: canary (`cached_enc_gf` + decoder on one sched — vulnerable when
+consecutive slices have equal T_mel), canary_ctc, chatterbox_s3gen
+(`unet_cached_gf`) share the cross-call cached-graph pattern and need the same
+treatment or a shared clear-after-use helper.
+
+### #215d 2026-07-03 the sync theories were WRONG — platform-gated CPU fallback
+
+The reporter tested the #215c build on a **Radeon** (debug `bt full` attached to
+the issue) and it **still segfaults** — with no env changes. The backtrace is
+decisive: `resetCommandPool` is at the patched line (so the `waitIdle` guard is
+compiled in), `ctx->compute_cmd_pool.q` is a valid queue (so `waitIdle` *ran*), and
+`resetCommandPool` **still faults**. A queue that is provably idle cannot have
+pending buffers — so the fault is NOT "reset with pending buffers", and both #215b
+(async-disable) and #215c (queue-drain) were chasing the wrong cause. A
+`resetCommandPool` fault after the queue is idle = corrupted pool/driver state, the
+TADA-#192 signature (graph-scale corruption, native-only, unreproducible on
+MoltenVK). Crash is on the **2nd** CLI audio slice (state accumulates across the
+shared context), conv chunk 0.
+
+Reverted both: the `GGML_VK_DISABLE_ASYNC` setenv (also timing-fragile —
+`support_async` is frozen at device creation, so a setenv after any earlier device
+enumeration is a silent no-op) and the ggml-vulkan `waitIdle` patch (draft 21
+downgraded to a bug report, patch removed). Replaced with a **timing-safe,
+platform-gated** decision: MoltenVK is the only Vulkan on Apple and macOS has no
+native Vulkan driver, so `#if !defined(__APPLE__)` a Vulkan backend == a native
+driver → run the model on CPU; Apple(MoltenVK)/CUDA/Metal keep the GPU. The
+decision reads the backend we actually got (compile-time platform + created-device
+description for the log), with no env / device-creation-ordering race that the
+earlier attempts died on. Only AMD-on-Linux (no CUDA) loses acceleration —
+deterministically, instead of crashing. `CRISPASR_MOSS_TRANSCRIBE_VULKAN_NATIVE=1`
+(and `..._MOSS_AUDIO_...`) force the native GPU path for hardware A/B of any future
+GPU experiment (e.g. batching the conv-stem so the encoder stops churning ~11 tiny
+graphs/slice — the likely real trigger, unverifiable without native HW). Verified
+on MoltenVK: still full GPU, jfk verbatim (1.5× RT). Native crash-gone is the
+reporter's to confirm.
+
+### #218 2026-07-04 greedy n-gram loops + 30 s-seam duplication on long audio
+
+Reporter: q8_0 on a 145 s clip (`t32-145s.wav`) emits "a lot of" repeated "hey"s
+and "come on"s. Two independent defects, both specific to long audio (the clip is
+auto-sliced into 6×30 s because moss-transcribe lacks `CAP_UNBOUNDED_INPUT`):
+
+1. **Greedy n-gram loops.** On two of the six slices the greedy decoder fell into a
+   repeated-phrase attractor and emitted it up to the 512-token cap — slice 2 ran
+   ~490 consecutive "hey," tokens, slice 5 cycled "run hey hey hey hey hey run".
+   Upstream MOSS decodes greedily with no `repetition_penalty` and no post-process,
+   so our runtime already matched the reference exactly; the raw output is just
+   unusable on this audio. Fixed by collapsing immediately-repeated n-grams in the
+   decoded **text** — the same algorithm the sibling higgs-stt backend already
+   ships (a port of the model's `ngram_loop_fix.py`), extracted to the shared header
+   `src/core/ngram_loop_fix.h` (`core_ngram::fix_loops`) and used by both. It is a
+   pure text post-process (token/logit parity vs the reference is unchanged) and a
+   no-op on non-degenerate slices, so clean slices stay byte-identical and the jfk
+   diff-harness is unaffected. Opt out with `CRISPASR_MOSS_TRANSCRIBE_NO_LOOPFIX=1`.
+   Shipped `3339a710`; unit test `tests/test-ngram-loop-fix.cpp`.
+2. **Seam duplication.** moss-transcribe is an LLM decoder that emits neither word
+   nor token timestamps, but it was NOT on the overlap-save opt-out list, so each
+   30 s slice was extended by ±3 s of acoustic context (issue #89) and then — with
+   no timestamps to trim by — kept whole via segment-level filtering. The overlap
+   region was therefore transcribed twice and duplicated at every seam
+   ("…move much **of** the fence. Don't move much **to** the fence."). The over-long
+   30 s+2×3 s buffer also pushes the greedy decoder further out of its trained window,
+   worsening (1). Fixed by adding `"moss-transcribe"` to `kBlocked` in
+   `crispasr_chunk_context_gate.h` — the same opt-out its LLM-decoder peers (qwen3,
+   granite, voxtral, …) already use — so long audio is sliced at a bare 30 s with no
+   overlap extension. Gate unit test updated (`test-issue-114-chunk-context-gate.cpp`).
+
 ## #205 2026-06-30 `--max-len` for text-only backends + granite-plus timestamp-mode derail
 
 Reporter: `--max-len` had no effect on granite / qwen3 (worked on whisper/cohere).
@@ -295,6 +736,25 @@ opt-in behind `CRISPASR_PARAKEET_ENC_CACHE=1` (`src/parakeet.cpp`) until it is
 reimplemented re-entrantly. Validated on `parakeet-tdt-0.6b-v3-q4_k` (M1/Metal):
 plain transcribe ×N verbatim, chunked 0 / 5 s verbatim, 60 s silence-split path
 bounded (4.1 s) and non-empty; 739/739 unit tests green. See [[LEARNINGS]].
+
+**2026-07-01 follow-ups (reporter's two non-blocker asks).**
+(a) **Progress callback.** Added `crispasr_session_set_progress_callback(s, cb,
+user_data)` — `cb(processed_samples, total_samples, ud)` fires once per finished
+window from `parakeet_session_chunked_merge`, monotonic to `total`. Also mirrored
+into the existing `crispasr_get_progress()` atomic so the Dart poll path (the
+project's callback-free progress mechanism) now covers chunked long-audio for
+free. Rust safe wrapper `Session::transcribe_chunked_with_progress` (scoped-closure
+trampoline). Validated live on `parakeet-tdt-0.6b-v3-q4_k` (M1/Metal) via a session
+harness: 33→53→72→92→100 %. Native-callback setter is intentionally not mirrored to
+the callback-hostile bindings (Dart/Go/Java/Ruby/WASM) — they use the poll.
+(b) **Encoder-cache reentrancy — measured DUD, not pursued.** The reporter asked
+whether a re-entrant cache would speed up chunked mode. Measured per uniform 20 s
+window on M1 Metal (new `PARAKEET_ENC_PROBE` hook): graph **build ≈0.3 ms**,
+`sched_alloc` ≈1 ms, GPU **compute ≈1 s** → build+alloc is ~0.13 % of per-window
+time; a re-entrant cache saves ~0.04 %. Kept opt-in-OFF; the probe also reproduces
+the 2nd-reuse std collapse (0.0218 → 0.0078) and the resulting mid-window text drop.
+Real headroom = encoder GPU compute + the ~40 % overlap re-encode, not the cache.
+763/763 unit tests green. See [[LEARNINGS]].
 
 ## §192 2026-06-29 TADA Vulkan — REPEAT-f16 abort unblocked; FM time-dim divergence localized (superseded below)
 
@@ -10730,3 +11190,16 @@ jumps over lazy dog"), where pre-fix it aborted 0-byte. SpeechT5 is
 autoregressive so GPU≠CPU bit-for-bit, but both give the same 28160-sample
 output and transcript. CUDA re-test of speecht5 still pending. Worktree:
 `/Volumes/backups/code/fastpitch-cuda-stash`.
+
+## 2026-07-02 — `--gpu-backend` selection fix (#214)
+
+`--gpu-backend vulkan` was silently ignored when CUDA was also compiled in.
+All 60+ backend init sites called `ggml_backend_init_best()` which picks CUDA
+unconditionally. Added `src/core/gpu_backend_pref.h` with
+`crispasr_init_gpu_backend()` — process-global preference set at CLI startup,
+filters devices by name prefix. Replaced all call sites. Also exposed as
+`crispasr_set_gpu_backend()` C API for library consumers.
+
+Kaggle P100 validation: 7/7 ASR backends pass (moonshine, firered-asr,
+parakeet, sensevoice, qwen3, glm-asr, fastconformer-ctc). `--gpu-backend cpu`
+runs 3.6× slower than CUDA with zero CUDA library references.

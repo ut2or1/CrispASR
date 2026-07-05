@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -247,16 +248,27 @@ def main():
     w.add_array("tokenizer.ggml.tokens", vocab_list)
     w.add_uint32("tokenizer.ggml.padding_token_id", 0)
 
-    # Also embed BPE merges if available (for C++ tokenization)
-    if hasattr(tokenizer, 'bpe_ranks') or hasattr(tokenizer, '_tokenizer'):
-        # Try to get merges from the fast tokenizer backend
-        try:
-            merges = tokenizer.backend_tokenizer.model.get_merges()
-            if merges:
-                w.add_array("tokenizer.ggml.merges", merges)
-                print(f"  Embedded {len(merges)} BPE merges")
-        except Exception:
-            pass
+    # Embed BPE merges (REQUIRED for C++ tokenization). Without them the C++
+    # core_bpe::tokenize_simple falls back to byte-level tokens (e.g. a 5-word
+    # transcript becomes ~26 byte-tokens), which mismatches the runtime's BPE
+    # prompt tokenization and breaks voice cloning (empty/garbled synth).
+    # tokenizers' get_merges() is version-dependent, so parse tokenizer.json
+    # directly. Its "model.merges" is either ["a b", ...] (older) or
+    # [["a","b"], ...] (tokenizers >= 0.20); core_bpe wants "a b" strings in
+    # rank order.
+    merges = []
+    try:
+        import json as _json
+        tj = _json.loads(tokenizer.backend_tokenizer.to_str())
+        raw = tj.get("model", {}).get("merges", [])
+        for m in raw:
+            merges.append(m if isinstance(m, str) else (m[0] + " " + m[1]))
+    except Exception as e:
+        print(f"  WARNING: could not extract BPE merges ({e}); "
+              "C++ tokenization will byte-fall-back and voice refs will be broken")
+    if merges:
+        w.add_array("tokenizer.ggml.merges", merges)
+        print(f"  Embedded {len(merges)} BPE merges")
 
     # ── Write tensors ──
     print("\nWriting tensors:")
@@ -360,8 +372,13 @@ def main():
     # LM head (CTC output → 128256 classes)
     lm_w_key = "encoder.lm_head.weight"
     lm_b_key = "encoder.lm_head.bias"
-    # LM head is huge (128256 × 1024) — store as F32 for quantization later
-    write_t("lm_head.weight", lm_w_key, force_f32=True)
+    # LM head is huge (128256 × 1024, ~525 MB F32). It is the CTC projection that
+    # drives the alignment argmax/DP, so it is stored F32 by default (safest).
+    # TADA_ALIGNER_LMHEAD_F16=1 stores it at --outtype precision (F16 halves it to
+    # ~262 MB) — only enable if validated (forced alignment is robust to logit
+    # rounding, but #192 measured q4_k on the ENCODER already costs ~220 ms drift).
+    lm_head_force_f32 = os.environ.get("TADA_ALIGNER_LMHEAD_F16", "") not in ("1", "true", "yes")
+    write_t("lm_head.weight", lm_w_key, force_f32=lm_head_force_f32)
     if lm_b_key in name_to_idx:
         write_t("lm_head.bias", lm_b_key, force_f32=True)
     else:

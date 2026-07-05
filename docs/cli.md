@@ -12,7 +12,7 @@ when you don't pass `--backend`, whisper is the default.
   - [TTS-specific flags](#tts-specific-flags) — voice, instruct, codec, steps, trim
 - [Output formats](#output) — txt / srt / vtt / json / csv / lrc
 - [Segmentation & chunking](#segmentation--chunking) — VAD, fixed chunks
-- [Word-level timestamps via CTC alignment](#word-level-timestamps-via-ctc-alignment)
+- [Word-level timestamps via CTC alignment](#word-level-timestamps-via-ctc-alignment) — incl. standalone `--align-only`
 - [Sampling / decoding](#sampling--decoding-whisper--llm-backends) — temperature, beam, grammar
 - [Language detection (LID)](#language-detection-lid)
 - [Diarization](#diarization) — `--diarize`, pyannote, embedder-based clustering
@@ -243,16 +243,33 @@ multilingual / v3 / EN models behave very differently:
 - **JA-only (vocab ≤ 4096):** the bidirectional encoder is numerically unstable
   when attention spans the whole utterance — codec-level perturbations as small
   as 0.3 % RMS flipped the encoder output std by ~14 % on the #89 clip, driving
-  the TDT decoder into emit-blank-forever past ~20 s. JA therefore keeps the
-  **streamed** path (global z-norm + overlapping encoder windows + single TDT
-  decode) driven by the dispatcher's VAD / 30 s chunking — unchanged from
-  before §216.
+  the TDT decoder into emit-blank-forever past ~20 s. (Upstream NeMo fails the
+  same way on the same audio — plain, local-attention, and buffered TDT
+  inference all score 1–51 % content recall vs a whisper-large-v3 reference.)
+  JA therefore uses **auto-VAD + a 12 s slice cap + single-pass per slice**:
+  VAD finds speech, slices longer than 12 s (continuous speech merges far past
+  the encoder's ~12 s safe window) are re-split at energy minima, and each
+  slice gets one NeMo-exact full-attention pass. A **gap-fill second pass**
+  then re-transcribes any span ≥1 s the first pass left empty inside a slice
+  (the encoder sometimes blanks an utterance whenever enough context follows
+  it, even though the same span transcribes verbatim in isolation) and merges
+  the recovered words back. Measured on the issue #89 reporter's clips
+  (phonetic char-bigram recall vs whisper-large-v3-turbo): 60 s **97.2 %**,
+  120 s **96.9 %**, 300 s **95.9 %** — up from 61–64 % with the previous
+  streamed default; NeMo's best long-form mode scores ~51 % raw recall on the
+  same audio, and an independent SenseVoice-small run tops out at the same
+  ~97 % (the inter-model agreement ceiling — the rest is kana/kanji hearing
+  variants, not missing content).
 
 **Env vars for tuning (all override the per-model defaults):**
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CRISPASR_PARAKEET_STREAM_THRESHOLD` | non-JA 300, JA 0 | Single-pass cap (seconds). Audio ≤ this gets one full-attention pass; `0` disables single-pass entirely (always streamed). |
+| `CRISPASR_PARAKEET_STREAM_THRESHOLD` | non-JA 300, JA 12 | Single-pass cap (seconds). Audio ≤ this gets one full-attention pass; `0` disables single-pass entirely (always streamed). |
+| `CRISPASR_PARAKEET_VAD_SLICE_CAP` | non-JA 0, JA 12 | Max VAD slice duration (seconds); longer slices are re-split at energy minima before decoding. `0` = no cap. |
+| `CRISPASR_PARAKEET_ATT_CONTEXT` | unset | `"L,R"` switches the encoder to rel_pos_local_attn with that window (encoder frames, 1 = 80 ms) — NeMo's `change_attention_model` equivalent. `"-1,-1"` forces full attention. |
+| `CRISPASR_GAP_FILL` | 1 (bounded-window backends only) | Second pass re-transcribing spans ≥1 s the first pass left empty inside a slice; recovered words are merged back. `0` disables. |
+| `CRISPASR_GAP_FILL_MIN_CS` | 100 | Gap-fill trigger threshold in centiseconds (100 = 1.0 s of missing speech). |
 | `CRISPASR_PARAKEET_LONGFORM` | non-JA 1, JA 0 | `1` = silence-split single-pass above the cap; `0` = streamed fallback above the cap. |
 | `CRISPASR_PARAKEET_INTERNAL_CHUNKING` | non-JA on, JA off | `0` = revert to the dispatcher's chunk-30 + overlap-save + LCS-merge path (A/B). |
 | `CRISPASR_PARAKEET_STREAM_CHUNK` | 0 (auto: 8 JA / 30 non-JA) | Streamed-path encoder chunk size (seconds). |
@@ -268,8 +285,9 @@ N-second chunk + merge; `--vad` forces the VAD path.
 # no flags needed, any length:
 crispasr -m parakeet-tdt-0.6b-v3.gguf -f long_de.wav -osrt
 
-# JA model — streamed by default (single-pass collapses past ~20 s):
-crispasr -m parakeet-tdt-0.6b-ja.gguf -f podcast_ja.wav --vad -osrt
+# JA model — auto-VAD + 12 s slice cap + per-slice single-pass by default
+# (whole-clip single-pass collapses past ~12 s), no flags needed:
+crispasr -m parakeet-tdt-0.6b-ja.gguf -f podcast_ja.wav -osrt
 
 # Force the old dispatcher chunk+merge path for comparison:
 CRISPASR_PARAKEET_INTERNAL_CHUNKING=0 \
@@ -478,6 +496,73 @@ the ~442 MB download or the second forward pass), add
 The implicit-enable line goes to stderr (suppressed under
 `--no-prints`) so it doesn't perturb stdout subtitle parsing in
 upstream tools like SubtitleEdit.
+
+### Standalone alignment — `--align-only` (issue #217)
+
+Aligns pre-existing text against audio without running ASR first.
+Accepts plain text (via `--ref-text` or `--text-file file.txt`) or an
+unaligned `.srt` file. Works with all three aligner families:
+canary-ctc, wav2vec2/hubert, qwen3-forced-aligner.
+
+For `.srt` input the cue structure is preserved: the cue texts are
+aligned as one transcript and each cue is re-emitted with corrected
+timings (first/last aligned word of that cue). So a mistimed subtitle
+file goes in, and the same subtitles come out re-timed.
+
+```bash
+# Re-time an unaligned/mistimed SRT (same cues, corrected timestamps):
+crispasr --align-only -am auto --auto-download -f audio.wav \
+    --text-file subtitles.srt --align-output retimed.srt
+
+# Align a transcript against audio, output word-level SRT:
+crispasr --align-only -am auto --auto-download -f audio.wav \
+    --ref-text "And so my fellow Americans ask not what your country can do for you"
+
+# Align a plain .txt (one subtitle line per text line) into cue-level SRT:
+crispasr --align-only -am auto --auto-download -f audio.wav \
+    --text-file transcript.txt --align-granularity segment \
+    --align-output aligned.srt
+
+# JSON with per-segment + nested per-word timings:
+crispasr --align-only -am canary-ctc-aligner-q4_k.gguf -f audio.wav \
+    --text-file subtitles.srt --align-format json
+```
+
+No ASR model (`-m`) is required. Output formats: `srt` (default),
+`json` (start/end in seconds), `plain` (tab-separated). Destination:
+stdout (default) or `--align-output <path>`.
+
+Granularity is controlled by `--align-granularity`:
+
+| Value | Meaning |
+|---|---|
+| `auto` (default) | `segment` for `.srt` input, `word` otherwise |
+| `segment` | one output entry per input SRT cue / non-empty `.txt` line, re-timed from the word alignment; JSON nests the per-word timings under each segment |
+| `word` | one output entry per aligned word (the pre-0.8.9 behaviour, also for `.srt` input) |
+
+### Aligner model options
+
+Any of these resolves via `-am <name> --auto-download`. All are
+permissively licensed (no NC restriction):
+
+| `-am` name | Family | Size (q4_k) | Languages | Upstream license |
+|---|---|---|---|---|
+| `canary-ctc-aligner` (= `auto`) | FastConformer-CTC (canary-1b-v2 aux) | ~442 MB | 25 European | CC-BY-4.0 |
+| `fastconformer-aligner[-en]` / `fastconformer-ctc` | FastConformer-CTC standalone | ~83 MB | en | CC-BY-4.0 |
+| `fastconformer-{aligner,ctc}-{en-pc,es,fr,it,nl,pl,ru,ua,hr,be,ar,fa,ka,hy,uz,kk-ru,de}` | FastConformer hybrid CTC branch | ~82 MB | per-language (+punct/caps except fa, kk-ru) | CC-BY-4.0 |
+| `parakeet-ctc-0.6b` / `parakeet-ctc-1.1b` | FastConformer-CTC | ~455 / ~795 MB | en | CC-BY-4.0 |
+| `wav2vec2-aligner-{en,de,fr,es,it,ja,zh,nl,uk,…}` | wav2vec2/XLSR CTC | ~212–300 MB | per-language (incl. CJK) | Apache-2.0 |
+| `qwen3-forced-aligner` / `qwen3-fa` | Qwen3 timestamp head | ~500 MB | multilingual | Apache-2.0 |
+
+Everything with GGUF arch `canary-ctc` (the whole NeMo
+`stt_*_fastconformer_ctc_*` standalone family, plus CTC branches
+extracted from the `stt_*_fastconformer_hybrid_large_pc` hybrids via
+`models/convert-stt-fastconformer-ctc-to-gguf.py`) loads through the
+default aligner dispatch — the ~80 MB FastConformer models are the
+smallest/fastest aligner option. The popular MMS-based aligners are
+deliberately absent (weights CC-BY-**NC**-4.0), as is the Portuguese
+hybrid `stt_pt_fastconformer_hybrid_large_pc` — the only NC release in
+NVIDIA's per-language hybrid fleet.
 
 ### Granite word-level timestamps and `--max-len` (#205)
 

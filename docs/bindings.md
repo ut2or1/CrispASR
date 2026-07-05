@@ -68,6 +68,27 @@ backend doesn't expose that knob, but the call is safe to make.
 > (`examples/addon.node`) reaches it via `transcribeSession`; the WASM/JS binding
 > (`bindings/javascript/emscripten.cpp`) via the `asr*` functions
 > (`asrOpen`/`asrTranscribe`/`asrSet…`).
+>
+> **Chunked long-form + progress (issue #208).** `transcribe_chunked` forces
+> the Parakeet backend through its bounded overlapping-window long-form path
+> (inert on other backends) and is exposed in **every** binding:
+> `Session.transcribe_chunked` (Python), `CrispasrSession.TranscribeChunked`
+> (Go), `.transcribeChunked` (Java/Dart), `Session.transcribe_chunked` (Ruby),
+> `asrTranscribeChunked` (WASM), `transcribeSession({chunk_seconds,…})` (Node
+> addon), and Rust `Session::transcribe_chunked[_with_language]`. Two ways to
+> surface per-window progress:
+> 1. **Poll (universal, no callback).** `crispasr_get_progress()` returns
+>    `0..100` (-1 idle) and now tracks the chunked-merge windows in lockstep (it
+>    was previously only fed by whisper). Exposed as `Session.get_progress`
+>    (Python/Ruby), `GetProgress()` (Go), `.getProgress()` (Java),
+>    `getTranscriptionProgress()` (Dart), `asrGetProgress()` (WASM). This is the
+>    Dart-friendly path (Dart FFI can't take C function-pointer callbacks).
+> 2. **Native callback.** `crispasr_session_set_progress_callback(s, cb,
+>    user_data)` — `cb(processed_samples, total_samples, user_data)` fires once
+>    per finished window on the transcribe thread. Exposed where native
+>    callbacks are idiomatic and safe: C/C++, Rust
+>    (`Session::transcribe_chunked_with_progress`), and Python
+>    (`transcribe_chunked(..., progress=fn)`). The other bindings use the poll.
 
 ## Python
 

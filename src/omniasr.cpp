@@ -6,9 +6,11 @@
 
 #include "omniasr.h"
 #include "core/attention.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/beam_decode.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -212,14 +214,7 @@ static void dump_tensor(ggml_tensor* t, const char* name, const char* dir) {
     char path[512];
     snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
     int n = (int)ggml_nelements(t);
-    std::vector<float> data(n);
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, data.data(), 0, n * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        std::vector<uint16_t> tmp(n);
-        ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(uint16_t));
-        ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t*>(tmp.data()), data.data(), n);
-    }
+    std::vector<float> data = core_cpu::to_f32(t); // F32/F16/quantized-safe
     FILE* f = fopen(path, "wb");
     if (f) {
         fwrite(data.data(), sizeof(float), n, f);
@@ -442,7 +437,7 @@ extern "C" struct omniasr_context* omniasr_init_from_file(const char* path_model
 
     // Load weights
     if (params.use_gpu) {
-        ctx->backend = ggml_backend_init_best();
+        ctx->backend = crispasr_init_gpu_backend();
     }
     if (!ctx->backend) {
         ctx->backend = ggml_backend_cpu_init();

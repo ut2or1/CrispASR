@@ -60,6 +60,56 @@ typedef struct whisper_context_params whisper_context_params;
 
 CRISPASR_SESSION_API int crispasr_get_progress(void);
 CRISPASR_SESSION_API void crispasr_reset_progress(void);
+
+// 0.10.3+ (issue #208): per-session progress callback for long-form
+// (chunked) transcription. Invoked once per finished window from within
+// crispasr_session_transcribe_chunked[_lang] (and any auto-chunked long
+// Parakeet transcribe) with the number of input samples processed so far
+// and the total. `processed` is monotonically non-decreasing and ends at
+// `total`. It is invoked on the calling (transcribe) thread — keep the
+// callback fast and non-blocking; do not re-enter the session from it.
+// Single-pass and non-Parakeet backends do not fire it. The module-level
+// atomic (crispasr_get_progress) is updated in lockstep, so pure pollers
+// (e.g. Dart FFI) get chunked progress without registering a callback.
+typedef void (*crispasr_progress_callback)(int processed, int total, void* user_data);
+
+// Register (or clear, with cb == NULL) the session progress callback.
+// user_data is passed back verbatim to every invocation. The pointer is
+// stored, not copied; keep it valid for the duration of transcribe calls.
+CRISPASR_SESSION_API void crispasr_session_set_progress_callback(crispasr_session* s, crispasr_progress_callback cb,
+                                                                 void* user_data);
+
+/// Per-segment streaming callback. Fired each time a new segment is
+/// committed during transcription. The segment text and timing are
+/// passed directly — the callback must copy any data it needs (the
+/// pointers are valid only for the duration of the call).
+typedef void (*crispasr_segment_callback)(
+    const char* text,       // segment text (UTF-8, null-terminated)
+    int64_t t0_cs,          // start time in centiseconds
+    int64_t t1_cs,          // end time in centiseconds
+    int segment_index,      // 0-based segment index within this transcription
+    void* user_data         // opaque pointer from registration
+);
+
+/// Register a per-segment streaming callback on the session.
+/// Pass NULL to clear. The callback is invoked on the transcription
+/// thread — it must be fast and non-blocking.
+CRISPASR_SESSION_API void crispasr_session_set_segment_callback(
+    crispasr_session* s,
+    crispasr_segment_callback cb,
+    void* user_data);
+
+/// Number of streamed segments available for polling (Dart FFI path).
+CRISPASR_SESSION_API int crispasr_get_streamed_segment_count(void);
+
+/// Drain all buffered streamed segments into a new result. Caller owns the
+/// returned pointer (free with crispasr_session_result_free). Returns NULL
+/// when the buffer is empty.
+CRISPASR_SESSION_API crispasr_session_result* crispasr_drain_streamed_segments(void);
+
+/// Clear the streamed-segment buffer. Call before starting a new
+/// transcription to discard stale segments from the previous run.
+CRISPASR_SESSION_API void crispasr_reset_streamed_segments(void);
 CRISPASR_SESSION_API void crispasr_params_set_language(whisper_full_params* p, const char* lang);
 CRISPASR_SESSION_API void crispasr_params_set_translate(whisper_full_params* p, int v);
 CRISPASR_SESSION_API void crispasr_params_set_detect_language(whisper_full_params* p, int v);
@@ -135,6 +185,10 @@ CRISPASR_SESSION_API int64_t crispasr_parakeet_result_token_t0(parakeet_result* 
 CRISPASR_SESSION_API int64_t crispasr_parakeet_result_token_t1(parakeet_result* r, int i);
 CRISPASR_SESSION_API float crispasr_parakeet_result_token_p(parakeet_result* r, int i);
 CRISPASR_SESSION_API void crispasr_parakeet_result_free(parakeet_result* r);
+// Issue #214: set the preferred GPU backend name ("cuda", "vulkan",
+// "metal"). Call before any crispasr_session_open*. NULL or "" = auto.
+CRISPASR_SESSION_API void crispasr_set_gpu_backend(const char* name);
+
 CRISPASR_SESSION_API int crispasr_detect_backend_from_gguf(const char* path, char* out_name, int out_cap);
 CRISPASR_SESSION_API crispasr_session* crispasr_session_open_explicit(const char* model_path, const char* backend_name,
                                                                       int n_threads);
@@ -158,8 +212,7 @@ CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe(crispa
 // uses the default. For non-Parakeet backends the chunk params are inert
 // and this behaves exactly like crispasr_session_transcribe[_lang].
 CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe_chunked_lang(
-    crispasr_session* s, const float* pcm, int n_samples, int chunk_seconds, int overlap_seconds,
-    const char* language);
+    crispasr_session* s, const float* pcm, int n_samples, int chunk_seconds, int overlap_seconds, const char* language);
 CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe_chunked(crispasr_session* s, const float* pcm,
                                                                                   int n_samples, int chunk_seconds,
                                                                                   int overlap_seconds);

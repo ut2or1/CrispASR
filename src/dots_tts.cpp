@@ -37,6 +37,7 @@
 
 #include "chatterbox_campplus.h"
 #include "core/activation.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/adaln.h"
 #include "core/attention.h"
 #include "core/audio_resample.h"
@@ -46,6 +47,7 @@
 #include "core/gguf_loader.h"
 #include "core/lstm.h"
 #include "core/wav_reader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include <algorithm>
 #include <cassert>
@@ -1849,7 +1851,7 @@ struct dots_tts_context* dots_tts_init_from_file(const char* path_model, struct 
     const char* cpu_env = std::getenv("CRISPASR_DOTS_TTS_CPU");
     const bool force_cpu = cpu_env && *cpu_env && *cpu_env != '0';
     if (params.use_gpu && !force_cpu) {
-        ctx->backend = ggml_backend_init_best();
+        ctx->backend = crispasr_init_gpu_backend();
         if (!ctx->backend)
             ctx->backend = ctx->backend_cpu;
     } else {
@@ -2035,19 +2037,7 @@ int dots_tts_set_vocoder_path(struct dots_tts_context* ctx, const char* path) {
 static std::vector<float> dots_read_f32(ggml_tensor* t) {
     if (!t)
         return {};
-    const int64_t n = ggml_nelements(t);
-    std::vector<float> out((size_t)n);
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, out.data(), 0, (size_t)n * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> tmp((size_t)n);
-        ggml_backend_tensor_get(t, tmp.data(), 0, (size_t)n * sizeof(ggml_fp16_t));
-        for (int64_t i = 0; i < n; i++)
-            out[(size_t)i] = ggml_fp16_to_fp32(tmp[(size_t)i]);
-    } else {
-        return {};
-    }
-    return out;
+    return core_cpu::to_f32(t); // F32/F16/quantized-safe
 }
 
 // Bind the 3D-Speaker CAM++ tensors from a loaded `dots-tts-soar-spk` GGUF
@@ -2956,7 +2946,7 @@ extern "C" int dots_tts_dit_diff(const char* model_gguf, const char* ref_gguf, i
 extern "C" int dots_tts_vocoder_diff(const char* voc_gguf, const char* ref_gguf, int verbosity) {
     auto* ctx = new dots_tts_context();
     ctx->backend_cpu = ggml_backend_cpu_init();
-    ctx->backend = dots_diff_use_gpu() ? ggml_backend_init_best() : ctx->backend_cpu;
+    ctx->backend = dots_diff_use_gpu() ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
     ctx->params = dots_tts_context_default_params();

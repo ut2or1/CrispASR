@@ -14,6 +14,7 @@
 
 #include "qwen3_asr.h"
 #include "../crisp_audio/include/crisp_audio.h"
+#include "crispasr_imatrix.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1111,6 +1112,7 @@ static void qwen3_asr_build_llm_body(qwen3_asr_context* ctx, ggml_context* ctx0,
 
     cur = ggml_rms_norm(ctx0, cur, eps);
     cur = ggml_mul(ctx0, cur, m.llm.output_norm_w);
+
     cur = ggml_mul_mat(ctx0, m.llm.output_w, cur);
 
     ggml_set_name(cur, "logits");
@@ -1355,6 +1357,7 @@ extern "C" const char* qwen3_asr_token_text(qwen3_asr_context* ctx, int id) {
 // below, granite uses the same primitives, and any future GPT-2-family
 // model gets them for free.
 #include "core/bpe.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1467,8 +1470,8 @@ extern "C" qwen3_asr_context* qwen3_asr_init_from_file(const char* path, qwen3_a
         ctx->model_path = path;
 
     // Try GPU backend first (Metal, CUDA, Vulkan...), fall back to CPU.
-    // ggml_backend_init_best() picks the highest-priority available backend.
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    // crispasr_init_gpu_backend() picks the highest-priority available backend.
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
     ctx->backend_cpu = ggml_backend_cpu_init();
@@ -1557,6 +1560,7 @@ extern "C" qwen3_asr_context* qwen3_asr_init_from_file(const char* path, qwen3_a
         if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
             backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 

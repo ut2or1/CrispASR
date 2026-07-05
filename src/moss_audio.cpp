@@ -5,6 +5,7 @@
 // See moss_audio.h for the full architecture description.
 
 #include "moss_audio.h"
+#include "core/win_compat.h"
 
 #include "core/beam_decode.h"
 
@@ -227,6 +228,16 @@ struct moss_audio_context {
     std::string model_path;
 
     int beam_size = 1; // 1 = greedy (default); >1 = beam search (§167g)
+
+    // Encoder attention path (issue #215). flash_attn_ext is fast on
+    // CPU/Metal/CUDA but segfaults on Vulkan during graph/command-pool cleanup —
+    // its split-k / mask-opt resource path mismanages command buffers. On Vulkan
+    // the encoder falls back to the manual mul_mat + soft_max_ext + mul_mat path
+    // (mathematically identical, same op sequence the LLM decode runs safely on
+    // Vulkan). Baked into the §176s cached encoder graph at first build.
+    //   CRISPASR_MOSS_AUDIO_ENC_FLASH=1  → force flash_attn_ext everywhere
+    //   CRISPASR_MOSS_AUDIO_ENC_MANUAL=1 → force the manual path everywhere
+    bool enc_use_flash = true;
 };
 
 // ===========================================================================
@@ -241,6 +252,13 @@ static ggml_tensor* try_get(moss_audio_model& m, const char* name) {
 
 static ggml_tensor* require(moss_audio_model& m, const char* name) {
     return core_gguf::require(m.tensors, name, "moss_audio");
+}
+
+static bool backend_is_vulkan(ggml_backend_t b) {
+    if (!b)
+        return false;
+    const char* name = ggml_backend_name(b);
+    return name && std::strncmp(name, "Vulkan", 6) == 0;
 }
 
 // ===========================================================================
@@ -758,10 +776,22 @@ static ggml_cgraph* moss_audio_build_encoder_graph(moss_audio_context* ctx, int 
         // path with ggml_flash_attn_ext. Bidirectional encoder — mask handles
         // padding positions. Scale is embedded in the op.
         float attn_scale = 1.0f / std::sqrt((float)head_dim);
-        ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, attn_mask, attn_scale, 0.0f, 0.0f);
-
-        // flash_attn_ext output: (hd, T, n_h) → reshape to (d, T)
-        attn = ggml_reshape_2d(ctx0, attn, d, T_down);
+        ggml_tensor* attn;
+        if (ctx->enc_use_flash) {
+            // flash_attn_ext output: (hd, n_h, T) → reshape to (d, T)
+            attn = ggml_flash_attn_ext(ctx0, Q, K, V, attn_mask, attn_scale, 0.0f, 0.0f);
+            attn = ggml_reshape_2d(ctx0, attn, d, T_down);
+        } else {
+            // Manual masked-softmax attention (Vulkan-safe, issue #215). Produces
+            // the identical (hd, n_h, T) → (d, T) layout as flash_attn_ext above.
+            // Q,K,V are (hd, T, n_h) contiguous.
+            ggml_tensor* scores = ggml_mul_mat(ctx0, K, Q);                           // (T_k, T_q, n_h)
+            scores = ggml_soft_max_ext(ctx0, scores, attn_mask, attn_scale, 0.0f);    // mask over T_k
+            ggml_tensor* V_perm = ggml_cont(ctx0, ggml_permute(ctx0, V, 1, 0, 2, 3)); // (T_k, hd, n_h)
+            attn = ggml_mul_mat(ctx0, V_perm, scores);                                // (hd, T_q, n_h)
+            attn = ggml_cont(ctx0, ggml_permute(ctx0, attn, 0, 2, 1, 3));             // (hd, n_h, T_q)
+            attn = ggml_reshape_2d(ctx0, attn, d, T_down);
+        }
 
         // Output projection
         ggml_tensor* attn_out = ggml_mul_mat(ctx0, blk.attn_o_w, attn);
@@ -871,6 +901,15 @@ extern "C" float* moss_audio_run_encoder(struct moss_audio_context* ctx, const f
     const auto& hp = ctx->model.hparams;
     const int d = (int)hp.enc_d_model;
     const bool want_ds = (ds_tap_0 || ds_tap_1 || ds_tap_2);
+
+    // Invalidate the §176s cached encoder graph across invocations (#215).
+    // Reuse within the chunk loop below stays safe (identical allocs, no
+    // gallocr regrow in between), but a graph cached across invocations
+    // keeps tensor->buffer pointers into gallocr buffers that the larger
+    // ds/decoder graphs have since freed — a use-after-free at the next
+    // sched_alloc_graph, and driver-heap corruption on native Vulkan (the
+    // moss-transcribe sibling of this bug is ASan-verified).
+    ctx->cached_enc_T_mel = 0;
 
     // ---- Chunked encoder processing ----
     // The Python reference splits the mel into chunks of chunk_frames=400,
@@ -1417,6 +1456,7 @@ static float* moss_audio_run_llm_prefill_with_deepstack(moss_audio_context* ctx,
 // ===========================================================================
 
 #include "core/bpe.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 extern "C" int moss_audio_tokenize(struct moss_audio_context* ctx, const char* text, int32_t* out_tokens,
                                    int max_tokens) {
@@ -2081,14 +2121,44 @@ extern "C" struct moss_audio_context* moss_audio_init_from_file(const char* path
     ctx->model_path = path_model;
 
     // Backend selection
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
     ctx->backend_cpu = ggml_backend_cpu_init();
     if (ctx->backend_cpu)
         ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+
+    // #215 resolved: the native-Vulkan segfault was a use-after-free in the
+    // encoder graph cached across invocations (see moss_audio_run_encoder);
+    // the GPU is the default again on all Vulkan drivers.
+    // CRISPASR_MOSS_AUDIO_FORCE_CPU=1 remains as an escape hatch.
+    {
+        const char* force_cpu = std::getenv("CRISPASR_MOSS_AUDIO_FORCE_CPU");
+        if (force_cpu && force_cpu[0] == '1')
+            ctx->backend = ctx->backend_cpu;
+    }
     if (ggml_backend_is_cpu(ctx->backend))
         ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+
+    // Encoder attention path (issue #215). On Vulkan the encoder uses the manual
+    // soft_max_ext attention rather than flash_attn_ext (avoids the FA split-k /
+    // mask-opt resource path).
+    {
+        const char* force_flash = std::getenv("CRISPASR_MOSS_AUDIO_ENC_FLASH");
+        const char* force_manual = std::getenv("CRISPASR_MOSS_AUDIO_ENC_MANUAL");
+        if (force_flash && force_flash[0] == '1') {
+            ctx->enc_use_flash = true;
+        } else if (force_manual && force_manual[0] == '1') {
+            ctx->enc_use_flash = false;
+        } else {
+            ctx->enc_use_flash = !backend_is_vulkan(ctx->backend);
+        }
+        if (!ctx->enc_use_flash && backend_is_vulkan(ctx->backend)) {
+            fprintf(stderr, "moss_audio: Vulkan backend detected — encoder using manual "
+                            "soft_max_ext attention (flash_attn_ext segfaults on Vulkan, issue #215; "
+                            "set CRISPASR_MOSS_AUDIO_ENC_FLASH=1 to override)\n");
+        }
+    }
 
     // Load model
     if (!moss_audio_load_model(ctx->model, ctx->vocab, path_model, ctx->backend)) {

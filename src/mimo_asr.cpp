@@ -42,8 +42,10 @@
 #include "core/bpe.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -377,7 +379,7 @@ extern "C" struct mimo_asr_context* mimo_asr_init_from_file(const char* path_mod
     // Set CRISPASR_MIMO_FORCE_CPU=1 to override back to CPU-only.
     const bool force_cpu = std::getenv("CRISPASR_MIMO_FORCE_CPU") != nullptr;
     if (params.use_gpu && !force_cpu) {
-        ctx->backend = ggml_backend_init_best();
+        ctx->backend = crispasr_init_gpu_backend();
         if (!ctx->backend) {
             fprintf(stderr, "mimo_asr: GPU backend init failed; falling back to CPU\n");
             ctx->backend = ctx->backend_cpu;
@@ -545,6 +547,7 @@ extern "C" struct mimo_asr_context* mimo_asr_init_from_file(const char* path_mod
         if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
             backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 

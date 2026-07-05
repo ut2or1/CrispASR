@@ -96,6 +96,11 @@ constexpr Entry k_registry[] = {
     {"qwen3-1.7b", "qwen3-asr-1.7b-q4_k.gguf",
      "https://huggingface.co/cstr/qwen3-asr-1.7b-GGUF/resolve/main/qwen3-asr-1.7b-q4_k.gguf",
      "~1.3 GB", nullptr, nullptr},
+    // Qwen3-ASR-1.7B fine-tuned for Japanese anime/galgame speech (Apache-2.0).
+    // Same architecture as qwen3-1.7b; uses the standard qwen3 backend.
+    {"qwen3-ja-anime", "qwen3-asr-1.7b-ja-anime-q4_k.gguf",
+     "https://huggingface.co/cstr/qwen3-asr-1.7b-ja-anime-GGUF/resolve/main/qwen3-asr-1.7b-ja-anime-q4_k.gguf",
+     "~1.3 GB", nullptr, nullptr},
     // higgs-audio-v3-stt: Whisper-large-v3 encoder + Qwen3-1.7B decoder (Apache-2.0).
     {"higgs-stt", "higgs-stt-q4_k.gguf",
      "https://huggingface.co/cstr/higgs-audio-v3-stt-GGUF/resolve/main/higgs-stt-q4_k.gguf",
@@ -308,6 +313,124 @@ constexpr Entry k_registry[] = {
     {"fastconformer-ctc", "stt-en-fastconformer-ctc-large-q4_k.gguf",
      "https://huggingface.co/cstr/stt-en-fastconformer-ctc-large-GGUF/resolve/main/stt-en-fastconformer-ctc-large-q4_k.gguf",
      "~83 MB", nullptr, nullptr},
+    // FastConformer-CTC models double as compact CTC forced aligners
+    // (-am <name>): the GGUF arch tag is canary-ctc, so crispasr_aligner's
+    // default dispatch loads them directly. The *-aligner-* aliases below
+    // mirror the wav2vec2-aligner-<lang> naming for discoverability.
+    {"fastconformer-aligner", "stt-en-fastconformer-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-en-fastconformer-ctc-large-GGUF/resolve/main/stt-en-fastconformer-ctc-large-q4_k.gguf",
+     "~83 MB", nullptr, nullptr},
+    {"fastconformer-aligner-en", "stt-en-fastconformer-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-en-fastconformer-ctc-large-GGUF/resolve/main/stt-en-fastconformer-ctc-large-q4_k.gguf",
+     "~83 MB", nullptr, nullptr},
+    // CTC branches of the nvidia/stt_*_fastconformer_hybrid_large[_pc] fleet
+    // (all CC-BY-4.0; pt is excluded upstream-NC): per-language ASR + forced
+    // alignment, ~82 MB q4_k each. _pc variants add punctuation/capitalisation
+    // (fa and kk-ru are non-pc). en-pc complements the uncased en standalone.
+    {"fastconformer-ctc-en-pc", "stt-en-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-en-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-en-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-en-pc", "stt-en-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-en-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-en-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-es", "stt-es-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-es-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-es-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-es", "stt-es-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-es-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-es-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-fr", "stt-fr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-fr-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-fr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-fr", "stt-fr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-fr-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-fr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-it", "stt-it-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-it-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-it-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-it", "stt-it-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-it-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-it-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-nl", "stt-nl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-nl-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-nl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-nl", "stt-nl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-nl-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-nl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-pl", "stt-pl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-pl-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-pl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-pl", "stt-pl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-pl-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-pl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-ru", "stt-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ru-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-ru", "stt-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ru-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-ua", "stt-ua-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ua-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ua-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-ua", "stt-ua-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ua-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ua-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-hr", "stt-hr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-hr-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-hr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-hr", "stt-hr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-hr-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-hr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-be", "stt-be-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-be-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-be-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-be", "stt-be-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-be-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-be-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-ar", "stt-ar-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ar-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ar-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-ar", "stt-ar-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ar-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ar-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-fa", "stt-fa-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-fa-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-fa-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-fa", "stt-fa-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-fa-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-fa-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-ka", "stt-ka-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ka-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ka-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-ka", "stt-ka-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ka-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ka-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-hy", "stt-hy-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-hy-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-hy-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-hy", "stt-hy-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-hy-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-hy-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-uz", "stt-uz-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-uz-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-uz-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-uz", "stt-uz-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-uz-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-uz-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-kk-ru", "stt-kk-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-kk-ru-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-kk-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-kk-ru", "stt-kk-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-kk-ru-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-kk-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    // CTC branch of nvidia/stt_de_fastconformer_hybrid_large_pc (CC-BY-4.0):
+    // German ASR + forced alignment with punctuation/capitalisation.
+    {"fastconformer-ctc-de", "stt-de-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-de-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-de-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~78 MB", nullptr, nullptr},
+    {"fastconformer-aligner-de", "stt-de-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-de-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-de-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~78 MB", nullptr, nullptr},
     // nvidia/parakeet-ctc-{0.6b,1.1b} — same FastConformer-CTC architecture
     // as the stt_en_fastconformer_ctc_* family (24 / 42 layers respectively),
     // English-only, lowercase + light-punct output. Filename heuristic
@@ -329,15 +452,16 @@ constexpr Entry k_registry[] = {
     {"titanet", "titanet-large.gguf",
      "https://huggingface.co/cstr/titanet-large-GGUF/resolve/main/titanet-large.gguf",
      "~45 MB", nullptr, nullptr},
-    // parakeet-ja: F16 is the auto-download default — Q4_K of this
+    // parakeet-ja: Q8_0 is the auto-download default — its TDT output is
+    // byte-identical to F16 in our tests at half the size. Q4_K of this
     // model is quantisation-sensitive (joint.pred / decoder.embed
-    // dimensions fall back to q4_0 inside q4_k mode) and the talker
-    // enters a fixed-point loop after ~8 tokens. The Q4_K file is
-    // available at the same repo for users who pin disk space, but
-    // we'd rather have correct output by default.
-    {"parakeet-ja", "parakeet-tdt-0.6b-ja.gguf",
-     "https://huggingface.co/cstr/parakeet-tdt-0.6b-ja-GGUF/resolve/main/parakeet-tdt-0.6b-ja.gguf",
-     "~1.24 GB", nullptr, nullptr},
+    // dimensions fall back to q4_0 inside q4_k mode) and the TDT decode
+    // enters a fixed-point repetition loop; CTC decode over the same q4_k
+    // file is clean (--parakeet-decoder ctc). All files at the repo carry
+    // the hybrid model's CTC head since 2026-07 (#89 / #221d).
+    {"parakeet-ja", "parakeet-tdt-0.6b-ja-q8_0.gguf",
+     "https://huggingface.co/cstr/parakeet-tdt-0.6b-ja-GGUF/resolve/main/parakeet-tdt-0.6b-ja-q8_0.gguf",
+     "~710 MB", nullptr, nullptr},
     // parakeet-v2 — English-only TDT (1024-vocab BPE, pred_layers=2).
     // The original Open ASR Leaderboard topper before v3 spread capacity
     // to 25 languages; often stronger on plain English. Same FastConformer
@@ -679,6 +803,11 @@ constexpr Entry k_registry[] = {
     {"m2m100", "m2m100-418m-q8_0.gguf",
      "https://huggingface.co/cstr/m2m100-418m-GGUF/resolve/main/m2m100-418m-q8_0.gguf",
      "~502 MB", nullptr, nullptr},
+    // f16 build — exact HF translation parity (q8_0 has rare quant-floor
+    // decode flips on borderline words). Same faithful SP-BPE tokenizer.
+    {"m2m100-f16", "m2m100-418m-f16.gguf",
+     "https://huggingface.co/cstr/m2m100-418m-GGUF/resolve/main/m2m100-418m-f16.gguf",
+     "~980 MB", nullptr, nullptr},
     // WMT21 dense-24-wide-en-x (facebook, MIT) — same m2m100
     // architecture as the 418M base, scaled up to 4.7B params and
     // narrower in coverage (English → 7 target languages, won the

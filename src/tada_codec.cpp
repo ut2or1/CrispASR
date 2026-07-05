@@ -18,7 +18,9 @@
 
 #include "tada_codec.h"
 #include "core/conv.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -283,15 +285,8 @@ static void precompute_all_inv_alphas(tada_codec_context* c) {
     // Fill each with 1/alpha
     for (auto& p : pairs) {
         int64_t n = ggml_nelements(p.src);
-        std::vector<float> a(n), inv(n);
-        if (p.src->type == GGML_TYPE_F16) {
-            std::vector<ggml_fp16_t> tmp(n);
-            ggml_backend_tensor_get(p.src, tmp.data(), 0, n * sizeof(ggml_fp16_t));
-            for (int64_t i = 0; i < n; i++)
-                a[i] = ggml_fp16_to_fp32(tmp[i]);
-        } else {
-            ggml_backend_tensor_get(p.src, a.data(), 0, n * sizeof(float));
-        }
+        std::vector<float> a = core_cpu::to_f32(p.src); // F32/F16/quantized-safe
+        std::vector<float> inv(n);
         for (int64_t i = 0; i < n; i++)
             inv[i] = 1.0f / (a[i] + 1e-12f);
         ggml_backend_tensor_set(*p.dst, inv.data(), 0, n * sizeof(float));
@@ -688,7 +683,7 @@ static tada_codec_context* tada_codec_init_from_file_impl(const char* path, int 
             return nullptr;
         }
         ggml_backend_cpu_set_n_threads(c->backend_cpu, n_threads);
-        c->backend = use_gpu ? ggml_backend_init_best() : c->backend_cpu;
+        c->backend = use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
         if (!c->backend)
             c->backend = c->backend_cpu;
     }

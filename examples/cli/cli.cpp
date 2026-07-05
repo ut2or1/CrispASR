@@ -10,6 +10,7 @@
 #include "crispasr_speaker_embedder.h" // pluggable speaker embedder (#107 P3)
 #include "crispasr_stream_punc.h"      // streaming punctuation mode helpers (#112)
 #include "crispasr_cache.h"            // crispasr_cache::ensure_cached_file (for --hf-repo, #128)
+#include "core/gpu_backend_pref.h"     // crispasr_set_gpu_backend_pref (#214)
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
 #include "crispasr_output.h"   // crispasr_make_disp_segments — split-on-punct (#29)
@@ -573,6 +574,18 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.make_ref_aligner = ARGV_NEXT;
     } else if (arg == "--make-ref-encoder") {
         params.make_ref_encoder = ARGV_NEXT;
+    } else if (arg == "--align") {
+        params.align = true;
+    } else if (arg == "--align-output") {
+        params.align_output = ARGV_NEXT;
+    } else if (arg == "--align-format") {
+        params.align_format = ARGV_NEXT;
+    } else if (arg == "--align-only") {
+        params.align_only = true;
+    } else if (arg == "--align-granularity") {
+        params.align_granularity = ARGV_NEXT;
+    } else if (arg == "--text-file") {
+        params.text_file = ARGV_NEXT;
     } else if (arg == "--instruct") {
         params.tts_instruct = ARGV_NEXT;
     } else if (arg == "--voice-dir") {
@@ -1136,7 +1149,19 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(
         stderr,
         "             --make-ref                create a TADA voice reference GGUF (with --voice <audio.wav>\n"
-        "                                                 --ref-text \"transcript\" [--make-ref-output path.gguf])\n");
+        "                                                 --ref-text \"transcript\" [--make-ref-output path.gguf])\n"
+        "                                       (TADA also clones inline: --tts \"…\" --voice ref.wav --ref-text "
+        "\"…\")\n");
+    fprintf(stderr,
+            "             --align                   forced-alignment word timestamps via the TADA aligner\n"
+            "                                                 (--voice <audio.wav> --ref-text \"transcript\"\n"
+            "                                                 [--align-format srt|json|plain] [--align-output f])\n"
+            "             --align-only              standalone CTC forced alignment (issue #217)\n"
+            "                                                 (-am <aligner.gguf> -f <audio> --ref-text \"text\"\n"
+            "                                                 or --text-file <file.txt|file.srt>)\n"
+            "             --align-granularity G     [auto   ] align-only output units: auto|word|segment\n"
+            "                                                 (segment = re-timed input SRT cues / .txt lines;\n"
+            "                                                 auto = segment for .srt input, word otherwise)\n");
     fprintf(stderr,
             "             --codec-model FNAME      codec / companion GGUF (defaults to sibling/cache/registry)\n");
     fprintf(stderr, "             --codec-quant Q          [%-7s] preferred quant for registry companion resolution\n",
@@ -2028,6 +2053,12 @@ int main(int argc, char** argv) {
 
     if (params.use_gpu && params.gpu_backend != "cpu") {
         ggml_backend_load_all();
+        // Issue #214 — propagate --gpu-backend preference so every
+        // backend's init picks the right GPU device instead of the
+        // highest-priority one (CUDA over Vulkan).
+        if (!params.gpu_backend.empty()) {
+            crispasr_set_gpu_backend_pref(params.gpu_backend.c_str());
+        }
     }
 
     // Issue #128 — resolve --hf-repo / --hf-file early, before any
@@ -2119,7 +2150,14 @@ int main(int argc, char** argv) {
         return crispasr_run_backend(params);
     }
 
-    if (params.fname_inp.empty() && !params.stream && params.tts_text.empty() && params.text_input.empty()) {
+    // Issue #217: --align-only is a standalone verb that needs only an aligner
+    // model + audio + text — no ASR backend.
+    if (params.align_only) {
+        return crispasr_run_backend(params);
+    }
+
+    if (params.fname_inp.empty() && !params.stream && params.tts_text.empty() && params.text_input.empty() &&
+        !params.make_ref && !params.align) {
         fprintf(stderr, "error: no input files specified\n");
         whisper_print_usage(argc, argv, params);
         return 2;
