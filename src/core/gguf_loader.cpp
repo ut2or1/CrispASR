@@ -939,6 +939,19 @@ bool load_weights_split(const char* path, ggml_backend_t gpu_backend, ggml_backe
                 continue;
             const size_t off = gguf_get_tensor_offset(gctx, tid);
             const size_t nbytes = ggml_nbytes(t);
+            // Bounds check (mirrors load_weights' mmap paths): a crafted/truncated
+            // GGUF whose tensor offset+size runs past the mapping would SIGBUS, or
+            // copy adjacent memory into the tensor buffer (info leak). This split
+            // mmap path was the only one of the four missing the guard.
+            if (data_off + off + nbytes > mf.size) {
+                fprintf(stderr,
+                        "%s: split mmap path: tensor '%s' exceeds file bounds "
+                        "(off=%zu + nbytes=%zu > file_size=%zu) — file truncated?\n",
+                        tag, ggml_get_name(t), data_off + off, nbytes, mf.size);
+                free_weights(out);
+                gguf_free(gctx);
+                return false;
+            }
             ggml_backend_tensor_set(t, (const char*)mf.base + data_off + off, 0, nbytes);
         }
     }

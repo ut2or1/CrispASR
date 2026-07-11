@@ -10,7 +10,10 @@
 // `ma_decoder` stream. Ogg Vorbis is handled by stb_vorbis (include it
 // header-only before miniaudio so MA_HAS_VORBIS is auto-defined). Opus is added
 // as a miniaudio custom backend (libopus/opusfile, CRISPASR_HAVE_OPUS; see
-// below), and AAC/M4A/ALAC/CAF fall back to AudioToolbox on Apple. All
+// below). Raw ADTS AAC-LC (.aac) is decoded by the in-tree glint clean-room
+// decoder — cross-platform and always available, no runtime library (gated by
+// CRISPASR_AAC_DECODER, glint primary); container AAC (M4A/ALAC/CAF) still
+// falls back to fdk-aac (dlopen) or AudioToolbox on Apple. All
 // permissive-licensed; ffmpeg stays an optional dynamic fallback only.
 
 // On Windows, include Media Foundation headers BEFORE miniaudio /
@@ -71,6 +74,10 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+// In-tree glint clean-room codec suite — used here for always-available,
+// cross-platform AAC-LC (ADTS) decode of raw .aac input (public C ABI only).
+#include <glint/glint.h>
 
 // Optional .opus (Ogg/Opus) support via libopus + opusfile (BSD-3-Clause),
 // wired in as a miniaudio custom decoding backend so .opus flows through the
@@ -282,22 +289,36 @@ int crispasr_au_decode(const char* path, int want_channels, float** out_buf, int
         return -2; // unsupported encoding
     }
 
+    // Determine the real file size up front so an untrusted data_offset /
+    // data_size can never drive an out-of-bounds seek or an unbounded
+    // allocation. Without this, a crafted .snd with data_size ≈ 4 GB in a
+    // tiny file forces a ~4 GB `raw` allocation (memory-exhaustion DoS /
+    // unhandled bad_alloc), and a data_offset past EOF makes the old
+    // `end - cur` underflow into a huge size_t.
+    if (std::fseek(f, 0, SEEK_END) != 0) {
+        std::fclose(f);
+        return -2;
+    }
+    long file_end = std::ftell(f);
+    if (file_end < 0 || (uint64_t)data_offset > (uint64_t)file_end) {
+        std::fclose(f);
+        return -2;
+    }
+
     // Seek to data
     if (std::fseek(f, (long)data_offset, SEEK_SET) != 0) {
         std::fclose(f);
         return -2;
     }
 
-    // Determine actual data size
+    // Determine actual data size — always clamped to the bytes the file
+    // really holds past data_offset, whatever the header claims.
+    size_t avail = (size_t)(file_end - (long)data_offset);
     size_t actual_size;
     if (data_size != 0xFFFFFFFFu && data_size != 0) {
-        actual_size = data_size;
+        actual_size = ((size_t)data_size < avail) ? (size_t)data_size : avail;
     } else {
-        long cur = std::ftell(f);
-        std::fseek(f, 0, SEEK_END);
-        long end = std::ftell(f);
-        std::fseek(f, cur, SEEK_SET);
-        actual_size = (size_t)(end - cur);
+        actual_size = avail;
     }
 
     size_t frame_size = (size_t)bytes_per_sample * file_ch;
@@ -610,11 +631,14 @@ int crispasr_amr_decode(const char* path, int want_channels, float** out_buf, in
 // ── WebM/Matroska Opus|Vorbis demux (inline EBML parser, no deps) ───────────
 // Minimal EBML parser extracts Opus or Vorbis codec data from WebM/Matroska
 // containers, then feeds the extracted Ogg stream to the existing
-// libopus (via opusfile) or stb_vorbis decoders. This covers browser-recorded
-// audio (MediaRecorder → WebM/Opus) and Matroska files with Opus/Vorbis tracks.
-// No external dependencies beyond what we already link (libopus, stb_vorbis).
+// in-tree glint Opus decoder (or libopus when pinned) and stb_vorbis. This
+// covers browser-recorded audio (MediaRecorder → WebM/Opus) and Matroska files
+// with Opus/Vorbis tracks. No external dependency — glint + stb_vorbis are
+// in-tree; libopus is an optional fallback (built with CRISPASR_OPUS, selected
+// via CRISPASR_OPUS_DECODER=libopus).
 #if defined(CRISPASR_HAVE_OPUS)
-#include <opusfile.h>
+#include <opusfile.h> // only for the optional libopus fallback path
+#endif
 
 namespace {
 
@@ -846,6 +870,12 @@ static std::vector<OpusPacket> parse_block_packets(const uint8_t* block_data, si
         if (n_frames <= 0 || br.remaining() == 0)
             return packets;
         size_t frame_size = br.remaining() / (size_t)n_frames;
+        // A zero-size fixed frame is meaningless and makes the loop below emit
+        // n_frames (up to 256) empty packets while br.skip(0) never advances —
+        // a crafted cluster of tiny blocks amplifies that into billions of
+        // empty vectors (OOM DoS). Reject it.
+        if (frame_size == 0)
+            return packets;
         for (int i = 0; i < n_frames && br.remaining() >= frame_size; ++i) {
             packets.push_back({br.ptr(), frame_size});
             br.skip(frame_size);
@@ -1034,6 +1064,11 @@ int crispasr_webm_decode(const char* path, int want_channels, float** out_buf, i
                     for (auto& p : pkts) {
                         opus_packets.emplace_back(p.data, p.data + p.size);
                     }
+                    // Defense-in-depth cap: a valid Opus packet occupies >=1 byte
+                    // of the file, so the packet count can never legitimately
+                    // exceed the file size — bail rather than accumulate forever.
+                    if (opus_packets.size() > file_data.size())
+                        return -2;
                 } else if (bid == EBML_BLOCK_GROUP) {
                     // Find Block element inside BlockGroup
                     EBMLReader bg(r.data, block_end);
@@ -1051,6 +1086,8 @@ int crispasr_webm_decode(const char* path, int want_channels, float** out_buf, i
                             for (auto& p : pkts) {
                                 opus_packets.emplace_back(p.data, p.data + p.size);
                             }
+                            if (opus_packets.size() > file_data.size())
+                                return -2;
                         }
                         bg.pos = bg_elem_end;
                     }
@@ -1066,8 +1103,6 @@ int crispasr_webm_decode(const char* path, int want_channels, float** out_buf, i
 
     // Decode the extracted packets
     if (is_opus) {
-        // Use libopus directly to decode packets
-        int opus_err = 0;
         int ch = audio_track.channels > 0 ? audio_track.channels : 2;
         if (ch > 2)
             ch = 2;
@@ -1084,22 +1119,45 @@ int crispasr_webm_decode(const char* path, int want_channels, float** out_buf, i
                 ch = 2;
         }
 
-        OpusDecoder* opus_dec = opus_decoder_create(48000, ch, &opus_err);
-        if (!opus_dec || opus_err != OPUS_OK)
-            return -2;
-
         std::vector<float> pcm_all;
         // Opus decodes at 48 kHz natively
         const int max_frame = 5760 * ch; // max 120ms at 48kHz
         std::vector<float> frame_buf((size_t)max_frame);
 
-        for (auto& pkt : opus_packets) {
-            int n = opus_decode_float(opus_dec, pkt.data(), (opus_int32)pkt.size(), frame_buf.data(), 5760, 0);
-            if (n > 0) {
-                pcm_all.insert(pcm_all.end(), frame_buf.data(), frame_buf.data() + n * ch);
+        // Decode the packets. Default: the in-tree glint packet decoder
+        // (RFC-conformant, no libopus). CRISPASR_OPUS_DECODER=libopus selects
+        // libopus (only when built with CRISPASR_OPUS).
+        bool use_libopus = false;
+#if defined(CRISPASR_HAVE_OPUS)
+        if (const char* pref = std::getenv("CRISPASR_OPUS_DECODER"))
+            use_libopus = pref[0] && std::strcmp(pref, "glint") != 0 && std::strcmp(pref, "auto") != 0;
+#endif
+        if (use_libopus) {
+#if defined(CRISPASR_HAVE_OPUS)
+            int opus_err = 0;
+            OpusDecoder* opus_dec = opus_decoder_create(48000, ch, &opus_err);
+            if (!opus_dec || opus_err != OPUS_OK)
+                return -2;
+            for (auto& pkt : opus_packets) {
+                int n = opus_decode_float(opus_dec, pkt.data(), (opus_int32)pkt.size(), frame_buf.data(), 5760, 0);
+                if (n > 0)
+                    pcm_all.insert(pcm_all.end(), frame_buf.data(), frame_buf.data() + n * ch);
             }
+            opus_decoder_destroy(opus_dec);
+#endif
+        } else {
+            if (const char* e = std::getenv("CRISPASR_OPUS_DEBUG"); e && e[0] && e[0] != '0')
+                std::fprintf(stderr, "[glint-webm-opus] %zu packets, %d ch @ 48000\n", opus_packets.size(), ch);
+            glint_opus_dec_t gdec = glint_opus_dec_create(ch, 48000);
+            if (!gdec)
+                return -2;
+            for (auto& pkt : opus_packets) {
+                int n = glint_opus_decode(gdec, pkt.data(), (int)pkt.size(), frame_buf.data(), 5760);
+                if (n > 0)
+                    pcm_all.insert(pcm_all.end(), frame_buf.data(), frame_buf.data() + n * ch);
+            }
+            glint_opus_dec_destroy(gdec);
         }
-        opus_decoder_destroy(opus_dec);
 
         if (pcm_all.empty())
             return -2;
@@ -1399,7 +1457,6 @@ int crispasr_webm_decode(const char* path, int want_channels, float** out_buf, i
     }
 }
 } // namespace
-#endif // CRISPASR_HAVE_OPUS
 
 // ── M4A/AAC decode via fdk-aac (runtime dlopen, MIT-clean) ──────────────────
 // Minimal ISOBMFF (MP4/M4A) parser extracts AudioSpecificConfig + raw AAC
@@ -1806,6 +1863,13 @@ static bool mp4_parse_audio(const uint8_t* data, size_t data_size, MP4AudioInfo&
                     if (bstart + 12 <= bend) {
                         uint32_t uniform_size = mp4_be32(data + bstart + 4);
                         uint32_t count = mp4_be32(data + bstart + 8);
+                        // Clamp the untrusted count so a crafted box can't drive a
+                        // multi-GB resize(): the non-uniform table needs 4 bytes per
+                        // entry (bounded by the box), and even a uniform table can't
+                        // describe more samples than the file has bytes.
+                        size_t max_count = (uniform_size != 0) ? data_size : (bend - (bstart + 12)) / 4;
+                        if (count > max_count)
+                            count = (uint32_t)max_count;
                         info.sample_sizes.resize(count);
                         if (uniform_size != 0) {
                             for (uint32_t i = 0; i < count; ++i)
@@ -1819,6 +1883,10 @@ static bool mp4_parse_audio(const uint8_t* data, size_t data_size, MP4AudioInfo&
                     // Chunk offset box (32-bit): version(4) + count(4) + [offsets]
                     if (bstart + 8 <= bend) {
                         uint32_t count = mp4_be32(data + bstart + 4);
+                        // Clamp: 4 bytes per offset, bounded by the box's remaining bytes.
+                        size_t max_count = (bend - (bstart + 8)) / 4;
+                        if (count > max_count)
+                            count = (uint32_t)max_count;
                         info.chunk_offsets.resize(count);
                         for (uint32_t i = 0; i < count && bstart + 8 + (i + 1) * 4 <= bend; ++i)
                             info.chunk_offsets[i] = mp4_be32(data + bstart + 8 + i * 4);
@@ -1827,6 +1895,10 @@ static bool mp4_parse_audio(const uint8_t* data, size_t data_size, MP4AudioInfo&
                     // Chunk offset box (64-bit): version(4) + count(4) + [offsets]
                     if (bstart + 8 <= bend) {
                         uint32_t count = mp4_be32(data + bstart + 4);
+                        // Clamp: 8 bytes per offset, bounded by the box's remaining bytes.
+                        size_t max_count = (bend - (bstart + 8)) / 8;
+                        if (count > max_count)
+                            count = (uint32_t)max_count;
                         info.chunk_offsets.resize(count);
                         for (uint32_t i = 0; i < count && bstart + 8 + (i + 1) * 8 <= bend; ++i)
                             info.chunk_offsets[i] = mp4_be64(data + bstart + 8 + i * 8);
@@ -1983,7 +2055,10 @@ int crispasr_m4a_decode(const char* path, int want_channels, float** out_buf, in
         for (size_t i = 0; i < mp4info.sample_sizes.size(); ++i) {
             uint64_t off = (i < sample_offsets.size()) ? sample_offsets[i] : 0;
             uint32_t sz = mp4info.sample_sizes[i];
-            if (off + sz > file_data.size())
+            // Overflow-safe bounds check: `off + sz` can wrap in uint64 for a
+            // co64 offset near UINT64_MAX, defeating the guard and yielding a
+            // wild `file_data.data() + off` pointer. Compare subtractively.
+            if (off > file_data.size() || sz > file_data.size() - off)
                 continue;
 
             FDK_UCHAR* in_ptr = file_data.data() + off;
@@ -2354,6 +2429,280 @@ int crispasr_ndk_decode(const char* path, int want_channels, float** out_buf, in
 ///   -2 decoder init failed (unsupported format or read error)
 ///   -3 allocation failed
 ///   -4 decode of a chunk failed mid-stream
+namespace {
+
+// ── glint ADTS AAC-LC decoder (cross-platform, no runtime dependency) ────────
+// Always-available AAC-LC decode for raw ADTS (.aac) via the in-tree glint
+// clean-room decoder (public C ABI). This is the PRIMARY path for raw AAC on
+// every platform, replacing the previously platform-specific chain
+// (fdk-aac dlopen on Linux/Windows, AudioToolbox on Apple) which required an
+// optional runtime library. glint's AAC-LC decoder matches ffmpeg and Apple
+// CoreAudio at 86–135 dB.
+//
+// Gated per the A/B convention: set CRISPASR_AAC_DECODER=fdk|coreaudio|os to
+// pin the old platform decoder (glint returns -2, caller falls through);
+// =glint|auto|unset keeps glint primary. On any glint failure we also return
+// -2 so the existing fallback chain still runs — the working path is never
+// removed. CRISPASR_AAC_DEBUG=1 prints a one-line decode summary.
+//
+// Signature matches the loader's other fallbacks (and the stereo
+// split_fallback lambda): returns 0 with a malloc-owned 16 kHz mono f32 buffer,
+// or a negative error. MP4/M4A/ALAC/CAF are NOT ADTS and are left to the
+// container-aware decoders.
+int crispasr_adts_decode_glint(const char* path, int want_channels, float** out_buf, int* out_frames,
+                               int* out_channels) {
+    (void)want_channels; // 16 kHz ASR path is mono; downmix here
+
+    if (const char* pref = std::getenv("CRISPASR_AAC_DECODER")) {
+        if (pref[0] && std::strcmp(pref, "glint") != 0 && std::strcmp(pref, "auto") != 0)
+            return -2; // user pinned a non-glint decoder
+    }
+    const bool dbg = [] {
+        const char* e = std::getenv("CRISPASR_AAC_DEBUG");
+        return e && e[0] && e[0] != '0';
+    }();
+
+    FILE* f = std::fopen(path, "rb");
+    if (!f)
+        return -2;
+    std::fseek(f, 0, SEEK_END);
+    long fsize = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (fsize <= 2 || fsize > 500 * 1024 * 1024) {
+        std::fclose(f);
+        return -2;
+    }
+    std::vector<uint8_t> buf((size_t)fsize);
+    if (std::fread(buf.data(), 1, (size_t)fsize, f) != (size_t)fsize) {
+        std::fclose(f);
+        return -2;
+    }
+    std::fclose(f);
+
+    // Skip a leading ID3v2 tag if present (our own AAC writer prepends one).
+    size_t pos = 0;
+    if (buf.size() > 10 && buf[0] == 'I' && buf[1] == 'D' && buf[2] == '3') {
+        size_t tag = ((size_t)(buf[6] & 0x7f) << 21) | ((size_t)(buf[7] & 0x7f) << 14) |
+                     ((size_t)(buf[8] & 0x7f) << 7) | (size_t)(buf[9] & 0x7f);
+        pos = 10 + tag;
+    }
+    // ADTS syncword is 0xFFF (12 bits): byte0 == 0xFF, byte1 high nibble == 0xF.
+    if (pos + 2 > buf.size() || buf[pos] != 0xFF || (buf[pos + 1] & 0xF0) != 0xF0)
+        return -2; // not ADTS — let the container decoders handle it
+
+    glint_aac_dec_t dec = glint_aac_dec_create();
+    if (!dec)
+        return -2;
+
+    std::vector<float> mono; // native-rate mono
+    std::vector<float> frame_pcm(1024 * 8);
+    int sr = 0, decoded_frames = 0;
+    while (pos + 2 <= buf.size()) {
+        if (buf[pos] != 0xFF || (buf[pos + 1] & 0xF0) != 0xF0) {
+            // Resync to the next ADTS syncword (tolerate stray bytes).
+            size_t scan = pos + 1;
+            while (scan + 1 < buf.size() && !(buf[scan] == 0xFF && (buf[scan + 1] & 0xF0) == 0xF0))
+                ++scan;
+            if (scan + 1 >= buf.size())
+                break;
+            pos = scan;
+        }
+        glint_dec_frame_info fi;
+        int n = glint_aac_decode(dec, buf.data() + pos, (int)(buf.size() - pos), frame_pcm.data(), &fi);
+        if (n <= 0 || fi.frame_bytes <= 0)
+            break;
+        sr = fi.sample_rate;
+        const int ch = fi.channels > 0 ? fi.channels : 1;
+        mono.reserve(mono.size() + (size_t)n);
+        for (int i = 0; i < n; ++i) {
+            float s = 0.0f;
+            for (int c = 0; c < ch; ++c)
+                s += frame_pcm[(size_t)i * ch + c];
+            mono.push_back(s / (float)ch);
+        }
+        pos += (size_t)fi.frame_bytes;
+        ++decoded_frames;
+    }
+    glint_aac_dec_destroy(dec);
+
+    if (mono.empty() || sr <= 0)
+        return -2;
+    if (dbg)
+        std::fprintf(stderr, "[glint-aac] decoded %d frames, %zu samples @ %d Hz -> 16 kHz mono\n", decoded_frames,
+                     mono.size(), sr);
+
+    // Resample native → 16 kHz mono (linear; matches the fdk/M4A path).
+    if (sr != kTargetSampleRate) {
+        ma_resampler_config rcfg =
+            ma_resampler_config_init(ma_format_f32, 1, (ma_uint32)sr, kTargetSampleRate, ma_resample_algorithm_linear);
+        ma_resampler rs;
+        if (ma_resampler_init(&rcfg, nullptr, &rs) != MA_SUCCESS)
+            return -2;
+        ma_uint64 in_len = mono.size();
+        ma_uint64 out_len = 0;
+        ma_resampler_get_expected_output_frame_count(&rs, in_len, &out_len);
+        out_len += 256;
+        float* result = (float*)std::malloc((size_t)out_len * sizeof(float));
+        if (!result) {
+            ma_resampler_uninit(&rs, nullptr);
+            return -3;
+        }
+        ma_uint64 in_consumed = in_len;
+        ma_uint64 out_produced = out_len;
+        ma_resampler_process_pcm_frames(&rs, mono.data(), &in_consumed, result, &out_produced);
+        ma_resampler_uninit(&rs, nullptr);
+        *out_buf = result;
+        *out_frames = (int)out_produced;
+        *out_channels = 1;
+        return 0;
+    }
+
+    float* result = (float*)std::malloc(mono.size() * sizeof(float));
+    if (!result)
+        return -3;
+    std::memcpy(result, mono.data(), mono.size() * sizeof(float));
+    *out_buf = result;
+    *out_frames = (int)mono.size();
+    *out_channels = 1;
+    return 0;
+}
+
+// ── glint Ogg Opus (.opus) decoder (RFC-conformant, no libopus) ──────────────
+// Decodes Ogg Opus (.opus, and Ogg-Opus-in-.ogg) via the in-tree glint decoder
+// (glint_decode_audio; SILK/CELT/hybrid, all 12 RFC 6716/8251 vectors pass,
+// SILK byte-identical to libopus). PRIMARY for Ogg Opus unless
+// CRISPASR_OPUS_DECODER pins libopus — so .opus reads even in builds without
+// libopus (CRISPASR_OPUS=OFF). Returns -2 for non-Opus Ogg (e.g. Vorbis) so
+// those fall through to stb_vorbis, and for non-Ogg input so WAV/etc. take the
+// ma_decoder path. On glint failure the caller still reaches the libopus path.
+// NOTE: only the Ogg container — WebM/Matroska Opus stays on libopus.
+//
+// Core: decode to INTERLEAVED 16 kHz f32 with the native channel count
+// preserved (malloc-owned, capped at 2 ch). The mono + stereo loaders wrap it.
+int crispasr_ogg_opus_decode_glint_16k(const char* path, float** out_itl, int* out_frames, int* out_channels) {
+    if (const char* pref = std::getenv("CRISPASR_OPUS_DECODER")) {
+        if (pref[0] && std::strcmp(pref, "glint") != 0 && std::strcmp(pref, "auto") != 0)
+            return -2; // user pinned libopus
+    }
+    const bool dbg = [] {
+        const char* e = std::getenv("CRISPASR_OPUS_DEBUG");
+        return e && e[0] && e[0] != '0';
+    }();
+
+    FILE* f = std::fopen(path, "rb");
+    if (!f)
+        return -2;
+    std::fseek(f, 0, SEEK_END);
+    long fsize = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (fsize <= 4 || fsize > 500 * 1024 * 1024) {
+        std::fclose(f);
+        return -2;
+    }
+    std::vector<uint8_t> buf((size_t)fsize);
+    if (std::fread(buf.data(), 1, (size_t)fsize, f) != (size_t)fsize) {
+        std::fclose(f);
+        return -2;
+    }
+    std::fclose(f);
+
+    // Must be an Ogg stream ("OggS"); glint_decode_audio further checks it is
+    // Opus (returns NULL for Ogg Vorbis, which then falls through to stb_vorbis).
+    if (buf[0] != 'O' || buf[1] != 'g' || buf[2] != 'g' || buf[3] != 'S')
+        return -2;
+
+    int sr = 0, ch = 0, frames = 0;
+    float* pcm = glint_decode_audio(buf.data(), (int)buf.size(), &sr, &ch, &frames);
+    if (!pcm)
+        return -2; // not Ogg Opus (e.g. Vorbis) or a decode error → fall through
+    if (frames <= 0 || ch < 1 || sr <= 0) {
+        glint_free(pcm);
+        return -2;
+    }
+    if (ch > 2) {
+        // Downmix >2 ch to stereo up front (rare; the loaders cap at 2).
+        for (int i = 0; i < frames; i++) {
+            pcm[(size_t)i * 2] = pcm[(size_t)i * ch];
+            pcm[(size_t)i * 2 + 1] = pcm[(size_t)i * ch + 1];
+        }
+        ch = 2;
+    }
+    if (dbg)
+        std::fprintf(stderr, "[glint-opus] decoded %d frames, %d ch @ %d -> 16 kHz\n", frames, ch, sr);
+
+    // Resample native -> 16 kHz, preserving channels (interleaved, linear).
+    if (sr != kTargetSampleRate) {
+        ma_resampler_config rcfg = ma_resampler_config_init(ma_format_f32, (ma_uint32)ch, (ma_uint32)sr,
+                                                            kTargetSampleRate, ma_resample_algorithm_linear);
+        ma_resampler rs;
+        if (ma_resampler_init(&rcfg, nullptr, &rs) != MA_SUCCESS) {
+            glint_free(pcm);
+            return -2;
+        }
+        ma_uint64 in_len = (ma_uint64)frames;
+        ma_uint64 out_len = 0;
+        ma_resampler_get_expected_output_frame_count(&rs, in_len, &out_len);
+        out_len += 256;
+        float* result = (float*)std::malloc((size_t)out_len * (size_t)ch * sizeof(float));
+        if (!result) {
+            ma_resampler_uninit(&rs, nullptr);
+            glint_free(pcm);
+            return -3;
+        }
+        ma_uint64 in_consumed = in_len;
+        ma_uint64 out_produced = out_len;
+        ma_resampler_process_pcm_frames(&rs, pcm, &in_consumed, result, &out_produced);
+        ma_resampler_uninit(&rs, nullptr);
+        glint_free(pcm);
+        *out_itl = result;
+        *out_frames = (int)out_produced;
+        *out_channels = ch;
+        return 0;
+    }
+
+    float* result = (float*)std::malloc((size_t)frames * (size_t)ch * sizeof(float));
+    if (!result) {
+        glint_free(pcm);
+        return -3;
+    }
+    std::memcpy(result, pcm, (size_t)frames * (size_t)ch * sizeof(float));
+    glint_free(pcm);
+    *out_itl = result;
+    *out_frames = frames;
+    *out_channels = ch;
+    return 0;
+}
+
+// Mono wrapper — signature matches the loader fallbacks: 0 + malloc-owned
+// 16 kHz mono f32. Downmixes the core's interleaved output.
+int crispasr_ogg_opus_decode_glint(const char* path, int want_channels, float** out_buf, int* out_frames,
+                                   int* out_channels) {
+    (void)want_channels; // 16 kHz ASR path is mono; downmix here
+    float* itl = nullptr;
+    int frames = 0, ch = 0;
+    int rc = crispasr_ogg_opus_decode_glint_16k(path, &itl, &frames, &ch);
+    if (rc != 0)
+        return rc;
+    float* mono = (float*)std::malloc((size_t)frames * sizeof(float));
+    if (!mono) {
+        std::free(itl);
+        return -3;
+    }
+    for (int i = 0; i < frames; i++) {
+        float s = 0.0f;
+        for (int c = 0; c < ch; c++)
+            s += itl[(size_t)i * ch + c];
+        mono[(size_t)i] = s / (float)ch;
+    }
+    std::free(itl);
+    *out_buf = mono;
+    *out_frames = frames;
+    *out_channels = 1;
+    return 0;
+}
+
+} // namespace
+
 CA_EXPORT int crispasr_audio_load(const char* path, float** out_pcm, int* out_samples, int* out_sample_rate) {
     if (!path || !out_pcm || !out_samples)
         return -1;
@@ -2362,10 +2711,41 @@ CA_EXPORT int crispasr_audio_load(const char* path, float** out_pcm, int* out_sa
     if (out_sample_rate)
         *out_sample_rate = 0;
 
+    // Ogg Opus (.opus) via the in-tree glint decoder — RFC-conformant, no
+    // libopus required, so .opus reads even in builds without CRISPASR_OPUS.
+    // Runs BEFORE ma_decoder (which would otherwise take it via libopus).
+    // Non-Opus Ogg (Vorbis) and non-Ogg inputs return -2 → normal path below.
+    {
+        float* g_buf = nullptr;
+        int g_fr = 0, g_ch = 0;
+        if (crispasr_ogg_opus_decode_glint(path, 1, &g_buf, &g_fr, &g_ch) == 0) {
+            *out_pcm = g_buf;
+            *out_samples = g_fr;
+            if (out_sample_rate)
+                *out_sample_rate = kTargetSampleRate;
+            return 0;
+        }
+    }
+
     ma_decoder_config cfg = ma_decoder_config_init(ma_format_f32, kTargetChannels, kTargetSampleRate);
     CRISPASR_OPUS_DECODER_CONFIG(cfg);
     ma_decoder decoder;
     if (ma_decoder_init_file(path, &cfg, &decoder) != MA_SUCCESS) {
+        // Raw ADTS AAC-LC (.aac) via the in-tree glint decoder — cross-platform,
+        // no runtime dependency, PRIMARY unless CRISPASR_AAC_DECODER pins the
+        // platform decoder. Returns -2 for non-ADTS (MP4/M4A) so the
+        // container-aware fallbacks below still run.
+        {
+            float* g_buf = nullptr;
+            int g_fr = 0, g_ch = 0;
+            if (crispasr_adts_decode_glint(path, 1, &g_buf, &g_fr, &g_ch) == 0) {
+                *out_pcm = g_buf;
+                *out_samples = g_fr;
+                if (out_sample_rate)
+                    *out_sample_rate = kTargetSampleRate;
+                return 0;
+            }
+        }
 #if defined(__APPLE__)
         // Format miniaudio can't decode (AAC / M4A / ALAC / CAF …) — try the
         // OS-native AudioToolbox decoder. Requesting 1 channel gives mono
@@ -2406,8 +2786,9 @@ CA_EXPORT int crispasr_audio_load(const char* path, float** out_pcm, int* out_sa
             }
         }
 #endif
-#if defined(CRISPASR_HAVE_OPUS)
-        // WebM/Matroska Opus fallback (EBML demux → libopus)
+        // WebM/Matroska fallback (EBML demux → glint Opus, or libopus when
+        // CRISPASR_OPUS_DECODER=libopus; Vorbis via stb_vorbis). Now always
+        // available — no libopus required.
         {
             float* webm_buf = nullptr;
             int webm_fr = 0, webm_ch = 0;
@@ -2419,7 +2800,6 @@ CA_EXPORT int crispasr_audio_load(const char* path, float** out_pcm, int* out_sa
                 return 0;
             }
         }
-#endif
 #if !defined(__APPLE__) && !defined(__EMSCRIPTEN__)
         // M4A / AAC / ADTS fallback (fdk-aac via dlopen, if installed)
         {
@@ -2536,6 +2916,36 @@ CA_EXPORT int crispasr_audio_load_stereo(const char* path, float** out_left, flo
     if (out_sample_rate)
         *out_sample_rate = 0;
 
+    // Ogg Opus (.opus) via glint — RFC-conformant, no libopus; stereo-preserving.
+    // Runs BEFORE ma_decoder (which would otherwise take it via libopus). Gated
+    // CRISPASR_OPUS_DECODER=libopus; non-Opus Ogg / non-Ogg fall through.
+    {
+        float* itl = nullptr;
+        int fr = 0, ch = 0;
+        if (crispasr_ogg_opus_decode_glint_16k(path, &itl, &fr, &ch) == 0) {
+            float* left = (float*)std::malloc((size_t)fr * sizeof(float));
+            float* right = (float*)std::malloc((size_t)fr * sizeof(float));
+            if (!left || !right) {
+                std::free(itl);
+                std::free(left);
+                std::free(right);
+                return -3;
+            }
+            for (int i = 0; i < fr; i++) {
+                left[i] = itl[(size_t)i * ch];
+                right[i] = (ch >= 2) ? itl[(size_t)i * ch + 1] : itl[(size_t)i * ch];
+            }
+            std::free(itl);
+            *out_left = left;
+            *out_right = right;
+            *out_samples = fr;
+            *out_channels = (ch >= 2) ? 2 : 1;
+            if (out_sample_rate)
+                *out_sample_rate = kTargetSampleRate;
+            return 0;
+        }
+    }
+
     // Detect native channel count (channels = 0 → native).
     ma_decoder_config probe_cfg = ma_decoder_config_init(ma_format_f32, 0, kTargetSampleRate);
     CRISPASR_OPUS_DECODER_CONFIG(probe_cfg);
@@ -2608,6 +3018,10 @@ CA_EXPORT int crispasr_audio_load_stereo(const char* path, float** out_left, flo
                 *out_sample_rate = kTargetSampleRate;
             return 0;
         };
+        // Raw ADTS AAC-LC (.aac) via glint — cross-platform primary (see the
+        // mono loader). Non-ADTS returns -2 and falls through.
+        if (split_fallback(crispasr_adts_decode_glint) == 0)
+            return 0;
         // AU / .snd fallback
         if (split_fallback(crispasr_au_decode) == 0)
             return 0;
@@ -2615,10 +3029,9 @@ CA_EXPORT int crispasr_audio_load_stereo(const char* path, float** out_left, flo
         if (split_fallback(crispasr_amr_decode) == 0)
             return 0;
 #endif
-#if defined(CRISPASR_HAVE_OPUS)
+        // WebM/Matroska (glint Opus / stb_vorbis) — always available, no libopus.
         if (split_fallback(crispasr_webm_decode) == 0)
             return 0;
-#endif
 #if !defined(__APPLE__) && !defined(__EMSCRIPTEN__)
         if (split_fallback(crispasr_m4a_decode) == 0)
             return 0;

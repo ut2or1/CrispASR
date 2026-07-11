@@ -236,6 +236,22 @@ static void whisper_ensure_cpu_threadpool(ggml_backend_sched_t sched, int n_thre
     }
 }
 
+// Release the persistent threadpool owned for `backend`, if any. Called
+// before ggml_backend_free so a dead backend's pool (and its worker threads)
+// don't outlive it — and so a later backend allocated at the same address
+// can't inherit a stale entry.
+static void whisper_release_cpu_threadpool(ggml_backend_t backend) {
+    std::lock_guard<std::mutex> lock(g_cpu_pools_mtx);
+    auto it = g_cpu_pools.find(backend);
+    if (it == g_cpu_pools.end())
+        return;
+    if (it->second.pool) {
+        ggml_backend_cpu_set_threadpool(backend, nullptr);
+        ggml_threadpool_free(it->second.pool);
+    }
+    g_cpu_pools.erase(it);
+}
+
 static bool ggml_graph_compute_helper(ggml_backend_sched_t sched, struct ggml_cgraph* graph, int n_threads,
                                       bool sched_reset = true) {
     // Lazy-init persistent threadpool on the CPU backend (#132).
@@ -4233,6 +4249,7 @@ void whisper_free_state(struct whisper_state* state) {
         ggml_backend_sched_free(state->sched_decode.sched);
 
         for (auto& backend : state->backends) {
+            whisper_release_cpu_threadpool(backend);
             ggml_backend_free(backend);
         }
 
@@ -5845,6 +5862,7 @@ void whisper_vad_free(whisper_vad_context* ctx) {
         ggml_backend_sched_free(ctx->sched.sched);
 
         for (auto& backend : ctx->backends) {
+            whisper_release_cpu_threadpool(backend);
             ggml_backend_free(backend);
         }
 

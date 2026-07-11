@@ -117,6 +117,7 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `grammar_rule` | Root rule name for the grammar |
 | `best_of` | Whisper best-of-N sampling candidates |
 | `beam_size` | Whisper beam search width |
+| `return_logits` | `true`/`false` — for supported dense CTC backends, include `ctc_logits` in JSON responses (`n_frames`, `n_vocab`, frame-major `data`, optional `vocab`) |
 | `entropy_thold` | Entropy threshold for decoder fallback |
 | `logprob_thold` | Log-probability threshold for decoder fallback |
 | `no_speech_thold` | No-speech probability threshold |
@@ -271,7 +272,7 @@ curl http://localhost:8080/v1/audio/speech \
 | `cfg_scale` | backend default | Classifier-free-guidance scale. For tada the acoustic CFG (Python `acoustic_cfg`, default 1.6). Also chatterbox/f5. Per request. |
 | `noise_temp` | backend default | tada flow-matching noise temperature (Python `noise_temp`, default 0.9). Per request. |
 | `speed` | `1.0` | Tempo multiplier `0.25 .. 4.0` (OpenAI range). Applied as a post-synth linear resampler. Out-of-range returns 400 with `code=invalid_speed`. |
-| `response_format` | `"wav"` | `wav` (16-bit PCM RIFF, 24 kHz mono — default), `pcm` (OpenAI spec: 24 kHz signed 16-bit LE raw, no header), or `f32` (crispasr-specific raw float32 for downstream DSP). |
+| `response_format` | `"wav"` | `wav` (16-bit PCM RIFF, 24 kHz mono — default), `pcm` (OpenAI spec: 24 kHz signed 16-bit LE raw, no header), `f32` (crispasr-specific raw float32 for downstream DSP), or the compressed containers `mp3` / `aac` / `opus` — all encoded in-tree by [glint](https://github.com/CrispStrobe/glint), no build deps. `opus` returns a standard **Ogg Opus** file (`audio/ogg`); set `CRISPASR_OPUS_ENCODER=libopus` (build with libopus) to fall back to the legacy raw-packet framing (`audio/opus`) instead. |
 | `consent_attestation` | empty | Required when `voice` ends in `.wav` (voice cloning). A free-text statement attesting speaker consent, e.g. `"I have the speaker's consent"`. Logged for audit. |
 | `spoken_disclaimer` | `true` | Set to `false` to skip the audible AI-disclosure prefix on voice-cloned output. Machine-readable provenance (watermark + C2PA) is always applied. When `false`, the caller assumes responsibility for providing appropriate AI-disclosure to end users. |
 
@@ -282,6 +283,7 @@ curl http://localhost:8080/v1/audio/speech \
 | 200 | `audio/wav` | RIFF WAV, 16-bit PCM int16, 24 kHz mono |
 | 200 | `audio/pcm` | Raw int16 LE bytes (OpenAI `pcm`) |
 | 200 | `application/octet-stream` | Raw float32 PCM (`f32`) |
+| 200 | `audio/mpeg` / `audio/aac` / `audio/ogg` | Compressed `mp3` / `aac` / `opus` (Ogg Opus) via glint |
 | 400 | `application/json` | OpenAI error shape: `{"error": {"message", "type", "code", "param"}}`. Codes: `missing_required_field`, `input_too_long`, `invalid_json`, `invalid_speed`, `unsupported_response_format`. |
 | 500 | `application/json` | Synthesis returned empty (e.g. unknown voice). `code=synthesis_failed`. |
 | 503 | `application/json` | Model still loading. |
@@ -415,7 +417,7 @@ audio is watermarked automatically, same as TTS.
 | Feature | Status |
 |---|---|
 | Streaming response (chunked / SSE) | Pending — see PLAN §70 (couples with chunked-VAE for the full latency win). |
-| `mp3` / `opus` / `aac` / `flac` encoding | Not implemented — needs lame/opusenc/etc. as build deps. |
+| `mp3` / `aac` / `opus` encoding | **Done** — encoded in-tree by glint, no build deps (`response_format=mp3\|aac\|opus`; `opus` = Ogg Opus). `flac` output still pending. |
 | `POST /v1/voices` (multipart upload for runtime provisioning) | Pending — security review (size limits, content-type validation, disk quota). |
 | `DELETE /v1/voices/{name}` | Pending alongside upload. |
 | Native-backend `speed` (duration knobs vs server-side resample) | Pending — backend-by-backend. |

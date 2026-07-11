@@ -128,6 +128,8 @@ def main():
     writer.add_float32("kyutai.hidden_scale", config["hidden_scale"])  # 4.125
     writer.add_uint32("kyutai.existing_text_padding_id", config["existing_text_padding_id"])  # 3
     writer.add_float32("kyutai.stt.audio_delay_seconds", config["stt_config"]["audio_delay_seconds"])
+    writer.add_float32("kyutai.stt.audio_silence_prefix_seconds",
+                       config["stt_config"].get("audio_silence_prefix_seconds", 0.0))
 
     # Mimi-specific hparams (fixed for the released Mimi codec)
     writer.add_uint32("kyutai.mimi.encoder_dim", 512)

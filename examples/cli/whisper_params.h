@@ -112,6 +112,7 @@ struct whisper_params {
     int flush_after = 0;
     bool show_alternatives = false;
     int32_t n_alternatives = 3;
+    bool return_logits = false;
     std::string aligner_model;
     // PLAN issue #62: when true, the CTC forced aligner runs even on
     // backends that already produce native timestamps — replacing
@@ -150,6 +151,10 @@ struct whisper_params {
     std::string parakeet_decoder; // "tdt" (default), "ctc" — selects parakeet decode head
     std::string hotwords;         // comma-separated hotword list (PLAN #98)
     float hotwords_boost = 2.0f;  // per-token log-prob boost for hotword prefix matches
+    // Free-form hotword/context text injected into the vibevoice-asr prompt
+    // (only backend that reads this so far). Matches the `context_info` param
+    // in microsoft/VibeVoice's vibevoice_asr_processor.py.
+    std::string context;
     // #205: granite-speech incremental decoding — seed the assistant turn with a
     // previously-decoded transcript so the model continues from it instead of
     // re-decoding (model-card `prefix_text`). Output is the continuation only.
@@ -380,6 +385,12 @@ struct whisper_params {
     // Playback uses the same watermarked PCM that is written to --tts-output.
     bool tts_play = false;
     int tts_play_device = -1;
+
+    // --tts-stream: stream synthesized audio to stdout as raw signed-16-bit
+    // little-endian mono PCM (at the backend's sample rate), emitting each
+    // sentence chunk as it is produced instead of writing one WAV at the end.
+    // For piping into a player, e.g. `… --tts-stream | ffplay -f s16le -ar 48000 -`.
+    bool tts_stream = false;
 
     // G2P phonemizer dictionary source:
     //   ""           → auto (OLaPh MIT preferred, then open-dict-data CC-BY-SA)

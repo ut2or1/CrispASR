@@ -80,7 +80,7 @@ if (CRISPASR_COREML)
         )
 
     set_target_properties(${TARGET} PROPERTIES FOLDER "libs")
-    install(TARGETS ${TARGET} LIBRARY)
+    install(TARGETS ${TARGET} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
 
 if (CRISPASR_OPENVINO)
@@ -388,6 +388,14 @@ if (CRISPASR_AMR)
         # wrappers (pvgsm*.cpp, decoder_gsm_amr.cpp) which depend on
         # case-insensitive includes and OSCL C++ framework classes we
         # don't need — the amrnb/wrapper.cpp already wraps the codec API.
+        # ALSO exclude the seven common/src files that upstream's authoritative
+        # amrnb/Makefile.am deliberately drops (see its "sources we exclude"
+        # comment): bits2prm, copy, div_32, l_abs, r_fft, vad1, vad2. They are
+        # encoder-only / unused by the decoder, and bits2prm.cpp in particular
+        # #includes a bits2prm.h that the fork does not ship — a blanket
+        # common/src/*.cpp glob picks it up and the static build fails with
+        # "bits2prm.h file not found". Matching upstream's set = upstream's
+        # working decoder.
         file(GLOB _amrnb_srcs
             "${_amr_src}/opencore/codecs_v2/audio/gsm_amr/amr_nb/dec/src/*.cpp"
             "${_amr_src}/opencore/codecs_v2/audio/gsm_amr/amr_nb/dec/src/*.c"
@@ -395,11 +403,19 @@ if (CRISPASR_AMR)
             "${_amr_src}/opencore/codecs_v2/audio/gsm_amr/amr_nb/common/src/*.c"
             "${_amr_src}/opencore/codecs_v2/audio/gsm_amr/common/dec/src/*.cpp"
             "${_amr_src}/opencore/codecs_v2/audio/gsm_amr/common/dec/src/*.c")
-        list(FILTER _amrnb_srcs EXCLUDE REGEX "pvgsm[^/]*\\.cpp$|decoder_gsm_amr\\.cpp$")
+        # Anchor each basename with a leading "/" so an exclusion can't match as
+        # a suffix of a longer filename (cf. the amr-wb dtx_decoder_amr_wb.cpp
+        # over-match fixed below).
+        list(FILTER _amrnb_srcs EXCLUDE REGEX
+            "pvgsm[^/]*\\.cpp$|/decoder_gsm_amr\\.cpp$|/(bits2prm|copy|div_32|l_abs|r_fft|vad1|vad2)\\.cpp$")
         file(GLOB _amrwb_srcs
             "${_amr_src}/opencore/codecs_v2/audio/gsm_amr/amr_wb/dec/src/*.cpp"
             "${_amr_src}/opencore/codecs_v2/audio/gsm_amr/amr_wb/dec/src/*.c")
-        list(FILTER _amrwb_srcs EXCLUDE REGEX "pvgsm[^/]*\\.cpp$|decoder_amr_wb\\.cpp$")
+        # "/decoder_amr_wb.cpp$" is anchored on "/" so it excludes ONLY the PV
+        # framework wrapper decoder_amr_wb.cpp — an unanchored "decoder_amr_wb"
+        # also matched dtx_decoder_amr_wb.cpp (suffix), dropping the DTX/comfort-
+        # noise decoder and breaking the link with undefined _dtx_dec_amr_wb.
+        list(FILTER _amrwb_srcs EXCLUDE REGEX "pvgsm[^/]*\\.cpp$|/decoder_amr_wb\\.cpp$")
         if (_amrnb_srcs AND _amrwb_srcs AND EXISTS "${_amr_src}/amrnb/wrapper.cpp")
             add_library(crispasr_amrnb STATIC
                 "${_amr_src}/amrnb/wrapper.cpp" ${_amrnb_srcs})
@@ -476,6 +492,12 @@ endif()
 
 find_package(Threads REQUIRED)
 target_link_libraries(crispasr-lib PUBLIC ggml Threads::Threads audioseal crispasr-core snac ${CMAKE_DL_LIBS})
+
+# glint — in-tree clean-room codec suite. crispasr_audio.cpp uses its AAC-LC
+# decoder for cross-platform raw-ADTS (.aac) input (glint target is defined
+# later via add_subdirectory(glint); CMake resolves the link at generate time).
+# PUBLIC so every consumer (CLI, server, bindings) inherits the static link.
+target_link_libraries(crispasr-lib PUBLIC glint)
 
 # `crispasr_cache.cpp` calls WinHTTP for HF auto-download on Windows. MSVC
 # auto-links winhttp.lib via `#pragma comment(lib, "winhttp.lib")` inside
@@ -625,6 +647,29 @@ endif()
 if(GGML_CUDA)
     target_compile_definitions(canary PRIVATE GGML_USE_CUDA)
     target_link_libraries(canary PUBLIC ggml-cuda)
+endif()
+
+# ---------------------------------------------------------------------------
+# Canary-Qwen — nvidia/canary-qwen-2.5b (FastConformer + Qwen3-1.7B SALM)
+# ---------------------------------------------------------------------------
+add_library(canary_qwen STATIC
+            canary_qwen.h
+            canary_qwen.cpp
+            )
+target_include_directories(canary_qwen PUBLIC . ../include)
+target_compile_features   (canary_qwen PUBLIC cxx_std_17)
+set_target_properties(canary_qwen PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (canary_qwen PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+if(NOT MSVC)
+    target_compile_options(canary_qwen PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(canary_qwen PRIVATE GGML_USE_METAL)
+    target_link_libraries(canary_qwen PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(canary_qwen PRIVATE GGML_USE_CUDA)
+    target_link_libraries(canary_qwen PUBLIC ggml-cuda)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -1052,6 +1097,26 @@ if(GGML_CUDA)
     target_link_libraries(voxtral4b PUBLIC ggml-cuda)
 endif()
 
+add_library(voxtral_tts STATIC
+            voxtral_tts.h
+            voxtral_tts.cpp
+            )
+target_include_directories(voxtral_tts PUBLIC . ../include)
+target_compile_features   (voxtral_tts PUBLIC cxx_std_17)
+set_target_properties(voxtral_tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (voxtral_tts PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+if(NOT MSVC)
+    target_compile_options(voxtral_tts PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(voxtral_tts PRIVATE GGML_USE_METAL)
+    target_link_libraries(voxtral_tts PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(voxtral_tts PRIVATE GGML_USE_CUDA)
+    target_link_libraries(voxtral_tts PUBLIC ggml-cuda)
+endif()
+
 add_library(higgs_stt STATIC
             higgs_stt.h
             higgs_stt.cpp
@@ -1283,6 +1348,18 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# moss_transcribe_diarize — OpenMOSS-Team/MOSS-Transcribe-Diarize-0.9B (Whisper encoder + Qwen3-0.6B LLM)
+# ---------------------------------------------------------------------------
+add_library(moss_transcribe_diarize STATIC moss_transcribe_diarize.h moss_transcribe_diarize.cpp)
+set_target_properties(moss_transcribe_diarize PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(moss_transcribe_diarize PUBLIC .)
+target_compile_features   (moss_transcribe_diarize PUBLIC cxx_std_17)
+target_link_libraries     (moss_transcribe_diarize PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(moss_transcribe_diarize PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # qwen3_tts — Qwen/Qwen3-TTS (Qwen3 talker + 16-codebook RVQ output)
 # ---------------------------------------------------------------------------
 add_library(qwen3_tts STATIC qwen3_tts.h qwen3_tts.cpp)
@@ -1292,6 +1369,18 @@ target_compile_features   (qwen3_tts PUBLIC cxx_std_17)
 target_link_libraries     (qwen3_tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
 if(NOT MSVC)
     target_compile_options(qwen3_tts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# omnivoice — k2-fsa/OmniVoice (Qwen3 + masked iterative multi-codebook TTS)
+# ---------------------------------------------------------------------------
+add_library(omnivoice STATIC omnivoice.h omnivoice.cpp)
+set_target_properties(omnivoice PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(omnivoice PUBLIC .)
+target_compile_features   (omnivoice PUBLIC cxx_std_17)
+target_link_libraries     (omnivoice PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(omnivoice PRIVATE -O3)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -1600,6 +1689,27 @@ target_link_libraries     (outetts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
 if(NOT MSVC)
     target_compile_options(outetts PRIVATE -O3)
 endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# irodori-tts — Aratako/Irodori-TTS RF-DiT flow matching TTS (native ggml)
+# ---------------------------------------------------------------------------
+add_library(irodori-tts STATIC irodori_tts.h irodori_tts.cpp)
+set_target_properties(irodori-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(irodori-tts PUBLIC .)
+target_compile_features   (irodori-tts PUBLIC cxx_std_17)
+target_link_libraries     (irodori-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+# Link libsentencepiece for exact SP tokenization (optional — falls back to custom Viterbi)
+find_library(SENTENCEPIECE_LIB sentencepiece)
+if(SENTENCEPIECE_LIB)
+    target_link_libraries(irodori-tts PUBLIC ${SENTENCEPIECE_LIB})
+    target_compile_definitions(irodori-tts PRIVATE IRODORI_HAVE_SENTENCEPIECE=1)
+    message(STATUS "irodori-tts: using libsentencepiece for tokenization")
+else()
+    message(STATUS "irodori-tts: libsentencepiece not found, using custom Viterbi (may produce wrong tokens)")
+endif()
+if(NOT MSVC)
+    target_compile_options(irodori-tts PRIVATE -O3)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -2088,6 +2198,9 @@ endif()
 if (TARGET canary)
     target_link_libraries(crispasr-lib PUBLIC canary)
 endif()
+if (TARGET canary_qwen)
+    target_link_libraries(crispasr-lib PUBLIC canary_qwen)
+endif()
 if (TARGET lfm2_audio)
     target_link_libraries(crispasr-lib PUBLIC lfm2_audio)
 endif()
@@ -2117,6 +2230,9 @@ if (TARGET higgs_stt)
 endif()
 if (TARGET voxtral4b)
     target_link_libraries(crispasr-lib PUBLIC voxtral4b)
+endif()
+if (TARGET voxtral_tts)
+    target_link_libraries(crispasr-lib PUBLIC voxtral_tts)
 endif()
 if (TARGET wav2vec2-ggml)
     target_link_libraries(crispasr-lib PUBLIC wav2vec2-ggml)
@@ -2192,8 +2308,14 @@ endif()
 if (TARGET moss_transcribe)
     target_link_libraries(crispasr-lib PUBLIC moss_transcribe)
 endif()
+if (TARGET moss_transcribe_diarize)
+    target_link_libraries(crispasr-lib PUBLIC moss_transcribe_diarize)
+endif()
 if (TARGET qwen3_tts)
     target_link_libraries(crispasr-lib PUBLIC qwen3_tts)
+endif()
+if (TARGET omnivoice)
+    target_link_libraries(crispasr-lib PUBLIC omnivoice)
 endif()
 if (TARGET orpheus)
     target_link_libraries(crispasr-lib PUBLIC orpheus)
@@ -2260,6 +2382,9 @@ if (TARGET dia-tts)
 endif()
 if (TARGET dots-tts)
     target_link_libraries(crispasr-lib PUBLIC dots-tts)
+endif()
+if (TARGET irodori-tts)
+    target_link_libraries(crispasr-lib PUBLIC irodori-tts)
 endif()
 if (TARGET fastpitch-tts)
     target_link_libraries(crispasr-lib PUBLIC fastpitch-tts)
@@ -2381,7 +2506,7 @@ if (TARGET crispasr-llama-core)
     target_link_libraries(crispasr-lib PRIVATE crispasr-llama-core)
 endif()
 
-install(TARGETS crispasr-lib LIBRARY)
+install(TARGETS crispasr-lib LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../include/crispasr_chat.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 

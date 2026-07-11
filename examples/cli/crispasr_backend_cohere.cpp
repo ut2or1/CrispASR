@@ -13,6 +13,7 @@
 #include "crispasr_backend.h"
 #include "crispasr_backend_utils.h"
 #include "whisper_params.h"
+#include "core/ngram_loop_fix.h"
 
 #include "cohere.h"
 
@@ -85,7 +86,7 @@ public:
         crispasr_segment seg;
         seg.t0 = t_offset_cs;
         seg.t1 = t_offset_cs;
-        seg.text = r->text ? r->text : "";
+        seg.text = core_ngram::fix_loops(r->text ? r->text : "");
 
         seg.tokens.reserve(r->n_tokens);
         for (int i = 0; i < r->n_tokens; i++) {
@@ -132,6 +133,42 @@ public:
             for (auto& word : seg.words) {
                 while (!word.text.empty() && word.text.front() == ' ')
                     word.text.erase(word.text.begin());
+            }
+        }
+
+        // issue #218 follow-up: fix_loops() above cleans seg.text, but
+        // seg.words was built from the raw (un-collapsed) token stream, so
+        // word-level output (SRT/VTT, JSON `words`) still shows every
+        // repeated word even once the flat text looks clean. Filter
+        // seg.words with the SAME collapse decision, in lockstep.
+        {
+            std::vector<std::string> word_texts;
+            word_texts.reserve(seg.words.size());
+            for (const auto& w : seg.words)
+                word_texts.push_back(w.text);
+            const std::vector<int> keep = core_ngram::fix_loops_keep_indices(word_texts);
+            if (keep.size() != seg.words.size()) {
+                std::vector<crispasr_word> filtered;
+                filtered.reserve(keep.size());
+                for (int idx : keep)
+                    filtered.push_back(std::move(seg.words[idx]));
+                seg.words = std::move(filtered);
+            }
+        }
+
+        // Apply the exact same logic to seg.tokens for full JSON output parity.
+        {
+            std::vector<std::string> token_texts;
+            token_texts.reserve(seg.tokens.size());
+            for (const auto& t : seg.tokens)
+                token_texts.push_back(t.text);
+            const std::vector<int> keep = core_ngram::fix_loops_keep_indices(token_texts);
+            if (keep.size() != seg.tokens.size()) {
+                std::vector<crispasr_token> filtered;
+                filtered.reserve(keep.size());
+                for (int idx : keep)
+                    filtered.push_back(std::move(seg.tokens[idx]));
+                seg.tokens = std::move(filtered);
             }
         }
 

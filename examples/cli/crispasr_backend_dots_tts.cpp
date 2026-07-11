@@ -88,9 +88,12 @@ public:
         cp.use_gpu = crispasr_backend_should_use_gpu(p);
         cp.seed = p.seed;
 
-        if (p.temperature > 0.0f) {
+        if (p.temperature > 0.0f)
             cp.temperature = p.temperature;
-        }
+        if (p.tts_steps > 0)
+            cp.ode_steps = p.tts_steps;
+        if (p.tts_cfg_scale > 0.0f)
+            cp.cfg_scale = p.tts_cfg_scale;
 
         ctx_ = dots_tts_init_from_file(p.model.c_str(), cp);
         if (!ctx_) {

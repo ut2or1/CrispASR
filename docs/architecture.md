@@ -165,6 +165,7 @@ regression test against `samples/jfk.wav`:
 | whisper | Enc-dec transformer | ✔ | ✔ | ✔ | CUDA / Metal / Vulkan | (upstream) |
 | parakeet | FastConformer + TDT | ✔ | ✔ | partial | CPU | mel, fastconformer |
 | canary | FastConformer + Transformer dec | ✔ | ✔ | ✔ | CUDA / Metal | mel, fastconformer |
+| canary-qwen | FastConformer + Qwen3-1.7B SALM | ✔ | ✔ | ✔ | CUDA | mel, fastconformer, kv_self_attn, swiglu, bpe |
 | cohere | Conformer + Transformer dec | ✔ | ✔ | ✔ | CUDA / Metal | mel |
 | granite | Conformer + Q-Former + LLM | ✔ | ✔ | ✔ | CPU | mel, kv_self_attn, swiglu, greedy_decode, bpe |
 | voxtral | Whisper enc + Mistral LLM | ✔ | ✔ | ✔ | CUDA / Metal | mel, kv_self_attn, encoder_self_attn, swiglu, greedy_decode, bpe |
@@ -173,7 +174,7 @@ regression test against `samples/jfk.wav`:
 | fc-ctc | FastConformer + CTC | ✔ | ✔ | — | CPU | mel, fastconformer |
 | wav2vec2 | CNN + Transformer + CTC | ✔ | — | — | CUDA / Metal | gguf_loader |
 | glm-asr | Whisper enc + Llama LLM | ✔ | ✔ | ✔ | CPU | mel, kv_self_attn, swiglu, greedy_decode, bpe |
-| kyutai-stt | Mimi codec + causal LM | ✔ | ✔ | ✔ | CPU | gguf_loader |
+| kyutai-stt | Mimi codec + causal LM (1B + 2.6B) | ✔ | ✔ | ✔ | CPU | gguf_loader |
 | firered-asr | Conformer + CTC + beam dec | ✔ | ✔ | ✔ | CPU | mel, gguf_loader |
 | moonshine | Conv + 6L enc-dec | ✔ | ✔ | ✔ | CPU | (vendored) |
 | moonshine-streaming | Sliding-window enc + dec | ✔ | ✔ | ✔ | CPU | (vendored) |
@@ -211,7 +212,11 @@ regression test against `samples/jfk.wav`:
   path; local attention (`att_context_size`) is supported for long-form
   models like ReazonSpeech.
 - **Codec + LM** (kyutai-stt): neural audio codec (RVQ) →
-  token-based LM.
+  token-based LM. Supports stt-1b-en_fr (16L, en+fr) and stt-2.6b-en
+  (48L, en-only). The 2.6B model has a 2.5 s `audio_delay` + 1.0 s
+  `audio_silence_prefix` (3.5 s total lookahead); the runtime prepends
+  the silence prefix before Mimi encode and the CLI appends a silence
+  tail of equal length so the causal LM can flush all pending tokens.
 - **TTS — codec / vocoder pipeline**:
   - **Discrete-token codec + vocoder** (qwen3-tts, orpheus): talker
     LM emits codec tokens; a separate decoder GGUF (12 Hz codec /
@@ -594,12 +599,50 @@ Encoder output padded to 3000 frames (Whisper 30s convention).
 at fixed intervals between audio frame embeddings. Supports custom prompts
 via `--prompt` / `set_ask()` for audio understanding tasks beyond ASR.
 
+### moss-diarize
+
+Joint ASR + speaker diarization + timestamps in a single 0.9B model
+(OpenMOSS-Team/MOSS-Transcribe-Diarize-0.9B, Apache-2.0). A **stock
+Whisper encoder** (80-mel → Conv1d stem → 24L pre-LN transformer, 1024d,
+16 heads, global attention → `ln_post`) feeds into a **4× temporal merge**
+(reshape T/4 × 4096) followed by a **VQAdaptor** (Linear(4096→1024) + SiLU
++ Linear(1024→1024) + LayerNorm) that projects merged audio frames into the
+LM embedding space. Time markers (digit tokens encoding the current
+timestamp) are injected every 5 seconds into the `<|audio_pad|>` token
+sequence. The decoder is a **Qwen3-0.6B** LM (28L, 1024d, 16Q/8KV,
+head_dim 128, SwiGLU 3072, RoPE θ=1M, tied embeddings). ~0.9B params,
+~500 MB at Q4_K.
+
+**Output format:** `[start_time][Sxx]text[end_time]` — each segment has
+a start/end timestamp in seconds and a speaker label (`[S01]`, `[S02]`,
+etc.). The CLI adapter parses these into `crispasr_segment` entries with
+native timestamps and speaker IDs.
+
+**Prompt format:** ChatML with a system instruction requesting timestamped,
+speaker-labelled transcription. Hotwords are injected into the system prompt
+via `热词提示：word1, word2`. The user turn wraps the audio pad sequence
+between `<|audio_start|>` and `<|audio_end|>`.
+
 ### qwen3-tts
 
 Qwen3 talker LM + 12 Hz RVQ speech tokenizer. Three variants:
 - `qwen3-tts-0.6b-base` — 0.6B talker, baked voice pack or WAV + `--ref-text`
 - `qwen3-tts-1.7b-base` — 1.7B talker, higher quality
 - `qwen3-tts-1.7b-voicedesign` — natural-language voice description via `--instruct`
+
+### omnivoice
+
+k2-fsa/OmniVoice (Apache-2.0) — masked iterative multi-codebook TTS.
+Qwen3-0.6B LLM backbone with:
+- `audio_embeddings`: Embedding(8×1025, 1024) with per-codebook offsets
+- `audio_heads`: Linear(1024, 8×1025) — projects to 8 codebooks × 1025 vocab
+- Generation: SoundStorm-style masked iterative (not autoregressive). 32
+  steps, each unmasking top-k highest-confidence positions via Gumbel sampling.
+- Audio tokenizer: HiggsAudioV2 (HuBERT semantic + DAC acoustic, 24 kHz, 75 Hz
+  frame rate). Separate GGUF (`--codec-model`).
+- 600+ languages, zero-shot voice cloning from reference audio.
+
+Supports finetunes: `ModelsLab/omnivoice-singing` (same architecture).
 
 ### csm
 

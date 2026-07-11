@@ -124,6 +124,7 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # branch ("canary") compares mel_spectrogram + encoder_output; the
     # per-layer captures listed in DEFAULT_STAGES are diagnostic-only.
     "canary":     "reference_backends.canary",
+    "canary-qwen": "reference_backends.canary_qwen",
     "gemma4":     "reference_backends.gemma4",
     # Qwen3-TTS-12Hz Base. The audio arg is the voice-clone reference WAV
     # (16 kHz mono); synth text + ref text come from env vars. See
@@ -138,6 +139,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # Qwen3-TTS-Tokenizer-12Hz codec ENCODER (audio → codes).
     # model_dir = the Tokenizer-12Hz HF snapshot. audio is unused.
     "qwen3-tts-cenc":  "reference_backends.qwen3_tts_cenc",
+    # OmniVoice: k2-fsa/OmniVoice — Qwen3 + masked iterative TTS.
+    # model_dir = k2-fsa/OmniVoice (HF id) or local snapshot.
+    # audio arg is unused (TTS). Text from OMNIVOICE_SYN_TEXT env.
+    "omnivoice":  "reference_backends.omnivoice",
     # VibeVoice-ASR 7B: two σ-VAE encoders + connectors + Qwen2 decoder.
     # NOTE: audio must be 16 kHz on entry (shared loader); the backend
     # resamples to 24 kHz internally.
@@ -290,6 +295,23 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # repo with lit_model.pth + small.pt + model_config.yaml. Needs the
     # litgpt package on sys.path (set MINI_OMNI2_REPO or put it in model_dir).
     "mini-omni2": "reference_backends.mini_omni2",
+    # Irodori-TTS (Aratako/Irodori-TTS-500M-v3): RF-DiT flow matching TTS.
+    # model_dir = HF id or local .safetensors. Audio arg is unused (TTS).
+    # Text from IRODORI_TEST_TEXT env (default "こんにちは、世界。").
+    # Captures text_state, cond_embed, dit_block_0, v_pred_step0.
+    "irodori-tts": "reference_backends.irodori_tts",
+    # kyutai/stt-1b-en_fr and kyutai/stt-2.6b-en.
+    # Captures: pcm_24k, seanet_output, enc_tfm_output, downsampled,
+    # rvq_codes, lm_frame0_logits, generated_text.
+    # Requires: safetensors sentencepiece scipy moshi
+    "kyutai-stt":  "reference_backends.kyutai_stt",
+    # mistralai/Voxtral-4B-TTS-2603. Three-component TTS:
+    # Ministral-3B AR + 3L FM transformer + codec decoder → 24 kHz PCM.
+    # Text from VOXTRAL_TTS_TEXT env, voice from VOXTRAL_TTS_VOICE env.
+    "voxtral-tts": "reference_backends.voxtral_tts",
+    # MOSS-Transcribe-Diarize: Whisper-Medium encoder + VQAdaptor + Qwen3-0.6B.
+    # Joint ASR + diarization + timestamps. model_dir = OpenMOSS-Team/MOSS-Transcribe-Diarize.
+    "moss-diarize": "reference_backends.moss_diarize",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import

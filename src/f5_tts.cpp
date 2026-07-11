@@ -65,6 +65,16 @@ static bool f5_bench_enabled() {
     return v != 0;
 }
 
+// Opt-in: batch the CFG cond+uncond DiT passes into one B=2 graph.
+static bool f5_batch_cfg_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("F5_BATCH_CFG");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
 struct f5_bench_stage {
     const char* name;
     std::chrono::steady_clock::time_point t0;
@@ -230,13 +240,14 @@ struct f5_voc_block_cache {
 
 struct f5_dit_graph_cache {
     int T_cached = -1;
+    int B_cached = -1; // batch (1 = plain, 2 = batched CFG)
     ggml_context* gctx = nullptr;
     ggml_cgraph* gf = nullptr;
     ggml_gallocr_t galloc = nullptr;
-    ggml_tensor* hidden_in = nullptr; // (dim, T) — input hidden state
-    ggml_tensor* t_emb_in = nullptr;  // (dim,)  — timestep embedding
-    ggml_tensor* pos_in = nullptr;    // (T,) i32 — constant [0..T-1]
-    ggml_tensor* output = nullptr;    // (mel_dim, T) — velocity
+    ggml_tensor* hidden_in = nullptr; // (dim, T, B) — input hidden state(s)
+    ggml_tensor* t_emb_in = nullptr;  // (dim,)  — timestep embedding (shared over B)
+    ggml_tensor* pos_in = nullptr;    // (T,) i32 — constant [0..T-1] (shared over B)
+    ggml_tensor* output = nullptr;    // (mel_dim, T, B) — velocity/velocities
 
     void reset() {
         if (galloc) {
@@ -250,6 +261,7 @@ struct f5_dit_graph_cache {
         gf = nullptr;
         hidden_in = t_emb_in = pos_in = output = nullptr;
         T_cached = -1;
+        B_cached = -1;
     }
     ~f5_dit_graph_cache() { reset(); }
 };
@@ -964,9 +976,9 @@ static void f5_grouped_conv1d(const float* in, const float* wt, const float* bia
 
 // ── Fused DiT graph: build (once per T) ──────────────────────────
 
-static bool f5_dit_cache_build(f5_tts_context* ctx, int T) {
+static bool f5_dit_cache_build(f5_tts_context* ctx, int T, int B) {
     auto& cache = ctx->dit_cache;
-    if (cache.T_cached == T && cache.galloc)
+    if (cache.T_cached == T && cache.B_cached == B && cache.galloc)
         return true;
     cache.reset();
 
@@ -983,8 +995,10 @@ static bool f5_dit_cache_build(f5_tts_context* ctx, int T) {
     if (!cache.gctx)
         return false;
 
-    // Graph inputs
-    cache.hidden_in = ggml_new_tensor_2d(cache.gctx, GGML_TYPE_F32, dim, T);
+    // Graph inputs. hidden_in carries B independent latents ([dim,T,B]); the
+    // DiT is identical per batch entry, so t_emb (shared timestep) and pos
+    // (shared) broadcast over B. B=1 is the plain path; B=2 is batched CFG.
+    cache.hidden_in = ggml_new_tensor_3d(cache.gctx, GGML_TYPE_F32, dim, T, B);
     ggml_set_name(cache.hidden_in, "hidden_in");
     ggml_set_input(cache.hidden_in);
 
@@ -1028,9 +1042,9 @@ static bool f5_dit_cache_build(f5_tts_context* ctx, int T) {
         v = ggml_add(cache.gctx, v, blk.attn_v_bias);
 
         // Reshape for RoPE: (dim, T) → (head_dim, n_heads, T)
-        q = ggml_reshape_3d(cache.gctx, q, head_dim, n_heads, T);
-        k = ggml_reshape_3d(cache.gctx, k, head_dim, n_heads, T);
-        v = ggml_reshape_3d(cache.gctx, v, head_dim, n_heads, T);
+        q = ggml_reshape_4d(cache.gctx, q, head_dim, n_heads, T, B);
+        k = ggml_reshape_4d(cache.gctx, k, head_dim, n_heads, T, B);
+        v = ggml_reshape_4d(cache.gctx, v, head_dim, n_heads, T, B);
 
         // RoPE (NORMAL mode, freq_base=10000)
         q = ggml_rope_ext(cache.gctx, q, cache.pos_in, nullptr, head_dim, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
@@ -1044,7 +1058,7 @@ static bool f5_dit_cache_build(f5_tts_context* ctx, int T) {
         // Flash attention (bidirectional, no mask)
         float attn_scale = 1.0f / sqrtf((float)head_dim);
         ggml_tensor* attn_out = ggml_flash_attn_ext(cache.gctx, q, k, v, nullptr, attn_scale, 0.0f, 0.0f);
-        attn_out = ggml_reshape_2d(cache.gctx, attn_out, dim, T);
+        attn_out = ggml_reshape_3d(cache.gctx, attn_out, dim, T, B);
 
         // O-proj + gated residual
         ggml_tensor* attn_proj = ggml_mul_mat(cache.gctx, blk.attn_o_weight, attn_out);
@@ -1094,8 +1108,12 @@ static bool f5_dit_cache_build(f5_tts_context* ctx, int T) {
     cache.gf = ggml_new_graph_custom(cache.gctx, 8192, false);
     ggml_build_forward_expand(cache.gf, cache.output);
 
-    // Reserve then allocate memory layout
-    cache.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend_cpu));
+    // Reserve then allocate memory layout on the compute backend (GPU when
+    // use_gpu; falls back to backend_cpu otherwise). The DiT weights already
+    // live on ctx->backend, so keeping the graph on the same backend keeps the
+    // 64×-per-synthesis forward off the CPU — a single-backend gallocr compute
+    // (no sched), matching the §206/§232 direct-gallocr pattern.
+    cache.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
     if (!ggml_gallocr_reserve(cache.galloc, cache.gf) || !ggml_gallocr_alloc_graph(cache.galloc, cache.gf)) {
         cache.reset();
         return false;
@@ -1108,31 +1126,53 @@ static bool f5_dit_cache_build(f5_tts_context* ctx, int T) {
     ggml_backend_tensor_set(cache.pos_in, pos_data.data(), 0, T * sizeof(int32_t));
 
     cache.T_cached = T;
+    cache.B_cached = B;
     return true;
 }
 
 // ── Fused DiT graph: run one step ────────────────────────────────
 
-static std::vector<float> f5_dit_run(f5_tts_context* ctx, const float* hidden, int T, const float* t_emb_data) {
+// Run the DiT for B stacked latents in one graph. `hidden` is [dim,T,B]
+// contiguous, output is [mel_dim,T,B] contiguous. B=1 is the plain path;
+// B=2 batches the CFG cond+uncond passes into one dispatch chain (the DiT
+// is per-forward dispatch-overhead-bound, so halving the dispatch count per
+// step is the win). t_emb/pos are shared across B (same timestep/positions).
+static std::vector<float> f5_dit_run_batched(f5_tts_context* ctx, const float* hidden, int T, int B,
+                                             const float* t_emb_data) {
     auto& cache = ctx->dit_cache;
-    if (!f5_dit_cache_build(ctx, T))
+    if (!f5_dit_cache_build(ctx, T, B))
         return {};
 
-    // Re-assign buffer pointers (fast for same T)
+    // Re-assign buffer pointers (fast for same T,B)
     if (!ggml_gallocr_alloc_graph(cache.galloc, cache.gf))
         return {};
 
     const int dim = ctx->hp.dim;
-    ggml_backend_tensor_set(cache.hidden_in, hidden, 0, (size_t)T * dim * sizeof(float));
+    ggml_backend_tensor_set(cache.hidden_in, hidden, 0, (size_t)T * dim * B * sizeof(float));
     ggml_backend_tensor_set(cache.t_emb_in, t_emb_data, 0, (size_t)dim * sizeof(float));
+    // pos_in must be re-set every step: gallocr re-allocs the graph each call
+    // and may alias this input's slot with a prior step's compute intermediate,
+    // so a set-once value read back corrupt RoPE positions from step 1 on (the
+    // same gallocr input-aliasing bug fixed in omnivoice §245 / voxtral #93).
+    {
+        std::vector<int32_t> pos_data(T);
+        for (int i = 0; i < T; i++)
+            pos_data[i] = i;
+        ggml_backend_tensor_set(cache.pos_in, pos_data.data(), 0, (size_t)T * sizeof(int32_t));
+    }
 
-    if (ggml_backend_graph_compute(ctx->backend_cpu, cache.gf) != GGML_STATUS_SUCCESS)
+    if (ggml_backend_graph_compute(ctx->backend, cache.gf) != GGML_STATUS_SUCCESS)
         return {};
 
     const int mel_dim = ctx->hp.mel_dim;
-    std::vector<float> velocity((size_t)T * mel_dim);
+    std::vector<float> velocity((size_t)T * mel_dim * B);
     ggml_backend_tensor_get(cache.output, velocity.data(), 0, velocity.size() * sizeof(float));
     return velocity;
+}
+
+// Plain single-latent DiT forward (B=1). Unchanged callers use this.
+static std::vector<float> f5_dit_run(f5_tts_context* ctx, const float* hidden, int T, const float* t_emb_data) {
+    return f5_dit_run_batched(ctx, hidden, T, 1, t_emb_data);
 }
 
 // x:       (T, mel_dim)   — current ODE state
@@ -1140,24 +1180,28 @@ static std::vector<float> f5_dit_run(f5_tts_context* ctx, const float* hidden, i
 // text:    (T, text_dim)  — text embedding
 // time_emb: (dim,)        — timestep embedding
 
-static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, int T, int mel_dim,
-                                      const float* cond_data, const float* text_data, int text_dim,
-                                      const float* time_emb_data, bool drop_audio_cond, bool drop_text, int step_idx) {
-    const auto& hp = ctx->hp;
-    int dim = hp.dim;
+// F5_BENCH accumulators: split each DiT forward into host input-embed vs the
+// GPU DiT graph, summed across all cond/uncond passes and printed at synth end.
+static int64_t g_f5_hostembed_us = 0;
+static int64_t g_f5_ditgraph_us = 0;
 
-    // ── InputEmbedding: cat(x, cond, text) → proj → +conv_pos_embed ──
+// Host-side InputEmbedding: cat(x, cond, text) → input_proj → +conv_pos_embed.
+// Returns `hidden` [dim,T] (== ggml [dim,T] memory layout). Shared by the plain
+// per-pass path and the batched-CFG path (which computes it once per arm).
+static std::vector<float> f5_compute_hidden(f5_tts_context* ctx, const float* x_data, int T, int mel_dim,
+                                            const float* cond_data, const float* text_data, int text_dim,
+                                            bool drop_audio_cond, bool drop_text, int step_idx) {
+    (void)drop_text;
+    const int dim = ctx->hp.dim;
+
     // Concatenate along feature dim: (T, mel_dim + mel_dim + text_dim) = (T, 712)
     int cat_dim = mel_dim + mel_dim + text_dim;
     std::vector<float> cat_input(T * cat_dim);
     for (int t = 0; t < T; t++) {
-        // x
         for (int d = 0; d < mel_dim; d++)
             cat_input[t * cat_dim + d] = x_data[t * mel_dim + d];
-        // cond (zero if drop_audio_cond)
         for (int d = 0; d < mel_dim; d++)
             cat_input[t * cat_dim + mel_dim + d] = drop_audio_cond ? 0.0f : cond_data[t * mel_dim + d];
-        // text (zero if drop_text — but text is already zeroed during embedding if drop_text)
         for (int d = 0; d < text_dim; d++)
             cat_input[t * cat_dim + mel_dim + mel_dim + d] = text_data[t * text_dim + d];
     }
@@ -1177,7 +1221,6 @@ static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, 
     }
 
     // ConvPositionEmbedding: 2× (Conv1d(dim, dim, k=31, g=16, p=15) + Mish)
-    // Uses pre-cached weights; avoids 7.7 MB read_tensor_f32 per call.
     {
         int K = 31, pad_k = 15, groups = 16;
 
@@ -1203,10 +1246,22 @@ static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, 
     if (step_idx == 0 && !drop_audio_cond) {
         dump_stage(ctx, "input_embed", hidden.data(), hidden.size());
     }
+    return hidden;
+}
+
+static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, int T, int mel_dim,
+                                      const float* cond_data, const float* text_data, int text_dim,
+                                      const float* time_emb_data, bool drop_audio_cond, bool drop_text, int step_idx) {
+    const int64_t _f5_t_start = ggml_time_us();
+    std::vector<float> hidden = f5_compute_hidden(ctx, x_data, T, mel_dim, cond_data, text_data, text_dim,
+                                                  drop_audio_cond, drop_text, step_idx);
 
     // ── 22 DiT blocks + final AdaLN/proj (fused single graph) ──
     {
+        const int64_t _f5_t_pre_dit = ggml_time_us();
+        g_f5_hostembed_us += _f5_t_pre_dit - _f5_t_start;
         auto velocity = f5_dit_run(ctx, hidden.data(), T, time_emb_data);
+        g_f5_ditgraph_us += ggml_time_us() - _f5_t_pre_dit;
         if (velocity.empty())
             return {};
         if (step_idx == 0 && !drop_audio_cond)
@@ -1560,13 +1615,40 @@ static std::vector<float> euler_solve(f5_tts_context* ctx,
                 x[i] += velocity[i] * dt;
             }
         } else {
-            // CFG: conditioned + unconditioned forward
-            auto v_cond = dit_forward(ctx, x.data(), T, mel_dim, cond.data(), text_emb.data(), text_dim,
-                                      time_emb.data(), false, false, step);
-            auto v_uncond = dit_forward(ctx, x.data(), T, mel_dim, cond.data(), text_emb_uncond.data(), text_dim,
-                                        time_emb.data(), true, true, step);
-            if (v_cond.empty() || v_uncond.empty())
-                return {};
+            // CFG: conditioned + unconditioned forward. The DiT is identical
+            // per arm (the cond/uncond difference is baked into `hidden` on the
+            // host), so with F5_BATCH_CFG the two arms run as one B=2 DiT graph.
+            // MEASURED (M1 Metal, 8 steps): output identical to sequential
+            // (corr 1.00000) but NO speedup — slightly slower. The DiT is
+            // compute/bandwidth-bound, not dispatch-bound, so B=2 just does 2×
+            // work per dispatch. Kept opt-in + off by default; the real lever
+            // is DiT compute efficiency (F32→F16 activations). See PLAN §232.
+            std::vector<float> v_cond, v_uncond;
+            if (f5_batch_cfg_enabled()) {
+                auto h_cond = f5_compute_hidden(ctx, x.data(), T, mel_dim, cond.data(), text_emb.data(), text_dim,
+                                                false, false, step);
+                auto h_uncond = f5_compute_hidden(ctx, x.data(), T, mel_dim, cond.data(), text_emb_uncond.data(),
+                                                  text_dim, true, true, step);
+                if (h_cond.empty() || h_uncond.empty())
+                    return {};
+                const int dim = ctx->hp.dim;
+                std::vector<float> h_stack((size_t)T * dim * 2);
+                std::copy(h_cond.begin(), h_cond.end(), h_stack.begin());
+                std::copy(h_uncond.begin(), h_uncond.end(), h_stack.begin() + (size_t)T * dim);
+                auto v = f5_dit_run_batched(ctx, h_stack.data(), T, 2, time_emb.data());
+                if (v.empty())
+                    return {};
+                const size_t arm = (size_t)T * mel_dim;
+                v_cond.assign(v.begin(), v.begin() + arm);
+                v_uncond.assign(v.begin() + arm, v.begin() + 2 * arm);
+            } else {
+                v_cond = dit_forward(ctx, x.data(), T, mel_dim, cond.data(), text_emb.data(), text_dim, time_emb.data(),
+                                     false, false, step);
+                v_uncond = dit_forward(ctx, x.data(), T, mel_dim, cond.data(), text_emb_uncond.data(), text_dim,
+                                       time_emb.data(), true, true, step);
+                if (v_cond.empty() || v_uncond.empty())
+                    return {};
+            }
 
             // CFG: v = v_cond + cfg * (v_cond - v_uncond)
             float cfg = ctx->cfg_strength;
@@ -1999,9 +2081,14 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
     // ── ODE solve ──
     std::vector<float> generated;
     {
+        g_f5_hostembed_us = 0;
+        g_f5_ditgraph_us = 0;
         f5_bench_stage _b("ode_solve");
         generated = euler_solve(ctx, step_cond, text_emb, text_emb_uncond, duration, mel_dim, text_dim);
     }
+    if (f5_bench_enabled())
+        fprintf(stderr, "  f5_bench: %-22s host_embed=%.1f ms  dit_graph=%.1f ms\n", "ode_split",
+                g_f5_hostembed_us / 1000.0, g_f5_ditgraph_us / 1000.0);
     if (generated.empty())
         return 0;
 

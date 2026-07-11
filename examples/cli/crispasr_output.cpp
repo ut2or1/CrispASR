@@ -666,12 +666,19 @@ bool crispasr_write_json(const std::string& path, const std::vector<crispasr_seg
             f << ",\n      \"emotion\":    \"" << json_escape(s.emotion) << "\"";
         if (!s.itn_flag.empty())
             f << ",\n      \"itn_flag\":   \"" << json_escape(s.itn_flag) << "\"";
+        // NOTE ON UNITS (issue #228): segment `offsets` above are in milliseconds
+        // (t0/t1 are the internal centisecond timebase * 10). For back-compat the
+        // per-word / per-token `t0`/`t1` fields are kept in their original
+        // centisecond units, and each entry additionally carries an `offsets`
+        // object in milliseconds so every timed object in this document exposes a
+        // consistent ms field matching the segment shape.
         if (full && !s.words.empty()) {
             f << ",\n      \"words\": [\n";
             for (size_t j = 0; j < s.words.size(); j++) {
                 const auto& w = s.words[j];
                 f << "        { \"text\": \"" << json_escape(w.text) << "\", \"t0\": " << w.t0 << ", \"t1\": " << w.t1
-                  << " }" << (j + 1 < s.words.size() ? "," : "") << "\n";
+                  << ", \"offsets\": { \"from\": " << (w.t0 * 10) << ", \"to\": " << (w.t1 * 10) << " } }"
+                  << (j + 1 < s.words.size() ? "," : "") << "\n";
             }
             f << "      ]";
         }
@@ -680,8 +687,8 @@ bool crispasr_write_json(const std::string& path, const std::vector<crispasr_seg
             for (size_t j = 0; j < s.tokens.size(); j++) {
                 const auto& t = s.tokens[j];
                 f << "        { \"text\": \"" << json_escape(t.text) << "\", \"p\": " << t.confidence
-                  << ", \"t0\": " << t.t0 << ", \"t1\": " << t.t1 << " }" << (j + 1 < s.tokens.size() ? "," : "")
-                  << "\n";
+                  << ", \"t0\": " << t.t0 << ", \"t1\": " << t.t1 << ", \"offsets\": { \"from\": " << (t.t0 * 10)
+                  << ", \"to\": " << (t.t1 * 10) << " } }" << (j + 1 < s.tokens.size() ? "," : "") << "\n";
             }
             f << "      ]";
         }
@@ -709,6 +716,46 @@ bool crispasr_write_lrc(const std::string& path, const std::vector<crispasr_disp
         snprintf(buf, sizeof(buf), "[%02d:%02d.%02d]", mm, ss, xx);
         f << buf << prefix_speaker(s.speaker) << s.text << "\n";
     }
+    return true;
+}
+
+std::string crispasr_ctc_logits_to_json(const crispasr_ctc_logits& logits) {
+    std::ostringstream js;
+    js << "{";
+    js << "\"n_frames\":" << logits.n_frames << ",";
+    js << "\"n_vocab\":" << logits.n_vocab << ",";
+    js << "\"layout\":\"frame_major\",";
+    js << "\"normalization\":\"" << json_escape(logits.normalization) << "\",";
+    if (!logits.vocab.empty()) {
+        js << "\"vocab\":[";
+        for (size_t i = 0; i < logits.vocab.size(); i++) {
+            if (i)
+                js << ",";
+            js << "\"" << json_escape(logits.vocab[i]) << "\"";
+        }
+        js << "],";
+    }
+    js << "\"data\":[";
+    for (size_t i = 0; i < logits.data.size(); i++) {
+        if (i)
+            js << ",";
+        js << logits.data[i];
+    }
+    js << "]}";
+    return js.str();
+}
+
+bool crispasr_write_ctc_logits_json(const std::string& path, const crispasr_ctc_logits& logits,
+                                    const std::string& backend_name) {
+    std::ofstream f(path);
+    if (!f) {
+        fprintf(stderr, "crispasr: warning: cannot write CTC logits JSON '%s'\n", path.c_str());
+        return false;
+    }
+    f << "{\n";
+    f << "  \"backend\": \"" << json_escape(backend_name) << "\",\n";
+    f << "  \"ctc_logits\": " << crispasr_ctc_logits_to_json(logits) << "\n";
+    f << "}\n";
     return true;
 }
 

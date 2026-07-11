@@ -37,6 +37,124 @@ jobs:
         run: ./build/bin/crispasr --list-backends
 
   # ===========================================================================
+  # Linux x86_64 — AMR opencore FetchContent static build (opt-in gate guard)
+  # ===========================================================================
+  # The -DCRISPASR_AMR_FETCH=ON path compiles opencore-amr from source (for
+  # platforms without a system libopencore-amr). It is OFF by default, so the
+  # rest of the matrix never exercises it — and it silently broke once (§219):
+  # an over-inclusive common/src glob pulled in files upstream excludes
+  # (bits2prm.cpp → missing header), and an unanchored exclusion regex also
+  # matched dtx_decoder_amr_wb.cpp (link error). Neither surfaced until the
+  # static sources were actually compiled + linked + run. This job builds that
+  # path and decodes samples/jfk.amr end-to-end so a regression fails CI at
+  # authoring time. NOTE: the configure step asserts the gate genuinely turned
+  # ON — otherwise the [amr] test WARN-skips and hides the regression (a false
+  # green), which is precisely how the original break went unnoticed.
+  linux-amr-fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev
+
+      - name: Configure (AMR FetchContent static) + assert gate enabled
+        run: |
+          cmake -S . -B build-amr \
+            -DCMAKE_BUILD_TYPE=Release -DGGML_OPENBLAS=ON -DGGML_NATIVE=OFF \
+            -DCRISPASR_BUILD_TESTS=ON -DCRISPASR_AMR=ON -DCRISPASR_AMR_FETCH=ON \
+            2>&1 | tee cfg.log
+          grep -q "AMR via FetchContent" cfg.log || {
+            echo "::error::CRISPASR_AMR_FETCH did not enable — the AMR static gate is not actually being tested (would give a false green)";
+            exit 1;
+          }
+
+      - name: Build audio-format tests (compiles + links opencore-amr static)
+        run: cmake --build build-amr --target test-audio-formats -j $(nproc)
+
+      - name: Decode AMR end-to-end (samples/jfk.amr)
+        run: ./build-amr/bin/test-audio-formats "[amr]"
+
+  # ===========================================================================
+  # Linux x86_64 — Opus FetchContent static build (opt-in gate guard)
+  # ===========================================================================
+  # Sibling of linux-amr-fetch: -DCRISPASR_OPUS_FETCH=ON statically builds
+  # ogg + opus + opusfile (for platforms without a system opusfile). OFF by
+  # default, so nothing else in the matrix compiles it — same rot risk as the
+  # AMR path (opusfile is autotools-only, so its sources are hand-listed in
+  # src/CMakeLists.txt: an upstream layout change or a missing symbol would
+  # only surface here). This job builds it and decodes samples/jfk.webm
+  # (Opus-in-WebM) through the static libs. Same false-green guard: the
+  # configure step asserts the gate actually turned ON.
+  linux-opus-fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev
+
+      - name: Configure (Opus FetchContent static) + assert gate enabled
+        run: |
+          cmake -S . -B build-opus \
+            -DCMAKE_BUILD_TYPE=Release -DGGML_OPENBLAS=ON -DGGML_NATIVE=OFF \
+            -DCRISPASR_BUILD_TESTS=ON -DCRISPASR_OPUS=ON -DCRISPASR_OPUS_FETCH=ON \
+            2>&1 | tee cfg.log
+          grep -q "\.opus via FetchContent static" cfg.log || {
+            echo "::error::CRISPASR_OPUS_FETCH did not enable — the Opus static gate is not actually being tested (would give a false green)";
+            exit 1;
+          }
+
+      - name: Build audio-format tests (compiles + links opus/ogg/opusfile static)
+        run: cmake --build build-opus --target test-audio-formats -j $(nproc)
+
+      - name: Decode Opus-in-WebM end-to-end (samples/jfk.webm)
+        run: ./build-opus/bin/test-audio-formats "[webm]"
+
+  # ===========================================================================
+  # Linux x86_64 — ASan/UBSan on the audio-format decoders (untrusted input)
+  # ===========================================================================
+  # crispasr_audio_load parses untrusted file bytes with hand-rolled decoders
+  # (EBML/WebM demux, MP4 box parser, Sun-AU header). The default matrix builds
+  # them only in Release, so a heap overflow / UB in that attack surface would
+  # not surface. Build the audio-format tests with CRISPASR_SANITIZE_ADDRESS +
+  # _UNDEFINED and decode the committed samples under the sanitizer. Also guards
+  # the sanitizer build gate itself from rotting. (Scoped to the audio decoders
+  # — the fuzzable surface — which keeps the job fast; broaden to the full unit
+  # lane later if desired.)
+  linux-asan-audio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev libopusfile-dev
+
+      - name: Configure (ASan + UBSan)
+        run: >
+          cmake -S . -B build-asan
+          -DCMAKE_BUILD_TYPE=Debug
+          -DGGML_NATIVE=OFF
+          -DCRISPASR_BUILD_TESTS=ON
+          -DCRISPASR_SANITIZE_ADDRESS=ON
+          -DCRISPASR_SANITIZE_UNDEFINED=ON
+
+      - name: Build audio-format tests under sanitizers
+        run: cmake --build build-asan --target test-audio-formats -j $(nproc)
+
+      - name: Decode samples under ASan/UBSan
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ./build-asan/bin/test-audio-formats "[audio]"
+
+  # ===========================================================================
   # Linux x86_64 + Vulkan
   # ===========================================================================
   linux-vulkan:

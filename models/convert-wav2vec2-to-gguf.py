@@ -340,8 +340,11 @@ def main() -> None:
     # HuBERT is pre-norm (do_stable_layer_norm=True in config).
     stable_ln = 1 if is_hubert or getattr(config, "do_stable_layer_norm", False) else 0
     writer.add_uint32(f"{ARCH}.do_stable_layer_norm", stable_ln)
-    # Data2Vec applies global encoder LN BEFORE transformer layers (unique to data2vec)
-    global_ln_before = 1 if is_data2vec else 0
+    # Non-stable encoders (HF Wav2Vec2Encoder: standard wav2vec2-base, data2vec)
+    # apply the global encoder LayerNorm BEFORE the transformer layers; stable
+    # encoders (Wav2Vec2EncoderStableLayerNorm: large / MMS / XLS-R / HuBERT)
+    # apply it AFTER. This tracks do_stable_layer_norm exactly.
+    global_ln_before = 0 if stable_ln else 1
     writer.add_uint32(f"{ARCH}.global_ln_before_encoder", global_ln_before)
     if is_data2vec:
         print(f"  Detected data2vec: LayerNorm CNN, POST-norm encoder, global LN before layers")

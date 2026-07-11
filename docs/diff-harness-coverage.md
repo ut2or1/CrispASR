@@ -37,6 +37,7 @@ archived at `cstr/chatterbox-GGUF/diff-harness-ref/`.
 | backend | ref module | archive | mtime | harness | deps |
 |---|---|---|---|---|---|
 | `canary` | `tools/reference_backends/canary.py` | — | — | yes | nemo, torch |
+| `canary-qwen` | `tools/reference_backends/canary_qwen.py` | `cstr/canary-qwen-2.5b-GGUF/diff-harness-ref/canary-qwen-2.5b-ref.gguf` | 2026-07-11 | yes | nemo, torch |
 | `chatterbox` | `tools/reference_backends/chatterbox.py` | — | — | yes | chatterbox, librosa, torch, torchaudio |
 | `chatterbox_turbo` | `tools/reference_backends/chatterbox_turbo.py` | — | — | **no** | chatterbox, torch |
 | `cohere` | `tools/reference_backends/cohere.py` | — | — | yes | safetensors, torch, transformers |
@@ -51,6 +52,7 @@ archived at `cstr/chatterbox-GGUF/diff-harness-ref/`.
 | `granite-nle` | `tools/reference_backends/granite_nle.py` | — | — | yes | safetensors, torch, transformers |
 | `indextts` | `tools/reference_backends/indextts.py` | — | — | **no** | torch |
 | `kokoro` | `tools/reference_backends/kokoro.py` | — | — | yes | kokoro, torch |
+| `kyutai-stt` | `tools/reference_backends/kyutai_stt.py` | `cstr/kyutai-stt-2.6b-en-GGUF/kyutai-stt-2.6b-ref.gguf` | 2026-07-10 | yes | moshi, safetensors, scipy, sentencepiece, torch |
 | `kugelaudio` | `tools/reference_backends/kugelaudio.py` | — | — | yes | torch |
 | `lfm2-audio` | `tools/reference_backends/lfm2_audio.py` | — | — | yes | torch |
 | `lid-cld3` | `tools/reference_backends/lid_cld3.py` | — | — | yes | gguf, pycld3 |
@@ -115,6 +117,7 @@ code starts working.
 - `moonshine` — `tools/bootstrap_ref_env.sh moonshine` then `python tools/dump_reference.py --backend moonshine --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/moonshine-ref.gguf`
 - `moonshine-streaming` — `tools/bootstrap_ref_env.sh moonshine-streaming` then `python tools/dump_reference.py --backend moonshine-streaming --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/moonshine-streaming-ref.gguf`
 - `moss-audio` — `tools/bootstrap_ref_env.sh moss-audio` then `python tools/dump_reference.py --backend moss-audio --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/moss-audio-ref.gguf`
+- `moss-diarize` — `python tools/dump_reference.py --backend moss-diarize --model-dir OpenMOSS-Team/MOSS-Transcribe-Diarize --audio samples/jfk.wav --stages mel_spectrogram,conv_stem_out,encoder_output,audio_embeds --output moss-diarize-ref.gguf`. Stages: mel_spectrogram (80,3000), conv_stem_out (1500,1024), encoder_layer_0 (1500,1024), encoder_output (552,1024), audio_embeds (138,1024). All 4 core stages cos=1.000 on F32. Run with `crispasr-diff moss-diarize <model.gguf> <ref.gguf> <audio.wav>`.
 - `nemotron` — `tools/bootstrap_ref_env.sh nemotron` then `python tools/dump_reference.py --backend nemotron --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/nemotron-ref.gguf`
 - `orpheus` — `tools/bootstrap_ref_env.sh orpheus` then `python tools/dump_reference.py --backend orpheus --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/orpheus-snac-ref.gguf`
 - `orpheus-talker` — talker (Llama-3.2-3B) AR-decode greedy codec stream. `ORPHEUS_TEXT/SPEAKER/REF_DTYPE` + `ORPHEUS_CUSTOM_OFFSET/COUNT` (match the GGUF), `--model-dir` = the talker LM HF snapshot (e.g. `unsloth/orpheus-3b-0.1-ft`). Run with `crispasr-diff orpheus-talker <talker.gguf> <ref.gguf> <audio>` (`ORPHEUS_DIFF_GPU=1` for the GPU AR loop; `ORPHEUS_DIFF_MAXGEN` caps it). Frozen ref at `hf.co/cstr/orpheus-3b-0.1-ft-GGUF/diff-harness-ref/orpheus-talker-ref.gguf`. Full build→quantize→diff→upload runs on Kaggle via `tools/kaggle/orpheus-talker-cuda/`.

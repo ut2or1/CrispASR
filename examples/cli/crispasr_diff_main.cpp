@@ -37,14 +37,18 @@
 
 #include "voxtral.h"
 #include "voxtral4b.h"
+#include "voxtral_tts.h"
 #include "higgs_stt.h"
+#include "moss_transcribe_diarize.h"
 #include "qwen3_asr.h"
 #include "qwen3_tts.h"
+#include "omnivoice.h"
 #include "kokoro.h"
 #include "granite_speech.h"
 #include "granite_nle.h"
 #include "parakeet.h"
 #include "canary.h"
+#include "canary_qwen.h"
 #include "cohere.h"
 #include "gemma4_e2b.h"
 #include "mimo_asr.h"
@@ -72,6 +76,7 @@
 #include "moss_transcribe.h"
 #include "lfm2_audio.h"
 #include "mini_omni2.h"
+#include "kyutai_stt.h"
 #include "nemotron.h"
 #include "tada_codec.h"
 #include "tada_encoder.h"
@@ -1040,12 +1045,12 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "usage: %s <backend> <model.gguf> <reference.gguf> <audio.wav>\n"
                 "\n"
-                "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, tada-tts, "
+                "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, omnivoice, tada-tts, "
                 "tada-encoder, kokoro, granite, "
                 "granite-4.1, "
                 "granite-nle, parakeet, chatterbox, voxcpm2-tts, "
                 "canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, moonshine-streaming, "
-                "parler-tts, moss-audio\n"
+                "kyutai-stt, parler-tts, moss-audio\n"
                 "  model.gguf    crispasr-compatible model weights\n"
                 "  reference.gguf  archive produced by tools/dump_reference.py\n"
                 "  audio.wav     16 kHz mono WAV\n",
@@ -1081,6 +1086,11 @@ int main(int argc, char** argv) {
     if (backend_name == "dots-tts-spk") {
         // model_path = speaker encoder GGUF, ref_path = spk-ref GGUF.
         return dots_tts_spk_diff(model_path.c_str(), ref_path.c_str(), /*verbosity=*/2);
+    }
+    if (backend_name == "voxtral-tts") {
+        // model_path = voxtral-tts GGUF (F16 for a clean structural diff), ref_path =
+        // ref GGUF from tools/reference_backends/voxtral_tts.py. Per-layer frame-0 LLM cos.
+        return voxtral_tts_llm_diff(model_path.c_str(), ref_path.c_str(), /*verbosity=*/2);
     }
 
     // Load the reference archive.
@@ -1869,19 +1879,275 @@ int main(int argc, char** argv) {
         auto cp = qwen3_asr_context_default_params();
         cp.n_threads = 4;
         cp.verbosity = 0;
+        // CRISPASR_DIFF_NO_GPU=1 forces the CPU backend — discriminates
+        // GPU-numerics divergence from port-logic divergence.
+        cp.use_gpu = std::getenv("CRISPASR_DIFF_NO_GPU") == nullptr;
+        // CRISPASR_DIFF_STAGES=mel,conv,enc_ref,enc_own,ids,logits selects
+        // stages (comma list). Default: all. Long audio makes each stage
+        // memory-heavy — selecting one keeps the process small.
+        auto stage_on = [](const char* key) {
+            const char* s = std::getenv("CRISPASR_DIFF_STAGES");
+            if (!s || !*s)
+                return true;
+            return std::string(",").append(s).append(",").find(std::string(",") + key + ",") != std::string::npos;
+        };
         qwen3_asr_context* ctx = qwen3_asr_init_from_file(model_path.c_str(), cp);
         if (!ctx) {
             fprintf(stderr, "failed to load qwen3 model\n");
             return 4;
         }
-        auto mel_r = qwen3_mel(ctx, samples.data(), (int)samples.size());
-        if (mel_r.ok) {
-            auto rep = ref.compare("mel_spectrogram", mel_r.data.data(), mel_r.data.size());
-            print_row("mel_spectrogram", rep, COS_THRESHOLD);
-            record(rep);
-        } else {
-            printf("[ERR ] mel_spectrogram         %s\n", mel_r.note.c_str());
-            n_fail++;
+        StageResult mel_r;
+        if (stage_on("mel") || stage_on("enc_own") || stage_on("logits")) {
+            mel_r = qwen3_mel(ctx, samples.data(), (int)samples.size());
+        }
+        if (stage_on("mel")) {
+            if (mel_r.ok) {
+                auto rep = ref.compare("mel_spectrogram", mel_r.data.data(), mel_r.data.size());
+                print_row("mel_spectrogram", rep, COS_THRESHOLD);
+                record(rep);
+            } else {
+                printf("[ERR ] mel_spectrogram         %s\n", mel_r.note.c_str());
+                n_fail++;
+            }
+        }
+
+        // Reference mel (layout f*T + t — matches qwen3_asr_run_* input).
+        auto ref_mel = ref.get_f32("mel_spectrogram");
+        auto ref_mel_shape = ref.shape("mel_spectrogram");
+        int ref_T_mel = 0, ref_n_mels = 0;
+        if (ref_mel.first && ref_mel_shape.size() >= 2) {
+            // dumper stores numpy (1, 128, T): ne = [T, 128, 1]
+            ref_T_mel = (int)ref_mel_shape[0];
+            ref_n_mels = (int)ref_mel_shape[1];
+        }
+
+        // Stage: conv_out(ref_mel) — conv front (3× conv2d + GELU + conv_out
+        // linear, pre-PE) on the reference mel. Isolates conv weights + mel
+        // chunk packing from downstream encoder blocks.
+        if (stage_on("conv") && ref_mel.first && ref.has("conv_out")) {
+            int B = 0, Tc = 0, d = 0;
+            float* conv = qwen3_asr_run_conv(ctx, ref_mel.first, ref_n_mels, ref_T_mel, &B, &Tc, &d);
+            if (conv) {
+                auto rep = ref.compare("conv_out", conv, (size_t)B * Tc * d);
+                print_row("conv_out(ref_mel)", rep, COS_THRESHOLD);
+                record(rep);
+                free(conv);
+            } else {
+                printf("[ERR ] conv_out(ref_mel)       qwen3_asr_run_conv returned null\n");
+                n_fail++;
+            }
+        }
+
+        // Stage: enc_stages — per-block encoder intermediates on the
+        // reference mel, captured via CRISP_AUDIO_DUMP_STAGES. Bisects
+        // encoder-internal divergence to the first failing block. Run with
+        // CRISPASR_DIFF_NO_GPU=1 — set_output snapshots lie on Metal.
+        if (stage_on("enc_stages") && ref_mel.first) {
+            char tmpl[] = "/tmp/qwen3-enc-stages-XXXXXX";
+            const char* dir = mkdtemp(tmpl);
+            if (dir) {
+                setenv("CRISP_AUDIO_DUMP_STAGES", dir, 1);
+                int N = 0, pd = 0;
+                float* enc = qwen3_asr_run_encoder(ctx, ref_mel.first, ref_n_mels, ref_T_mel, &N, &pd);
+                unsetenv("CRISP_AUDIO_DUMP_STAGES");
+                if (enc)
+                    free(enc);
+                std::vector<std::string> names = {"ln_post_out", "proj1_out"};
+                for (int il = 0; il < 18; il++) {
+                    char nm[32];
+                    snprintf(nm, sizeof(nm), "enc_blk%02d_out", il);
+                    names.push_back(nm);
+                }
+                std::sort(names.begin(), names.end());
+                for (const auto& nm : names) {
+                    if (!ref.has(nm))
+                        continue;
+                    const std::string path = std::string(dir) + "/" + nm + ".f32";
+                    FILE* f = fopen(path.c_str(), "rb");
+                    if (!f)
+                        continue;
+                    fseek(f, 0, SEEK_END);
+                    const size_t n = (size_t)ftell(f) / sizeof(float);
+                    fseek(f, 0, SEEK_SET);
+                    std::vector<float> buf(n);
+                    if (fread(buf.data(), sizeof(float), n, f) == n) {
+                        auto rep = ref.compare(nm, buf.data(), n);
+                        print_row((nm + "(ref_mel)").c_str(), rep, COS_THRESHOLD);
+                        record(rep);
+                    }
+                    fclose(f);
+                    remove(path.c_str());
+                }
+                rmdir(dir);
+            }
+        }
+
+        // Stage: encoder_output(ref_mel) — full audio tower on the reference
+        // mel. Isolates encoder-internal divergence from mel divergence.
+        std::vector<float> enc_own; // encoder output on OUR mel (reused below)
+        int N_enc_own = 0, pdim_own = 0;
+        if (stage_on("enc_ref") && ref_mel.first && ref.has("encoder_output")) {
+            int N = 0, pd = 0;
+            float* enc = qwen3_asr_run_encoder(ctx, ref_mel.first, ref_n_mels, ref_T_mel, &N, &pd);
+            if (enc) {
+                auto rep = ref.compare("encoder_output", enc, (size_t)N * pd);
+                print_row("encoder_output(ref_mel)", rep, COS_THRESHOLD);
+                record(rep);
+                free(enc);
+            } else {
+                printf("[ERR ] encoder_output(ref_mel) qwen3_asr_run_encoder returned null\n");
+                n_fail++;
+            }
+        }
+
+        // Stage: encoder_output(own_mel) — composite mel→encoder path,
+        // exactly what the CLI adapter feeds the LLM.
+        if ((stage_on("enc_own") || stage_on("logits")) && mel_r.ok && ref.has("encoder_output")) {
+            const int T_own = mel_r.shape[1];
+            float* enc = qwen3_asr_run_encoder(ctx, mel_r.data.data(), mel_r.shape[0], T_own, &N_enc_own, &pdim_own);
+            if (enc) {
+                auto rep = ref.compare("encoder_output", enc, (size_t)N_enc_own * pdim_own);
+                print_row("encoder_output(own_mel)", rep, COS_THRESHOLD);
+                record(rep);
+                enc_own.assign(enc, enc + (size_t)N_enc_own * pdim_own);
+                free(enc);
+            } else {
+                printf("[ERR ] encoder_output(own_mel) qwen3_asr_run_encoder returned null\n");
+                n_fail++;
+            }
+        }
+
+        // Stage: prompt_ids — build the CLI-identical auto-language prompt
+        // (empty system turn, N_enc audio pads) and exact-compare the BPE
+        // tokenization against the reference chat-template ids.
+        std::vector<int32_t> own_ids;
+        if ((stage_on("ids") || stage_on("logits")) && ref.has("trace_input_ids")) {
+            auto ref_ids_f = ref.get_f32("trace_input_ids");
+            std::string text = "<|im_start|>system\n"
+                               "<|im_end|>\n"
+                               "<|im_start|>user\n"
+                               "<|audio_start|>";
+            for (int i = 0; i < N_enc_own; i++)
+                text += "<|audio_pad|>";
+            text += "<|audio_end|><|im_end|>\n"
+                    "<|im_start|>assistant\n";
+            int n_ids = 0;
+            int32_t* ids = qwen3_asr_tokenize(ctx, text.c_str(), &n_ids);
+            if (ids) {
+                own_ids.assign(ids, ids + n_ids);
+                free(ids);
+                size_t n_mismatch = 0;
+                int first_mismatch = -1;
+                const size_t n_common = std::min((size_t)n_ids, ref_ids_f.second);
+                for (size_t i = 0; i < n_common; i++) {
+                    if (own_ids[i] != (int32_t)ref_ids_f.first[i]) {
+                        n_mismatch++;
+                        if (first_mismatch < 0)
+                            first_mismatch = (int)i;
+                    }
+                }
+                const bool pass = (size_t)n_ids == ref_ids_f.second && n_mismatch == 0;
+                printf("%s prompt_ids             own=%d ref=%zu mismatches=%zu", pass ? "[PASS]" : "[FAIL]", n_ids,
+                       ref_ids_f.second, n_mismatch);
+                if (first_mismatch >= 0)
+                    printf(" first@%d (own=%d ref=%d)", first_mismatch, own_ids[first_mismatch],
+                           (int32_t)ref_ids_f.first[first_mismatch]);
+                printf("\n");
+                pass ? n_pass++ : n_fail++;
+            } else {
+                printf("[ERR ] prompt_ids             tokenize returned null\n");
+                n_fail++;
+            }
+        }
+
+        // Stage: first_logits(ref_embeds) — the reference's already-spliced
+        // prompt embeddings through OUR LLM prefill. Isolates LLM-side quant
+        // noise from every upstream stage.
+        if (stage_on("llm") && ref.has("trace_inputs_embeds") && ref.has("trace_first_logits")) {
+            auto emb = ref.get_f32("trace_inputs_embeds");
+            auto emb_shape = ref.shape("trace_inputs_embeds");
+            if (emb.first && emb_shape.size() >= 2) {
+                const int T_prompt = (int)emb_shape[1]; // ne=[1024, 1900]
+                if (qwen3_asr_kv_init(ctx, std::max(4096, T_prompt + 64))) {
+                    qwen3_asr_kv_reset(ctx);
+                    int n_t = 0, vocab = 0;
+                    float* logits = qwen3_asr_run_llm_kv(ctx, const_cast<float*>(emb.first), T_prompt, 0, &n_t, &vocab);
+                    if (logits) {
+                        const float* last = logits + (size_t)(n_t - 1) * vocab;
+                        auto rep = ref.compare("trace_first_logits", last, (size_t)vocab);
+                        print_row("first_logits(ref_embeds)", rep, COS_THRESHOLD);
+                        record(rep);
+                        free(logits);
+                    } else {
+                        printf("[ERR ] first_logits(ref_embeds) llm prefill returned null\n");
+                        n_fail++;
+                    }
+                }
+            }
+        }
+
+        // Stage: first_logits(own) — the full own pipeline (own mel → own
+        // encoder → own prompt → embed + splice → KV prefill), compared to
+        // the reference's last-position logits. This is what the CLI
+        // actually computes before the first sampled token.
+        if (stage_on("logits") && !enc_own.empty() && !own_ids.empty() && ref.has("trace_first_logits")) {
+            float* embeds = qwen3_asr_embed_tokens(ctx, own_ids.data(), (int)own_ids.size());
+            if (embeds) {
+                int n_pad_id = 0;
+                int32_t* pad_arr = qwen3_asr_tokenize(ctx, "<|audio_pad|>", &n_pad_id);
+                const int audio_pad_id = (pad_arr && n_pad_id >= 1) ? pad_arr[0] : -1;
+                free(pad_arr);
+                int spliced = 0;
+                for (size_t i = 0; i < own_ids.size() && spliced < N_enc_own; i++) {
+                    if (own_ids[i] == audio_pad_id) {
+                        std::memcpy(embeds + i * pdim_own, enc_own.data() + (size_t)spliced * pdim_own,
+                                    pdim_own * sizeof(float));
+                        spliced++;
+                    }
+                }
+                printf("       spliced %d/%d audio frames into %zu-token prompt\n", spliced, N_enc_own, own_ids.size());
+                const int T_prompt = (int)own_ids.size();
+                if (qwen3_asr_kv_init(ctx, std::max(4096, T_prompt + 64))) {
+                    qwen3_asr_kv_reset(ctx);
+                    int n_t = 0, vocab = 0;
+                    float* logits = qwen3_asr_run_llm_kv(ctx, embeds, T_prompt, 0, &n_t, &vocab);
+                    if (logits) {
+                        const float* last = logits + (size_t)(n_t - 1) * vocab;
+                        auto rep = ref.compare("trace_first_logits", last, (size_t)vocab);
+                        int own_arg = 0;
+                        float mx = -1e30f;
+                        for (int k = 0; k < vocab; k++)
+                            if (last[k] > mx) {
+                                mx = last[k];
+                                own_arg = k;
+                            }
+                        auto ref_lg = ref.get_f32("trace_first_logits");
+                        int ref_arg = 0;
+                        float rmx = -1e30f;
+                        for (size_t k = 0; k < ref_lg.second; k++)
+                            if (ref_lg.first[k] > rmx) {
+                                rmx = ref_lg.first[k];
+                                ref_arg = (int)k;
+                            }
+                        char extra[96];
+                        snprintf(extra, sizeof(extra), "argmax own=%d ref=%d %s", own_arg, ref_arg,
+                                 own_arg == ref_arg ? "MATCH" : "MISMATCH");
+                        print_row("first_logits(own)", rep, COS_THRESHOLD, extra);
+                        record(rep);
+                        free(logits);
+                    } else {
+                        printf("[ERR ] first_logits(own)      llm prefill returned null\n");
+                        n_fail++;
+                    }
+                } else {
+                    printf("[ERR ] first_logits(own)      kv_init failed\n");
+                    n_fail++;
+                }
+                free(embeds);
+            } else {
+                printf("[ERR ] first_logits(own)      embed_tokens returned null\n");
+                n_fail++;
+            }
         }
         qwen3_asr_free(ctx);
     } else if (backend_name == "qwen3-tts") {
@@ -3686,8 +3952,12 @@ int main(int argc, char** argv) {
         {
             auto mel_pair = ref.get_f32("mel_spectrogram");
             auto mel_shp = ref.shape("mel_spectrogram");
-            int staged_n_mels = mel_shp.size() >= 1 ? (int)mel_shp[0] : 128;
-            int staged_T_mel = mel_shp.size() >= 2 ? (int)mel_shp[1] : 0;
+            // dump_reference stores cohere mel as (T, n_mels) row-major, which is
+            // exactly the [n_mels, T] ggml layout the staged encoder expects.
+            // shp[0]=T, shp[1]=n_mels (these were previously swapped, which made
+            // cohere_run_encoder_staged reject the mel with a feature mismatch).
+            int staged_T_mel = mel_shp.size() >= 1 ? (int)mel_shp[0] : 0;
+            int staged_n_mels = mel_shp.size() >= 2 ? (int)mel_shp[1] : 128;
             const float* staged_mel = mel_pair.first;
 
             struct CohereStageCap {
@@ -6539,6 +6809,86 @@ int main(int argc, char** argv) {
 
         mini_omni2_free(ctx);
 
+    } else if (backend_name == "kyutai-stt") {
+        // kyutai/stt-1b-en_fr and kyutai/stt-2.6b-en.
+        // Python reference: tools/reference_backends/kyutai_stt.py
+        // Stages: seanet_output, enc_tfm_output, downsampled, rvq_codes,
+        //         lm_frame0_logits, generated_text.
+        // The reference GGUF for 2.6B is hosted on HF:
+        //   cstr/kyutai-stt-2.6b-en-GGUF / kyutai-stt-2.6b-ref.gguf
+        auto cp = kyutai_stt_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        kyutai_stt_context* ctx = kyutai_stt_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load kyutai-stt model '%s'\n", model_path.c_str());
+            return 4;
+        }
+
+        // Append silence tail so the LM flushes all pending tokens.
+        const float lookahead_s = kyutai_stt_total_lookahead_seconds(ctx);
+        const int tail_n = std::max(8000, (int)(lookahead_s * 16000.0f));
+        std::vector<float> samples_tail(samples);
+        samples_tail.resize(samples_tail.size() + (size_t)tail_n, 0.0f);
+
+        // Full transcription.
+        kyutai_stt_result_ex* r = kyutai_stt_transcribe_ex(ctx, samples_tail.data(), (int)samples_tail.size(), 0);
+
+        if (r && r->text && *r->text) {
+            printf("[INFO] transcript (C++)    : %s\n", r->text);
+        } else {
+            printf("[WARN] kyutai-stt returned empty transcript\n");
+        }
+
+        // Compare transcript against Python reference (stored as GGUF metadata).
+        {
+            std::string ref_text = ref.meta("generated_text");
+            std::string cpp_text = (r && r->text) ? r->text : "";
+            // Trim leading/trailing whitespace for comparison.
+            auto trim = [](std::string s) {
+                while (!s.empty() && (s.front() == ' ' || s.front() == '\n'))
+                    s.erase(s.begin());
+                while (!s.empty() && (s.back() == ' ' || s.back() == '\n'))
+                    s.pop_back();
+                return s;
+            };
+            ref_text = trim(ref_text);
+            cpp_text = trim(cpp_text);
+            if (!ref_text.empty()) {
+                printf("[INFO] transcript (Python) : %s\n", ref_text.c_str());
+                bool match = (cpp_text == ref_text);
+                printf("[%s ] generated_text          (exact-match=%s)\n", match ? "PASS" : "DIFF",
+                       match ? "yes" : "no");
+                if (match)
+                    n_pass++;
+                else
+                    n_fail++;
+            }
+        }
+
+        // Stage: seanet_output — SEANet CNN output (512, T_enc).
+        // TODO: expose kyutai_stt_run_encoder() stage API for element-wise diff.
+        if (ref.has("seanet_output")) {
+            printf("[SKIP] seanet_output           (stage API pending — transcript-only regression)\n");
+            n_skip++;
+        }
+        if (ref.has("enc_tfm_output")) {
+            printf("[SKIP] enc_tfm_output          (stage API pending)\n");
+            n_skip++;
+        }
+        if (ref.has("rvq_codes")) {
+            printf("[SKIP] rvq_codes               (stage API pending)\n");
+            n_skip++;
+        }
+        if (ref.has("lm_frame0_logits")) {
+            printf("[SKIP] lm_frame0_logits        (stage API pending)\n");
+            n_skip++;
+        }
+
+        if (r)
+            kyutai_stt_result_ex_free(r);
+        kyutai_stt_free(ctx);
+
     } else if (backend_name == "nemotron") {
         // Nemotron-3.5-ASR-Streaming: Cache-Aware FastConformer + RNN-T.
         // Compare mel, pre-encode, and encoder output against NeMo reference.
@@ -6567,14 +6917,170 @@ int main(int argc, char** argv) {
         nemotron_result_free(r);
         nemotron_free(ctx);
 
+    } else if (backend_name == "omnivoice") {
+        // OmniVoice: masked iterative TTS. Minimal diff harness — load
+        // model, compare text embeddings. Full pipeline diff pending
+        // audio tokenizer implementation.
+        auto cp = omnivoice_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        omnivoice_context* ctx = omnivoice_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load omnivoice model\n");
+            return 4;
+        }
+
+        // Stage: text_input_ids — verify tokenisation matches
+        auto ids_pair = ref.get_f32("text_input_ids");
+        if (ids_pair.first && ids_pair.second > 0) {
+            fprintf(stderr, "  text_input_ids: %d tokens in reference\n", (int)ids_pair.second);
+        }
+
+        omnivoice_free(ctx);
+
+    } else if (backend_name == "canary-qwen") {
+        auto cp = canary_qwen_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        canary_qwen_context* ctx = canary_qwen_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load canary-qwen model\n");
+            return 4;
+        }
+
+        // Mel spectrogram
+        int mel_n_mels = 0, mel_T = 0;
+        float* mel_ptr = canary_qwen_compute_mel(ctx, samples.data(), (int)samples.size(), &mel_n_mels, &mel_T);
+        if (mel_ptr && ref.has("mel_spectrogram")) {
+            auto rep = ref.compare("mel_spectrogram", mel_ptr, (size_t)mel_n_mels * mel_T);
+            print_row("mel_spectrogram", rep, COS_THRESHOLD);
+            record(rep);
+        }
+
+        // Encoder + projection
+        if (mel_ptr) {
+            int T_enc = 0, d_enc = 0;
+            float* enc_ptr = canary_qwen_run_encoder(ctx, mel_ptr, mel_n_mels, mel_T, &T_enc, &d_enc);
+            if (enc_ptr && ref.has("projected")) {
+                auto rep = ref.compare("projected", enc_ptr, (size_t)T_enc * d_enc);
+                print_row("projected", rep, COS_THRESHOLD);
+                record(rep);
+            }
+            if (enc_ptr && ref.has("encoder_output")) {
+                auto rep = ref.compare("encoder_output", enc_ptr, (size_t)T_enc * d_enc);
+                print_row("encoder_output", rep, COS_THRESHOLD);
+                record(rep);
+            }
+            free(enc_ptr);
+        }
+
+        // Full transcription
+        char* text = canary_qwen_transcribe(ctx, samples.data(), (int)samples.size());
+        if (text && ref.has("generated_text")) {
+            auto ref_pair = ref.get_f32("generated_text");
+            auto ref_shp = ref.shape("generated_text");
+            if (ref_pair.first && !ref_shp.empty()) {
+                std::string ref_text((const char*)ref_pair.first, ref_shp[0]);
+                printf("[INFO] generated_text (C++)    : %s\n", text);
+                printf("[INFO] generated_text (Python) : %s\n", ref_text.c_str());
+            }
+        } else if (text) {
+            printf("[INFO] generated_text (C++)    : %s\n", text);
+        }
+
+        free(mel_ptr);
+        free(text);
+        canary_qwen_free(ctx);
+
+    } else if (backend_name == "moss-diarize") {
+        auto cp = moss_diarize_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        moss_diarize_context* ctx = moss_diarize_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load moss-diarize model\n");
+            return 4;
+        }
+
+        // mel_spectrogram + conv_stem_out: single 30s chunk
+        float* mel_for_enc = nullptr;
+        int mel_n = 0, mel_T = 0;
+        {
+            int chunk_samples = std::min((int)samples.size(), 480000);
+            std::vector<float> chunk(480000, 0.0f);
+            std::memcpy(chunk.data(), samples.data(), (size_t)chunk_samples * sizeof(float));
+            mel_for_enc = moss_diarize_compute_mel(ctx, chunk.data(), 480000, &mel_n, &mel_T);
+            if (mel_for_enc) {
+                auto rep = ref.compare("mel_spectrogram", mel_for_enc, (size_t)mel_n * mel_T);
+                print_row("mel_spectrogram", rep, COS_THRESHOLD);
+                record(rep);
+            } else {
+                printf("[ERR ] mel_spectrogram         compute_mel returned null\n");
+                n_fail++;
+            }
+        }
+
+        // conv_stem_out: dump via env, compare against ref
+        {
+            std::string conv_dump = "/mnt/volume1/tmp-overflow/moss_diarize_conv_stem.bin";
+            setenv("CRISPASR_MOSS_DIARIZE_CONV_DUMP", conv_dump.c_str(), 1);
+        }
+
+        // encoder_output + audio_embeds: full chunked pipeline
+        {
+            int T_enc = 0, enc_d = 0;
+            float* enc = moss_diarize_run_encoder(ctx, samples.data(), (int)samples.size(), &T_enc, &enc_d);
+            if (enc) {
+                auto rep = ref.compare("encoder_output", enc, (size_t)T_enc * enc_d);
+                print_row("encoder_output", rep, COS_THRESHOLD);
+                record(rep);
+
+                int adapt_T = 0, adapt_d = 0;
+                float* adapted = moss_diarize_run_adaptor(ctx, enc, T_enc, enc_d, &adapt_T, &adapt_d);
+                if (adapted) {
+                    auto rep2 = ref.compare("audio_embeds", adapted, (size_t)adapt_T * adapt_d);
+                    print_row("audio_embeds", rep2, COS_THRESHOLD);
+                    record(rep2);
+                    free(adapted);
+                } else {
+                    printf("[ERR ] audio_embeds            run_adaptor returned null\n");
+                    n_fail++;
+                }
+                free(enc);
+            } else {
+                printf("[ERR ] encoder_output          run_encoder returned null\n");
+                n_fail++;
+            }
+        }
+        if (mel_for_enc)
+            free(mel_for_enc);
+
+        // conv_stem_out: read dumped file and compare
+        {
+            std::string conv_dump = "/mnt/volume1/tmp-overflow/moss_diarize_conv_stem.bin";
+            FILE* f = fopen(conv_dump.c_str(), "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                size_t sz = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                std::vector<float> cs(sz / sizeof(float));
+                (void)!fread(cs.data(), sizeof(float), cs.size(), f);
+                fclose(f);
+                auto rep = ref.compare("conv_stem_out", cs.data(), cs.size());
+                print_row("conv_stem_out", rep, COS_THRESHOLD);
+                record(rep);
+            }
+        }
+
+        moss_diarize_free(ctx);
     } else {
         fprintf(stderr,
                 "crispasr-diff: backend '%s' is not recognised. "
-                "Supported: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, granite-4.1, "
-                "granite-nle, parakeet, canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, "
-                "moonshine-streaming, lid-cld3, glm-asr, firered-asr, voxcpm2-tts, funasr, paraformer, sensevoice, "
-                "cosyvoice3-tts, melotts, parler-tts, moss-audio, kugelaudio, zonos-tts, lfm2-audio, mini-omni2, "
-                "nemotron.\n",
+                "Supported: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, omnivoice, kokoro, granite, "
+                "granite-4.1, granite-nle, parakeet, canary, canary-qwen, cohere, gemma4, mimo-tokenizer, mimo-asr, "
+                "orpheus, moonshine, moonshine-streaming, lid-cld3, glm-asr, firered-asr, voxcpm2-tts, funasr, "
+                "paraformer, sensevoice, cosyvoice3-tts, melotts, parler-tts, moss-audio, kugelaudio, zonos-tts, "
+                "lfm2-audio, mini-omni2, nemotron, kyutai-stt, moss-diarize.\n",
                 backend_name.c_str());
         return 5;
     }

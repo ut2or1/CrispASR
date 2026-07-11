@@ -22,6 +22,7 @@
 
 #include "core/conv.h"
 #include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
+#include "core/fft.h"     // core_fft::fft_radix2_wrapper (STFT: FFT instead of O(N^2) DFT)
 #include "core/gguf_loader.h"
 
 #if defined(HAVE_ACCELERATE)
@@ -516,19 +517,21 @@ static void stft_magnitude(const float* pcm, int n_samples, int fft_size, int ho
         T_out = 1;
     spec.resize(n_fft_bins * T_out, 0.0f);
 
+    // Per-frame FFT instead of the O(bins*win) scalar DFT: a windowed frame is
+    // zero-padded to fft_size and transformed with the shared radix-2 FFT. Same
+    // window / reflect-pad / bin count / magnitude formula — only the transform
+    // order changes (FFT vs naive DFT: identical to float rounding, ~1e-5).
+    std::vector<float> frame(fft_size);
+    std::vector<float> fout(2 * fft_size);
     for (int t = 0; t < T_out; t++) {
         int start = t * hop;
+        for (int n = 0; n < fft_size; n++) {
+            int idx = start + n;
+            frame[n] = (n < win_len && idx < padded_len) ? padded[idx] * win[n] : 0.0f;
+        }
+        core_fft::fft_radix2_wrapper(frame.data(), fft_size, fout.data());
         for (int k = 0; k < n_fft_bins; k++) {
-            float re = 0, im = 0;
-            for (int n = 0; n < win_len; n++) {
-                int idx = start + n;
-                if (idx < padded_len) {
-                    float x = padded[idx] * win[n];
-                    float angle = -2.0f * (float)M_PI * k * n / fft_size;
-                    re += x * cosf(angle);
-                    im += x * sinf(angle);
-                }
-            }
+            float re = fout[2 * k], im = fout[2 * k + 1];
             // Match upstream: sqrt(re^2 + im^2 + 1e-6)
             spec[t * n_fft_bins + k] = sqrtf(re * re + im * im + 1e-6f);
         }

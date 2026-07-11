@@ -89,6 +89,11 @@ def main():
     cli_md = read("docs/cli.md")
     streaming = read("docs/streaming.md")
     readme = read("README.md")
+    tts_md = read("docs/tts.md")
+    arch_md = read("docs/architecture.md")
+    src_cmake = read("src/CMakeLists.txt")
+    py_binding = read("python/crispasr/_binding.py")
+    env_live = read("tests/env-live-tests.sh")
 
     tests_dir = sorted(p.name for p in (ROOT / "tests").glob("*"))
     refs_dir = sorted(p.name for p in (ROOT / "tools/reference_backends").glob("*.py"))
@@ -149,6 +154,32 @@ def main():
             adv_missing.append("ref-dumper")
         if f'"{name}"' not in registry:
             adv_missing.append("registry")
+        # env-live-tests.sh: only flag if the backend has a *_live.cpp test
+        # that actually needs model env vars (params-only tests don't need them)
+        has_live_test = any(any(s in f and "live" in f for s in stem_variants(name))
+                           for f in tests_dir)
+        if has_live_test and not any(s in env_live for s in stem_variants(name)):
+            adv_missing.append("env-live-tests")
+        # Python binding docstring should list TTS backends (ASR backends
+        # are dispatched generically via transcribe() and don't need listing)
+        if "tts" in caps and name not in py_binding:
+            adv_missing.append("py-binding-doc")
+        # src/CMakeLists.txt should link the backend lib into crispasr-lib.
+        # Some backends share a lib (e.g. fastconformer-ctc → canary_ctc,
+        # wav2vec2 → wav2vec2-ggml), so also check the CLI adapter's includes.
+        in_src_cmake = any(s in src_cmake for s in stem_variants(name))
+        if not in_src_cmake:
+            adapter_path = ROOT / "examples/cli" / f"crispasr_backend_{name.replace('-', '_')}.cpp"
+            adapter_src = adapter_path.read_text(errors="ignore") if adapter_path.exists() else ""
+            # grep for #include "<lib>.h" and check that lib is in CMake
+            import re as _re
+            includes = _re.findall(r'#include\s+"(\w+)\.h"', adapter_src)
+            in_src_cmake = any(inc in src_cmake for inc in includes)
+        if not in_src_cmake:
+            adv_missing.append("src-cmake")
+        # TTS backends should be in docs/tts.md
+        if "tts" in caps and name not in tts_md:
+            adv_missing.append("tts.md")
         # streaming.md documents ASR live transcription only. The `streaming` cap on
         # a TTS backend means incremental PCM synthesis (documented in tts.md), so
         # only expect a streaming.md row for ASR backends.

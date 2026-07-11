@@ -11,6 +11,7 @@
 
 #include "crispasr_aligner.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -326,6 +327,71 @@ TEST_CASE("align-only: live alignment with canary-ctc-aligner", "[live][align]")
     for (auto& w : aligned) {
         CHECK(!w.text.empty());
     }
+
+    crispasr_aligner_free_cache();
+}
+
+// §176e (wav2vec2): the aligner keeps one model resident across calls so a
+// 300 MB–1 GB GGUF is not reloaded on every crispasr_align_words. This test
+// aligns twice with the SAME wav2vec2 model and checks (a) the two calls are
+// byte-identical (a stale/corrupted cache would drift) and (b) the second
+// call is faster (the first pays the one-time load + Metal pipeline compile;
+// the second reuses the resident model). Needs a wav2vec2 aligner GGUF.
+TEST_CASE("align-only: wav2vec2 aligner cache reuse", "[live][align]") {
+    std::string model = get_env("CRISPASR_MODEL_ALIGNER_W2V");
+    if (model.empty()) {
+        const char* dir = std::getenv("CRISPASR_MODELS_DIR");
+        if (dir) {
+            model = std::string(dir) + "/wav2vec2-xlsr-en-q4_k.gguf";
+            FILE* f = fopen(model.c_str(), "rb");
+            if (f)
+                fclose(f);
+            else
+                model.clear();
+        }
+    }
+    if (model.empty())
+        SKIP("CRISPASR_MODEL_ALIGNER_W2V not set and no wav2vec2 fallback found");
+
+    std::string audio_path = get_env("CRISPASR_TEST_AUDIO_JFK", "samples/jfk.wav");
+    auto pcm = load_wav_16k_mono(audio_path);
+    if (pcm.empty())
+        SKIP("Cannot load audio: " + audio_path);
+    REQUIRE(pcm.size() > 16000);
+
+    const std::string transcript = "And so my fellow Americans ask not what your country can do for you "
+                                   "ask what you can do for your country";
+
+    // Start from a clean cache so call 1 definitely pays the load.
+    crispasr_aligner_free_cache();
+
+    using clock = std::chrono::steady_clock;
+    auto t0 = clock::now();
+    auto first = crispasr_align_words(model, transcript, pcm.data(), (int)pcm.size(), 0, 4);
+    auto t1 = clock::now();
+    auto second = crispasr_align_words(model, transcript, pcm.data(), (int)pcm.size(), 0, 4);
+    auto t2 = clock::now();
+
+    REQUIRE(!first.empty());
+    REQUIRE(!second.empty());
+
+    double ms_load = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double ms_cached = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    INFO("call1 (load+align) = " << ms_load << " ms, call2 (cached align) = " << ms_cached << " ms");
+
+    // (a) Byte-identical results across the two calls — the resident model +
+    //     its mutable dequant tensor_cache must not perturb the output.
+    REQUIRE(first.size() == second.size());
+    for (size_t i = 0; i < first.size(); i++) {
+        CHECK(first[i].text == second[i].text);
+        CHECK(first[i].t0_cs == second[i].t0_cs);
+        CHECK(first[i].t1_cs == second[i].t1_cs);
+    }
+
+    // (b) The cached second call skips the model reload, so it is faster. Use a
+    //     modest margin (5 %) to stay robust to timing noise on a loaded box;
+    //     reloading a multi-hundred-MB model dwarfs one short-clip forward pass.
+    CHECK(ms_cached < ms_load * 0.95);
 
     crispasr_aligner_free_cache();
 }

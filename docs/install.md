@@ -165,26 +165,36 @@ crispasr --gpu-backend vulkan -dev 1 -m model.gguf -f audio.wav
 crispasr --gpu-backend cpu -m model.gguf -f audio.wav        # benchmarking
 ```
 
-## Opus support (default, no ffmpeg)
+## Opus / AAC support (default, no ffmpeg, no libopus)
 
-`.opus` (Ogg/Opus) decodes natively via libopus + opusfile — **no ffmpeg
-needed**. It's on by default (`CRISPASR_OPUS`) when the system `opusfile` is
-found via pkg-config (e.g. `apt install libopusfile-dev`, `brew install
-opusfile`). On platforms without system libs (Windows / iOS / Android / WASM),
-build them statically:
+`.opus` (Ogg/Opus, **including WebM/Matroska Opus**) and raw ADTS `.aac`
+(AAC-LC) decode natively through the in-tree clean-room
+[glint](https://github.com/CrispStrobe/glint) decoder — **no ffmpeg and no
+libopus needed** — via the library `crispasr_audio_load` API used by the
+bindings. glint is RFC-conformant for Opus (all 12 RFC 6716/8251 vectors), so
+this works on every platform including WASM, out of the box. A build with
+`-DCRISPASR_OPUS=OFF` (no libopus linked at all) still decodes `.opus` and
+WebM/Opus.
+
+libopus + opusfile remains available as an optional Opus fallback, selected with
+`CRISPASR_OPUS_DECODER=libopus`. It's on by default (`CRISPASR_OPUS`) when the
+system `opusfile` is found via pkg-config (e.g. `apt install libopusfile-dev`,
+`brew install opusfile`), but is no longer required for any input format. On
+platforms without system libs (Windows / iOS / Android / WASM), build it
+statically:
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DCRISPASR_OPUS_FETCH=ON
 ```
 
-AAC / M4A / ALAC / CAF decode natively on **Apple** (macOS/iOS) via the system
-AudioToolbox framework — also no ffmpeg. See [cli.md](cli.md#audio-formats) for
-the full format matrix.
+Container AAC (`.m4a` / `.alac` / `.caf`) decodes natively on **Apple**
+(macOS/iOS) via AudioToolbox, or via libfdk-aac (`dlopen`) on Linux/Windows —
+also no ffmpeg. See [cli.md](cli.md#audio-formats) for the full format matrix.
 
-## ffmpeg ingestion (AAC on Linux, WebM, WMA, …) — optional fallback
+## ffmpeg ingestion (container AAC/M4A off-Apple, WMA, …) — optional fallback
 
-For formats with no permissive native decoder (AAC/M4A on Linux, WebM, WMA,
-AMR, …), build with the optional ffmpeg fallback:
+For formats with no permissive native decoder (container `.m4a` without
+libfdk-aac, WMA, exotic containers, …), build with the optional ffmpeg fallback:
 
 ```bash
 # Install ffmpeg dev libs first:

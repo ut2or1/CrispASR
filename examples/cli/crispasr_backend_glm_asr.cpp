@@ -4,7 +4,9 @@
 #include "crispasr_backend_utils.h"
 #include "glm_asr.h"
 #include "whisper_params.h"
+#include "core/ngram_loop_fix.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -68,10 +70,16 @@ public:
         if (!ctx_)
             return out;
 
-        // Propagate ask / language instruction to the C library.
+        // Propagate ask / language instruction to the C library. "en" (the
+        // CLI default) and "auto" use the blueprint's default transcription
+        // prompt — a language instruction is only injected for an explicit
+        // non-English hint (English IS the default prompt's behaviour;
+        // silently replacing the blueprint prompt on every run would be
+        // off-distribution).
         if (!params.ask.empty()) {
             glm_asr_set_ask(ctx_, params.ask.c_str());
-        } else if (!params.language.empty() && params.language != "auto" && !params.translate) {
+        } else if (!params.language.empty() && params.language != "auto" && params.language != "en" &&
+                   !params.translate) {
             const std::string instr = "Please transcribe in " + crispasr_iso_to_english_lang(params.language) + ".";
             glm_asr_set_ask(ctx_, instr.c_str());
         } else {
@@ -122,6 +130,8 @@ public:
         while (!seg.text.empty() && (seg.text.back() == ' ' || seg.text.back() == '\n'))
             seg.text.pop_back();
 
+        // Apply fix_loops to text; token dedup done after token construction below (#218)
+
         // GPT-2 byte-level BPE decoder: Ġ (U+0120, UTF-8 0xC4 0xA0) → space,
         // Ċ (U+010A, UTF-8 0xC4 0x8A) → newline. All other bytes pass through.
         auto decode_bpe_piece = [](const char* raw) -> std::string {
@@ -151,15 +161,27 @@ public:
 
         // Per-token confidence; no per-token timestamps (GLM-ASR's LLM
         // decoder isn't time-aligned).
-        seg.tokens.reserve((size_t)r->n_tokens);
+        std::vector<crispasr_token> all_tokens;
+        all_tokens.reserve((size_t)r->n_tokens);
         for (int i = 0; i < r->n_tokens; i++) {
             crispasr_token tok;
             tok.id = r->token_ids[i];
             tok.confidence = r->token_probs[i];
             tok.text = decode_bpe_piece(glm_asr_token_text(ctx_, r->token_ids[i]));
-            seg.tokens.push_back(std::move(tok));
+            all_tokens.push_back(std::move(tok));
         }
         glm_asr_result_free(r);
+
+        // Apply fix_loops to both text and tokens (#218)
+        std::vector<std::string> tok_texts;
+        for (auto& tk : all_tokens)
+            tok_texts.push_back(tk.text);
+        const std::vector<int> keep = core_ngram::fix_loops_keep_indices(tok_texts);
+        seg.text = core_ngram::fix_loops(seg.text);
+        for (int ki : keep) {
+            if (ki >= 0 && ki < (int)all_tokens.size())
+                seg.tokens.push_back(std::move(all_tokens[ki]));
+        }
 
         // --no-punctuation: strip ASCII punctuation from segment text and per-token
         // pieces. GLM-ASR's LLM produces punctuated, capitalised English by
@@ -214,9 +236,16 @@ public:
         if (!audio_embeds)
             return;
 
-        // 3. Prompt (mirrors glm_asr_transcribe_impl)
+        // 3. Prompt (mirrors glm_asr_transcribe_impl's blueprint template:
+        //    <|user|>\n<|begin_of_audio|>…<|end_of_audio|><|user|>\n
+        //    Please transcribe this audio into text<|assistant|>\n).
+        //    glm_asr_tokenize is specials-only, so free-text instructions
+        //    fall back to the default transcription prompt like the impl.
+        static const int32_t kNewline = 10;
+        static const int32_t kDefaultInstruction[] = {14215, 1700, 8091, 643, 14812, 1636, 2815};
         std::vector<int32_t> ids;
         ids.push_back(59253); // <|user|>
+        ids.push_back(kNewline);
         ids.push_back(59261); // <|begin_of_audio|>
         for (int i = 0; i < N_enc; i++)
             ids.push_back(59260); // <|pad|>
@@ -225,26 +254,33 @@ public:
         {
             std::string instr;
             if (!params.ask.empty()) {
-                instr = "\n" + params.ask + "\n";
+                instr = "\n" + params.ask;
             } else if (!tgt_lang_.empty()) {
                 char buf[256];
-                snprintf(buf, sizeof(buf), "\nPlease translate the speech to %s.\n", tgt_lang_.c_str());
+                snprintf(buf, sizeof(buf), "\nPlease translate the speech to %s.", tgt_lang_.c_str());
                 instr = buf;
-            } else if (!params.language.empty() && params.language != "auto") {
-                instr = "\nPlease transcribe in " + crispasr_iso_to_english_lang(params.language) + ".\n";
+            } else if (!params.language.empty() && params.language != "auto" && params.language != "en") {
+                instr = "\nPlease transcribe in " + crispasr_iso_to_english_lang(params.language) + ".";
             }
+            bool emitted = false;
             if (!instr.empty()) {
                 int n_instr = 0;
                 int32_t* itoks = glm_asr_tokenize(ctx_, instr.c_str(), &n_instr);
                 if (itoks && n_instr > 0) {
                     for (int i = 0; i < n_instr; i++)
                         ids.push_back(itoks[i]);
-                    free(itoks);
-                } else if (itoks)
-                    free(itoks);
+                    emitted = true;
+                }
+                free(itoks);
+            }
+            if (!emitted) {
+                ids.push_back(kNewline);
+                for (int32_t id : kDefaultInstruction)
+                    ids.push_back(id);
             }
         }
         ids.push_back(59254); // <|assistant|>
+        ids.push_back(kNewline);
 
         // 4. Embed + splice audio
         float* text_embeds = glm_asr_embed_tokens(ctx_, ids.data(), (int)ids.size());
@@ -262,8 +298,9 @@ public:
         }
         free(audio_embeds);
 
-        // 5. KV init + prefill
-        if (!glm_asr_kv_init(ctx_, 4096)) {
+        // 5. KV init + prefill (sized to prompt + decode budget; kv_init
+        //    grows when a larger request arrives)
+        if (!glm_asr_kv_init(ctx_, std::max(4096, (int)ids.size() + 512 + 16))) {
             free(text_embeds);
             return;
         }

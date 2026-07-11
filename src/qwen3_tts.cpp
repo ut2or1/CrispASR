@@ -642,6 +642,12 @@ struct g3t_codec {
     ggml_backend_buffer_t buf_w = nullptr;
     ggml_context* ctx_perm = nullptr;
     ggml_backend_buffer_t buf_perm = nullptr;
+    // §232 FASTCONV: F32 copies of the K>1 conv kernels, baked at load so
+    // ggml_conv_1d/_dw don't insert a per-graph F16→F32 CAST of multi-MB
+    // weights (the fork casts the kernel when activations are F32; the
+    // in_conv cast alone was ~70 ms per decode on M1 Metal).
+    ggml_context* ctx_conv32 = nullptr;
+    ggml_backend_buffer_t buf_conv32 = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
 
     bool loaded = false;
@@ -782,26 +788,50 @@ struct qwen3_tts_context {
     ggml_backend_sched_t cp_step0_sched = nullptr;
     bool cp_step0_reserved = false;
 
+    // CP_DIRECT (§232/#245): sched-free persistent code_pred graphs. The T=1
+    // step graph and the T=2 step-0 graph are each built ONCE into their own
+    // arena with the O15 topology (fixed Lk = cp_kv_max_ctx, runtime
+    // `positions` as both RoPE input and set_rows KV write index, lm_head via
+    // cp_lm_head_slot), allocated ONCE with a dedicated gallocr on the single
+    // code_pred backend, then re-dispatched per step with only tensor_set on
+    // the inputs + ggml_backend_graph_compute. No scheduler is involved, so
+    // the sched-reuse breakage that killed O15_SKIP_REALLOC (#56 CUDA assert;
+    // Metal nil-buffer inputs after the ggml sched cross-backend tightening)
+    // cannot occur. Falls back to the sched paths below when any graph op is
+    // unsupported on the backend (checked once at init).
+    ggml_context* cp_dir_ctx = nullptr; // arena for the persistent T=1 graph
+    std::vector<uint8_t> cp_dir_meta;
+    ggml_cgraph* cp_dir_gf = nullptr;
+    ggml_gallocr_t cp_dir_galloc = nullptr;
+    ggml_context* cp_dir0_ctx = nullptr; // arena for the persistent T=2 step-0 graph
+    std::vector<uint8_t> cp_dir0_meta;
+    ggml_cgraph* cp_dir0_gf = nullptr;
+    ggml_gallocr_t cp_dir0_galloc = nullptr;
+    int cp_dir_state = 0; // 0 = untried, 1 = active, -1 = disabled (unsupported op / init failure)
+
     // Fused Q+K+V weights for the talker (F16/F32 only, runtime-built from
     // the unfused tensors so Q4_K/Q8_0 talkers fall back to the 3-matmul path).
     ggml_context* fused_ctx = nullptr;
     ggml_backend_buffer_t fused_buf = nullptr;
 
-    // Lk bucketing for talker AR steps (PLAN #52 step 4). Each bucket caches a
-    // graph plan at fixed Lk; AR step picks the smallest bucket where
-    // n_past + T <= Lk_bucket, eliminating per-step graph rebuild + sched
-    // reset/alloc on cache hits. Gated on QWEN3_TTS_LK_BUCKET=1. Uses a
-    // dedicated `talker_step_sched` so prefill / embed_text / embed_audio
-    // (which share `sched`) don't invalidate cached step plans.
+    // Lk bucketing for talker AR steps (PLAN #52 step 4, reworked for §232).
+    // Each bucket holds a persistent step graph at fixed Lk; the AR step picks
+    // the smallest bucket where n_past + 1 <= Lk_bucket. Since §232 each
+    // bucket is gallocr-allocated ONCE on the single talker backend and
+    // dispatched sched-free (the previous sched-plan reuse hit the same
+    // sched-reuse breakage as O15_SKIP_REALLOC: nil-buffer inputs on Metal →
+    // SIGSEGV). Gated on QWEN3_TTS_LK_BUCKET.
     struct TalkerBucket {
         int lk = 0;
         ggml_context* ctx = nullptr;
         std::vector<uint8_t> compute_meta;
         ggml_cgraph* gf = nullptr;
+        ggml_gallocr_t galloc = nullptr;
     };
     std::array<TalkerBucket, 5> talker_buckets;
-    ggml_backend_sched_t talker_step_sched = nullptr;
+    ggml_backend_sched_t talker_step_sched = nullptr; // legacy; no longer used by the bucket path
     int talker_active_bucket = -1;
+    int talker_dir_state = 0; // 0 = untried, 1 = active, -1 = disabled (unsupported op / init failure)
 
     // Loaded voice pack (zero-copy: `vp_tensors` references the
     // weight context's tensors directly).
@@ -1123,7 +1153,7 @@ ggml_cgraph* build_graph_talker_kv(qwen3_tts_context* c, int n_past, int n_token
 // per-bucket arena instead of the shared `c->compute_meta`. Used by
 // the step-0 cache (T=2 graph survives across frames).
 ggml_cgraph* build_graph_code_pred_kv(qwen3_tts_context* c, int n_past, int n_tokens, ggml_tensor* lm_head,
-                                      ggml_context* arena_ctx = nullptr) {
+                                      ggml_context* arena_ctx = nullptr, int o15_force = -1) {
     const auto& hp = c->hp;
     const int d = (int)hp.cp_d_model;
     const int n_q = (int)hp.cp_n_heads;
@@ -1147,7 +1177,9 @@ ggml_cgraph* build_graph_code_pred_kv(qwen3_tts_context* c, int n_past, int n_to
     // first call into code_pred_generate_15 (Jetson Orin AGX, sm_87).
     // M1 Metal users who want the speedup should set QWEN3_TTS_O15=1.
     // The flag will go back to default-ON once the CUDA path is fixed.
-    const bool o15 = env_bool_default("QWEN3_TTS_O15", false);
+    // o15_force >= 0 pins the topology choice (CP_DIRECT builds O15-shaped
+    // graphs regardless of the env); < 0 keeps the env-driven behaviour.
+    const bool o15 = o15_force >= 0 ? o15_force != 0 : env_bool_default("QWEN3_TTS_O15", false);
     const int Lk = o15 ? c->cp_kv_max_ctx : (n_past + T);
 
     ggml_context* ctx0 = arena_ctx;
@@ -1417,6 +1449,21 @@ float* run_embed_audio(qwen3_tts_context* c, const int32_t* ids, int n) {
     return r;
 }
 
+// §232: sched-free persistent-graph dispatch requires every op of the graph
+// to run on the single target backend (no split, no fallback). Checked once
+// per graph at init; on any unsupported op the caller keeps its sched path.
+static bool graph_ops_supported(ggml_backend_t be, ggml_cgraph* gf, const char* tag) {
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        ggml_tensor* node = ggml_graph_node(gf, i);
+        if (!ggml_backend_supports_op(be, node)) {
+            fprintf(stderr, "qwen3_tts: %s disabled — op %s unsupported on %s; using sched path\n", tag,
+                    ggml_op_desc(node), ggml_backend_name(be));
+            return false;
+        }
+    }
+    return true;
+}
+
 // Lk bucketing helpers (PLAN #52 step 4). Gated on QWEN3_TTS_LK_BUCKET=1.
 // Pre-built talker step graphs at fixed Lk buckets eliminate per-step
 // graph rebuild + sched alloc on cache hits — same cached-graph trick the
@@ -1430,19 +1477,6 @@ static int talker_pick_bucket(int needed_lk) {
         }
     }
     return -1;
-}
-
-static ggml_backend_sched_t talker_step_pick_sched(qwen3_tts_context* c) {
-    if (c->talker_step_sched) {
-        return c->talker_step_sched;
-    }
-    // Lazy-create on first bucket use. Uses the same backend list as c->sched.
-    // Buffer size mirrors the existing talker sched (16384 nodes is plenty
-    // for the 28L step graph: ~8 nodes/layer + I/O = ~250 nodes).
-    ggml_backend_t backends[2] = {c->backend, c->backend_cpu};
-    int n_be = (c->backend && c->backend != c->backend_cpu) ? 2 : 1;
-    c->talker_step_sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
-    return c->talker_step_sched;
 }
 
 static ggml_cgraph* talker_bucket_get_or_build(qwen3_tts_context* c, int idx) {
@@ -1483,12 +1517,18 @@ static float* run_talker_kv_dynamic(qwen3_tts_context* c, const float* embeds, i
 
 float* run_talker_kv(qwen3_tts_context* c, const float* embeds, int n_tokens, int n_past, float** out_hidden_d) {
     // Bucketed AR-step path: T=1 only (prefill stays on the dynamic-Lk path).
-    // Dispatched only when env opt-in and a bucket fits the current n_past.
-    if (n_tokens == 1 && env_bool("QWEN3_TTS_LK_BUCKET")) {
+    // Dispatched only when env opt-in, a bucket fits the current n_past, and
+    // the direct dispatch hasn't been disabled (unsupported op on the
+    // backend / init failure — then every step falls back to dynamic).
+    if (n_tokens == 1 && env_bool("QWEN3_TTS_LK_BUCKET") && c->talker_dir_state >= 0) {
         const int needed = n_past + 1;
         const int idx = talker_pick_bucket(needed);
         if (idx >= 0) {
-            return run_talker_kv_bucket(c, embeds, n_past, out_hidden_d);
+            float* r = run_talker_kv_bucket(c, embeds, n_past, out_hidden_d);
+            if (r || c->talker_dir_state >= 0) {
+                return r;
+            }
+            // Direct dispatch just disabled itself; fall through to dynamic.
         }
         // No bucket fits (n_past+1 > 4096); fall through to dynamic path.
     }
@@ -1606,9 +1646,10 @@ static float* run_talker_kv_dynamic(qwen3_tts_context* c, const float* embeds, i
 }
 
 // Bucketed talker step path — see run_talker_kv() dispatch above.
-// Caches one graph plan per Lk bucket; switching buckets pays one
-// reset+alloc, in-bucket steps reuse the cached plan (no rebuild,
-// no reset, no alloc — matches the cp_t1_gf O15 pattern).
+// §232: each bucket's graph is gallocr-allocated once on the single talker
+// backend and dispatched sched-free; every in-bucket step is tensor_set +
+// one ggml_backend_graph_compute. (The previous sched-plan reuse hit the
+// ggml sched-reuse breakage — nil-buffer inputs on Metal → SIGSEGV.)
 static float* run_talker_kv_bucket(qwen3_tts_context* c, const float* embeds, int n_past, float** out_hidden_d) {
     if (out_hidden_d) {
         *out_hidden_d = nullptr;
@@ -1651,22 +1692,34 @@ static float* run_talker_kv_bucket(qwen3_tts_context* c, const float* embeds, in
     }
     const double t_build1 = bench ? now_ms() : 0.0;
 
-    ggml_backend_sched_t sched = talker_step_pick_sched(c);
-    if (!sched) {
-        return nullptr;
-    }
-
-    const bool reuse = (c->talker_active_bucket == idx);
-    const double t_reset0 = bench ? now_ms() : 0.0;
-    if (!reuse) {
-        ggml_backend_sched_reset(sched);
-    }
-    const double t_reset1 = bench ? now_ms() : 0.0;
-    if (!reuse) {
-        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-            fprintf(stderr, "qwen3_tts: bucket[%d] alloc_graph failed\n", idx);
+    // One-time per-bucket gallocr allocation on the single talker backend.
+    // On unsupported ops / alloc failure the whole bucket dispatch disables
+    // itself (talker_dir_state = -1) and run_talker_kv falls back to dynamic.
+    auto& bk = c->talker_buckets[idx];
+    if (!bk.galloc) {
+        // KV-on-CPU spill (PLAN #69b env) puts kv_k/kv_v outside the talker
+        // backend — a sched-free single-backend graph can't reach them.
+        if (c->kv_k && c->kv_k->buffer &&
+            ggml_backend_buffer_get_type(c->kv_k->buffer) != ggml_backend_get_default_buffer_type(c->backend)) {
+            fprintf(stderr, "qwen3_tts: talker_bucket disabled — KV cache not on the talker backend\n");
+            c->talker_dir_state = -1;
             return nullptr;
         }
+        if (!graph_ops_supported(c->backend, gf, "talker_bucket")) {
+            c->talker_dir_state = -1;
+            return nullptr;
+        }
+        bk.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(c->backend));
+        if (!bk.galloc || !ggml_gallocr_alloc_graph(bk.galloc, gf)) {
+            fprintf(stderr, "qwen3_tts: bucket[%d] gallocr alloc failed\n", idx);
+            if (bk.galloc) {
+                ggml_gallocr_free(bk.galloc);
+                bk.galloc = nullptr;
+            }
+            c->talker_dir_state = -1;
+            return nullptr;
+        }
+        c->talker_dir_state = 1;
         c->talker_active_bucket = idx;
     }
     const double t_alloc1 = bench ? now_ms() : 0.0;
@@ -1676,8 +1729,9 @@ static float* run_talker_kv_bucket(qwen3_tts_context* c, const float* embeds, in
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
                             mask.size() * sizeof(ggml_fp16_t));
 
-    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_graph_compute(c->backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "qwen3_tts: talker bucket compute failed\n");
+        c->talker_dir_state = -1;
         return nullptr;
     }
     const double t_compute1 = bench ? now_ms() : 0.0;
@@ -1695,20 +1749,19 @@ static float* run_talker_kv_bucket(qwen3_tts_context* c, const float* embeds, in
     }
 
     if (bench) {
-        static double sum_build = 0.0, sum_reset = 0.0, sum_alloc = 0.0, sum_compute = 0.0, sum_read = 0.0;
+        static double sum_build = 0.0, sum_alloc = 0.0, sum_compute = 0.0, sum_read = 0.0;
         static int count = 0;
         sum_build += t_build1 - t_build0;
-        sum_reset += t_reset1 - t_reset0;
-        sum_alloc += t_alloc1 - t_reset1;
+        sum_alloc += t_alloc1 - t_build1;
         sum_compute += t_compute1 - t_alloc1;
         sum_read += now_ms() - t_compute1;
         count++;
         if (count == 14) {
             fprintf(stderr,
-                    "qwen3_tts: talker_bucket (%d calls): build=%.1f ms  reset=%.1f ms  alloc=%.1f ms  "
+                    "qwen3_tts: talker_bucket (%d calls): build=%.1f ms  alloc=%.1f ms  "
                     "compute=%.1f ms  read=%.1f ms\n",
-                    count, sum_build, sum_reset, sum_alloc, sum_compute, sum_read);
-            sum_build = sum_reset = sum_alloc = sum_compute = sum_read = 0.0;
+                    count, sum_build, sum_alloc, sum_compute, sum_read);
+            sum_build = sum_alloc = sum_compute = sum_read = 0.0;
             count = 0;
         }
     }
@@ -1855,6 +1908,160 @@ static ggml_backend_sched_t cp_step0_pick_sched(qwen3_tts_context* c) {
     return c->cp_step0_sched;
 }
 
+// ---------------------------------------------------------------------------
+// CP_DIRECT (§232/#245): sched-free persistent code_pred dispatch.
+//
+// The code_pred is a 5-layer / d=1024 transformer whose per-frame work is one
+// T=2 prefill + 14 T=1 steps, all with identical topology under O15 (fixed
+// Lk, runtime positions for RoPE + set_rows KV write, lm_head via the
+// writable slot). Under ggml_backend_sched each of those 15 dispatches pays
+// reset + alloc_graph + split scheduling — measured ~25 ms/dispatch on M1
+// Metal (~400 ms/frame) against sub-ms kernel time. Here the two graphs are
+// built and gallocr-allocated once on the single code_pred backend and each
+// step is: blit lm_head into the slot, tensor_set the inputs, one
+// ggml_backend_graph_compute, read logits.
+
+static bool cp_direct_init(qwen3_tts_context* c) {
+    if (c->cp_dir_state != 0) {
+        return c->cp_dir_state > 0;
+    }
+    c->cp_dir_state = -1; // pessimistic; flipped to 1 on success
+    // cp_cpu_pinned keeps its dedicated CPU sched (no slot allocated there);
+    // the slot + a resident KV cache on c->backend are hard requirements.
+    if (c->cp_cpu_pinned || !c->cp_lm_head_slot || !c->code_pred.lm_head[0] || !c->cp_kv_k || !c->backend ||
+        c->compute_meta.empty()) {
+        return false;
+    }
+    auto fail = [c]() {
+        if (c->cp_dir_galloc) {
+            ggml_gallocr_free(c->cp_dir_galloc);
+            c->cp_dir_galloc = nullptr;
+        }
+        if (c->cp_dir0_galloc) {
+            ggml_gallocr_free(c->cp_dir0_galloc);
+            c->cp_dir0_galloc = nullptr;
+        }
+        if (c->cp_dir_ctx) {
+            ggml_free(c->cp_dir_ctx);
+            c->cp_dir_ctx = nullptr;
+        }
+        if (c->cp_dir0_ctx) {
+            ggml_free(c->cp_dir0_ctx);
+            c->cp_dir0_ctx = nullptr;
+        }
+        c->cp_dir_gf = nullptr;
+        c->cp_dir0_gf = nullptr;
+        return false;
+    };
+    // T=1 step graph (steps 1..14). n_past is NOT baked in: positions carries
+    // it into RoPE and the set_rows KV write, the mask input carries it into
+    // attention, and lm_head is routed through cp_lm_head_slot.
+    c->cp_dir_meta.assign(c->compute_meta.size(), 0);
+    ggml_init_params ip1 = {c->cp_dir_meta.size(), c->cp_dir_meta.data(), true};
+    c->cp_dir_ctx = ggml_init(ip1);
+    if (!c->cp_dir_ctx) {
+        return fail();
+    }
+    c->cp_dir_gf = build_graph_code_pred_kv(c, /*n_past=*/2, /*n_tokens=*/1, c->code_pred.lm_head[0], c->cp_dir_ctx,
+                                            /*o15_force=*/1);
+    // T=2 step-0 graph. lm_head[0] is referenced directly (it is the only
+    // lm_head ever used at T=2); n_past is always 0 there.
+    c->cp_dir0_meta.assign(c->compute_meta.size(), 0);
+    ggml_init_params ip0 = {c->cp_dir0_meta.size(), c->cp_dir0_meta.data(), true};
+    c->cp_dir0_ctx = ggml_init(ip0);
+    if (!c->cp_dir0_ctx) {
+        return fail();
+    }
+    c->cp_dir0_gf = build_graph_code_pred_kv(c, /*n_past=*/0, /*n_tokens=*/2, c->code_pred.lm_head[0], c->cp_dir0_ctx,
+                                             /*o15_force=*/1);
+    if (!c->cp_dir_gf || !c->cp_dir0_gf) {
+        return fail();
+    }
+    if (!graph_ops_supported(c->backend, c->cp_dir_gf, "cp_direct") ||
+        !graph_ops_supported(c->backend, c->cp_dir0_gf, "cp_direct")) {
+        return fail();
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(c->backend);
+    c->cp_dir_galloc = ggml_gallocr_new(buft);
+    c->cp_dir0_galloc = ggml_gallocr_new(buft);
+    if (!c->cp_dir_galloc || !c->cp_dir0_galloc || !ggml_gallocr_alloc_graph(c->cp_dir_galloc, c->cp_dir_gf) ||
+        !ggml_gallocr_alloc_graph(c->cp_dir0_galloc, c->cp_dir0_gf)) {
+        fprintf(stderr, "qwen3_tts: cp_direct gallocr alloc failed; using sched path\n");
+        return fail();
+    }
+    c->cp_dir_state = 1;
+    if (c->params.verbosity >= 1) {
+        fprintf(stderr, "qwen3_tts: cp_direct active (persistent sched-free code_pred graphs)\n");
+    }
+    return true;
+}
+
+// Dispatch one code_pred forward on the persistent direct graphs. Returns
+// malloc'd logits (cp_vocab_size floats) or nullptr when the direct path is
+// unavailable — the caller then falls back to the sched paths.
+static float* run_code_pred_direct(qwen3_tts_context* c, const float* embeds, int n_tokens, int n_past,
+                                   ggml_tensor* lm_head) {
+    if (!cp_direct_init(c)) {
+        return nullptr;
+    }
+    const auto& hp = c->hp;
+    const int vocab = (int)hp.cp_vocab_size;
+    const int d = (int)hp.cp_d_model;
+    const int d_in_eff = (c->cp_mtp_fused && c->code_pred.small_to_mtp_w) ? (int)c->code_pred.small_to_mtp_w->ne[0] : d;
+    const int mask_Lk = c->cp_kv_max_ctx;
+    ggml_cgraph* gf = (n_tokens == 1) ? c->cp_dir_gf : c->cp_dir0_gf;
+
+    const bool bench = env_bool("QWEN3_TTS_BENCH");
+    const double t0 = bench ? now_ms() : 0.0;
+
+    if (n_tokens == 1) {
+        ggml_backend_tensor_copy(lm_head, c->cp_lm_head_slot);
+    }
+    std::vector<int32_t> positions(n_tokens);
+    for (int i = 0; i < n_tokens; i++) {
+        positions[i] = n_past + i;
+    }
+    const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t neginf_h = ggml_fp32_to_fp16(-INFINITY);
+    std::vector<ggml_fp16_t> mask((size_t)mask_Lk * n_tokens, neginf_h);
+    for (int q = 0; q < n_tokens; q++) {
+        for (int k = 0; k <= n_past + q; k++) {
+            mask[(size_t)q * mask_Lk + k] = zero_h;
+        }
+    }
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inputs_embeds"), embeds, 0,
+                            (size_t)d_in_eff * n_tokens * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), positions.data(), 0,
+                            positions.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
+                            mask.size() * sizeof(ggml_fp16_t));
+    const double t_set = bench ? now_ms() : 0.0;
+    if (ggml_backend_graph_compute(c->backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "qwen3_tts: cp_direct compute failed; using sched path\n");
+        c->cp_dir_state = -1;
+        return nullptr;
+    }
+    const double t_compute = bench ? now_ms() : 0.0;
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "logits");
+    float* r = (float*)malloc((size_t)vocab * sizeof(float));
+    ggml_backend_tensor_get(out, r, 0, (size_t)vocab * sizeof(float));
+    if (bench) {
+        static double sum_set = 0.0, sum_compute = 0.0, sum_read = 0.0;
+        static int count = 0;
+        sum_set += t_set - t0;
+        sum_compute += t_compute - t_set;
+        sum_read += now_ms() - t_compute;
+        count++;
+        if (count == 15) {
+            fprintf(stderr, "qwen3_tts: cp_direct bench (%d calls): set=%.2f ms  compute=%.1f ms  read=%.2f ms\n",
+                    count, sum_set, sum_compute, sum_read);
+            sum_set = sum_compute = sum_read = 0.0;
+            count = 0;
+        }
+    }
+    return r;
+}
+
 float* run_code_pred_kv(qwen3_tts_context* c, const float* embeds, int n_tokens, int n_past, ggml_tensor* lm_head,
                         bool skip_plan = false) {
     if (!lm_head) {
@@ -1863,6 +2070,25 @@ float* run_code_pred_kv(qwen3_tts_context* c, const float* embeds, int n_tokens,
     if (n_past + n_tokens > c->cp_kv_max_ctx) {
         fprintf(stderr, "qwen3_tts: cp_kv overflow (%d+%d > %d)\n", n_past, n_tokens, c->cp_kv_max_ctx);
         return nullptr;
+    }
+    // CP_DIRECT (§232/#245): sched-free persistent-graph dispatch. Covers
+    // exactly the two shapes the per-frame loop produces (T=2 prefill at
+    // n_past=0 and T=1 steps); anything else — and any backend where an op is
+    // unsupported — falls through to the sched paths below.
+    //
+    // Default policy (validated 2026-07-10, md5-identical WAV everywhere):
+    // ON when the code_pred runs on a GPU backend — M1 Metal ~equal on an
+    // idle box but ~3x faster under load (the sched path degrades badly
+    // under contention), CUDA P100 11% faster. OFF on CPU, where there is
+    // no dispatch cost to save and the per-step lm_head slot blit
+    // (~2.2 MB memcpy x14/frame) makes it ~2x SLOWER. Env always wins.
+    const bool cp_direct_default = c->backend && c->backend != c->backend_cpu;
+    if (env_bool_default("QWEN3_TTS_CP_DIRECT", cp_direct_default) && !c->cp_cpu_pinned &&
+        (n_tokens == 1 || (n_tokens == 2 && n_past == 0))) {
+        float* r_dir = run_code_pred_direct(c, embeds, n_tokens, n_past, lm_head);
+        if (r_dir) {
+            return r_dir;
+        }
     }
     const auto& hp = c->hp;
     const int d = (int)hp.cp_d_model;
@@ -3529,9 +3755,56 @@ bool build_voicedesign_prefill_embeds(qwen3_tts_context* c, const std::string& i
 // where dilations cycle through 1, 3, 9.
 // Input/output: [C, T] channels-first.
 // ---------------------------------------------------------------------------
+// §232 FASTCONV gate (default ON; opt out with QWEN3_TTS_CODEC_FASTCONV=0
+// — validated 2026-07-11: WAV md5-identical to the legacy path on M1 Metal,
+// and within 1 int16 LSB / PCM cos 1.00000000 on CPU; codec wall ~3x faster
+// on Metal, ~2.1x on CPU): three codec conv rewrites that remove the decode
+// hot spots found by QWEN3_TTS_CODEC_TRACE on M1 Metal (im2col of K=1
+// convs, CPU-placed asymmetric PAD nodes, and per-graph F16→F32 kernel
+// casts):
+//   1. K==1 stride-1 conv == channel matmul — no transposes, no im2col
+//      (the im2col of a 1×1 conv is a pure copy of the input; ~75 ms and a
+//      ~300 MB intermediate per instance at 24 kHz T).
+//   2. K>1 causal conv: symmetric pad INSIDE im2col + keep the first T_out
+//      columns. Metal rejects left/asymmetric PAD so the explicit pad node
+//      lands on the CPU backend and forces sched splits + copies; the
+//      im2col-internal pad has no such node. Same trick as voxcpm2's
+//      causal_conv1d_ggml.
+//   3. F32 conv kernels baked at load (see load_codec) so ggml_conv_1d
+//      doesn't cast multi-MB F16 kernels inside every graph.
+static bool codec_fastconv_enabled() {
+    return env_bool_default("QWEN3_TTS_CODEC_FASTCONV", true);
+}
+
 static ggml_tensor* codec_causal_conv1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, int stride,
                                         int dilation) {
     const int K = (int)w->ne[0];
+    const bool fastconv = codec_fastconv_enabled() && stride == 1;
+    if (fastconv && K == 1) {
+        // 1×1 conv: y = Wᵀx over channels, directly on the [C_in, T] layout.
+        ggml_tensor* w2d = ggml_reshape_2d(ctx, w, w->ne[1], w->ne[2]); // [C_in, C_out]
+        ggml_tensor* y = ggml_mul_mat(ctx, w2d, x);                     // [C_out, T]
+        if (b) {
+            y = ggml_add(ctx, y, b);
+        }
+        return y;
+    }
+    if (fastconv) {
+        const int pad = (K - 1) * dilation;
+        const int64_t T_in = x->ne[1];
+        x = ggml_cont(ctx, ggml_transpose(ctx, x));                 // [T, C_in]
+        ggml_tensor* y = ggml_conv_1d(ctx, w, x, 1, pad, dilation); // [T + pad, C_out]
+        if (y->ne[0] > T_in) {
+            // Causal = the first T_in output columns; the trailing `pad`
+            // columns read right-padding and are dropped.
+            y = ggml_view_2d(ctx, y, T_in, y->ne[1], y->nb[1], 0);
+        }
+        y = ggml_cont(ctx, ggml_transpose(ctx, y)); // [C_out, T]
+        if (b) {
+            y = ggml_add(ctx, y, b);
+        }
+        return y;
+    }
     int pad_left = (K - 1) * dilation;
     if (stride > 1) {
         pad_left -= (stride - 1);
@@ -3561,6 +3834,24 @@ static ggml_tensor* codec_causal_conv1d(ggml_context* ctx, ggml_tensor* x, ggml_
 static ggml_tensor* codec_dw_causal_conv1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b) {
     const int K = (int)w->ne[0];
     const int pad_left = K - 1;
+    if (codec_fastconv_enabled()) {
+        // Same causal trick as codec_causal_conv1d: pad inside im2col (no
+        // CPU-placed PAD node), keep the first T_in output columns.
+        const int64_t T_in = x->ne[1];
+        x = ggml_cont(ctx, ggml_transpose(ctx, x)); // [T, C]
+        ggml_tensor* y = ggml_conv_1d_dw(ctx, w, x, 1, pad_left, 1);
+        if (ggml_n_dims(y) > 2) {
+            y = ggml_reshape_2d(ctx, y, y->ne[0], y->ne[1] * y->ne[2]);
+        }
+        if (y->ne[0] > T_in) {
+            y = ggml_view_2d(ctx, y, T_in, y->ne[1], y->nb[1], 0);
+        }
+        y = ggml_cont(ctx, ggml_transpose(ctx, y)); // [C, T]
+        if (b) {
+            y = ggml_add(ctx, y, b);
+        }
+        return y;
+    }
     x = ggml_cont(ctx, ggml_transpose(ctx, x)); // [T, C]
     if (pad_left > 0) {
         x = ggml_pad_ext(ctx, x, pad_left, 0, 0, 0, 0, 0, 0, 0);
@@ -3997,6 +4288,63 @@ static bool load_codec(qwen3_tts_context* c, const char* path) {
         for (int b = 0; b < 4; b++)
             ggml_backend_tensor_set(codec.blocks[b].tconv_w_perm, blk_wp_buf[b].get(), 0,
                                     ggml_nbytes(codec.blocks[b].tconv_w_perm));
+    }
+
+    // ---------- §232 FASTCONV: bake F32 copies of the K>1 conv kernels ----------
+    // ggml_conv_1d/_dw (fork) cast an F16 kernel to F32 inside EVERY graph
+    // when the activations are F32 — the in_conv cast alone was ~70 ms per
+    // decode on M1 Metal. Baking F32 copies once at load makes that cast a
+    // no-op. K==1 kernels are excluded: the fastconv matmul path consumes
+    // F16 directly (and better). ~+55 MB resident for the F16→F32 copies.
+    if (codec_fastconv_enabled()) {
+        std::vector<ggml_tensor**> conv_ws = {&codec.pre_conv_w, &codec.in_conv_w, &codec.out_conv_w,
+                                              &codec.rvq_first_out_w, &codec.rvq_rest_out_w};
+        for (int s = 0; s < 2; s++) {
+            conv_ws.push_back(&codec.up[s].dw_w);
+        }
+        for (int b = 0; b < 4; b++) {
+            for (int u = 0; u < 3; u++) {
+                conv_ws.push_back(&codec.blocks[b].res[u].conv1_w);
+                conv_ws.push_back(&codec.blocks[b].res[u].conv2_w);
+            }
+        }
+        std::vector<ggml_tensor**> to_cast;
+        for (auto** pw : conv_ws) {
+            if (*pw && (*pw)->type == GGML_TYPE_F16 && (*pw)->ne[0] > 1) {
+                to_cast.push_back(pw);
+            }
+        }
+        if (!to_cast.empty()) {
+            ggml_init_params cp = {ggml_tensor_overhead() * (to_cast.size() + 1) + 4096, nullptr, true};
+            codec.ctx_conv32 = ggml_init(cp);
+            if (codec.ctx_conv32) {
+                std::vector<ggml_tensor*> dsts(to_cast.size());
+                for (size_t i = 0; i < to_cast.size(); i++) {
+                    ggml_tensor* src = *to_cast[i];
+                    dsts[i] = ggml_new_tensor(codec.ctx_conv32, GGML_TYPE_F32, GGML_MAX_DIMS, src->ne);
+                    ggml_format_name(dsts[i], "%s.f32", src->name);
+                }
+                codec.buf_conv32 = ggml_backend_alloc_ctx_tensors(codec.ctx_conv32, weight_backend);
+                if (codec.buf_conv32) {
+                    std::vector<ggml_fp16_t> h16;
+                    std::vector<float> h32;
+                    for (size_t i = 0; i < to_cast.size(); i++) {
+                        ggml_tensor* src = *to_cast[i];
+                        const int64_t n = ggml_nelements(src);
+                        h16.resize((size_t)n);
+                        h32.resize((size_t)n);
+                        ggml_backend_tensor_get(src, h16.data(), 0, (size_t)n * sizeof(ggml_fp16_t));
+                        ggml_fp16_to_fp32_row(h16.data(), h32.data(), n);
+                        ggml_backend_tensor_set(dsts[i], h32.data(), 0, (size_t)n * sizeof(float));
+                        *to_cast[i] = dsts[i]; // graph builder now sees the F32 kernel
+                    }
+                } else {
+                    fprintf(stderr, "qwen3_tts: codec: fastconv F32 kernel bake alloc failed (non-fatal)\n");
+                    ggml_free(codec.ctx_conv32);
+                    codec.ctx_conv32 = nullptr;
+                }
+            }
+        }
     }
 
     // Codec compute metadata
@@ -7196,6 +7544,9 @@ extern "C" void qwen3_tts_free(struct qwen3_tts_context* ctx) {
         ggml_backend_sched_free(ctx->talker_step_sched);
     }
     for (auto& bk : ctx->talker_buckets) {
+        if (bk.galloc) {
+            ggml_gallocr_free(bk.galloc);
+        }
         if (bk.ctx) {
             ggml_free(bk.ctx);
         }
@@ -7211,6 +7562,18 @@ extern "C" void qwen3_tts_free(struct qwen3_tts_context* ctx) {
     }
     if (ctx->cp_step0_ctx) {
         ggml_free(ctx->cp_step0_ctx);
+    }
+    if (ctx->cp_dir_galloc) {
+        ggml_gallocr_free(ctx->cp_dir_galloc);
+    }
+    if (ctx->cp_dir0_galloc) {
+        ggml_gallocr_free(ctx->cp_dir0_galloc);
+    }
+    if (ctx->cp_dir_ctx) {
+        ggml_free(ctx->cp_dir_ctx);
+    }
+    if (ctx->cp_dir0_ctx) {
+        ggml_free(ctx->cp_dir0_ctx);
     }
     if (ctx->sched) {
         ggml_backend_sched_free(ctx->sched);
@@ -7256,6 +7619,12 @@ extern "C" void qwen3_tts_free(struct qwen3_tts_context* ctx) {
     }
     if (ctx->codec.ctx_perm) {
         ggml_free(ctx->codec.ctx_perm);
+    }
+    if (ctx->codec.buf_conv32) {
+        ggml_backend_buffer_free(ctx->codec.buf_conv32);
+    }
+    if (ctx->codec.ctx_conv32) {
+        ggml_free(ctx->codec.ctx_conv32);
     }
     if (ctx->vp_buf_w) {
         ggml_backend_buffer_free(ctx->vp_buf_w);

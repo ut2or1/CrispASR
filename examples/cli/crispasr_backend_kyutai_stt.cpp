@@ -85,12 +85,16 @@ public:
         // its final-token state. The batch wrapper passes raw samples and
         // stops, so the model emits the partial token id for the last word
         // (e.g. "c" for "country") but never receives the audio it needs
-        // to commit "ountry." + EOS. Append ~500 ms of zero-frame silence
-        // so the LM walks forward and finishes the word. Tokens emitted
-        // during the silence-tail keep their t_offset_cs arithmetic and
-        // simply land a few cs past the original input end — acceptable
-        // for word-timestamps. Pre-allocate once; reuse across best-of-N.
-        constexpr int kTailSilenceSamples = 8000; // 500 ms @ 16 kHz
+        // to commit "ountry." + EOS. Append silence equal to the model's
+        // total lookahead (audio_delay_seconds + silence_prefix_seconds)
+        // so the LM walks forward and finishes all pending words.
+        // Tokens emitted during the silence-tail keep their t_offset_cs
+        // arithmetic and simply land a few cs past the original input end
+        // — acceptable for word-timestamps.
+        // Default 500 ms for models where the accessor isn't available yet;
+        // stt-2.6b-en uses 2.5+1.0 = 3.5s → 56000 samples.
+        const float lookahead_s = kyutai_stt_total_lookahead_seconds(ctx_);
+        const int kTailSilenceSamples = std::max(8000, (int)(lookahead_s * 16000.0f));
         std::vector<float> padded;
         padded.reserve((size_t)n_samples + kTailSilenceSamples);
         padded.assign(samples, samples + n_samples);

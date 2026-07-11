@@ -123,10 +123,20 @@ struct ms_dec_layer {
     ggml_tensor* ffn_fc2_b = nullptr;
 };
 
+// §232 hybrid placement: encoder weights on GPU, decoder weights on CPU. The
+// per-token decode graph is CPU-pinned (KV cache is a CPU buffer), so keeping
+// the decoder weights CPU-resident avoids a per-token GPU->CPU weight re-copy.
+// Mirrors the moonshine (offline) fix. See PLAN §232 / LEARNINGS 25.
+static bool ms_is_gpu_tensor(const char* tensor_name, void* /*user*/) {
+    return tensor_name && std::strncmp(tensor_name, "encoder.", 8) == 0;
+}
+
 struct ms_model {
     ms_hparams hp;
     ggml_context* ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
+    // §232: CPU partition for decoder weights under the hybrid (split) load.
+    ggml_backend_buffer_t buf_w_cpu = nullptr;
 
     // Audio frontend
     ggml_tensor* embedder_log_k = nullptr;
@@ -294,13 +304,24 @@ extern "C" struct moonshine_streaming_context* moonshine_streaming_init_from_fil
         ctx->backend = ctx->backend_cpu;
     ctx->use_gpu = (ctx->backend != ctx->backend_cpu);
 
-    // Load weights via core_gguf (mmap, backend buffer)
+    // Load weights via core_gguf (mmap, backend buffer). §232: on GPU, split
+    // encoder->GPU / decoder->CPU (opt out with MOONSHINE_ALL_GPU=1).
     core_gguf::WeightLoad wl;
-    if (!core_gguf::load_weights(path_model, ctx->backend, "moonshine_streaming", wl)) {
+    const char* all_gpu_env = std::getenv("MOONSHINE_ALL_GPU");
+    const bool all_gpu = all_gpu_env && all_gpu_env[0] == '1';
+    bool loaded;
+    if (ctx->use_gpu && !all_gpu) {
+        loaded = core_gguf::load_weights_split(path_model, ctx->backend, ctx->backend_cpu, ms_is_gpu_tensor, nullptr,
+                                               "moonshine_streaming", wl);
+    } else {
+        loaded = core_gguf::load_weights(path_model, ctx->backend, "moonshine_streaming", wl);
+    }
+    if (!loaded) {
         fprintf(stderr, "moonshine_streaming: failed to load weights from '%s'\n", path_model);
         delete ctx;
         return nullptr;
     }
+    m.buf_w_cpu = wl.buf_cpu; // non-null only for the split (hybrid) load
     m.ctx_w = wl.ctx;
     m.buf_w = wl.buf;
 
@@ -580,21 +601,7 @@ static int run_encoder(moonshine_streaming_context* ctx, const float* frontend_o
     float ln_eps = 1e-5f;
     bool verbose = ctx->verbosity >= 2 || getenv("MOONSHINE_STREAMING_BENCH");
 
-    // §176s: reuse cached encoder graph when T_enc matches.
-    if (ctx->cached_enc_gf && ctx->cached_enc_T == T_enc) {
-        ggml_cgraph* gf = ctx->cached_enc_gf;
-        ggml_backend_sched_reset(ctx->sched);
-        if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
-            return -2;
-        ggml_tensor* inp = ggml_graph_get_tensor(gf, "enc_input");
-        ggml_backend_tensor_set(inp, frontend_out, 0, (size_t)d * T_enc * sizeof(float));
-        if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
-            return -3;
-        ggml_tensor* out = ggml_graph_get_tensor(gf, "encoder_output");
-        enc_output.resize((size_t)d * T_enc);
-        ggml_backend_tensor_get(out, enc_output.data(), 0, enc_output.size() * sizeof(float));
-        return 0;
-    }
+    // #215e UAF fix: always rebuild (sched gallocr regrow frees cached buffers).
     if (ctx->cached_enc_ctx) {
         ggml_free(ctx->cached_enc_ctx);
         ctx->cached_enc_ctx = nullptr;
@@ -613,7 +620,11 @@ static int run_encoder(moonshine_streaming_context* ctx, const float* frontend_o
     ggml_set_name(cur, "enc_input");
     ggml_set_input(cur);
 
-    // Per-layer masks
+    // Per-layer sliding-window masks. Required for correctness — the model
+    // was trained with specific window sizes and produces garbage without them.
+    // §232 note: removing masks for offline-mode was tested and produces
+    // degenerate output (repeating tokens). The masks ARE the computational
+    // bottleneck (~550² × 6 layers) but cannot be skipped.
     std::vector<ggml_tensor*> masks(hp.enc_n_layers, nullptr);
     for (uint32_t li = 0; li < hp.enc_n_layers; li++) {
         auto [wl, wr] = hp.sliding_windows[li];
@@ -1158,6 +1169,8 @@ extern "C" void moonshine_streaming_free(struct moonshine_streaming_context* ctx
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf_w)
         ggml_backend_buffer_free(ctx->model.buf_w);
+    if (ctx->model.buf_w_cpu)
+        ggml_backend_buffer_free(ctx->model.buf_w_cpu);
     if (ctx->model.ctx_w)
         ggml_free(ctx->model.ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)

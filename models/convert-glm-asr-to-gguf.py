@@ -127,6 +127,24 @@ def main():
         # Store as GGUF string array
         writer.add_array("tokenizer.ggml.tokens", vocab_list)
         print(f"  Tokenizer: {vocab_size} tokens")
+        # BPE merges — required by glm_asr_tokenize's byte-level BPE encoder
+        # (without them plain-text instructions cannot be encoded and the
+        # runtime falls back to the baked default transcription prompt).
+        if os.path.isdir(args.input):
+            tok_json = os.path.join(args.input, "tokenizer.json")
+        else:
+            tok_json = hf_hub_download(args.input, "tokenizer.json")
+        merges: list[str] = []
+        if os.path.exists(tok_json):
+            raw = json.load(open(tok_json)).get("model", {}).get("merges", [])
+            for m in raw:
+                merges.append(" ".join(m) if isinstance(m, (list, tuple)) else m)
+        if merges:
+            writer.add_array("tokenizer.ggml.merges", merges)
+            print(f"  Tokenizer: {len(merges)} BPE merges")
+        else:
+            print("  Warning: no BPE merges found (tokenizer.json missing?) — "
+                  "text encoding will be specials-only at runtime")
     except Exception as e:
         print(f"  Warning: tokenizer load failed: {e}")
 

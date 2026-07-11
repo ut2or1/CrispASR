@@ -30,7 +30,10 @@ unset _whisper_cache _whisper_default
 export CRISPASR_MODEL_GLM_ASR="${CRISPASR_MODEL_GLM_ASR:-$CRISPASR_MODELS_DIR/glm-asr-nano.gguf}"
 export CRISPASR_MODEL_QWEN3_ASR="${CRISPASR_MODEL_QWEN3_ASR:-$CRISPASR_MODELS_DIR/qwen3-asr-0.6b.gguf}"
 export CRISPASR_MODEL_HIGGS_STT="${CRISPASR_MODEL_HIGGS_STT:-$CRISPASR_MODELS_DIR/higgs-stt-q8_0.gguf}"
+export CRISPASR_MODEL_VOXTRAL_TTS="${CRISPASR_MODEL_VOXTRAL_TTS:-$CRISPASR_MODELS_DIR/voxtral-4b-tts-q4_k.gguf}"
 export CRISPASR_MODEL_CANARY="${CRISPASR_MODEL_CANARY:-$CRISPASR_MODELS_DIR/canary-1b-v2.gguf}"
+# canary-qwen SALM (nvidia/canary-qwen-2.5b). #247 short-window echo regression.
+export CRISPASR_MODEL_CANARY_QWEN="${CRISPASR_MODEL_CANARY_QWEN:-$CRISPASR_MODELS_DIR/canary-qwen-2.5b-q8_0.gguf}"
 export CRISPASR_MODEL_LFM2_EN="${CRISPASR_MODEL_LFM2_EN:-$CRISPASR_MODELS_DIR/lfm2-audio-1.5b-q5_k.gguf}"
 export CRISPASR_MODEL_LFM2_JP="${CRISPASR_MODEL_LFM2_JP:-$CRISPASR_MODELS_DIR/lfm2-audio-1.5b-jp-q5_k.gguf}"
 # dots.tts: F16 core (the CFG flow-match derails on full-q8) + vocoder companion.
@@ -73,6 +76,9 @@ export CRISPASR_MODEL_MOSS_AUDIO="${CRISPASR_MODEL_MOSS_AUDIO:-$CRISPASR_MODELS_
 
 # MOSS-Transcribe (OpenMOSS-Team/MOSS-Transcribe-preview-2B): ASR
 export CRISPASR_MODEL_MOSS_TRANSCRIBE="${CRISPASR_MODEL_MOSS_TRANSCRIBE:-$CRISPASR_MODELS_DIR/moss-transcribe-preview-2b-q4_k.gguf}"
+
+# MOSS-Transcribe-Diarize (OpenMOSS-Team/MOSS-Transcribe-Diarize-0.9B): ASR + diarization + timestamps
+export CRISPASR_MODEL_MOSS_DIARIZE="${CRISPASR_MODEL_MOSS_DIARIZE:-$CRISPASR_MODELS_DIR/moss-transcribe-diarize-0.9b-q4_k.gguf}"
 
 # ARK-ASR-3B (AutoArk-AI/ARK-ASR-3B): Whisper-large-v3 enc (partial RoPE) + Qwen2.5-3B LM.
 # ⚠️ experimental/WIP — CPU only. See PLAN.md §ARK.

@@ -51,7 +51,10 @@
 #include "crispasr_watermark.h"
 #include "crispasr_watermark_dispatch.h"
 #include "crispasr_wav_writer.h"
-#include "common-crispasr.h" // read_audio_data
+#include "crispasr_mp3_writer.h"  // MP3 output via in-tree glint encoder
+#include "crispasr_aac_writer.h"  // AAC-LC (ADTS) output via in-tree glint encoder
+#include "crispasr_opus_writer.h" // Ogg Opus output via in-tree glint encoder
+#include "common-crispasr.h"      // read_audio_data
 
 #include <algorithm>
 #include <atomic>
@@ -72,6 +75,61 @@
 #include <vector>
 
 namespace {
+
+// Serialize synthesized (TTS/S2S) float32 PCM to `out_path` — WAV by
+// default, MP3 or AAC-LC/ADTS (in-tree glint encoder) when the path
+// ends in .mp3 / .aac. All carry AI-provenance metadata (WAV LIST/INFO
+// chunk, MP3/AAC ID3v2 TXXX tag). C2PA Content Credentials signing is
+// WAV-only; requesting it with a lossy output warns instead of
+// silently dropping the manifest. Returns 0 on success, 16 on failure
+// (caller's exit code).
+static int crispasr_write_synth_audio(const std::string& out_path, const float* pcm, int n_samples, int sample_rate,
+                                      const std::string& c2pa_cert, const std::string& c2pa_key) {
+    auto has_ext = [&](const char* lo, const char* up) {
+        return out_path.size() >= 4 &&
+               (out_path.compare(out_path.size() - 4, 4, lo) == 0 || out_path.compare(out_path.size() - 4, 4, up) == 0);
+    };
+    // Case-insensitive suffix test (handles extensions of any length, e.g. the
+    // 5-char ".opus" that has_ext's fixed 4-char compare can't).
+    auto ends_with_ci = [&](const char* suf) {
+        const size_t n = std::strlen(suf);
+        if (out_path.size() < n)
+            return false;
+        for (size_t i = 0; i < n; ++i)
+            if (std::tolower((unsigned char)out_path[out_path.size() - n + i]) != std::tolower((unsigned char)suf[i]))
+                return false;
+        return true;
+    };
+    const bool is_mp3 = has_ext(".mp3", ".MP3");
+    const bool is_aac = has_ext(".aac", ".AAC");
+    const bool is_opus = ends_with_ci(".opus") || ends_with_ci(".ogg");
+    std::string blob;
+    if (is_mp3 || is_aac || is_opus) {
+        const char* codec = is_mp3 ? "MP3" : (is_aac ? "AAC" : "Opus");
+        blob = is_mp3   ? crispasr_make_mp3(pcm, n_samples, sample_rate)
+               : is_aac ? crispasr_make_aac(pcm, n_samples, sample_rate)
+                        : crispasr_make_opus(pcm, n_samples, sample_rate);
+        if (blob.empty()) {
+            fprintf(stderr, "crispasr: error: %s encoding failed for '%s'\n", codec, out_path.c_str());
+            return 16;
+        }
+        if (!c2pa_cert.empty() || !c2pa_key.empty())
+            fprintf(stderr, "crispasr: warning: C2PA signing is WAV-only; '%s' is written unsigned\n",
+                    out_path.c_str());
+    } else {
+        blob = crispasr_make_wav_int16(pcm, n_samples, sample_rate);
+        // C2PA Content Credentials signing (when available + configured)
+        crispasr_c2pa_sign_wav(blob, c2pa_cert, c2pa_key);
+    }
+    FILE* fout = fopen(out_path.c_str(), "wb");
+    if (!fout) {
+        fprintf(stderr, "crispasr: error: cannot write '%s'\n", out_path.c_str());
+        return 16;
+    }
+    fwrite(blob.data(), 1, blob.size(), fout);
+    fclose(fout);
+    return 0;
+}
 
 // Apply FireRedPunc punctuation restoration to all segments.
 static void apply_punc_model(fireredpunc_context* punc_ctx, std::vector<crispasr_segment>& segs) {
@@ -212,6 +270,41 @@ std::vector<crispasr_segment> merge_segments(std::vector<std::vector<crispasr_se
 
 bool crispasr_words_have_positive_span(const std::vector<crispasr_word>& words) {
     return !words.empty() && words.back().t1 > words.front().t0;
+}
+
+// True if any segment carries a non-whitespace character (i.e. real text).
+// Bytes <= 0x20 are ASCII whitespace/control; UTF-8 continuation/lead bytes
+// are >= 0x80, so this also counts non-Latin scripts as text.
+static bool crispasr_segs_have_text(const std::vector<crispasr_segment>& segs) {
+    for (const auto& s : segs) {
+        for (unsigned char c : s.text) {
+            if (c > 0x20)
+                return true;
+        }
+    }
+    return false;
+}
+
+// Silent-failure guard (issue #240). A degenerate / over-quantized model can
+// emit an empty transcript for clearly non-silent audio while still reporting
+// a successful run; in scripted / embedding contexts (e.g. SubtitleEdit) that
+// is indistinguishable from success. Emit a stderr warning so the empty output
+// is at least visible. Gated by !no_prints (same as the timing line), and by a
+// peak-amplitude silence gate so genuinely silent input never warns.
+static void crispasr_warn_if_empty_transcript(bool have_text, const std::vector<float>& samples, double audio_s,
+                                              const whisper_params& params) {
+    if (params.no_prints || have_text || audio_s < 0.5)
+        return;
+    float peak = 0.0f;
+    for (float v : samples)
+        peak = std::fmax(peak, std::fabs(v));
+    if (peak < 0.01f) // ~ -40 dBFS: treat as silence, no speech expected
+        return;
+    fprintf(stderr,
+            "crispasr: WARNING: no text produced for %.1fs of non-silent audio (peak %.2f). "
+            "Possible causes: the audio has no speech, an unsupported language, or an "
+            "over-quantized model (try a q8_0/f16 build).\n",
+            audio_s, (double)peak);
 }
 
 // Stdout serialization mutex. Used by the parallel-processors path to
@@ -611,6 +704,7 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
                 fprintf(stderr, "crispasr: transcribed %.1fs audio in %.2fs (%.1fx realtime)\n", audio_s, t_total,
                         audio_s / std::max(t_total, 0.001));
             }
+            crispasr_warn_if_empty_transcript(crispasr_segs_have_text(all_segs), samples, audio_s, params);
             std::lock_guard<std::mutex> lock(g_stdout_mutex);
             crispasr_print_stdout(disp, show_timestamps);
             if (params.show_alternatives)
@@ -629,12 +723,20 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
         if (params.output_jsn)
             crispasr_write_json(out_path(".json"), all_segs, backend.name(), params.model, params.language,
                                 params.output_jsn_full, lid_info.lang_code.empty() ? nullptr : &lid_info);
+        if (params.return_logits) {
+            if (const auto* logits = backend.last_ctc_logits()) {
+                crispasr_write_ctc_logits_json(out_path(".ctc-logits.json"), *logits, backend.name());
+            } else if (!params.no_prints) {
+                fprintf(stderr, "crispasr: warning: backend '%s' did not produce CTC logits\n", backend.name());
+            }
+        }
         return 0;
     }
 
     // --------------- Per-slice path (non-VAD or single slice) ---------------
     // Process VAD slices — parallel when multiple slices AND n_processors > 1
     std::vector<std::vector<crispasr_segment>> per_slice(slices.size());
+    std::vector<crispasr_ctc_logits> per_slice_logits(slices.size());
 
     // Pyannote cross-slice fix (issue #107): pre-compute the
     // segmentation posteriors once over the FULL mono audio, then have
@@ -739,6 +841,12 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
 
         std::vector<crispasr_segment> segs =
             be.transcribe(samples.data() + ext_start, ext_end - ext_start, ext_t0_cs, params);
+        if (params.return_logits) {
+            if (const auto* logits = be.last_ctc_logits())
+                per_slice_logits[i] = *logits;
+            else
+                per_slice_logits[i] = {};
+        }
 
         // Trim back to the original slice range when context was added.
         if (use_chunk_context && !segs.empty()) {
@@ -905,7 +1013,25 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
         }
     };
 
-    const int n_workers = std::min(params.n_processors, (int32_t)slices.size());
+    const int n_workers = params.return_logits ? 1 : std::min(params.n_processors, (int32_t)slices.size());
+
+    auto merged_ctc_logits = [&]() {
+        crispasr_ctc_logits merged;
+        for (const auto& lg : per_slice_logits) {
+            if (lg.data.empty() || lg.n_frames <= 0 || lg.n_vocab <= 0)
+                continue;
+            if (merged.n_vocab == 0) {
+                merged.n_vocab = lg.n_vocab;
+                merged.normalization = lg.normalization;
+                merged.vocab = lg.vocab;
+            }
+            if (merged.n_vocab != lg.n_vocab)
+                continue;
+            merged.data.insert(merged.data.end(), lg.data.begin(), lg.data.end());
+            merged.n_frames += lg.n_frames;
+        }
+        return merged;
+    };
 
     if (n_workers > 1 && slices.size() > 1) {
         // Parallel slice processing with separate backend instances
@@ -959,7 +1085,8 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     } else if (params.flush_after > 0 && slices.size() > 1) {
         // Progressive mode: process slices sequentially, flush output after each.
         // This gives media players SRT entries as soon as each VAD segment is done.
-        int srt_index = 1; // running SRT entry counter
+        int srt_index = 1;                 // running SRT entry counter
+        bool progressive_any_text = false; // issue #240 silent-failure guard
         const bool show_ts = !params.no_timestamps && (params.output_srt || params.output_vtt || params.max_len > 0 ||
                                                        params.print_colors || params.diarize);
         for (size_t i = 0; i < slices.size(); i++) {
@@ -982,6 +1109,12 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
 
             // Print SRT entries progressively to stdout
             for (const auto& d : disp) {
+                for (unsigned char c : d.text) {
+                    if (c > 0x20) {
+                        progressive_any_text = true;
+                        break;
+                    }
+                }
                 if (params.output_srt) {
                     int t0_ms = (int)(d.t0 * 10);
                     int t1_ms = (int)(d.t1 * 10);
@@ -1011,6 +1144,7 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
                 fprintf(stderr, "crispasr: transcribed %.1fs audio in %.2fs (%.1fx realtime)\n", audio_s, t_total,
                         audio_s / t_total);
             }
+            crispasr_warn_if_empty_transcript(progressive_any_text, samples, audio_s, params);
         }
 
         // Write output files (full set, from all slices combined)
@@ -1059,6 +1193,11 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             if (params.output_jsn)
                 crispasr_write_json(out_path(".json"), all_segs, backend.name(), params.model, params.language,
                                     params.output_jsn_full, lid_info.lang_code.empty() ? nullptr : &lid_info);
+            if (params.return_logits) {
+                auto logits = merged_ctc_logits();
+                if (!logits.data.empty())
+                    crispasr_write_ctc_logits_json(out_path(".ctc-logits.json"), logits, backend.name());
+            }
         }
         return 0;
     } else {
@@ -1128,6 +1267,7 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             fprintf(stderr, "crispasr: transcribed %.1fs audio in %.2fs (%.1fx realtime)\n", audio_s, t_total,
                     audio_s / std::max(t_total, 0.001));
         }
+        crispasr_warn_if_empty_transcript(crispasr_segs_have_text(all_segs), samples, audio_s, params);
 
         // Serialize stdout across parallel workers so multi-file
         // transcripts don't interleave line-by-line.
@@ -1151,6 +1291,13 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     if (params.output_jsn)
         crispasr_write_json(out_path(".json"), all_segs, backend.name(), params.model, params.language,
                             params.output_jsn_full, lid_info.lang_code.empty() ? nullptr : &lid_info);
+    if (params.return_logits) {
+        auto logits = merged_ctc_logits();
+        if (!logits.data.empty())
+            crispasr_write_ctc_logits_json(out_path(".ctc-logits.json"), logits, backend.name());
+        else if (!params.no_prints)
+            fprintf(stderr, "crispasr: warning: backend '%s' did not produce CTC logits\n", backend.name());
+    }
 
     return 0;
 }
@@ -1652,6 +1799,20 @@ int crispasr_run_backend(const whisper_params& params_in) {
         }
     }
 
+    // #231 — "cohere-ar" is the Arabic shorthand for the cohere backend
+    // (routes to the same runtime; the registry resolves the recommended
+    // Arabic imatrix GGUF for `-m auto`). Default the language to "ar" so
+    // `--backend cohere-ar audio.wav` works without also requiring `-l ar`.
+    // Only fires when the user hasn't already picked a language (matches
+    // the chatterbox block's "auto" == unset convention above); an explicit
+    // `-l <lang>` always wins, e.g. for LID experiments against the model.
+    if (backend_name == "cohere-ar" && (params.language.empty() || params.language == "auto")) {
+        params.language = "ar";
+        if (!params.no_prints) {
+            fprintf(stderr, "crispasr: --backend cohere-ar — defaulting language to 'ar' (pass -l to override)\n");
+        }
+    }
+
     // Resolve "-m auto" via the model registry + curl/wget download.
     const std::string resolved = crispasr_resolve_model_cli(params.model, backend_name, params.no_prints,
                                                             params.cache_dir, params.auto_download, params.model_quant);
@@ -2074,6 +2235,60 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // CLI `--tts` path to parity. Single-sentence input is a 1-element vector
         // (one std::vector move of overhead). The policy wrapper keeps VibeVoice
         // voice cloning single-shot (chunking breaks its continuous-prompt ICL).
+        // --tts-stream: emit each sentence chunk to stdout as raw s16le mono
+        // PCM as soon as it's synthesized (progressive playback), instead of
+        // concatenating into one WAV. Watermark is embedded per chunk; the
+        // spoken disclaimer (if voice-cloned) is emitted first. All logs stay
+        // on stderr so stdout is a clean PCM stream.
+        if (params.tts_stream) {
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr: streaming TTS as s16le mono @ %d Hz to stdout\n", sr_in);
+            auto emit = [&](std::vector<float>& pcm) {
+                if (pcm.empty())
+                    return;
+                crispasr_wm_dispatch::embed(pcm.data(), (int)pcm.size(), sr_in);
+                std::vector<int16_t> s16(pcm.size());
+                for (size_t i = 0; i < pcm.size(); i++) {
+                    float v = pcm[i] * 32767.0f;
+                    s16[i] = (int16_t)(v < -32768.0f ? -32768.0f : (v > 32767.0f ? 32767.0f : v));
+                }
+                fwrite(s16.data(), sizeof(int16_t), s16.size(), stdout);
+                fflush(stdout);
+            };
+            if (is_voice_clone && !params.tts_no_spoken_disclaimer) {
+                const auto& disc = crispasr_tts_get_disclaimer(backend.get(), params);
+                if (!disc.empty()) {
+                    std::vector<float> d(disc.begin(), disc.end());
+                    emit(d);
+                    std::vector<float> gap((size_t)sr_in / 5, 0.0f); // 200 ms
+                    emit(gap);
+                }
+            }
+            const std::vector<std::string> stream_chunks =
+                crispasr_tts_plan_chunks_for_backend(params.tts_text, backend->name());
+            bool any = false;
+            for (size_t ci = 0; ci < stream_chunks.size(); ci++) {
+                std::vector<float> c = backend->synthesize(stream_chunks[ci], params);
+                if (c.empty())
+                    continue;
+                if (any) {
+                    std::vector<float> gap((size_t)sr_in / 5, 0.0f); // 200 ms between chunks
+                    emit(gap);
+                }
+                emit(c);
+                any = true;
+            }
+            fflush(stdout);
+            crispasr_wm_dispatch::shutdown();
+            if (!any) {
+                fprintf(stderr, "crispasr: error: TTS synthesis failed\n");
+                return 15;
+            }
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr: TTS stream complete\n");
+            return 0;
+        }
+
         std::vector<float> audio;
         {
             const std::vector<std::string> chunks_txt =
@@ -2132,20 +2347,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // Embed watermark (AudioSeal if loaded, otherwise spread-spectrum)
         crispasr_wm_dispatch::embed(audio.data(), (int)audio.size(), sr_in);
 
-        // Write output WAV (backend-native sample rate, mono).
-        // crispasr_make_wav_int16 includes a LIST/INFO chunk with
-        // AI-provenance metadata (ISFT, ICMT).
+        // Write output audio (backend-native sample rate, mono) — WAV by
+        // default, MP3/AAC when --tts-output ends in .mp3/.aac.
         std::string out_path = params.tts_output.empty() ? "tts_output.wav" : params.tts_output;
-        std::string wav = crispasr_make_wav_int16(audio.data(), (int)audio.size(), sr_in);
-        // C2PA Content Credentials signing (when available + configured)
-        crispasr_c2pa_sign_wav(wav, params.c2pa_cert, params.c2pa_key);
-        FILE* fout = fopen(out_path.c_str(), "wb");
-        if (!fout) {
-            fprintf(stderr, "crispasr: error: cannot write '%s'\n", out_path.c_str());
-            return 16;
-        }
-        fwrite(wav.data(), 1, wav.size(), fout);
-        fclose(fout);
+        if (int rc = crispasr_write_synth_audio(out_path, audio.data(), (int)audio.size(), sr_in, params.c2pa_cert,
+                                                params.c2pa_key))
+            return rc;
 
         // Post-embed watermark verification: re-detect on the in-memory
         // PCM (which has already been watermarked) and warn if confidence
@@ -2225,17 +2432,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // Embed watermark
         crispasr_wm_dispatch::embed(audio.data(), (int)audio.size(), sr_out);
 
-        // Write output WAV
+        // Write output audio — WAV by default, MP3/AAC when --s2s-output
+        // ends in .mp3/.aac.
         std::string out_path = params.s2s_output.empty() ? "s2s_output.wav" : params.s2s_output;
-        std::string wav = crispasr_make_wav_int16(audio.data(), (int)audio.size(), sr_out);
-        crispasr_c2pa_sign_wav(wav, params.c2pa_cert, params.c2pa_key);
-        FILE* fout = fopen(out_path.c_str(), "wb");
-        if (!fout) {
-            fprintf(stderr, "crispasr: error: cannot write '%s'\n", out_path.c_str());
-            return 16;
-        }
-        fwrite(wav.data(), 1, wav.size(), fout);
-        fclose(fout);
+        if (int rc = crispasr_write_synth_audio(out_path, audio.data(), (int)audio.size(), sr_out, params.c2pa_cert,
+                                                params.c2pa_key))
+            return rc;
 
         if (!params.no_prints)
             fprintf(stderr, "crispasr: S2S output written to '%s' (%zu samples @ %d Hz, %.2f sec)\n", out_path.c_str(),
@@ -3232,7 +3434,9 @@ int crispasr_run_backend(const whisper_params& params_in) {
 
         // Transcribe each slice.
         std::vector<std::vector<crispasr_segment>> per_slice;
+        std::vector<crispasr_ctc_logits> per_slice_logits;
         per_slice.reserve(slices.size());
+        per_slice_logits.reserve(slices.size());
         for (size_t i = 0; i < slices.size(); i++) {
             const auto & sl = slices[i];
             // Always transcribe in mono — every backend takes mono PCM
@@ -3242,6 +3446,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 sl.end - sl.start,
                 sl.t0_cs,
                 params);
+            if (params.return_logits) {
+                if (const auto* logits = backend->last_ctc_logits())
+                    per_slice_logits.push_back(*logits);
+                else
+                    per_slice_logits.push_back({});
+            }
 
             // Apply the generic diarize post-step. Stereo-only methods
             // (energy, xcorr) need have_stereo == true; mono-friendly
@@ -3360,6 +3570,24 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 out_path(".json"),
                 all_segs, backend->name(), params.model, params.language,
                 params.output_jsn_full, nullptr);
+        if (params.return_logits) {
+            crispasr_ctc_logits merged;
+            for (const auto& lg : per_slice_logits) {
+                if (lg.data.empty() || lg.n_vocab <= 0 || lg.n_frames <= 0)
+                    continue;
+                if (merged.n_vocab == 0) {
+                    merged.n_vocab = lg.n_vocab;
+                    merged.normalization = lg.normalization;
+                    merged.vocab = lg.vocab;
+                }
+                if (merged.n_vocab != lg.n_vocab)
+                    continue;
+                merged.data.insert(merged.data.end(), lg.data.begin(), lg.data.end());
+                merged.n_frames += lg.n_frames;
+            }
+            if (!merged.data.empty())
+                crispasr_write_ctc_logits_json(out_path(".ctc-logits.json"), merged, backend->name());
+        }
     }
 
     if (punc_ctx) fireredpunc_free(punc_ctx);

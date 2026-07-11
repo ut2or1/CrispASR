@@ -680,23 +680,21 @@ static std::vector<float> canary_encode_mel(canary_context* ctx, const float* me
         ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
     }
 
-    // §176s: reuse cached encoder graph when T_mel matches.
-    ggml_cgraph* gf;
-    if (ctx->cached_enc_gf && ctx->cached_enc_T_mel == T_mel) {
-        gf = ctx->cached_enc_gf;
-    } else {
-        if (ctx->cached_enc_ctx) {
-            ggml_free(ctx->cached_enc_ctx);
-            ctx->cached_enc_ctx = nullptr;
-            ctx->cached_enc_gf = nullptr;
-        }
-        ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
-        ggml_init_params aip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
-        ctx->cached_enc_ctx = ggml_init(aip);
-        gf = canary_build_graph_encoder(ctx, T_mel, ctx->cached_enc_ctx);
-        ctx->cached_enc_gf = gf;
-        ctx->cached_enc_T_mel = T_mel;
+    // #215e UAF fix: rebuild the encoder graph every invocation. A cached graph's
+    // tensor->buffer pointers go stale when the sched's gallocr regrows for a
+    // larger interleaved graph (decoder/adapter). The graph-build is fast (~0.1 ms);
+    // the sched alloc + compute dominate. Same fix as moss_transcribe (#215).
+    if (ctx->cached_enc_ctx) {
+        ggml_free(ctx->cached_enc_ctx);
+        ctx->cached_enc_ctx = nullptr;
+        ctx->cached_enc_gf = nullptr;
     }
+    ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
+    ggml_init_params aip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
+    ctx->cached_enc_ctx = ggml_init(aip);
+    ggml_cgraph* gf = canary_build_graph_encoder(ctx, T_mel, ctx->cached_enc_ctx);
+    ctx->cached_enc_gf = gf;
+    ctx->cached_enc_T_mel = T_mel;
 
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {

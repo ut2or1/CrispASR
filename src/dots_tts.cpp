@@ -1134,18 +1134,17 @@ static void dots_dit_forward(dots_tts_context* ctx, const float* fm_seq, int fm_
 // One latent patch (in_dim, n_frames) -> one LLM embedding (out_dim).
 //   1. causal Conv1d(k=2,s=2) downsample          -> out_ds_rate tokens
 //   2. in_proj (Linear + bias)                     -> (hidden, out_ds_rate)
-//   3. n_layers x [RMSNorm -> causal MHA(no RoPE,  -> (hidden, out_ds_rate)
-//      no qk_norm) -> +res ; RMSNorm -> SiLU MLP -> +res]
+//   3. n_layers x [RMSNorm -> causal MHA(RoPE θ=10K,  -> (hidden, out_ds_rate)
+//      unweighted QK-norm) -> +res ; RMSNorm -> SiLU MLP -> +res]
 //   4. concat the out_ds_rate tokens -> (hidden*out_ds_rate)
 //   5. out_proj (Linear + bias)                    -> (out_dim, 1)
 //
 // MULTI-PATCH via full causal recompute. The reference streams one patch at a
 // time with a persisted conv_tail (1 latent frame) + per-layer causal KV cache.
-// Because the PatchEncoder uses NO RoPE (position-independent attention) and the
-// stride-2 causal downsample window boundaries are identical whether streamed or
-// run over the whole sequence at once, running the full causal encoder over ALL
-// accumulated latents and grouping the encoder tokens is mathematically IDENTICAL
-// to the incremental decode_patch loop. So this takes the entire latent history
+// The PatchEncoder uses RoPE (theta=10K, NEOX) + unweighted QK-norm. Running the
+// full causal encoder over ALL accumulated latents with sequential positions
+// (0..T-1) is mathematically IDENTICAL to the incremental decode_patch loop
+// (the stride-2 causal downsample window boundaries are the same either way). So this takes the entire latent history
 // (in_dim, n_frames) [n_frames a multiple of patch_size] and emits one LLM
 // embedding (out_dim) per patch -> out_embeds is (n_patches, out_dim). The caller
 // (AR loop) uses only the last; the diff harness checks all. The symmetric pad=1
@@ -1176,6 +1175,11 @@ static void dots_penc_forward(dots_tts_context* ctx, const float* latents, int n
     ggml_set_name(mask, "penc_mask");
     ggml_set_input(mask);
 
+    // RoPE position IDs for the PatchEncoder (0..T-1)
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_name(positions, "penc_positions");
+    ggml_set_input(positions);
+
     // ── 1. Downsample conv (k=2, s=2, causal). conv_tail=0 for patch 0, so a
     //        symmetric pad=1 conv reproduces windows [0,f0],[f1,f2],... ; crop.
     ggml_tensor* xT = ggml_cont(ctx0, ggml_transpose(ctx0, x));                        // (T_in, in_dim)
@@ -1201,7 +1205,7 @@ static void dots_penc_forward(dots_tts_context* ctx, const float* latents, int n
             break;
         }
 
-        // Attention: RMSNorm -> MHA (no RoPE, no qk_norm) + residual
+        // Attention: RMSNorm -> QKV proj -> QK-norm (unweighted) -> RoPE -> MHA + residual
         ggml_tensor* residual = cur;
         ggml_tensor* h = rms_norm(ctx0, cur, L.attn_norm, 1e-6f);
         ggml_tensor* Q = ggml_mul_mat(ctx0, L.q_proj, h); // (H, T)
@@ -1210,6 +1214,22 @@ static void dots_penc_forward(dots_tts_context* ctx, const float* latents, int n
         Q = ggml_reshape_3d(ctx0, Q, hd, nh, T); // (hd, nh, T)
         K = ggml_reshape_3d(ctx0, K, hd, nh, T);
         V = ggml_reshape_3d(ctx0, V, hd, nh, T);
+
+        // QK-norm: unweighted RMSNorm (all-ones weight, not stored in GGUF).
+        // Applied per-head before RoPE. If learned weights exist, multiply.
+        Q = ggml_rms_norm(ctx0, Q, 1e-6f);
+        if (L.q_norm)
+            Q = ggml_mul(ctx0, Q, L.q_norm);
+        K = ggml_rms_norm(ctx0, K, 1e-6f);
+        if (L.k_norm)
+            K = ggml_mul(ctx0, K, L.k_norm);
+
+        // RoPE (NEOX / neghalf, theta=10000) — applied after reshape, before permute
+        Q = ggml_rope_ext(ctx0, Q, positions, nullptr, hd, GGML_ROPE_TYPE_NEOX, 0, pe.rope_theta, 1.0f, 0.0f, 1.0f,
+                          0.0f, 0.0f);
+        K = ggml_rope_ext(ctx0, K, positions, nullptr, hd, GGML_ROPE_TYPE_NEOX, 0, pe.rope_theta, 1.0f, 0.0f, 1.0f,
+                          0.0f, 0.0f);
+
         Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3)); // (hd, T, nh)
         K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3)); // (hd, T, nh)
         ggml_tensor* kq = ggml_mul_mat(ctx0, K, Q);             // (Tk, Tq, nh)
@@ -1264,6 +1284,13 @@ static void dots_penc_forward(dots_tts_context* ctx, const float* latents, int n
             mask_data[(size_t)q * T + k] = (k <= q) ? 0.0f : -INFINITY;
     ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_data.size() * sizeof(float));
 
+    // RoPE positions: 0, 1, 2, ..., T-1
+    std::vector<int32_t> pos_data(T);
+    for (int i = 0; i < T; i++)
+        pos_data[i] = i;
+    ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "penc_positions");
+    ggml_backend_tensor_set(pos_t, pos_data.data(), 0, (size_t)T * sizeof(int32_t));
+
     ggml_backend_graph_compute(ctx->backend, gf);
 
     ggml_tensor* out = ggml_graph_get_tensor(gf, "penc_output");
@@ -1286,10 +1313,9 @@ static void dots_penc_reset(dots_tts_context* ctx) {
 // dots_penc_forward (decode_patch with conv_tail + per-layer causal KV), but
 // O(N) per patch vs the full recompute's O(N²) — so long utterances stay linear.
 //
-// The PatchEncoder uses NO RoPE, so core_attn::kv_self_attn is reused with
-// all-zero positions: RoPE at position 0 is the identity (no rotation), giving
-// exactly the position-independent attention the encoder expects, while the
-// proven cache write/read mechanics handle the streaming K/V.
+// PatchEncoder incremental decode: one patch per call, persistent KV cache.
+// Uses core_attn::kv_self_attn with RoPE (theta=10K, NEOX) and unweighted
+// QK-norm (all-ones weight created in-graph).
 static void dots_penc_step(dots_tts_context* ctx, const float* new_latents, float* out_embed) {
     auto& pe = ctx->penc;
     const int in_dim = (int)pe.input_dim;
@@ -1338,17 +1364,26 @@ static void dots_penc_step(dots_tts_context* ctx, const float* new_latents, floa
     atp.n_kv_heads = nh; // MHA: grp == 1, no GQA expansion
     atp.n_kv_grp = 1;
     atp.attn_scale = 1.0f / std::sqrt((float)hd);
-    atp.rope_theta = 10000.0f; // unused at position 0
+    atp.rope_theta = pe.rope_theta;
+    atp.rope_type = GGML_ROPE_TYPE_NEOX;
     atp.n_ctx_orig = 4096;
-    atp.qk_norm_eps = 1e-6f; // unused (no q/k norm)
+    atp.qk_norm_eps = 1e-6f;
+
+    // Unweighted QK-norm: all-ones (hd,) tensor for core_attn::kv_self_attn.
+    // PatchEncoder has RMSNorm(64) for q/k with no learned scale in safetensors.
+    ggml_tensor* qk_norm_ones = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hd);
+    ggml_set_name(qk_norm_ones, "penc_qk_norm_ones");
+    ggml_set_input(qk_norm_ones);
 
     for (uint32_t il = 0; il < pe.n_layers; il++) {
         auto& L = pe.layers[il];
         ggml_tensor* residual = cur;
         ggml_tensor* h = rms_norm(ctx0, cur, L.attn_norm, 1e-6f);
+        ggml_tensor* q_nw = L.q_norm ? L.q_norm : qk_norm_ones;
+        ggml_tensor* k_nw = L.k_norm ? L.k_norm : qk_norm_ones;
         ggml_tensor* attn = core_attn::kv_self_attn(
-            ctx0, gf, h, L.q_proj, L.k_proj, L.v_proj, L.o_proj, /*q_norm=*/nullptr, /*k_norm=*/nullptr, positions,
-            mask, ctx->penc_kv.k, ctx->penc_kv.v, (int)il, n_past, atp, /*qkv_w=*/nullptr, /*fixed_kv_len=*/0,
+            ctx0, gf, h, L.q_proj, L.k_proj, L.v_proj, L.o_proj, q_nw, k_nw, positions, mask, ctx->penc_kv.k,
+            ctx->penc_kv.v, (int)il, n_past, atp, /*qkv_w=*/nullptr, /*fixed_kv_len=*/0,
             /*kv_indices=*/nullptr, /*q_b=*/nullptr, /*k_b=*/nullptr, /*v_b=*/nullptr, /*o_b=*/L.o_proj_b);
         cur = ggml_add(ctx0, residual, attn);
 
@@ -1383,8 +1418,18 @@ static void dots_penc_step(dots_tts_context* ctx, const float* new_latents, floa
     std::memcpy(conv_in.data() + in_dim, new_latents, (size_t)in_dim * patch * sizeof(float));
     ggml_backend_tensor_set(cin, conv_in.data(), 0, conv_in.size() * sizeof(float));
 
-    std::vector<int32_t> pos((size_t)T, 0);
+    // RoPE positions: [n_past, n_past+1, ..., n_past+T-1]
+    std::vector<int32_t> pos(T);
+    for (int i = 0; i < T; i++)
+        pos[i] = n_past + i;
     ggml_backend_tensor_set(positions, pos.data(), 0, (size_t)T * sizeof(int32_t));
+
+    // QK-norm all-ones weight
+    {
+        ggml_tensor* qkn = ggml_graph_get_tensor(gf, "penc_qk_norm_ones");
+        std::vector<float> ones(hd, 1.0f);
+        ggml_backend_tensor_set(qkn, ones.data(), 0, (size_t)hd * sizeof(float));
+    }
 
     int Lk = n_past + T;
     std::vector<ggml_fp16_t> mask_data((size_t)Lk * T, ggml_fp32_to_fp16(-INFINITY));

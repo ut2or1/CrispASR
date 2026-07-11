@@ -570,25 +570,18 @@ static std::string sensevoice_transcribe_impl(sensevoice_context* ctx, const flo
     {
         sensevoice_bench_stage s("encoder+ctc");
 
-        // §176s: reuse cached graph when T_lfr matches previous call.
-        ggml_cgraph* gf;
-        if (ctx->cached_gf && ctx->cached_gf_T_lfr == T_lfr) {
-            gf = ctx->cached_gf;
-        } else {
-            if (ctx->cached_gf_ctx) {
-                ggml_free(ctx->cached_gf_ctx);
-                ctx->cached_gf_ctx = nullptr;
-                ctx->cached_gf = nullptr;
-            }
-            // Allocate a separate arena for the cached graph so it
-            // survives across calls (compute_meta is shared).
-            ctx->cached_gf_meta.assign(ctx->compute_meta.size(), 0);
-            ggml_init_params ip = {ctx->cached_gf_meta.size(), ctx->cached_gf_meta.data(), true};
-            ctx->cached_gf_ctx = ggml_init(ip);
-            gf = sensevoice_build_graph(ctx, T_lfr, T_total, ctx->cached_gf_ctx);
-            ctx->cached_gf = gf;
-            ctx->cached_gf_T_lfr = T_lfr;
+        // #215e UAF fix: always rebuild (sched gallocr regrow frees cached buffers).
+        if (ctx->cached_gf_ctx) {
+            ggml_free(ctx->cached_gf_ctx);
+            ctx->cached_gf_ctx = nullptr;
+            ctx->cached_gf = nullptr;
         }
+        ctx->cached_gf_meta.assign(ctx->compute_meta.size(), 0);
+        ggml_init_params ip = {ctx->cached_gf_meta.size(), ctx->cached_gf_meta.data(), true};
+        ctx->cached_gf_ctx = ggml_init(ip);
+        ggml_cgraph* gf = sensevoice_build_graph(ctx, T_lfr, T_total, ctx->cached_gf_ctx);
+        ctx->cached_gf = gf;
+        ctx->cached_gf_T_lfr = T_lfr;
 
         ggml_backend_sched_reset(ctx->sched);
         if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {

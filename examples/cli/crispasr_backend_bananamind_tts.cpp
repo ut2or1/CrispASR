@@ -33,6 +33,7 @@ public:
     bool init(const whisper_params& p) override {
         bananamind_tts_params bp = bananamind_tts_default_params();
         bp.n_threads = p.n_threads;
+        bp.use_gpu = p.use_gpu;
         bp.verbosity = p.no_prints ? 0 : 1;
 
         ctx_ = bananamind_tts_init_from_file(p.model.c_str(), bp);

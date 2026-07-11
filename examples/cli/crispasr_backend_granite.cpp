@@ -21,6 +21,7 @@
 #include "whisper_params.h"
 #include "core/greedy_decode.h"
 #include "core/beam_decode.h"
+#include "core/ngram_loop_fix.h" // core_ngram::fix_loops (issue #218)
 
 #include "granite_speech.h"
 
@@ -364,7 +365,7 @@ public:
             size_t start = 0;
             while (start < transcript.size() && transcript[start] == ' ')
                 start++;
-            seg.text = transcript.substr(start);
+            seg.text = core_ngram::fix_loops(transcript.substr(start));
             seg.tokens.reserve(gen_ids.size());
             for (size_t i = 0; i < gen_ids.size(); i++) {
                 if (gen_ids[i] == eos_tok)
@@ -373,6 +374,23 @@ public:
                 ct.id = gen_ids[i];
                 ct.confidence = (i < probs.size()) ? probs[i] : -1.0f;
                 seg.tokens.push_back(std::move(ct));
+            }
+
+            // issue #218 follow-up: filter seg.tokens in lockstep with the
+            // collapse decision made on seg.text above.
+            {
+                std::vector<std::string> token_ids_str;
+                token_ids_str.reserve(seg.tokens.size());
+                for (const auto& t : seg.tokens)
+                    token_ids_str.push_back(std::to_string(t.id));
+                const std::vector<int> keep = core_ngram::fix_loops_keep_indices(token_ids_str);
+                if (keep.size() != seg.tokens.size()) {
+                    std::vector<crispasr_token> filtered;
+                    filtered.reserve(keep.size());
+                    for (int idx : keep)
+                        filtered.push_back(std::move(seg.tokens[idx]));
+                    seg.tokens = std::move(filtered);
+                }
             }
             if (!params.punctuation) {
                 crispasr_strip_ascii_punctuation(seg.text);
@@ -563,9 +581,25 @@ public:
                     std::vector<crispasr_word> words;
                     std::string clean = parse_ts(chunk, words);
                     if (!words.empty()) {
+                        // issue #218 follow-up: filter `words` with the SAME
+                        // collapse decision as `clean`'s fix_loops(), so
+                        // word-level output (SRT/VTT) doesn't still show
+                        // every repeated word once the flat text looks clean.
+                        std::vector<std::string> word_texts;
+                        word_texts.reserve(words.size());
+                        for (const auto& w : words)
+                            word_texts.push_back(w.text);
+                        const std::vector<int> keep = core_ngram::fix_loops_keep_indices(word_texts);
+                        if (keep.size() != words.size()) {
+                            std::vector<crispasr_word> filtered;
+                            filtered.reserve(keep.size());
+                            for (int idx : keep)
+                                filtered.push_back(std::move(words[idx]));
+                            words = std::move(filtered);
+                        }
                         s.t0 = words.front().t0;
                         s.t1 = words.back().t1;
-                        s.text = std::move(clean);
+                        s.text = core_ngram::fix_loops(clean);
                         s.words = std::move(words);
                         saa_segs.push_back(std::move(s));
                         return;
@@ -573,7 +607,7 @@ public:
                 }
                 s.t0 = seg.t0;
                 s.t1 = seg.t1;
-                s.text = std::move(chunk);
+                s.text = core_ngram::fix_loops(chunk);
                 saa_segs.push_back(std::move(s));
             };
 
@@ -614,6 +648,25 @@ public:
                     seg.text.clear();
             }
         }
+        seg.text = core_ngram::fix_loops(seg.text);
+        // issue #218 follow-up: seg.words (native [T:N] word timestamps) was
+        // built from the raw, un-collapsed text above — filter it with the
+        // same collapse decision so word-level output doesn't still show
+        // every repeated word.
+        if (!seg.words.empty()) {
+            std::vector<std::string> word_texts;
+            word_texts.reserve(seg.words.size());
+            for (const auto& w : seg.words)
+                word_texts.push_back(w.text);
+            const std::vector<int> keep = core_ngram::fix_loops_keep_indices(word_texts);
+            if (keep.size() != seg.words.size()) {
+                std::vector<crispasr_word> filtered;
+                filtered.reserve(keep.size());
+                for (int idx : keep)
+                    filtered.push_back(std::move(seg.words[idx]));
+                seg.words = std::move(filtered);
+            }
+        }
 
         // Per-token entries with decode-loop confidences. granite uses
         // its own batch detokenizer (granite_speech_decode_tokens) for
@@ -629,6 +682,23 @@ public:
             ct.id = gen_ids[i];
             ct.confidence = (i < probs.size()) ? probs[i] : -1.0f;
             seg.tokens.push_back(std::move(ct));
+        }
+
+        // issue #218 follow-up: filter seg.tokens in lockstep with the
+        // collapse decision made on seg.text above.
+        {
+            std::vector<std::string> token_ids_str;
+            token_ids_str.reserve(seg.tokens.size());
+            for (const auto& t : seg.tokens)
+                token_ids_str.push_back(std::to_string(t.id));
+            const std::vector<int> keep = core_ngram::fix_loops_keep_indices(token_ids_str);
+            if (keep.size() != seg.tokens.size()) {
+                std::vector<crispasr_token> filtered;
+                filtered.reserve(keep.size());
+                for (int idx : keep)
+                    filtered.push_back(std::move(seg.tokens[idx]));
+                seg.tokens = std::move(filtered);
+            }
         }
 
         out.push_back(std::move(seg));

@@ -42,7 +42,13 @@ static void aligner_cache_free_locked() {
         qwen3_asr_free((qwen3_asr_context*)g_aligner_cache_ctx);
         break;
     case AlignerType::Wav2Vec2:
-        // wav2vec2 doesn't have a public C context — not cached.
+        // Heap-allocated wav2vec2_model (value type, non-copyable). Its
+        // destructor frees buf→ctx→backend in Metal-safe order, so delete
+        // suffices — no separate free fn. This runs from
+        // crispasr_aligner_free_cache() at CLI shutdown (crispasr_run.cpp),
+        // i.e. before ggml_metal's static teardown, avoiding the residency-set
+        // assert the ~wav2vec2_model() comment warns about.
+        delete (wav2vec2_model*)g_aligner_cache_ctx;
         break;
     case AlignerType::CanaryCTC:
         canary_ctc_free((canary_ctc_context*)g_aligner_cache_ctx);
@@ -312,22 +318,39 @@ std::vector<CrispasrAlignedWord> align_wav2vec2_ctc(const std::string& model_pat
     if (words.empty())
         return out;
 
-    wav2vec2_model model;
-    if (!wav2vec2_load(model_path.c_str(), model)) {
-        fprintf(stderr, "crispasr[aligner-wav2vec2]: failed to load '%s'\n", model_path.c_str());
-        return out;
+    // §176e: reuse cached model context if same model path. wav2vec2 aligner
+    // GGUFs are 300 MB–1 GB, so reloading per call dominated wall time for the
+    // resident server / repeated bindings-API calls (crispasr_align_words is a
+    // single pass over the whole audio, so the win is cross-call, not in-call).
+    // Hold the lock across compute like the qwen3-FA / canary-ctc paths — the
+    // model's mutable tensor_cache is populated during compute and is not
+    // thread-safe; serialising also lets that dequant cache persist across calls.
+    std::lock_guard<std::mutex> lock(g_aligner_cache_mtx);
+    if (g_aligner_cache_type != AlignerType::Wav2Vec2 || g_aligner_cache_path != model_path)
+        aligner_cache_free_locked();
+    wav2vec2_model* model = (wav2vec2_model*)g_aligner_cache_ctx;
+    if (!model) {
+        model = new wav2vec2_model();
+        if (!wav2vec2_load(model_path.c_str(), *model)) {
+            fprintf(stderr, "crispasr[aligner-wav2vec2]: failed to load '%s'\n", model_path.c_str());
+            delete model;
+            return out;
+        }
+        g_aligner_cache_ctx = model;
+        g_aligner_cache_path = model_path;
+        g_aligner_cache_type = AlignerType::Wav2Vec2;
     }
 
-    auto logits = wav2vec2_compute_logits(model, samples, n_samples, n_threads);
+    auto logits = wav2vec2_compute_logits(*model, samples, n_samples, n_threads);
     if (logits.empty()) {
         fprintf(stderr, "crispasr[aligner-wav2vec2]: compute_logits failed\n");
         return out;
     }
 
-    const int V = (int)model.hparams.vocab_size;
+    const int V = (int)model->hparams.vocab_size;
     const int T = (int)(logits.size() / V);
-    auto aligned = ctc_forced_align(logits.data(), T, V, words, model.vocab, (int)model.hparams.pad_token_id,
-                                    wav2vec2_frame_dur(model));
+    auto aligned = ctc_forced_align(logits.data(), T, V, words, model->vocab, (int)model->hparams.pad_token_id,
+                                    wav2vec2_frame_dur(*model));
     if (aligned.empty()) {
         fprintf(stderr, "crispasr[aligner-wav2vec2]: align_words failed\n");
         return out;

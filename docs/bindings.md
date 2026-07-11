@@ -18,7 +18,7 @@ backend doesn't expose that knob, but the call is safe to make.
 | `set_tts_seed(seed)` | `set_tts_seed` / `set_tts_seed` / `SetTTSSeed` / `setTtsSeed` | Chatterbox, vibevoice, qwen3-tts, orpheus; rc=-2 for others |
 | `set_max_new_tokens(n)` | `set_max_new_tokens` / `set_max_new_tokens` / `SetMaxNewTokens` / `setMaxNewTokens` | AR backends; ≤ 0 clears override |
 | `set_frequency_penalty(f)` | `set_frequency_penalty` / `set_frequency_penalty` / `SetFrequencyPenalty` / `setFrequencyPenalty` | AR backends; ≤ 0 disables |
-| `set_tts_steps(n)` | `set_tts_steps` / `set_tts_steps` / `SetTTSSteps` / `setTtsSteps` | Chatterbox S3Gen CFM steps; vibevoice DPM-Solver++ steps |
+| `set_tts_steps(n)` | `set_tts_steps` / `set_tts_steps` / `SetTTSSteps` / `setTtsSteps` | Chatterbox S3Gen CFM steps; vibevoice DPM-Solver++ steps; kugelaudio; tada FM steps; irodori flow-matching ODE steps |
 | `set_tts_num_candidates(n)` | `set_tts_num_candidates` / `set_tts_num_candidates` / `SetTTSNumCandidates` / `setTtsNumCandidates` | TADA flow-matching timing candidates ranked per token (default 4); rc=-2 for others |
 | `set_top_p(p)` | `set_top_p` / `set_top_p` / `SetTopP` / `setTopP` | Chatterbox AR T3 loop |
 | `set_top_k(k)` | `set_top_k` / `set_top_k` / `SetTopK` / `setTopK` | TADA talker sampler (0 = disabled); rc=-2 for others |
@@ -32,6 +32,7 @@ backend doesn't expose that knob, but the call is safe to make.
 | `set_length_scale(s)` | `set_length_scale` / `set_length_scale` / `SetLengthScale` / `setLengthScale` | Kokoro phoneme duration multiplier (1.0 = normal) |
 | `set_best_of(n)` | `set_best_of` / `set_best_of` / `SetBestOf` / `setBestOf` | Best-of-N sampling for temperature > 0 |
 | `set_beam_size(n)` | `set_beam_size` / `set_beam_size` / `SetBeamSize` / `setBeamSize` | Beam search width |
+| `set_return_logits(enable)` | `set_return_logits` / `set_return_logits` / `SetReturnLogits` / `setReturnLogits` | Opt-in dense CTC grid capture for backends that expose frame-level CTC scores |
 | `set_grammar_text(gbnf, root, penalty)` | `set_grammar_text` / `set_grammar_text` / `SetGrammarText` / `setGrammarText` | GBNF constrained decoding (whisper); empty string clears |
 | `set_fallback_thresholds(...)` | `set_fallback_thresholds` / `set_fallback_thresholds` / `SetFallbackThresholds` / `setFallbackThresholds` | Whisper entropy/logprob/no-speech thresholds + temp-inc |
 | `set_alt_n(n)` | `set_alt_n` / `set_alt_n` / `SetAltN` / `setAltN` | Per-token alternative candidates (whisper greedy) |
@@ -50,6 +51,14 @@ backend doesn't expose that knob, but the call is safe to make.
 > many tokens from `chunk[i]` and rebuilds its own segment / word /
 > text representation. The C declaration lives in `include/crispasr.h`;
 > see also the `--lcs-dedup` / `--lcs-min-length` CLI flags.
+
+> **CTC logits and vocab.** `transcribe_with_logits` / `TranscribeWithLogits`
+> enables `set_return_logits(true)` for a single call, copies the result-owned
+> dense CTC grid into language-owned memory, and then disables capture again.
+> The grid is frame-major (`data[t * n_vocab + v]`). Omni CTC and wav2vec2
+> return raw pre-softmax logits; canary/FastConformer CTC returns log-probs.
+> `ctc_vocab` / `CtcVocab` returns raw token pieces where the backend exposes a
+> CTC vocabulary.
 
 | Language | Status | Surface |
 |---|---|---|
@@ -263,11 +272,21 @@ Every binding above (Python, Rust, Dart/Flutter, Go, Java, JavaScript,
 Ruby) reaches all TTS backends through the same two unified-C-API calls,
 so there is nothing TTS-specific per wrapper:
 
-- `synthesize(text) -> float32 PCM @ 24 kHz mono`
-  (`crispasr_session_synthesize`)
+- `synthesize(text) -> float32 PCM (mono, backend-native rate — 24 kHz
+  for most, 48 kHz for irodori/voxcpm2)` (`crispasr_session_synthesize`)
+- `synthesize_streaming(text, cb, user)` — same, but fires `cb(pcm,
+  n_samples, is_final, user)` once per sentence chunk as it's produced, for
+  progressive playback (`crispasr_session_synthesize_streaming`). The PCM is
+  owned by the call; copy it in the callback if you need to keep it.
 - `set_voice(path, ref_text?)` — `path` is a preset/baked-voice name
   **or** a `*.wav` clone reference (`ref_text` required for a WAV);
   `set_instruct(...)` for qwen3-tts VoiceDesign.
+
+For cloning backends whose reference encode is expensive (irodori, indextts),
+the encoded conditioning is cached automatically (content-addressed on the
+reference audio) so a repeated reference skips the encode — this happens in the
+runtime, so wrappers get it for free. Control with `CRISPASR_TTS_REF_CACHE=0`
+(disable) / `CRISPASR_TTS_REF_CACHE_DIR` (location).
 
 Open the TTS model GGUF like any other; the backend auto-detects from
 the GGUF architecture. Supported TTS backends: `kokoro`, `qwen3-tts`

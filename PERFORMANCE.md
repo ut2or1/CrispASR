@@ -179,6 +179,91 @@ for the implementation write-up.
 
 ---
 
+## Runtime Optimization Audit — Re-verification (2026-07-11)
+
+Full re-sweep of the ASR + TTS + codec + pipeline paths against the matrix and
+the §232 campaign. Verified against current code, not carried from this doc.
+**The matrix and per-model TTS section are stale on several flash/CFG claims**
+— corrections below.
+
+### Stale claims corrected
+
+- **Flash attention is NOT missing across AR decoders.** The per-model TTS
+  section lists Orpheus/OuteTTS/Zonos/TADA/Chatterbox/CSM as flash-"stub" or
+  "not wired". In fact they route through `core_attn::kv_self_attn`
+  (`src/core/attention.h:665,903`), whose body **unconditionally** calls
+  `ggml_flash_attn_ext` (no soft_max fallback). The per-file grep-count of 0 is
+  because the call lives in the shared helper. The Tier-1 "wire flash in all AR
+  decoders" backlog item is largely obsolete.
+- **The real remaining flash gaps** are only the manual-`ggml_soft_max`
+  backends — **dia, speecht5, parler** — and the **structurally-can't-flash**
+  additive-relpos models **melotts, piper** (same constraint as T5).
+- **chatterbox flash "stub"** — false: `chatterbox.cpp:1806,2662`, default ON.
+- **tada "two sequential B=1 FM passes"** — false: opt-in B=2 graph exists
+  (`tada_tts.cpp:238`).
+- **Batched TDT/RNNT decode is env-gated, not GPU-gated** — it is a CPU
+  sgemm-batching win (370 sgemv → 26 sgemm), `CRISPASR_TDT_BATCH` /
+  `CRISPASR_RNNT_BATCH`, default OFF (parakeet.cpp:3179; nemotron.cpp:2526).
+
+### Verified state
+
+- **§232 TTS campaign** (persistent sched-free graph + batched CFG cond+uncond +
+  device KV + FASTCONV codec) has landed for qwen3-tts, voxtral-tts, omnivoice,
+  tada, chatterbox. Un-migrated: f5, dots, kugelaudio, pocket (natural next
+  targets — same levers).
+- **Codec decoders are already ggml-graph** (snac/dac/seanet/hifigan/adaln/
+  qformer). Scalar survivors: `core/rvq.cpp` encode-search and `core/istft.h`
+  O(N²) IRFFT (both run once/synthesis).
+- **Encoder-graph caching is a closed chapter** — disabled in 8 backends for a
+  GPU heap-use-after-free (#235) *and* independently a measured dud on
+  compute-bound encoders. The one working cache is nemotron's dimension-keyed
+  streaming cache.
+- **#218 quant floor**: audio towers floored to Q8_0 (cos 0.97→0.9998 fixes
+  long-form loops/empty output); quantizing the **tied LM head** re-introduces
+  loops even with a Q8 tower — plain `-q4_k`/`-q8_0` are the long-form
+  recommendation, imatrix variants for short clips only. No inference-time cost.
+- **CUDA-graph capture (§210)** gives ~9–13× on RTX decode; Metal lacks the
+  equivalent (no ICB in ggml-metal).
+
+### True remaining gaps (2026-07-11)
+
+| P | Area | Gap | Impact |
+|---|---|---|---|
+| **P0** | firered_asr | Decoder self-attention has **no KV cache** — growing vector, O(T²) recompute (`firered_asr.cpp:2697`) | Highest-impact ASR gap |
+| ~~P0 relpos~~ → **P0 hifigan (genuine compute)** | melotts / piper | relpos is a MEASURED DUD (`2026-07-11`): already GEMM'd (`melotts_use_scalar()` gate) and only **~1.5% of synthesis** (text_encoder 190 ms of 12.3 s). **hifigan_decode is 73–92%** and is **genuine GPU compute** (~4× realtime, stable ~8.4 s across 3 warm runs; NOT JIT-bound — the `Apple_M1.archive` works, 0 "add-to-archive skipped", the "compiling pipeline" lines are an unconditional DEBUG log at `ggml-metal-device.m:410` that fires even on an archive hit). **Spike GATED OUT (`CRISPASR_METAL_PROFILE`, 2026-07-11):** the hifigan graph (1198 nodes) is **99.7% GPU-compute-bound** — `gpu_us=4,020,540` vs `encode_us=10,667` (host 0.27%). So op-fusion / ICB / transpose-elim (all host-encode levers) ceil at ~0.3% (= §210 granite). The two applicable FASTCONV levers are ALREADY in ggml_conv_1d (F32 im2col + pad-in-im2col, `ggml.c` conv patch line 13-14); no K=1 convs for the matmul lever. Unloaded true cost: hifigan 4.4 s / synth 5.2 s for 2.58 s audio = RTF **2.0×** (the earlier "8.4 s/3.5×" was ~2× load inflation). Only remaining paths = hand-written fused Metal conv kernel (research-grade, uncertain) or fewer FLOPs (quality tradeoff) — both = CV3-HiFT-not-worth-it. **Do not fund without a new kernel insight.** Teardown assert FIXED (`119ec75a`, RAII dtor). | HiFi-GAN at compute floor; no cheap lever |
+| **P0** | voxcpm2_tts | CPU-only (Metal SIGSEGV), manual per-step host KV re-upload (`voxcpm2_tts.cpp:106-111`) | GPU-locked-out |
+| ~~P0~~ | openvoice2 | STFT scalar O(bins·win) DFT → shared radix-2 FFT: **1182 ms → 10.7 ms** (110×, ~26% of convert) `2026-07-11`. WaveNet already GEMM'd (§176d); ref-enc is 4% one-time. **Remaining: hifigan_decode is 67% of convert** — next target | STFT fixed; vocoder dominant |
+| **P1** | voxtral/voxtral4b enc, mimo LLM decoder | Attention not on flash_attn_ext (O(T²) manual softmax) | Enc mem+dispatch; mimo dispatch-bound |
+| **P1** | dia / speecht5 / parler | Manual soft_max + host KV re-uploaded per step | Long outputs |
+| **P1** | firered/glm/funasr/qwen3/omniasr/mimo | Beam search is replay (no KV snapshot pool; canary/moonshine/kyutai have one) | beam≥2 quadratic |
+| **P1** | f5/dots/kugelaudio/pocket | CFG serial / no persistent graph — un-migrated §232 targets | ~halves DiT time |
+| **P1** | granite/moss Metal decode | Per-op dispatch ~100ms/step; ggml-metal has no ICB replay | Dominant Metal decode cost |
+| **P2** | Scalar CPU hotpaths | RNN-T LSTM pred+joint; granite cpu_linear+depthwise; paraformer CIF; rvq encode; istft IRFFT; titanet mel front-end; diarize `apply_xcorr` | Per-token/frame scalar loops |
+| **P2** | parakeet/nemotron | Batched sgemm decode opt-in default-OFF — validate + flip on | Unshipped CPU win |
+| **P2** | align_wav2vec2_ctc | **Reloads the 300MB–1GB model every call** (`crispasr_aligner.cpp:315`) — missing the §176e ctx-cache | Concrete single-file win |
+| **P2** | paraformer / voxcpm2 | CPU-only, no GPU backend (paraformer leaks 256MB buffer) | GPU offload available |
+| **P3** | Threading | Hardcoded default 4 threads in ~90 sites; only whisper-core caps to `min(4, hw)` | Idle cores on big hosts |
+| **P3** | Misc | pyannote per-slice not once-over-audio (#107); RNNoise recreates state+resamplers/call; glm mel padded to 3000 always | Localized |
+
+### Highest-ceiling paths forward
+
+1. **Lk-bucketed decode-step graph caching** generalized to the 30+ decoders
+   that rebuild per step — templates: qwen3-tts (5 buckets), granite §210
+   gallocr, mimo `step_t1_gf`. Cache the *decode-step* graph, not the encoder.
+2. **ggml-metal ICB replay** — the Apple-side equivalent of CUDA-graph capture;
+   decode is per-op-dispatch bound.
+3. **BLAS/ggml the scalar hotpaths** (~~melotts/piper relpos~~ — measured DUD,
+   already GEMM'd + ~1.5%; ~~openvoice2 WaveNet~~ — GEMM'd §176d; openvoice2 STFT
+   DFT→FFT DONE `2026-07-11`; rvq, titanet mel, RNN-T LSTM/joint still open) and
+   extend §232's CFG-batch + device-KV playbook to f5/dots/kugelaudio/pocket/dia/
+   speecht5/parler. **The real cross-cutting TTS cost is HiFi-GAN decode**
+   (openvoice2 67%, melotts 73–92%) — GPU-resident but cold-JIT-confounded on Metal.
+
+Do **not** re-enable encoder-graph caching (#235 UAF + measured dud), and do
+**not** CPU-batch decode that feeds a GPU pipeline (item 24).
+
+---
+
 ## Kaggle GPU — full backend sweep — 2026-06-20
 
 Platform: Kaggle GPU worker (CUDA), `tools/kaggle-benchmark-all-backends.py`
@@ -429,7 +514,7 @@ Commit: `b9fd8eb`. **All 19 backends pass.**
 | Canary 1B | 1B | 672 | 0.0% | 6.2x | 1.8s | GPU enc+dec, 32+8 layers |
 | Cohere Transcribe | 2B | 1440 | 0.0% | 5.2x | 2.1s | GPU enc, AED dec |
 | Kyutai STT 1B | 1B | 636 | 4.5% | 1.4x | 7.7s | 24-layer Mimi decoder |
-| FireRed ASR2 AED | 900M | 918 | 0.0% | 0.6x | 19.0s | CPU Q4_K SIMD dec (60ms/step) |
+| FireRed ASR2 AED | 900M | 918 | 0.0% | 0.6x | 19.0s | CPU Q4_K SIMD dec (60ms/step greedy; beam batched through Q4_K mul_mat, 16.8s→3.1s at beam=3, §224); enc.* split-loaded to GPU by DEFAULT with use_gpu (transcript-identical, enc 2.2-2.3x on Metal/Vulkan/CUDA-P100, §224; CRISPASR_FIRERED_ENC_CPU=1 opts out) |
 
 #### Encoder-LLM (autoregressive, language model decoder)
 
@@ -1529,6 +1614,77 @@ section. The structural-fusion gap is a CPU x86 specific story;
 GPU paths bypass it because compute throughput, not memory
 bandwidth, is what limits them.
 
+## issue #81 round 3 — Kaggle P100 CUDA fleet benchmark (2026-07-10)
+
+> **⚠ CORRECTION (2026-07-11) — the parakeet-ctc-0.6b rows below were WRONG
+> (a benchmark-harness bug), now retracted.** The kernel
+> (`tools/kaggle/issue81-onnx-bench`) ran parakeet-**ctc** models through the
+> `--backend parakeet` *transducer* runtime, which **rejects CTC models and
+> exits in ~0.5 s** ("this GGUF has no RNN-T decoder/joint tensors — failed to
+> load"). `bench_crispasr` had no return-code / transcript check, so it timed the
+> crash and computed `rtf = audio_dur / (crash time)` → bogus 19.9× / 102.4× /
+> 127.7×. The tell is in the raw log: parakeet-ctc "took" **0.552 s for 11 s and
+> 0.537 s for 55 s** — i.e. a *fixed* sub-second runtime independent of audio
+> length (real inference scales with duration, as parakeet-**tdt** does right
+> below). Fixed 2026-07-11: the kernel now auto-detects the CTC backend and
+> `bench_crispasr` marks a failed/empty run as FAIL. **Real** parakeet-ctc-0.6b
+> measured on M1 CPU (auto-detected `fastconformer-ctc`, verified transcript):
+> **3.2× (Q4_K) / 3.5× (Q8_0)** — note Q8_0 is *not* slower, so the "Q4_K
+> memory-bandwidth advantage" story was also false. A valid CUDA figure is
+> pending a kernel re-run. The parakeet-**tdt** and CrispASR-only / onnx-asr rows
+> below ran correctly and stand.
+
+Full-fleet benchmark on Kaggle P100 (sm_60, CUDA 12.8). CrispASR built
+with GGML_CUDA=ON. onnx-asr uses CPU EP (onnxruntime-gpu requires
+CUDA 13 which Kaggle doesn't provide) — so this is CrispASR-CUDA vs
+onnx-**CPU**, NOT a GPU-vs-GPU comparison (the #81 reporter later measured
+onnx GPU/CoreML at 40–45× on parakeet, which this kernel never ran).
+Kernel: `chr1s4/crispasr-issue81-onnx-bench` v6.
+
+### Head-to-head (CrispASR CUDA Q8_0 vs onnx-asr CPU int8)
+
+| model | engine | JFK 11s | Long 55s | ratio (long) |
+|---|---|---|---|---|
+| ~~parakeet-ctc-0.6b~~ | ~~CrispASR~~ | ~~19.9×~~ | ~~102.4×~~ | **RETRACTED — failed-load artifact (see above); real M1 CPU 3.2–3.5×** |
+| parakeet-ctc-0.6b | onnx-asr | 7.3× RT | 6.6× RT | (valid) |
+| parakeet-tdt-0.6b | **CrispASR** | 7.5× RT | **11.8× RT** | **1.8× faster** |
+| parakeet-tdt-0.6b | onnx-asr | 7.5× RT | 6.7× RT | |
+
+### CrispASR-only backends (no onnx-asr equivalent)
+
+| backend | JFK 11s | architecture | notes |
+|---|---|---|---|
+| moonshine-tiny | **103.2× RT** | Conv + 6L enc-dec (17 MB) | fastest backend |
+| sensevoice-small | 17.4× RT | 70 SANM blocks + CTC (240 MB) | multilingual |
+| paraformer-zh | 5.2× RT | NAR enc-dec + CIF (Q8_0) | Chinese + English |
+| glm-asr-nano | 5.2× RT | Whisper enc + Llama LLM (Q4_K) | Mandarin + English |
+| firered-asr2 | 2.6× RT | Conformer + CTC + beam (Q4_K) | 20+ languages |
+| kyutai-stt-1b | 2.3× RT | Mimi codec + 16L LM (Q4_K) | en + fr |
+
+### VPS CPU-only comparison (4-core Xeon, same JFK 11s)
+
+| engine | quant | mean time | x-realtime |
+|---|---|---|---|
+| ~~CrispASR~~ | ~~Q4_K~~ | ~~0.086s~~ | ~~127.7×~~ **RETRACTED — same failed-load bug (0.086 s can't even load a 687 MB model)** |
+| onnx-asr | int8 | 4.312s | 2.6× (valid) |
+
+The "50× faster on CPU / Q4_K memory-bandwidth advantage" claim is
+**withdrawn.** Real CrispASR parakeet-ctc-0.6b on CPU is single-digit
+realtime (M1: 3.2× Q4_K, 3.5× Q8_0 — Q4_K is *not* meaningfully faster),
+consistent with the ~5× a #81 reporter measured; onnx-asr int8 is faster
+than CrispASR on that x86 CPU.
+
+### Summary (revised 2026-07-11)
+
+What actually holds: with the CUDA build + flash-attn fusion shipped,
+CrispASR is competitive-to-faster vs onnx-asr **CPU EP** on the models
+that ran correctly (parakeet-**tdt** 1.8× on long audio), and offers 25+
+backends onnx-asr doesn't. What does **not** hold: the parakeet-**ctc**
+"15.5×/50× faster" headline (a failed-load artifact) and any GPU-vs-GPU
+superiority claim (onnx here was CPU-only; the reporter's onnx GPU is
+40–45× on parakeet). Net: the honest picture is parity-class on GPU with
+a real CPU/coverage story, not a blowout.
+
 ---
 
 ## Long-audio coverage — 2026-07-04 final state (issue #89 closed out)
@@ -1557,6 +1713,73 @@ Gap-fill cost: one extra short encode per recovered gap (~1.3-2× wall on
 gap-heavy clips); `CRISPASR_GAP_FILL=0` restores single-pass-per-slice.
 Reproduce: `tools/asr_coverage_score.py <whisper-ref> <hyp> --strip-latin
 --reading` (scorer) and `tools/nemo_parakeet_blueprint.py` (NeMo modes).
+
+## Long-form single-pass — qwen3-asr / glm-asr (#218, 2026-07-10)
+
+Platforms: Apple M1 16 GB Metal + Kaggle T4 CUDA validation
+(`tools/kaggle/qwen3-family-rebake/`). Canonical clip: the reporter's
+145 s `t32-145s.wav` (noisy dialogue, quiet lead). Full detail in
+PLAN "#218 …" sections; the performance-relevant facts:
+
+### Encoder quantization floor (quality, not speed)
+
+Sub-8-bit `audio.*` towers flip greedy LLM decode into loops/empty output
+on long audio — a behavioral step function, not gradual WER loss.
+`crispasr-quantize` now floors qwen3-asr `audio.*` at Q8_0 (opt-out
+`CRISPASR_QWEN3ASR_QUANT_AUDIO=1`):
+
+| model | q4_k size | encoder cos_mean vs F16 | un-chunked 145 s |
+|---|---|---|---|
+| qwen3-asr-0.6b, old tower Q4 | 540 MB | 0.9716 (cos_min 0.75 @1885 fr) | loops / "language none" |
+| qwen3-asr-0.6b, Q8 tower | 631 MB | 0.9997 (cos_min 0.992) | clean+complete, raw (loop-fix off) |
+| qwen3-asr-1.7b, old tower Q4 (#240) | 1334 MB | 0.9913 (cos_min 0.963 @jfk 143 fr!) | empty on Metal |
+| qwen3-asr-1.7b, Q8 tower (#240) | 1490 MB | 0.9998 (cos_min 0.9989) | fixed |
+| 1.7b-ja-anime, Q8 tower | 1421 MB (was 1334) | — | 1024 chars, max run 1 |
+| mega-asr, Q8 tower | not shipped | — | still loops at bf16 too — LoRA-inherent, chunked-only |
+
+imatrix caveat: quantizing the tied LM head re-introduces long-form loops
+even with a Q8 tower, and a long-form-recalibrated imatrix still drifts
+(tested + rejected) — plain `-q4_k`/`-q8_0` are the long-form
+recommendation; imatrix variants are for short clips.
+
+### Memory: full vs windowed encoder attention (qwen3-asr)
+
+Default full self-attention is O(T²) in the audio tower: 145 s
+(1885 frames) fits easily on 16 GB; beyond ~10 min un-chunked it OOMs.
+KV is sized `max(4096, prompt+max_new+16)` + grow-on-demand (the old
+fixed 4096 capped un-chunked audio at ~5 min regardless of encoder).
+
+`CRISP_AUDIO_WINDOWED_ATTN=1` (opt-in, 46e08bc4) runs the FA2/cu_seqlens
+block-diagonal semantics natively: full 104-frame windows as ONE batched
+unmasked attention + ragged tail, no dense mask → **O(N·W) memory**,
+removing the encoder length cap. Encoder cos_mean 0.99953 vs a windowed
+bf16 reference. **Default flip evaluated and REJECTED (2026-07-10)**,
+raw-decode A/B on M1 Metal (phrase-cycle metric, q4_k-v2):
+
+| clip | mode | wall | peak RSS | max uni-run / cycle | complete |
+|---|---|---|---|---|---|
+| t32-145s (noisy) | full | ~400 s | 1.65 GB | 1 / 0 | yes |
+| t32-145s (noisy) | windowed | 658 s | 1.99 GB | **238 / 119** | **no** |
+| jfk×12 132 s (clean) | full | 271 s | 1.99 GB | 1 / 0 | 198 words |
+| jfk×12 132 s (clean) | windowed | 397 s | 1.97 GB | 1 / 0 | 176 words |
+
+The windowed path attends the quiet/noisy lead and greedy decode
+collapses there — on Metal as well as CUDA (the earlier "Metal recovers"
+observation was not robust). It is also ~1.5× slower at these lengths
+(many 104² matmuls vs one big one), and the O(N·W) memory advantage only
+matters past full attention's ~10-min OOM point. Default stays full
+attention + 30 s chunks; windowed remains the escape hatch for >10-min
+single-pass audio, with fix_loops ON. (jfk×12 note: both modes EOS early
+on genuinely 12×-repeated audio — model behaviour, not a loop bug.)
+
+### glm-asr multi-window single-pass
+
+Blueprint path: 30 s sample windows, encode-then-trim, concatenated into
+ONE prompt/decode — cap 21 windows = 655 s (processor `max_audio_len`).
+The 145 s clip = 5 windows, 1812 audio tokens, 1827-token prompt,
+q4_k output 113 tokens vs bf16 blueprint's 115 (near-verbatim). Note the
+blueprint (and therefore our single-pass) SKIPS quiet leading audio; the
+default 30 s-chunked path covers more content on such clips.
 
 ## Long-audio coverage benchmark — 2026-05-21 (issue #89, historical)
 
@@ -2816,10 +3039,13 @@ core infrastructure.
 
 **OpenVoice2** (`openvoice2.cpp`):
 - Has: pre-permuted HiFi-GAN ConvT weights, ref encoder embedding
-  reusable, WaveNet speaker cond precomputed, GPU backend for HiFi-GAN
-- Gap: **WaveNet entirely scalar CPU** (16 layers × T × K=5 × C=192 —
-  highest-impact gap), **ref encoder Conv2d + GRU scalar CPU**, STFT
-  recomputed fresh per call, no threading in WaveNet
+  reusable, WaveNet speaker cond precomputed, GPU backend for HiFi-GAN,
+  WaveNet GEMM'd via Accelerate (§176d), **STFT now radix-2 FFT** (2026-07-11:
+  1182→10.7 ms, 110×; was O(bins·win) scalar DFT)
+- Measured breakdown (3 s convert, quiet M1): **hifigan_decode 67 %**,
+  ~~stft 27 %~~ (fixed), ref_enc 4 % (one-time, not worth caching),
+  enc_q+flow×2 3 %. **Real remaining gap: HiFi-GAN decode** — the WaveNet/
+  ConvT vocoder dominates; ref-enc Conv2d+GRU scalar is a rounding error.
 
 **Zonos** (`zonos_tts.cpp`):
 - Has: dual KV caches (quant), fused gate+up, DAC lazy-loaded,
@@ -2836,12 +3062,20 @@ core infrastructure.
   coefficients recomputed per call
 
 **Qwen3 TTS** (`qwen3_tts.cpp`):
-- Has: **Lk-bucketing** (5 pre-built graphs), **O15 code-predictor
-  reuse** (14-19 ms/frame saving), **CPU embedding cache**, per-op
-  profiler, fused QKV, codec CPU pinning workaround, dedicated talker
-  scheduler, flash attn throughout
-- Gap: O15 default OFF (CUDA sm_87 crash), Lk bucket boundaries
-  hardcoded, no speculative decoding
+- Has: **CP_DIRECT sched-free code predictor** (§232, default ON GPU /
+  OFF CPU — two persistent gallocr graphs, no scheduler; −11 % CUDA,
+  ~3× under Metal load, md5-identical; supersedes O15 and fixes its #56
+  CUDA crash), **codec FASTCONV** (§232, default ON — K=1-conv→matmul +
+  pad-in-im2col + load-time F32 kernel bake; codec 3× Metal / 2.1× CPU,
+  0.6B pipeline RTF 2.9→1.25), **CPU embedding cache**, per-op profiler
+  + per-node codec trace, fused QKV, dedicated talker scheduler, flash
+  attn throughout. Lk-bucketing (opt-in, sched-free since §232 — Metal
+  loses ~10 % at short outputs, fastest config on CUDA P100).
+- Gap: talker AR step is **GPU-execution-bound** (§232 profiled: encode
+  2-3 ms vs GPU 38-42 ms — dispatch tricks can't help; needs kv_self_attn
+  node-count slimming, shared 30-backend helper, deprioritized); codec
+  residual cost is the legitimate K=7 SEANet im2cols; no speculative
+  decoding.
 
 **CosyVoice3** (`cosyvoice3_tts.cpp`):
 - Has: RAS sampler, multi-GGUF pipeline, voice packs with precomputed
@@ -2932,20 +3166,31 @@ core infrastructure.
   mel filterbank recomputed per call
 
 **Pyannote** (`pyannote_seg.cpp`):
-- Has: direct tensor pointer access (correct for tiny model), CPU-forced
-- Gap: forward/backward LSTM serial (could parallel), SincNet conv scalar,
-  no context caching
+- Has: ggml-graph forward (§224, default): SincNet + classifier as CPU-backend
+  graphs, LSTM input projections batched per layer/dir as one mul_mat, the
+  sequential recurrence dual-threaded (one thread per direction). 4.38 s →
+  0.55 s on 31.5 s audio (M1), output frame-identical.
+  `CRISPASR_PYANNOTE_LEGACY=1` restores the scalar path (A/B ground truth).
+- Gap: no context caching; recurrence R@h still plain (autovec) loops
 
 #### LID
 
 **ECAPA-TDNN LID** (`ecapa_lid.cpp`):
-- Has: GPU for Conv1d trunk, mel filterbank in GGUF, 15s audio cap
-- Gap: ASP + FC layers scalar CPU (9216×T dominant), BN not pre-folded
+- Has: GPU for Conv1d trunk, mel filterbank in GGUF, 15s audio cap; ASP + FC
+  head in-graph (§224, titanet-style). Inverse-default: in-graph WITHOUT
+  Accelerate (scalar head was ~3.0 s of a 4.5 s detect → in-graph removes it);
+  WITH Accelerate the GEMM head (57 ms) stays default.
+  CRISPASR_ECAPA_ASP_GGML=1 / CRISPASR_ECAPA_ASP_CPU=1 force either way.
+- Gap: trunk graph ~1.3 s dominates on M1 (profile Metal residency); BN not
+  pre-folded
 
 **Silero LID** (`silero_lid.cpp`):
-- Has: GPU weight loading, learned STFT front-end
-- Gap: **entire forward pass is scalar CPU** despite GPU init — 8 stages
-  × O(T²) attention loops
+- Has: ggml-graph forward (§224, default): CPU frontend (log-mag precision) +
+  sched encoder (GPU on Metal/CUDA; auto-routed to CPU on Vulkan pending an
+  upstream mul_mat fix), 30 s slice cap. 103 ms Metal / 183 ms CPU-ggml vs
+  241 ms Accelerate / 1014 ms scalar legacy (11 s audio, M1).
+  `CRISPASR_SILERO_LID_LEGACY=1` restores the scalar path.
+- Gap: Vulkan GPU blocked on the ggml-vulkan FFN MUL_MAT miscompute
 
 **FireRed LID** (`firered_lid.cpp`):
 - Has: reuses full firered_asr runtime
@@ -2954,9 +3199,14 @@ core infrastructure.
 #### Speaker
 
 **TitaNet** (`titanet.cpp`):
-- Has: BN pre-folding at init, pre-emphasis, L2 normalization
-- Gap: **all inference is scalar CPU loops** (depthwise conv, pointwise
-  conv, SE, ASP TDNN 9216×T — no ggml graph, no GPU despite init_best)
+- Has: BN pre-folding at init, pre-emphasis, L2 normalization; ggml-graph
+  forward (§224): full encoder + ASP as one CPU-backend graph, embeddings
+  cos=1.000000 vs legacy. Inverse-default: ggml is default WITHOUT Accelerate
+  (scalar was 106–131 s/embed on M1 → 3.4 s ggml, ~35×); WITH Accelerate the
+  legacy AMX GEMM path stays default (0.7 s vs 3.4 s ggml).
+  `CRISPASR_TITANET_GGML=1` / `CRISPASR_TITANET_LEGACY=1` force either way.
+- Gap: ggml F32 matmul ≪ AMX on Apple (F16 weights would halve bandwidth);
+  segments not batched
 
 #### Translation
 

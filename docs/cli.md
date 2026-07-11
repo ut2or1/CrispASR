@@ -83,6 +83,7 @@ crispasr --list-backends
 | `-l LANG`, `--language LANG` | ISO-639-1 code (default: `en`) |
 | `--tts "TEXT"` | Synthesize speech from text (requires `CAP_TTS` backend). Output via `--tts-output` |
 | `--tts-output FNAME` | Output path for TTS WAV (default: `tts_output.wav`) |
+| `--tts-stream` | Stream s16le mono PCM to stdout per sentence (pipe to a player); logs stay on stderr. See [streaming.md](streaming.md#streaming-synthesized-audio-out) |
 | `--s2s` | Speech-to-speech mode: audio in → audio out (requires `CAP_S2S` backend, e.g. `lfm2-audio`, `mini-omni2`) |
 | `--s2s-output FNAME` | Output path for S2S WAV |
 | `--voice PATH` | Voice reference for TTS: GGUF voice pack or reference WAV for cloning (`--i-have-rights` required for WAV cloning) |
@@ -92,6 +93,7 @@ crispasr --list-backends
 | `--list-backends` | Print the capability matrix and exit |
 | `--gpu-backend NAME` | Force GPU backend: `cuda`, `vulkan`, `metal`, or `cpu` (default: `auto`) |
 | `--no-gpu` / `--device N` | Disable GPU entirely, or pin to GPU index N |
+| `--return-logits` | For dense CTC backends, write `<audio>.ctc-logits.json` containing the frame-major CTC grid (`data[t * n_vocab + v]`) plus shape metadata and any exposed vocab |
 
 ### Model resolution flags
 
@@ -165,7 +167,20 @@ CrispASR writes outputs side-by-side with the input audio (e.g.
 ```
 
 Add `-ojf` (`--output-json-full`) to include per-word `words[]` and
-per-token `tokens[]` arrays when the backend populates them.
+per-token `tokens[]` arrays when the backend populates them:
+
+```json
+      "words": [
+        { "text": "And", "t0": 24, "t1": 52, "offsets": { "from": 240, "to": 520 } }
+      ]
+```
+
+**Time units.** Segment `offsets` (and each word/token `offsets`) are in
+**milliseconds**. The per-word / per-token `t0`/`t1` fields are in
+**centiseconds** — this is the library's internal timebase (see the C ABI's
+`t0_cs`/`t1_cs`) and is retained for backwards compatibility. Prefer the
+`offsets` object for a unit that is consistent across every level of the
+document (issue #228).
 
 ## Segmentation / chunking
 
@@ -588,7 +603,7 @@ causing `--max-len` to silently have no effect.
 | `-tp F`, `--temperature F` | Sampling temperature. `0` = pure argmax (default, bit-identical). `> 0` enables multinomial sampling for whisper, voxtral, voxtral4b, qwen3, granite |
 | `--seed N` | RNG seed for sampling. `0` = non-deterministic. Used by temperature-sampling ASR backends and TTS backends that sample; CLI values override backend-specific env seeds |
 | `-bo N`, `--best-of N` | Number of best candidates to keep when temperature > 0 (whisper + some AR backends) |
-| `-bs N`, `--beam-size N` | Beam search width. Default 5 for whisper, 1 (greedy) for other backends. 21 backends: whisper, parakeet, nemotron, canary, cohere, granite, qwen3, voxtral, voxtral4b, glm-asr, kyutai-stt, moonshine, moonshine-streaming, firered-asr, omniasr, gemma4-e2b, funasr, sensevoice, granite-nle, moss-audio, moss-transcribe, higgs-stt, ark-asr, mimo-asr, m2m100, madlad/t5. Also lfm2-audio (stub). Not applicable to paraformer (NAR) |
+| `-bs N`, `--beam-size N` | Beam search width. Default 5 for whisper, 1 (greedy) for other backends. 23 backends: whisper, parakeet, nemotron, canary, canary-qwen, cohere, granite, qwen3, voxtral, voxtral4b, glm-asr, kyutai-stt, moonshine, moonshine-streaming, firered-asr, omniasr, gemma4-e2b, funasr, sensevoice, granite-nle, moss-audio, moss-transcribe, moss-diarize, higgs-stt, ark-asr, mimo-asr, m2m100, madlad/t5. Also lfm2-audio (stub). Not applicable to paraformer (NAR) |
 | `-tpi F`, `--temperature-inc F` | Whisper temperature-fallback increment |
 | `-nf`, `--no-fallback` | Disable temperature fallback (equivalent to `--temperature-inc 0`) |
 | `--frequency-penalty F` | Opt-in repeated generated-token penalty for autoregressive ASR backends (`0.0` disabled). Applied to generated output tokens before greedy/sampling selection. |
@@ -620,7 +635,24 @@ Per-word boost suffix: `"Berenz^5.0,NVIDIA^3.0,plain"`.
 |---|---|
 | **CTC-WS trie (Phase A)** — token-level logit boost during CTC/TDT decode | parakeet (CTC + TDT) |
 | **LLM prompt injection (Phase B)** — hotwords appended to the system/instruction prompt | qwen3-asr, voxtral |
+| **Free-form prompt injection** — separate `--context` flag, not `--hotwords` (see below) | vibevoice |
 | Not applicable | voxtral4b (fixed streaming prompt), granite-nle (NAR, no text prompt), funasr (hardcoded prompt), whisper (use `--prompt` instead) |
+
+### VibeVoice-ASR: `--context` (free-form prompt injection)
+
+VibeVoice-ASR uses its own flag, `--context "TEXT"`, rather than
+`--hotwords` — the model's prompt format accepts free-form prose/metadata
+(names, organizations, topic context) instead of a structured hotword
+list with per-word boost weights. The text is spliced directly into the
+model's instruction prompt, matching the `context_info` parameter in
+microsoft/VibeVoice's `vibevoice_asr_processor.py`. Empty or
+whitespace-only `--context` behaves identically to omitting the flag
+(same prompt, byte-for-byte).
+
+```bash
+crispasr --backend vibevoice -m auto -f meeting.wav \
+    --context "ACME Corp, John Smith, Q3 earnings"
+```
 
 ### Example
 
@@ -1001,26 +1033,45 @@ embedded or linked:
   PCM, IEEE float, A-law, μ-law, ADPCM), FLAC, MP3, and the WAV family **AIFF /
   W64 / RF64** (via its bundled `dr_wav`)
 - **[stb_vorbis](https://github.com/nothings/stb)** (public domain) — OGG Vorbis
-- **libopus + opusfile** (BSD-3) — **`.opus`** (Ogg/Opus). Built by default
-  (`CRISPASR_OPUS`, on when system `opusfile` is found; `CRISPASR_OPUS_FETCH=ON`
-  builds it statically for platforms without system libs)
-- **AudioToolbox** (Apple system framework) — **`.aac` / `.m4a` / `.alac` /
-  `.caf`** on macOS/iOS, no extra dependency
+- **[glint](https://github.com/CrispStrobe/glint)** (MIT) — in-tree clean-room
+  decoder for **raw ADTS `.aac`** (AAC-LC) and **Ogg `.opus`** (RFC-conformant:
+  all 12 RFC 6716/8251 vectors, SILK byte-identical to libopus). Cross-platform,
+  always available with no runtime library, so it is the **default** for both
+  `.aac` and `.opus` via the library `crispasr_audio_load` API — `.opus` decodes
+  even in builds without libopus. Pin the previous decoder with
+  `CRISPASR_AAC_DECODER=fdk`/`coreaudio` or `CRISPASR_OPUS_DECODER=libopus`
+  (`=glint`/`auto` = default); `CRISPASR_{AAC,OPUS}_DEBUG=1` prints a one-line
+  decode summary. Opus is glint by default **everywhere it appears** — bare
+  `.opus`, the stereo loader, and **WebM/Matroska Opus** — so a build with
+  `CRISPASR_OPUS=OFF` (no libopus at all) still decodes them.
+- **libopus + opusfile** (BSD-3) — optional fallback for Opus (`.opus` + WebM),
+  selected via `CRISPASR_OPUS_DECODER=libopus`. Built by default (`CRISPASR_OPUS`,
+  on when system `opusfile` is found; `CRISPASR_OPUS_FETCH=ON` builds it statically
+  for platforms without system libs). No longer required for any input format.
+- **AudioToolbox** (Apple system framework) — container **`.m4a` / `.alac` /
+  `.caf`** (and `.aac`) on macOS/iOS, no extra dependency; **fdk-aac** via
+  `dlopen` provides the same container support on Linux/Windows when installed.
 
 | Format | Linux/other | Apple (macOS/iOS) | `CRISPASR_FFMPEG=ON` |
 |---|:---:|:---:|:---:|
 | WAV / FLAC / MP3 / OGG Vorbis / AIFF / W64 / RF64 | ✔ | ✔ | ✔ |
 | `.opus` | ✔ | ✔ | ✔ |
-| `.aac` / `.m4a` / `.alac` / `.caf` | ✗¹ | ✔ (AudioToolbox) | ✔ |
-| `.webm` / `.wma` / `.amr` / raw PCM | ✗ | ✗ | ✔ / pre-convert |
+| `.aac` (raw ADTS, AAC-LC) | ✔ (glint) | ✔ (glint) | ✔ |
+| `.m4a` / `.alac` / `.caf` (container) | ✔¹ | ✔ (AudioToolbox) | ✔ |
+| `.webm` (Opus/Vorbis, Matroska) | ✔ (glint/stb_vorbis) | ✔ | ✔ |
+| `.wma` / `.amr` / raw PCM | ✗ | ✗ | ✔ / pre-convert |
 
-¹ No permissive cross-platform AAC decoder exists. On Apple it's handled natively
-(AudioToolbox); on Windows/Android the OS decoders (Media Foundation /
-MediaCodec) are planned; on Linux use `CRISPASR_FFMPEG=ON` or pre-convert.
+¹ Container AAC (`.m4a`) needs libfdk-aac installed (loaded via `dlopen`) or
+`CRISPASR_FFMPEG=ON`; only **raw ADTS `.aac`** is covered dependency-free by the
+in-tree glint decoder. On Apple all AAC/ALAC/CAF is handled natively
+(AudioToolbox).
 
-For anything not covered natively, build with `CRISPASR_FFMPEG=ON` (an optional,
-dynamically-linked fallback — see [install.md](install.md)) or pre-convert:
-`ffmpeg -i in.X -ar 16000 -ac 1 -c:a pcm_s16le out.wav`.
+The `crispasr` CLI decodes all of the above through the same library loader
+(`crispasr_audio_load`), so `-f in.opus` / `in.aac` / `in.m4a` / `in.webm` work
+with **no ffmpeg subprocess** — the ffmpeg fallback is only reached for formats
+the native decoders can't handle. For those, build with `CRISPASR_FFMPEG=ON` (an
+optional, dynamically-linked fallback — see [install.md](install.md)) or
+pre-convert: `ffmpeg -i in.X -ar 16000 -ac 1 -c:a pcm_s16le out.wav`.
 
 ## Memory footprint
 
@@ -1295,8 +1346,15 @@ CosyVoice3 performance notes:
   on CPU; `--gpu-backend metal` selects Metal explicitly on macOS.
 - `-n/--max-new-tokens` is also the AR KV-cache sizing bound. A realistic
   cap reduces per-token work, but a value that is too low truncates speech.
-- `COSYVOICE3_FLOW_STEPS=5` approximately halves flow work. The default `10`
-  preserves upstream quality.
+- `COSYVOICE3_FLOW_STEPS=N` sets the CFM Euler step count (default `10`). Flow
+  work is ~linear in `N` and flow is ~48 % of the wall. M1 sweep (`--seed 42`,
+  log-mel-spectrogram corr vs the 10-step output — ASR roundtrip is verbatim at
+  8/6 and cannot distinguish steps): `8`→0.9948, `6`→0.9925, `4`→0.9895 with a
+  one-word ASR slip. **`6` is the perceptual sweet spot** (~−40 % flow work,
+  ~−19 % of the wall) and matches the chatterbox default; `4` starts to show
+  audible artifacts. `6` was confirmed across short / numbers / long sentences
+  (6-vs-10 mel-corr 0.9953 / 0.9930 / 0.9938). `10` is the conservative
+  upstream default; drop to `6` for a large speedup at near-identical quality.
 - An external model directory affects cold startup, not steady-state
   synthesis. For repeated requests, use server mode so the ~1.2 GB model set
   remains resident.

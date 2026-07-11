@@ -223,8 +223,12 @@ struct tada_context {
         std::vector<uint8_t> meta;
         ggml_cgraph* gf = nullptr;
     };
-    static constexpr int kBucketN = 4;
-    static constexpr int kBucketLks[kBucketN] = {512, 1024, 2048, 4096};
+    // §215b follow-up: smaller buckets prepended for short generations. The
+    // eligible floor is gated at runtime (tada_pick_bucket); the default floor
+    // (512) makes {64,128,256} inert — never picked, never built — so default
+    // behaviour is byte- AND perf-identical to the original §176b set.
+    static constexpr int kBucketN = 7;
+    static constexpr int kBucketLks[kBucketN] = {64, 128, 256, 512, 1024, 2048, 4096};
     std::array<TadaBucket, kBucketN> ar_buckets{};
     ggml_backend_sched_t ar_step_sched = nullptr;
 
@@ -1157,9 +1161,22 @@ static float* build_step_embedding(tada_context* c, int32_t token_id, const floa
 
 // §176b: Lk-bucketed single-step AR decode helpers.
 static int tada_pick_bucket(tada_context* c, int needed_lk) {
-    for (int i = 0; i < tada_context::kBucketN; i++)
-        if (tada_context::kBucketLks[i] >= needed_lk && tada_context::kBucketLks[i] <= c->kv_max_ctx)
+    // §215b follow-up: smallest ELIGIBLE bucket. The floor gates out buckets below
+    // CRISPASR_TADA_BUCKET_MIN (default 512 = original §176b behaviour). Lowering it
+    // (e.g. =64) lets a short generation (n_past << 512) use a tighter Lk and waste
+    // far less padded attention. Output-identical — padding positions are masked
+    // to -inf in run_talker_kv_bucket — so this is a pure speed A/B, default OFF.
+    static const int s_bucket_min = []() {
+        const char* e = std::getenv("CRISPASR_TADA_BUCKET_MIN");
+        return (e && e[0]) ? atoi(e) : 512;
+    }();
+    for (int i = 0; i < tada_context::kBucketN; i++) {
+        const int lk = tada_context::kBucketLks[i];
+        if (lk < s_bucket_min)
+            continue;
+        if (lk >= needed_lk && lk <= c->kv_max_ctx)
             return i;
+    }
     return -1;
 }
 
@@ -1246,7 +1263,14 @@ static talker_result run_talker_kv_bucket(tada_context* c, const float* embeds, 
 static talker_result run_talker_kv(tada_context* c, const float* embeds, int n_tokens, int n_past, bool need_logits,
                                    ggml_tensor* use_kv_k = nullptr, ggml_tensor* use_kv_v = nullptr) {
     // §176b: Lk-bucketed fast path for single-step decode on default KV.
-    if (n_tokens == 1 && !use_kv_k && !use_kv_v) {
+    // §215b diagnostic: CRISPASR_TADA_NO_BUCKET=1 forces the positive pass through
+    // the exact-Lk path (same as the CFG negative pass) to isolate how much of the
+    // pos/neg per-call asymmetry is the bucket's padded-attention (Lk>=512) width.
+    static const bool s_no_bucket = []() {
+        const char* e = std::getenv("CRISPASR_TADA_NO_BUCKET");
+        return e && e[0] && e[0] != '0';
+    }();
+    if (!s_no_bucket && n_tokens == 1 && !use_kv_k && !use_kv_v) {
         talker_result br = run_talker_kv_bucket(c, embeds, n_past, need_logits);
         if (br.hidden)
             return br;
@@ -2818,6 +2842,22 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     const int extra_steps = (s_extra_steps >= 0) ? s_extra_steps : 0;
     const int total_steps = num_prompt + extra_steps;
 
+    // §215b STEP-0 instrumentation: measure whether the talker (AR backbone,
+    // run twice/step for CFG) is dispatch-bound + a dominant fraction of per-step
+    // wall time — the precondition for a batched-CFG (B=2) port paying off.
+    // Gated CRISPASR_TADA_TALKER_TIMING=1 (measurement only, no graph change).
+    static const bool s_talker_timing = []() {
+        const char* e = std::getenv("CRISPASR_TADA_TALKER_TIMING");
+        return e && e[0] && e[0] != '0';
+    }();
+    int64_t t_talker_pos_us = 0, t_talker_neg_us = 0, t_loop_us = 0;
+    int n_talker_pos = 0, n_talker_neg = 0;
+    // Isolate the one-time lazy bucket/graph BUILD (folded into the first call of
+    // each pass) so the steady-state per-call cost — the only thing a B=2 batch
+    // can shrink — is reported separately from cold build amortization.
+    int64_t t_talker_pos_first_us = 0, t_talker_neg_first_us = 0;
+    const int64_t t_loop_start_us = s_talker_timing ? ggml_time_us() : 0;
+
     // Main AR + FM loop: runs for exactly total_steps steps.
     bool done = false;
     for (int step = loop_start; step < total_steps && !done; step++) {
@@ -2839,7 +2879,15 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
         }
 
         // LLM forward (positive — uses real tokens)
+        const int64_t t_pos0 = s_talker_timing ? ggml_time_us() : 0;
         talker_result tr = run_talker_kv(ctx, emb, 1, n_past, need_logits);
+        if (s_talker_timing) {
+            const int64_t dt = ggml_time_us() - t_pos0;
+            if (n_talker_pos == 0)
+                t_talker_pos_first_us = dt;
+            t_talker_pos_us += dt;
+            n_talker_pos++;
+        }
         free(emb);
         if (!tr.hidden) {
             fprintf(stderr, "tada: talker failed at step %d\n", step);
@@ -2859,7 +2907,15 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
             float* neg_emb =
                 build_step_embedding(ctx, neg_token, cur_acoustic.data(), cur_mask, cur_t_before, cur_t_after);
             if (neg_emb) {
+                const int64_t t_neg0 = s_talker_timing ? ggml_time_us() : 0;
                 talker_result neg_tr = run_talker_kv(ctx, neg_emb, 1, n_past, false, ctx->kv_neg_k, ctx->kv_neg_v);
+                if (s_talker_timing) {
+                    const int64_t dt = ggml_time_us() - t_neg0;
+                    if (n_talker_neg == 0)
+                        t_talker_neg_first_us = dt;
+                    t_talker_neg_us += dt;
+                    n_talker_neg++;
+                }
                 free(neg_emb);
                 neg_hidden = neg_tr.hidden; // caller frees
             }
@@ -3092,6 +3148,38 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
         }
 
         free(tr.hidden);
+    }
+
+    if (s_talker_timing) {
+        t_loop_us = ggml_time_us() - t_loop_start_us;
+        const double loop_ms = t_loop_us / 1e3;
+        const double pos_ms = t_talker_pos_us / 1e3;
+        const double neg_ms = t_talker_neg_us / 1e3;
+        const double talker_ms = pos_ms + neg_ms;
+        const int n_steps = n_talker_pos > 0 ? n_talker_pos : 1;
+        // Steady-state (exclude the first, build-inflated call of each pass).
+        const double pos_first_ms = t_talker_pos_first_us / 1e3;
+        const double neg_first_ms = t_talker_neg_first_us / 1e3;
+        const double pos_ss_ms = n_talker_pos > 1 ? (pos_ms - pos_first_ms) / (n_talker_pos - 1)
+                                                  : pos_ms / (n_talker_pos > 0 ? n_talker_pos : 1);
+        const double neg_ss_ms = n_talker_neg > 1 ? (neg_ms - neg_first_ms) / (n_talker_neg - 1)
+                                                  : neg_ms / (n_talker_neg > 0 ? n_talker_neg : 1);
+        // Steady-state talker per step and its share of a per-step loop time that
+        // ALSO excludes the cold first step (loop minus both first calls, /N-1).
+        const double talker_ss_step_ms = pos_ss_ms + neg_ss_ms;
+        const double loop_ss_step_ms =
+            n_steps > 1 ? (loop_ms - pos_first_ms - neg_first_ms) / (n_steps - 1) : loop_ms / n_steps;
+        fprintf(stderr,
+                "tada §215b talker timing: loop=%.1fms over %d steps (%.3f ms/step) | "
+                "talker=%.1fms (%.1f%% of loop) | pos=%.1fms/%d (%.3f ms/call, first=%.1f, ss=%.3f) | "
+                "neg=%.1fms/%d (%.3f ms/call, first=%.1f, ss=%.3f)\n"
+                "tada §215b STEADY-STATE: talker=%.3f ms/step (%.1f%% of %.3f ms/step loop) "
+                "[batchable body ~2x neg_ss=%.3f]\n",
+                loop_ms, n_steps, loop_ms / n_steps, talker_ms, loop_ms > 0 ? 100.0 * talker_ms / loop_ms : 0.0, pos_ms,
+                n_talker_pos, n_talker_pos > 0 ? pos_ms / n_talker_pos : 0.0, pos_first_ms, pos_ss_ms, neg_ms,
+                n_talker_neg, n_talker_neg > 0 ? neg_ms / n_talker_neg : 0.0, neg_first_ms, neg_ss_ms,
+                talker_ss_step_ms, loop_ss_step_ms > 0 ? 100.0 * talker_ss_step_ms / loop_ss_step_ms : 0.0,
+                loop_ss_step_ms, 2.0 * neg_ss_ms);
     }
 
     if (acoustic_features.empty()) {

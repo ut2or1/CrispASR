@@ -248,6 +248,14 @@ struct kugelaudio_model {
     kugelaudio_hparams hp;
     std::map<std::string, ggml_tensor*> tensors;
     std::vector<std::string> vocab;
+
+    // Lazily built greedy-tokenizer lookup over `vocab` (see
+    // tokenize_text_greedy). Scoped to the model so a second model with a
+    // different vocab is not tokenized with the first's (same single-model
+    // assumption as the dequant caches fixed in PR #244).
+    // mutable: tokenize_text_greedy takes `const kugelaudio_model&`.
+    mutable std::map<std::string, int> greedy_vocab_map;
+    mutable int greedy_max_token_len = 0;
 };
 
 // ── Context ────────────────────────────────────────────────────────────────
@@ -581,17 +589,15 @@ static const std::vector<int>& qwen_byte_encoder() {
 
 // Greedy longest-match tokenizer for Qwen2.5 BPE vocabulary
 static std::vector<int32_t> tokenize_text_greedy(const kugelaudio_model& m, const char* text) {
-    static std::map<std::string, int> vocab_map;
-    static int max_token_len = 0;
-    static bool built = false;
-    if (!built && !m.vocab.empty()) {
+    auto& vocab_map = m.greedy_vocab_map;
+    auto& max_token_len = m.greedy_max_token_len;
+    if (vocab_map.empty() && !m.vocab.empty()) {
         for (int i = 0; i < (int)m.vocab.size(); i++) {
             if (!m.vocab[i].empty())
                 vocab_map[m.vocab[i]] = i;
             if ((int)m.vocab[i].size() > max_token_len)
                 max_token_len = (int)m.vocab[i].size();
         }
-        built = true;
     }
 
     // Convert text to GPT-2 byte-encoded string
@@ -1261,6 +1267,25 @@ extern "C" float* kugelaudio_synthesize(struct kugelaudio_context* ctx, const ch
                                 "distinct voice of each respective speaker.\n";
 
     bool has_voice = (ctx->n_voice_frames > 0 && !ctx->voice_acoustic_mean.empty());
+
+    // VibeVoice zero-tensor fallback (#248): when no voice GGUF is loaded,
+    // synthesize a 1-frame neutral embedding from an all-zeros VAE latent
+    // run through the acoustic_connector. The connector's bias terms +
+    // RMSNorm produce a non-trivial "default speaker" that the LM can
+    // condition on. Upstream VibeVoice does the same
+    // (modeling_vibevoice.py:~281, forward_speech_features zero-tensor path).
+    // Quality is lower than a real voice reference but produces intelligible
+    // speech instead of noise.
+    if (!has_voice) {
+        if (ctx->params.verbosity >= 1) {
+            fprintf(stderr, "kugelaudio: no voice loaded — using zero-tensor neutral fallback.\n"
+                            "  For better quality, pass --voice <voice.gguf>.\n");
+        }
+        int vae_dim = hp.vae_dim_acoustic;
+        ctx->voice_acoustic_mean.assign((size_t)vae_dim, 0.0f);
+        ctx->n_voice_frames = 1;
+        has_voice = true;
+    }
 
     // Voice input section: " Voice input:\n Speaker 0:" + [VAE placeholders] + "\n"
     std::string voice_section;

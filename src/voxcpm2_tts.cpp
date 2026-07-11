@@ -376,6 +376,12 @@ struct voxcpm2_context {
     // RNG for CFM noise generation (seeded per synthesis call)
     mt19937_state rng;
 
+    // Single-entry VAE-encode memo (see vae_encode_cached)
+    const float* vae_cache_pcm = nullptr;
+    int vae_cache_n_samples = -1;
+    int vae_cache_T = 0;
+    std::vector<float> vae_cache_feat;
+
     // Helper: return gpu_weights for graph build (GPU-resident) or weights
     // for legacy paths (always CPU-accessible).
     const vox_weights& graph_weights() const { return has_gpu_weights ? gpu_weights : weights; }
@@ -4569,19 +4575,6 @@ static int vae_enc_block(voxcpm2_context* ctx, int blk_idx, int in_ch, int out_c
 // (matching Python `feat.view(D, -1, P).permute(1, 2, 0)`).
 // On failure (encoder weights missing) returns an empty vector and sets
 // *out_T_patches = 0.
-// Process-wide VAE encode cache. The diff harness calls extract_stage once per
-// stage and several stages need ref_feat — the encoder takes ~30 s on CPU so
-// re-running it 5-10 times serialises into multiple minutes. Cache keyed on
-// (ctx, ref pointer, ref length).
-struct vox_vae_cache_key {
-    voxcpm2_context* ctx;
-    const float* pcm;
-    int n_samples;
-    bool operator==(const vox_vae_cache_key& o) const {
-        return ctx == o.ctx && pcm == o.pcm && n_samples == o.n_samples;
-    }
-};
-
 static std::vector<float> vae_encode_uncached(voxcpm2_context* ctx, const float* pcm, int n_samples,
                                               int* out_T_patches);
 // VOXCPM2_USE_GRAPH=1 GPU encoder (PLAN §181) + its dispatcher; defined after
@@ -4590,20 +4583,23 @@ static std::vector<float> vae_encode_graph(voxcpm2_context* ctx, const float* pc
 static std::vector<float> vae_encode_dispatch(voxcpm2_context* ctx, const float* pcm, int n_samples,
                                               int* out_T_patches);
 
+// Per-context VAE encode cache. The diff harness calls extract_stage once per
+// stage and several stages need ref_feat — the encoder takes ~30 s on CPU so
+// re-running it 5-10 times serialises into multiple minutes. Cache keyed on
+// (ref pointer, ref length) and stored in the context so its lifetime matches
+// it (a stale entry can't outlive the context and hit a later one that reuses
+// the same addresses — same single-model assumption as PR #244).
 static const std::vector<float>& vae_encode_cached(voxcpm2_context* ctx, const float* pcm, int n_samples,
                                                    int* out_T_patches) {
-    static vox_vae_cache_key cached_key{nullptr, nullptr, -1};
-    static std::vector<float> cached;
-    static int cached_T = 0;
-    vox_vae_cache_key key{ctx, pcm, n_samples};
-    if (!(key == cached_key)) {
-        cached = vae_encode_dispatch(ctx, pcm, n_samples, &cached_T);
-        cached_key = key;
+    if (ctx->vae_cache_pcm != pcm || ctx->vae_cache_n_samples != n_samples) {
+        ctx->vae_cache_feat = vae_encode_dispatch(ctx, pcm, n_samples, &ctx->vae_cache_T);
+        ctx->vae_cache_pcm = pcm;
+        ctx->vae_cache_n_samples = n_samples;
     }
     if (out_T_patches) {
-        *out_T_patches = cached_T;
+        *out_T_patches = ctx->vae_cache_T;
     }
-    return cached;
+    return ctx->vae_cache_feat;
 }
 
 static std::vector<float> vae_encode(voxcpm2_context* ctx, const float* pcm, int n_samples, int* out_T_patches) {

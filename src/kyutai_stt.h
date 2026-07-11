@@ -98,6 +98,11 @@ struct kyutai_stt_result_ex {
 
 void kyutai_stt_result_ex_free(struct kyutai_stt_result_ex* r);
 
+// Returns the model's audio_delay_seconds + audio_silence_prefix_seconds.
+// The CLI wrapper uses this to size the silence tail it appends: the tail
+// must be at least as long as the lookahead so the LM can flush the final word.
+float kyutai_stt_total_lookahead_seconds(struct kyutai_stt_context* ctx);
+
 // Like kyutai_stt_transcribe but returns per-token + word-level timing.
 //
 // `t_offset_cs`: absolute start of this audio slice in centiseconds.

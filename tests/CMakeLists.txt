@@ -596,6 +596,27 @@ catch_discover_tests(test-ark-asr
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test-canary-qwen-live — live integration tests for canary-qwen (#247:
+# short-window instruction-echo regression guard). Needs CRISPASR_MODEL_CANARY_QWEN.
+add_executable(test-canary-qwen-live
+    test_canary_qwen_live.cpp
+)
+target_include_directories(test-canary-qwen-live PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-canary-qwen-live PRIVATE
+    Catch2::Catch2WithMain
+    canary_qwen
+)
+catch_discover_tests(test-canary-qwen-live
+    TEST_SPEC "[canary-qwen]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── test - lfm2-audio — live integration tests for LFM2-Audio ASR + TTS
 add_executable(test-lfm2-audio
     test_lfm2_audio_live.cpp
@@ -955,6 +976,23 @@ target_link_libraries(test-canary-params PRIVATE
 catch_discover_tests(test-canary-params
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;canary"
+)
+
+# ─── test-canary-qwen-params — Catch2 unit tests for canary-qwen params /
+# null-guards and the #247 instruction-echo detection. No GGUF required. ────────
+add_executable(test-canary-qwen-params
+    test-canary-qwen-params.cpp
+)
+target_include_directories(test-canary-qwen-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-canary-qwen-params PRIVATE
+    Catch2::Catch2WithMain
+    canary_qwen
+)
+catch_discover_tests(test-canary-qwen-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;canary-qwen"
 )
 
 # ─── test-orpheus-params — Catch2 unit tests for orpheus_context_params defaults
@@ -1505,6 +1543,18 @@ catch_discover_tests(test-openvoice2-params
     PROPERTIES LABELS "unit;openvoice2"
 )
 
+# ─── test-openvoice2-hifi — standalone convert harness (needs a GGUF + src/ref wav).
+# Not a ctest; used for manual bench/validation of openvoice2_convert. ───────────
+add_executable(test-openvoice2-hifi
+    test-openvoice2-hifi.cpp
+)
+target_include_directories(test-openvoice2-hifi PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-openvoice2-hifi PRIVATE
+    openvoice2
+)
+
 # ─── test-t5translate-params — Catch2 unit tests for t5_translate_context_params defaults
 # and null-guard coverage. No GGUF required. ───────────────────────────────────
 add_executable(test-t5translate-params
@@ -1607,6 +1657,23 @@ target_link_libraries(test-voxtral4b-params PRIVATE
 catch_discover_tests(test-voxtral4b-params
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;voxtral4b"
+)
+
+# ─── test-voxtral-tts-params — Catch2 unit tests for voxtral_tts_context_params
+# defaults, sample rate, and null-guard coverage. No GGUF required. ─────────────
+add_executable(test-voxtral-tts-params
+    test-voxtral-tts-params.cpp
+)
+target_include_directories(test-voxtral-tts-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-voxtral-tts-params PRIVATE
+    Catch2::Catch2WithMain
+    voxtral_tts
+)
+catch_discover_tests(test-voxtral-tts-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;voxtral-tts"
 )
 
 # ─── test-qwen3-tts-cv-style — Catch2 unit tests for qwen3_tts_set_cv_style_instruct
@@ -1845,6 +1912,41 @@ catch_discover_tests(test-ngram-loop-fix
     PROPERTIES LABELS "unit;ngram-loop"
 )
 
+# ─── test-generation-health — Catch2 unit tests for the generation-health
+# regression gate (core/generation_health.h). Objective quality checks on
+# ASR/TTS output: not-empty, duration plausibility, n-gram loop, truncation.
+add_executable(test-generation-health
+    test-generation-health.cpp
+)
+target_include_directories(test-generation-health PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-generation-health PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-generation-health
+    TEST_SPEC "[gen-health]"
+    PROPERTIES LABELS "unit;gen-health"
+)
+
+# ─── test-issue-239-popen-mode — regression guard for issue #239.
+#
+# Verifies that crispasr_popen("cmd", "rb") succeeds on POSIX (it failed
+# before the fix because glibc popen() rejects mode "rb" with EINVAL).
+add_executable(test-issue-239-popen-mode
+    test-issue-239-popen-mode.cpp
+)
+target_include_directories(test-issue-239-popen-mode PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-issue-239-popen-mode PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-issue-239-popen-mode
+    TEST_SPEC "[issue-239]"
+    PROPERTIES LABELS "unit;popen;issue-239"
+)
+
 # ─── test-lcs-c-abi — pin the public C ABI surface for the LCS dedup.
 # Verifies that `crispasr_lcs_dedup_prefix_count` is exported from
 # libcrispasr and agrees with the in-tree algorithm on the same
@@ -2035,14 +2137,15 @@ catch_discover_tests(test_watermark
 )
 
 # ─── test_tts_provenance — Catch2 unit tests for TTS AI-provenance
-#compliance (WAV LIST/INFO, ID3v2, C2PA, consent gate, watermark edge cases).
-#Pure CPU, no model dependencies.
+#compliance (WAV LIST/INFO, ID3v2, MP3/glint encode, C2PA, consent gate,
+#watermark edge cases). Pure CPU, no model dependencies.
 add_executable(test_tts_provenance test_tts_provenance.cpp)
 target_include_directories(test_tts_provenance PRIVATE
     ${PROJECT_SOURCE_DIR}/examples/cli
 )
 target_link_libraries(test_tts_provenance PRIVATE
     Catch2::Catch2WithMain
+    glint
 )
 catch_discover_tests(test_tts_provenance
     TEST_SPEC "[unit]"
@@ -2281,6 +2384,7 @@ catch_discover_tests(test-core-seanet
 add_executable(test-audio-formats test-audio-formats.cpp)
 target_include_directories(test-audio-formats PRIVATE
     ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/ggml/include
 )
 target_link_libraries(test-audio-formats PRIVATE

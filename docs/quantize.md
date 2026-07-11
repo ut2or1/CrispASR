@@ -186,7 +186,7 @@ Notes:
   Trust CER; the single-position cosine is only a proxy.
 - Implemented for the ASR backends whose large weights actually benefit
   (whisper, parakeet, canary, cohere, qwen3-asr / mega-asr, higgs-stt,
-  ark-asr, moss-transcribe, granite, glm-asr, mimo-asr, voxtral). The
+  ark-asr, moss-transcribe, moss-diarize, granite, glm-asr, mimo-asr, voxtral). The
   collector is installed on the decode scheduler
   (`crispasr_imatrix_install`); adding it to another backend is a
   one-line call after its `ggml_backend_sched_new`.

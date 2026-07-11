@@ -30,6 +30,7 @@ public:
         mp.model_path = params.model.c_str();
         mp.tokenizer_path = nullptr; // auto-detect
         mp.n_threads = params.n_threads;
+        mp.use_gpu = params.use_gpu;
         ctx_ = moonshine_init_with_params(mp);
         return ctx_ != nullptr;
     }

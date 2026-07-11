@@ -16,6 +16,7 @@
 #include "core/bpe.h"
 #include "core/greedy_decode.h"
 #include "core/beam_decode.h"
+#include "core/ngram_loop_fix.h"
 
 #include "qwen3_asr.h"
 
@@ -94,17 +95,29 @@ public:
         //                     <|im_start|>user\n<|audio_start|>
         //                     <|audio_pad|> x N
         //                     <|audio_end|><|im_end|>\n
-        //                     <|im_start|>assistant\n
+        //                     <|im_start|>assistant\n[PREFILL]
+        // Blueprint contract (qwen_asr inference/qwen3_asr.py
+        // _build_text_prompt): a forced language is expressed as an
+        // ASSISTANT-TURN PREFILL "language <Name><asr_text>" appended
+        // after the generation prompt — the model then emits transcript
+        // text only and structurally cannot answer "language none"
+        // (issue #218's empty-output escape). The system turn carries
+        // only the optional context/ask string.
+        //
         // For --translate we put a plain English instruction in the
-        // SYSTEM turn ("Translate the audio to TGT.") because qwen3-asr
-        // is a specialized ASR fine-tune that ignores user-turn
-        // instructions but does honour system-prompt control. The
-        // default transcribe path keeps the system turn empty, which
-        // is the bit-identical historical behaviour. ISO-639-1 codes are
-        // mapped to plain English names via crispasr_iso_to_english_lang —
-        // qwen3 reads the system prompt literally and a bare "de" gets
-        // interpreted as Spanish ("de" = "of"); the full name avoids that.
+        // SYSTEM turn ("Translate the speech to TGT.") — a CrispASR
+        // extension; qwen3-asr honours system-prompt control.
+        // ISO-639-1 codes are mapped to plain English names via
+        // crispasr_iso_to_english_lang — qwen3 reads the prompt
+        // literally and a bare "de" would be read as Spanish ("de" =
+        // "of"). CRISPASR_QWEN3_SYSPROMPT_LANG=1 restores the legacy
+        // "Transcribe the speech in X." system-turn form.
+        const bool legacy_lang_prompt = [] {
+            const char* e = getenv("CRISPASR_QWEN3_SYSPROMPT_LANG");
+            return e && atoi(e) != 0;
+        }();
         std::string sys_instruction;
+        std::string assistant_prefill;
         if (!params.ask.empty()) {
             // Note: qwen3-asr is an ASR-specific fine-tune that may
             // ignore arbitrary instructions and transcribe anyway.
@@ -115,7 +128,10 @@ public:
                 params.target_lang.empty() ? std::string("English") : crispasr_iso_to_english_lang(params.target_lang);
             sys_instruction = "Translate the speech to " + tgt + ".";
         } else if (!params.language.empty() && params.language != "auto") {
-            sys_instruction = "Transcribe the speech in " + crispasr_iso_to_english_lang(params.language) + ".";
+            if (legacy_lang_prompt)
+                sys_instruction = "Transcribe the speech in " + crispasr_iso_to_english_lang(params.language) + ".";
+            else
+                assistant_prefill = "language " + crispasr_iso_to_english_lang(params.language) + "<asr_text>";
         }
         // PLAN #98 Phase B: hotword prompt injection
         if (!params.hotwords.empty()) {
@@ -133,6 +149,7 @@ public:
             text += "<|audio_pad|>";
         text += "<|audio_end|><|im_end|>\n"
                 "<|im_start|>assistant\n";
+        text += assistant_prefill;
 
         int n_prompt = 0;
         int32_t* raw_ids = qwen3_asr_tokenize(ctx_, text.c_str(), &n_prompt);
@@ -174,7 +191,12 @@ public:
         free(audio_embeds);
 
         // ---- KV cache + best-of-N decode ----
-        if (!qwen3_asr_kv_init(ctx_, 4096)) {
+        // Blueprint default max_new_tokens=512 (qwen_asr Qwen3ASRModel).
+        // KV sized to the actual prompt + decode budget — a fixed 4096 caps
+        // unchunked audio at ~5 min (12.9 audio tokens/s).
+        const int prompt_len = (int)ids.size();
+        const int max_new = params.max_new_tokens > 0 ? params.max_new_tokens : 512;
+        if (!qwen3_asr_kv_init(ctx_, std::max(4096, prompt_len + max_new + 16))) {
             free(text_embeds);
             fprintf(stderr, "crispasr[qwen3]: kv_init failed\n");
             return out;
@@ -187,9 +209,6 @@ public:
         if (eos_arr && n_eos >= 1)
             eos_id = eos_arr[0];
         free(eos_arr);
-
-        const int prompt_len = (int)ids.size();
-        const int max_new = params.max_new_tokens > 0 ? params.max_new_tokens : 256;
 
         // ---- Beam search path ----
         if (params.beam_size > 1) {
@@ -251,7 +270,7 @@ public:
                 if (raw.size() >= 5 && raw[0] == '[' && raw[1] == 'P' && raw[2] == 'A' && raw[3] == 'D')
                     continue;
                 std::string txt = decode_token(raw);
-                if (raw == "language") {
+                if (assistant_prefill.empty() && raw == "language") {
                     capture_language = true;
                     continue;
                 }
@@ -384,7 +403,11 @@ public:
                 continue;
 
             std::string txt = decode_token(raw);
-            if (txt == "language") {
+            // "language <name>" metadata only appears when the assistant turn
+            // was NOT prefilled — with the forced-language prefill the model
+            // emits transcript text directly and a literal leading word
+            // "language" must not be swallowed.
+            if (assistant_prefill.empty() && txt == "language") {
                 capture_language = true;
                 continue;
             }
@@ -454,8 +477,16 @@ public:
         crispasr_segment seg;
         seg.t0 = t_offset_cs;
         seg.t1 = t_offset_cs + (int64_t)((double)n_samples / 16000.0 * 100.0);
-        seg.text = transcript;
-        seg.tokens = std::move(out_tokens);
+        // Apply fix_loops to both text and tokens (#218)
+        std::vector<std::string> tok_texts;
+        for (auto& tk : out_tokens)
+            tok_texts.push_back(tk.text);
+        const std::vector<int> keep = core_ngram::fix_loops_keep_indices(tok_texts);
+        seg.text = core_ngram::fix_loops(transcript);
+        for (int ki : keep) {
+            if (ki >= 0 && ki < (int)out_tokens.size())
+                seg.tokens.push_back(std::move(out_tokens[ki]));
+        }
         out.push_back(std::move(seg));
         return out;
     }
@@ -479,8 +510,14 @@ public:
         if (!audio_embeds)
             return;
 
-        // ---- Prompt ----
+        // ---- Prompt ---- (same blueprint contract as transcribe() above:
+        // forced language = assistant-turn prefill, not a system instruction)
+        const bool legacy_lang_prompt = [] {
+            const char* e = getenv("CRISPASR_QWEN3_SYSPROMPT_LANG");
+            return e && atoi(e) != 0;
+        }();
         std::string sys_instruction;
+        std::string assistant_prefill;
         if (!params.ask.empty()) {
             sys_instruction = params.ask;
         } else if (params.translate) {
@@ -488,7 +525,10 @@ public:
                 params.target_lang.empty() ? std::string("English") : crispasr_iso_to_english_lang(params.target_lang);
             sys_instruction = "Translate the speech to " + tgt + ".";
         } else if (!params.language.empty() && params.language != "auto") {
-            sys_instruction = "Transcribe the speech in " + crispasr_iso_to_english_lang(params.language) + ".";
+            if (legacy_lang_prompt)
+                sys_instruction = "Transcribe the speech in " + crispasr_iso_to_english_lang(params.language) + ".";
+            else
+                assistant_prefill = "language " + crispasr_iso_to_english_lang(params.language) + "<asr_text>";
         }
         if (!params.hotwords.empty()) {
             if (!sys_instruction.empty() && sys_instruction.back() != ' ')
@@ -503,6 +543,7 @@ public:
         for (int i = 0; i < N_enc; i++)
             text += "<|audio_pad|>";
         text += "<|audio_end|><|im_end|>\n<|im_start|>assistant\n";
+        text += assistant_prefill;
 
         int n_prompt = 0;
         int32_t* raw_ids = qwen3_asr_tokenize(ctx_, text.c_str(), &n_prompt);
@@ -542,8 +583,9 @@ public:
 
         const int prompt_len = (int)ids.size();
 
-        // ---- KV init ----
-        if (!qwen3_asr_kv_init(ctx_, 4096)) {
+        // ---- KV init ---- (dynamic sizing, same rationale as transcribe())
+        const int stream_max_new = params.max_new_tokens > 0 ? params.max_new_tokens : 512;
+        if (!qwen3_asr_kv_init(ctx_, std::max(4096, prompt_len + stream_max_new + 16))) {
             free(text_embeds);
             return;
         }
@@ -565,7 +607,7 @@ public:
             eos_id = 151645; // Fallback
 
         core_greedy_decode::Config dec_cfg;
-        dec_cfg.max_new_tokens = params.max_new_tokens;
+        dec_cfg.max_new_tokens = stream_max_new;
         dec_cfg.eos_id = eos_id;
         dec_cfg.vocab_size = vocab;
         dec_cfg.temperature = params.temperature;

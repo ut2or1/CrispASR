@@ -45,14 +45,20 @@ namespace crispasr_chunk_context {
 // twice and duplicates at every 30 s seam ("...of the fence. Don't move much to
 // the fence.", #218); the over-long (30 s + 2×3 s) buffer also pushes the
 // greedy decoder further out of its trained window and worsens the repeated-
-// phrase loops the same issue is about. The bare-slice path avoids both. The
-// blocked backends were caught by the A/B sweep in tools/check-overlap-save-bug.sh.
+// phrase loops the same issue is about. The bare-slice path avoids both.
+// canary-qwen (FastConformer + Qwen3-1.7B LLM decoder) emits no per-token or
+// word timestamps — all tokens receive the segment-level t0/t1, so the
+// word-level overlap-save trim cannot excise the context region and the acoustic
+// overlap is decoded twice, duplicating text at every seam (#218). The backend
+// also declares CAP_INTERNAL_CHUNKING, meaning overlap-save context from the
+// external chunker is redundant as well as harmful. The blocked backends were
+// caught by the A/B sweep in tools/check-overlap-save-bug.sh.
 inline bool backend_allows_chunk_context(const char* backend_name) {
     if (backend_name == nullptr) {
         return true;
     }
-    static const char* const kBlocked[] = {"cohere",     "gemma4-e2b",      "glm-asr", "granite",
-                                           "kyutai-stt", "moss-transcribe", "qwen3",   "voxtral"};
+    static const char* const kBlocked[] = {"canary-qwen", "cohere",          "gemma4-e2b", "glm-asr", "granite",
+                                           "kyutai-stt",  "moss-transcribe", "qwen3",      "voxtral"};
     for (const char* b : kBlocked) {
         if (std::strcmp(backend_name, b) == 0) {
             return false;

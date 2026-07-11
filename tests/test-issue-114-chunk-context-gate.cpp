@@ -54,6 +54,7 @@ TEST_CASE("backend can opt out of external overlap-save context", "[unit][chunk-
 TEST_CASE("backend_allows_chunk_context: known offenders opt out, others do not",
           "[unit][chunk-context][backend-list]") {
     // Surfaced by tools/check-overlap-save-bug.sh A/B sweep.
+    REQUIRE_FALSE(backend_allows_chunk_context("canary-qwen"));    // #218: no word timestamps → seam dup; CAP_INTERNAL_CHUNKING makes external context redundant
     REQUIRE_FALSE(backend_allows_chunk_context("cohere"));
     REQUIRE_FALSE(backend_allows_chunk_context("gemma4-e2b"));
     REQUIRE_FALSE(backend_allows_chunk_context("glm-asr"));
@@ -81,6 +82,7 @@ TEST_CASE("backend_allows_chunk_context: known offenders opt out, others do not"
     REQUIRE(backend_allows_chunk_context(nullptr));
 
     // Match is exact, not prefix/substring.
+    REQUIRE(backend_allows_chunk_context("canary-qwen-v2"));   // future variant, not blocked
     REQUIRE(backend_allows_chunk_context("cohere-v2"));
     REQUIRE(backend_allows_chunk_context("glm-asr-streaming"));
     REQUIRE(backend_allows_chunk_context("xglm-asr"));

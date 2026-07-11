@@ -10,12 +10,14 @@ trade-off:
 | **`piper`** | Tiniest footprint (30 MB). rhasspy/piper VITS; 250+ community voices across 30+ languages. Built-in G2P (CMUdict + LTS rules) for English — no espeak-ng needed. Optional espeak-ng for other langs (loaded via dlopen). 22 kHz output. Use `--g2p-dict` to select dictionary source. | No (per-voice GGUF) | Manual `wget` |
 | **`kokoro`** | Smallest + fastest. 82 M-param StyleTTS2-derived model. Multilingual via built-in G2P or espeak-ng (dlopen/popen fallback). | No (preset voice packs) | Manual `wget` (no `-m auto`) |
 | **`qwen3-tts`** | Highest fidelity / strongest cloning. Speech-LLM (talker + code predictor + 12 Hz codec). Default voice auto-downloaded with `-m auto`; or supply your own WAV + ref-text. | Optional (auto default voice; or WAV + ref-text or baked voice GGUF) | ~1.3 GB via `-m auto` |
+| **`omnivoice`** | 600+ languages. Qwen3-0.6B backbone with masked iterative 8-codebook TTS (SoundStorm-style). Zero-shot voice cloning from reference audio. Supports finetunes (omnivoice-singing). | Yes (`--voice <wav> --ref-text "..."`) | ~1.2 GB F16 + ~400 MB tokenizer |
 | **`vibevoice-tts`** | Lowest-latency streaming TTS, designed for realtime. | Preset voice packs | ~636 MB via `-m auto` |
 | **`vibevoice-1.5b`** | Base VibeVoice TTS model with WAV cloning. | Yes (`VIBEVOICE_VOICE_AUDIO=<wav>` or `--voice <wav>`) | ~1.6 GB via `-m auto` |
 | **`orpheus`** | Llama-3.2-3B talker + SNAC 24 kHz codec. 8 baked English speakers; expressive output. Greedy loops — pass `--temperature 0.6`. | Preset names via `--voice tara/leah/...` | ~3.5 GB via `-m auto` (talker Q8 + 26 MB SNAC) |
 | **`chatterbox`** | T3 AR + S3Gen flow-matching + HiFTGenerator. Built-in voice baked into the T3 GGUF; clones via a baked voice GGUF (see workflow below). EN/AR/DE variants share runtime. | Yes (`--voice <voice.gguf>`, baked from a WAV with `models/bake-chatterbox-voice-from-wav.py`) | ~880 MB via `-m auto` (T3 Q8 + S3Gen Q8) |
 | **`outetts`** | OuteTTS-0.3-1B: OLMo-1B LLM + WavTokenizer single-codebook VQ-GAN. Lightweight (1B params), CC BY 4.0 license. 24 kHz output. | Yes (`--voice <speaker.json>`, created with `tools/reference_backends/outetts_create_speaker.py`) | ~2.5 GB via `-m auto` (talker F16 + WavTokenizer decoder) |
 | **`f5-tts`** | F5-TTS v1 Base: 22-layer DiT flow-matching TTS + Vocos iSTFT vocoder. MIT license. High-quality zero-shot voice cloning from 3-15s reference audio. 24 kHz output, character-level tokenization. | Yes (`--voice <ref.wav> --ref-text "transcript"`) | ~953 MB via `-m auto` (single F16 GGUF, DiT + Vocos) |
+| **`irodori-tts`** | Irodori-TTS: RF-DiT flow-matching TTS with LowRankAdaLN + JointAttention + half-RoPE + SwiGLU. 48 kHz via Semantic-DACVAE-Japanese-32dim codec. MIT license. Japanese-focused (llm-jp-3 tokenizer). Zero-shot voice cloning from any reference WAV (DAC-VAE encoder + speaker CFG); emoji emotion control; duration predictor for output length. **VoiceDesign** (600M-v3): adds caption encoder for style/emotion control via text descriptions (`--instruct "calm adult male, deep voice"`); independent text/speaker/caption CFG. | Yes (`--voice <ref.wav> --i-have-rights`) | ~526 MB Q4_K (VoiceDesign) / ~852 MB Q4_K (base) + DAC-VAE codec |
 | **`indextts`** | IndexTTS-1.5: GPT-2 AR (24L/1280d) mel-code generator + BigVGAN vocoder. Designed for Chinese+English. Zero-shot voice cloning from any reference WAV. | Yes (`--voice <ref.wav>`) | ~2.4 GB via `-m auto` (GPT F16 + BigVGAN F16) |
 | **`cosyvoice3-tts`** | Fun-CosyVoice3-0.5B-2512: Qwen2-0.5B AR speech-token LM + DiT-CFM (10-step Euler) + HiFT (NSF + iSTFT) @ 24 kHz. 9 languages + 18 Chinese dialects. Ships an 8-voice baked bank (`zero_shot` + `fleurs-{en,de,zh,ja,fr,es,ko}`). | Yes — baked-bank name via `--voice <name>`, **or** native arbitrary-WAV cloning via `--voice <ref.wav> --ref-text "..."` (ports speech_tokenizer_v3 + CAMPPlus + matcha mel to ggml; speech tokens byte-exact vs ONNX). | ~1.2 GB via `-m auto` (Q4_K LLM + Q8_0 flow + HiFT + s3tok + campplus + voices) |
 | **`csm`** | Sesame CSM-1B: Llama-3.2 1B backbone (first-codebook AR) + 100M depth decoder (codebooks 1–31) + Kyutai Mimi codec (32-codebook RVQ → SEANet) @ 24 kHz. Single GGUF. Apache-2.0. | No (single built-in voice) | ~1.4 GB via `-m auto` (single Q4_K GGUF) |
@@ -34,6 +36,7 @@ trade-off:
 | **`lfm2-audio`** | LiquidAI LFM2.5-Audio 1.5B: FastConformer encoder + LFM2 hybrid conv+attention backbone + 6L depthformer (8-codebook Mimi) + ISTFT detokenizer → 24 kHz. Interleaved text+audio generation. Also does ASR and speech-to-speech. LFM Open License v1.0 ($10M revenue cap). | No | ~1.5 GB Q4_K (JP) / ~1.6 GB Q5_K (EN) + ~157 MB detokenizer companion |
 | **`dots-tts`** | rednote-hilab dots.tts-soar: Qwen2.5-1.5B LLM + 24L VAESemanticEncoder + 18L DiT flow-matching head (16-step Euler CFG) + BigVGAN vocoder → 48 kHz. Continuous-latent AR (patch-by-patch). Apache-2.0. **The CFG flow-match needs F16 — a full-q8 core derails; use the F16 core or a mixed-quant (`crispasr-quantize` keeps the DiT at F16, quantizes the LLM+PatchEncoder to Q8_0 → ~3.1 GB).** | TODO (CAM++ speaker; text-only today) | ~4.6 GB F16 / ~3.1 GB mixed-Q8 core + 345 MB vocoder companion |
 | **`mini-omni2`** | gpt-omni/mini-omni2: Whisper-small encoder + Qwen2-0.5B LLM with 8-stream architecture + SNAC 24 kHz decoder → 24 kHz. Also does ASR and speech-to-speech. MIT license. Requires `--codec-model snac-24khz.gguf` companion. | No | ~1.0 GB Q4_K + ~80 MB SNAC companion |
+| **`voxtral-tts`** | Mistral Voxtral-4B-TTS-2603: Ministral-3B AR backbone (26L GQA, NORMAL/adjacent-pair RoPE) + 3L bidirectional flow-matching acoustic transformer (8-step Euler ODE + CFG α=1.2, no positional encoding) + Voxtral codec decoder (ALiBi sliding-window attention + reflect-causal conv + ConvTranspose upsampling) → 24 kHz. 20 preset voices across 9 languages (en/fr/de/es/it/pt/nl/ar/hi); strong on French technical text. CC-BY-NC-4.0. | No (20 preset voices via `--voice <name>`, e.g. `fr_female`) | ~2.4 GB Q4_K / ~4.3 GB Q8_0 / ~8.2 GB F16 via `-m auto` |
 
 All backends write mono WAV via `--tts-output` (22 kHz for piper/fastpitch/bananamind-tts, 16 kHz for speecht5, 24 kHz for most others, 44.1 kHz for melotts/dia/parler-tts/zonos-tts, 48 kHz for voxcpm2-tts).
 
@@ -503,7 +506,9 @@ defaults reproduce the validated, end-to-end-tested code path.
 |---|---|---|
 | `QWEN3_TTS_SEED` | `42` | Override the AR sampling seed (superseded by `--seed N` on the CLI). |
 | `QWEN3_TTS_MAX_FRAMES` | `1500` | Hard cap on AR decode steps. Short prompts that fail to sample `codec_eos` would otherwise run to the 1500-frame ceiling. |
-| `QWEN3_TTS_O15` | unset | Pin code-predictor `Lk = cp_kv_max_ctx` and reuse one cached T=1 graph across AR steps 2..14 (saves ~14-19 ms/frame on Mac/Metal — alloc+build collapse from ~20 ms/frame to ~1.6 ms/frame). Default flipped back to OFF after [#56](https://github.com/CrispStrobe/CrispASR/issues/56): the cached-graph reuse asserts on the CUDA backend (`GGML_ASSERT` in `ggml_backend_tensor_set` on first `code_pred_generate_15` call, Jetson Orin AGX sm_87). M1 Metal users who want the speedup should set `QWEN3_TTS_O15=1`. Default goes back to ON once the CUDA path is verified. |
+| `QWEN3_TTS_O15` | unset | Pin code-predictor `Lk = cp_kv_max_ctx` and reuse one cached T=1 graph across AR steps 2..14 (saves ~14-19 ms/frame on Mac/Metal — alloc+build collapse from ~20 ms/frame to ~1.6 ms/frame). Default flipped back to OFF after [#56](https://github.com/CrispStrobe/CrispASR/issues/56): the cached-graph reuse asserts on the CUDA backend (`GGML_ASSERT` in `ggml_backend_tensor_set` on first `code_pred_generate_15` call, Jetson Orin AGX sm_87). M1 Metal users who want the speedup should set `QWEN3_TTS_O15=1`. Default goes back to ON once the CUDA path is verified. Largely superseded by `QWEN3_TTS_CP_DIRECT`, which gets the same graph-reuse win without touching the scheduler. |
+| `QWEN3_TTS_CP_DIRECT` | auto (GPU on, CPU off) | §232/#245: dispatch the code predictor through two persistent sched-free graphs (one T=2 step-0 graph, one T=1 step graph with the O15 topology), gallocr-allocated once on the code-pred backend. Each of the 15 per-frame steps is then just input `tensor_set` + one `ggml_backend_graph_compute` — no scheduler reset/alloc, so the sched-reuse breakage behind #56 cannot occur. Validated md5-identical WAV vs. the sched path on M1 Metal and CUDA P100 (0.6B Q8_0, seed 42; ASR roundtrip verbatim). Default ON when the code predictor runs on a GPU backend: Metal is ~equal on an idle box but ~3x faster under load (the sched path degrades badly under contention), CUDA P100 is ~11% faster. Default OFF on CPU, where there is no dispatch cost to save and the per-step lm_head slot blit (~2.2 MB memcpy ×14/frame) makes it ~2x slower. Set `=1`/`=0` to override either way; falls back to the sched path automatically when an op is unsupported on the backend or the code predictor is CPU-pinned. |
+| `QWEN3_TTS_LK_BUCKET` | unset | Bucketed fixed-`Lk` talker AR steps (256/512/1024/2048/4096), one persistent graph per bucket. Since §232 the bucket graphs are gallocr-allocated once and dispatched sched-free (the previous sched-plan reuse segfaulted on current ggml — nil-buffer inputs, same root cause as #56). Stays opt-in: on Metal the fixed-`Lk` attention costs ~10% at short outputs; on CUDA P100 it was the fastest config (~5% under CP_DIRECT alone) — CUDA users can enable both. |
 | `QWEN3_TTS_FUSED_QKV` | unset | Fuse Q+K+V weights into one matmul per talker layer at load time (F16/F32 talker only; auto-skipped for Q8_0/Q4_K). Bit-identical to the unfused path on M1 Metal; speed effect is machine-dependent. |
 | `QWEN3_TTS_BENCH` | unset | Print per-call build/alloc/compute/read timings for `talker_kv` and `code_pred_kv`. |
 | `QWEN3_TTS_PROF` | unset | Per-op profiler (more granular than `BENCH`). |
@@ -511,6 +516,7 @@ defaults reproduce the validated, end-to-end-tested code path.
 | `QWEN3_TTS_DUMP_DIR` | unset | Write per-frame intermediate tensors into the named directory. Bulky; intended for diff-harness work (`tools/dump_reference.py --backend qwen3-tts`). |
 | `QWEN3_TTS_CODEC_GPU` | auto | Force codec weights and decode through the GPU scheduler. GPU is now the default on all GPU backends including Metal — the `CONV_TRANSPOSE_1D` hang was fixed in `f8fc8b8e` and the op replaced by `mul_mat+col2im_1d` in `5f600f25`. Distinct from `QWEN3_TTS_CODEC_FORCE_METAL`, which also enables a per-op trace callback for debugging. |
 | `QWEN3_TTS_CODEC_CPU` | unset | Force codec weights and decode through the CPU-only `codec_sched`. Useful for A/B timing and regression bisection. |
+| `QWEN3_TTS_CODEC_FASTCONV` | **on** (set `=0` to opt out) | §232: three codec conv rewrites — K=1 convs run as channel matmuls (the im2col of a 1×1 conv is a pure ~300 MB copy at 24 kHz T), K>1 causal convs pad inside im2col and crop (removes the CPU-placed asymmetric PAD nodes Metal can't run), and K>1 F16 conv kernels are baked to F32 once at load (removes a ~70 ms per-decode kernel cast). Validated 2026-07-11 on 0.6B Q8_0, seed 42: WAV **md5-identical** on M1 Metal; on CPU within 1 int16 LSB (PCM cos 1.00000000). Codec decode ~3× faster on Metal (3.9 s → 1.3 s for 4.6 s audio), ~2.1× on CPU. The `=0` path is the legacy graph, kept for regression bisection. |
 | `QWEN3_TTS_CODEC_CHUNK` | `150` (`64` on CUDA) | Maximum generated codec frames per decode chunk. CUDA clamps values above `64` and treats `0` as `64` unless `QWEN3_TTS_CODEC_ALLOW_FULL=1` is also set, avoiding oversized `mul_mat+col2im_1d` allocations on 10 GB cards. |
 | `QWEN3_TTS_CODEC_CTX` | `128` (`96` on CUDA) | Left-context codec frames prepended to each chunk. Values below the codec sliding window are raised; CUDA clamps larger values unless `QWEN3_TTS_CODEC_ALLOW_FULL=1` is set. |
 | `QWEN3_TTS_SKIP_REF_DECODE` | **on** (set `=0` to opt out) | Skip the codec decode of the reference audio in `qwen3_tts_synthesize`. The default-on path emits `codec_decode_codes(gen)` directly; the opt-out path concatenates `ref_codes + gen_codes`, decodes both, then trims the ref portion. With a 26 s reference (~334 codec frames at 12 Hz), the ref half adds ~16 s of constant codec compute regardless of how much new audio is generated (Jetson Orin AGX, issue #64). End-to-end RTF on Orin drops from ~7-9 → ~1.5; the win compounds N× under `/v1/audio/speech` long-form chunking. Bit-identity verified 2026-05-05 on Apple Silicon Metal, qwen3-tts-customvoice 0.6B Q8_0: max\|diff\| = 0, cosine similarity = 1.0 — equivalence holds because the codec is a straight-line forward pass with no rolling state. Set `QWEN3_TTS_SKIP_REF_DECODE=0` only for A/B verification or if a future codec graph variant grows rolling state. |
@@ -1058,6 +1064,75 @@ sources unless you also vet the env var.
 When the hook fires you'll see no extra log line by default; pass
 `-v` to confirm the post-hook tokenization (`indextts: text "..." ->
 N tokens`).
+
+---
+
+## Irodori-TTS — Japanese voice cloning + emoji emotion control
+
+Irodori-TTS v3 (500M) is an RF-DiT flow-matching model at 48 kHz via the
+Semantic-DACVAE-Japanese-32dim codec. Needs the companion codec GGUF next to the
+model (auto-discovered) or via `--codec-model`.
+
+```bash
+# Plain synthesis:
+crispasr --backend irodori-tts -m irodori-tts-500m-v3-q8_0.gguf \
+    --codec-model dacvae-ja-32dim-f16.gguf --tts "こんにちは、世界。" -o out.wav
+
+# Zero-shot voice cloning from any reference WAV:
+crispasr --backend irodori-tts -m irodori-tts-500m-v3-q8_0.gguf \
+    --codec-model dacvae-ja-32dim-f16.gguf \
+    --voice reference.wav --i-have-rights --tts "テスト。" -o cloned.wav
+
+# VoiceDesign (600M-v3): style/emotion control via --instruct:
+crispasr --backend irodori-tts -m irodori-tts-600m-v3-voicedesign-q4_k.gguf \
+    --codec-model dacvae-ja-32dim-f16.gguf \
+    --instruct "落ち着いた大人の男性。深く響く声で丁寧に話している。" \
+    --tts "こんにちは、世界。" -o voicedesign.wav
+```
+
+**Voice cloning** encodes the reference through the DAC-VAE encoder (resample →
+−16 LUFS → latent) and conditions the DiT via speaker CFG. `--i-have-rights` is
+the consent attestation; a spoken AI-disclosure is prepended unless
+`--no-spoken-disclaimer`. A short, clean 5–15 s reference clones as well as a
+long one and is faster.
+
+**Emoji emotion control** — Irodori's emoji drive prosody (👂 whisper, 😮‍💨
+breath, 😭 crying, …); include them in the text. See the model's
+`EMOJI_ANNOTATIONS.md` for the supported set. Emoji outside the trained set are
+harmlessly ignored.
+
+**Output length** is set by the model's duration predictor (kanji unpack to a
+variable number of mora, so a fixed chars/sec heuristic truncates). Nudge it with
+`--duration-scale` (`>1` longer), or pin the exact frame count with
+`CRISPASR_IRODORI_T_LATENT=N`.
+
+**Knobs (env):**
+
+| Variable | Effect |
+| --- | --- |
+| `CRISPASR_IRODORI_CFG_SPEAKER` | Speaker-CFG strength for cloning (default 5.0). |
+| `CRISPASR_IRODORI_T_LATENT` | Force the exact output latent-frame count. |
+| `CRISPASR_IRODORI_DECODE_CHUNK` / `_CTX` | Overlap-save codec-decode window / context (auto for long outputs; `CHUNK=0` disables). Bounds peak decode memory; exact (byte-identical) output. |
+| `CRISPASR_IRODORI_CODEC_GPU=1` | Run the DAC-VAE codec on the GPU under Vulkan (CPU by default there — validated clean on MoltenVK; confirm on your driver). `CRISPASR_IRODORI_CODEC_CPU=1` forces CPU. |
+
+See also the shared [reference-conditioning cache](#reference-conditioning-cache)
+and [streaming TTS output](streaming.md#streaming-synthesized-audio-out).
+
+## Reference-conditioning cache
+
+Voice cloning encodes the reference into a small conditioning blob — a DAC-VAE
+latent (irodori) or Conformer/Perceiver + ECAPA conditioning (indextts) — which
+is slow for long references. CrispASR caches it **content-addressed on the
+reference audio**, in the runtime, so **every entry point** (CLI, server, C ABI,
+language wrappers) skips the encode on a repeat reference automatically — output
+is byte-identical to a fresh encode.
+
+- Cache directory: `CRISPASR_TTS_REF_CACHE_DIR` (default: a `crispasr-tts-refcache`
+  folder under the system temp dir).
+- Disable entirely with `CRISPASR_TTS_REF_CACHE=0`.
+
+No flag is needed to enable it — it's on by default. (f5-tts caches its
+auto-transcribed reference transcript separately, next to the voice file.)
 
 ---
 

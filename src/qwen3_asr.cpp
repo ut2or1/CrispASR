@@ -1371,43 +1371,61 @@ extern "C" int32_t* qwen3_asr_tokenize(qwen3_asr_context* ctx, const char* text,
     const auto& v = ctx->vocab;
     std::vector<int32_t> result;
 
+    // Match an added special token starting at position `pos`: either the
+    // "<|...|>" form (<|im_start|>, <|audio_pad|>, ...) or the bare "<...>"
+    // form Qwen3-ASR also ships (<asr_text>, <non_speech>, <think>, ...).
+    // Returns the matched length, or 0 and leaves `id` untouched. Only
+    // exact vocab entries match — a literal '<' in user text is unaffected.
+    auto match_special = [&](const std::string& str, size_t pos, int32_t& id) -> size_t {
+        if (str[pos] != '<')
+            return 0;
+        const bool pipe_form = pos + 1 < str.size() && str[pos + 1] == '|';
+        const size_t close = pipe_form ? str.find("|>", pos + 2) : str.find('>', pos + 1);
+        if (close == std::string::npos)
+            return 0;
+        const size_t len = close + (pipe_form ? 2 : 1) - pos;
+        // Bare-form tokens are short identifiers (<asr_text>); cap the scan
+        // so an unmatched '<' in a long text doesn't cause a huge lookup.
+        if (!pipe_form && len > 24)
+            return 0;
+        auto it = v.token_to_id.find(str.substr(pos, len));
+        if (it == v.token_to_id.end())
+            return 0;
+        id = it->second;
+        return len;
+    };
+
     const std::string s = text;
     size_t i = 0;
     while (i < s.size()) {
-        // 1. Special-token check: if the next chars are "<|...|>" and the
-        //    full token exists in the vocab, emit it directly.
-        if (s[i] == '<' && i + 1 < s.size() && s[i + 1] == '|') {
-            size_t end = s.find("|>", i + 2);
-            if (end != std::string::npos) {
-                std::string special = s.substr(i, end + 2 - i);
-                auto it = v.token_to_id.find(special);
-                if (it != v.token_to_id.end()) {
-                    result.push_back(it->second);
-                    i = end + 2;
-                    continue;
-                }
+        // 1. Special-token check: if the next chars form a special token
+        //    present in the vocab ("<|...|>" or "<...>"), emit it directly.
+        if (s[i] == '<') {
+            int32_t sp_id = 0;
+            const size_t sp_len = match_special(s, i, sp_id);
+            if (sp_len > 0) {
+                result.push_back(sp_id);
+                i += sp_len;
+                continue;
             }
         }
 
-        // 2. Plain text segment: collect chars up to the next "<|...|>" we
-        //    can recognize. We treat a "<|" as a candidate boundary only if
-        //    it's an actual special token we know — otherwise we keep
-        //    extending the plain-text segment past it (a literal "<|" in
-        //    user text isn't a special token).
+        // 2. Plain text segment: collect chars up to the next special token
+        //    we can recognize. We treat a '<' as a candidate boundary only
+        //    if it starts an actual special token we know — otherwise we
+        //    keep extending the plain-text segment past it (a literal '<'
+        //    in user text isn't a special token).
         size_t j = i;
         // Ensure we always advance by at least one char on every outer
-        // iteration, even if step 1 just failed on a "<|...|>" lookalike
-        // that isn't actually a special token.
-        if (s[j] == '<' && j + 1 < s.size() && s[j + 1] == '|')
+        // iteration, even if step 1 just failed on a special-token
+        // lookalike that isn't actually in the vocab.
+        if (s[j] == '<')
             j++;
         while (j < s.size()) {
-            if (s[j] == '<' && j + 1 < s.size() && s[j + 1] == '|') {
-                size_t end = s.find("|>", j + 2);
-                if (end != std::string::npos) {
-                    std::string special = s.substr(j, end + 2 - j);
-                    if (v.token_to_id.find(special) != v.token_to_id.end())
-                        break;
-                }
+            if (s[j] == '<') {
+                int32_t sp_id = 0;
+                if (match_special(s, j, sp_id) > 0)
+                    break;
             }
             j++;
         }
@@ -1737,12 +1755,9 @@ extern "C" float* qwen3_asr_run_encoder(qwen3_asr_context* ctx, const float* mel
     // is ready when we add real per-chunk padding masking later.)
     std::vector<float> mask((size_t)N_padded * N_padded, 0.0f);
 
-    // §176s: reuse cached encoder graph when shape matches.
+    // #235: always rebuild — cached graph has stale GPU buffer handles after sched regrow
     ggml_cgraph* gf;
-    if (ctx->cached_enc_gf && ctx->cached_enc_T_chunk == chunk_T && ctx->cached_enc_num_chunks == num_chunks &&
-        ctx->cached_enc_T_chunk_out == T_chunk_out) {
-        gf = ctx->cached_enc_gf;
-    } else {
+    {
         ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
         std::swap(ctx->compute_meta, ctx->cached_enc_meta);
         gf = qwen3_asr_build_graph_encoder(ctx, chunk_T, num_chunks, T_chunk_out);
@@ -1803,8 +1818,21 @@ extern "C" float* qwen3_asr_run_encoder(qwen3_asr_context* ctx, const float* mel
 extern "C" bool qwen3_asr_kv_init(qwen3_asr_context* ctx, int max_ctx) {
     if (!ctx || max_ctx <= 0)
         return false;
-    if (ctx->kv_k)
-        return true; // already initialized
+    if (ctx->kv_k) {
+        if (ctx->kv_max_ctx >= max_ctx)
+            return true; // already initialized and large enough
+        // Grow: a long-audio prompt (unchunked 145 s ≈ 1.9k tokens; longer
+        // clips scale linearly) can exceed the capacity a previous shorter
+        // call allocated. Free and reallocate below at the new size.
+        ggml_backend_buffer_free(ctx->kv_buf);
+        ggml_free(ctx->kv_ctx);
+        ctx->kv_buf = nullptr;
+        ctx->kv_ctx = nullptr;
+        ctx->kv_k = nullptr;
+        ctx->kv_v = nullptr;
+        ctx->kv_max_ctx = 0;
+        ctx->kv_n_used = 0;
+    }
 
     const auto& hp = ctx->model.hparams;
     const int hd = (int)hp.llm_head_dim;

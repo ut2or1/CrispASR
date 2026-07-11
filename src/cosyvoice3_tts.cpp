@@ -5515,7 +5515,14 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
     std::vector<float> x_init = cv3_seeded_gaussian((size_t)T_mel_total * (size_t)mel, /*seed*/ 0);
 
     // ---- 7. Run flow Euler → mel ----
-    int flow_steps = (int)ctx->flow.hp.cfm_n_steps;
+    // §235: audible synthesis defaults to 6 CFM Euler steps — perceptual parity
+    // with the upstream 10 (log-mel corr vs 10-step: 6→0.9925, confirmed across
+    // short/numbers/long + a human listen, 2026-07-11), for ~−40% flow work
+    // (~−19% of the synthesis wall). hp.cfm_n_steps (10) is preserved for the
+    // diff harness / cv3_extract_* stages (which pin 10 to match PyTorch); the
+    // min() also respects a model GGUF that ships fewer steps. Override with
+    // COSYVOICE3_FLOW_STEPS.
+    int flow_steps = std::min((int)ctx->flow.hp.cfm_n_steps, 6);
     if (const char* env_steps = std::getenv("COSYVOICE3_FLOW_STEPS")) {
         char* end = nullptr;
         const long parsed = std::strtol(env_steps, &end, 10);
