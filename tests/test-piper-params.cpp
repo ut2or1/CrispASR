@@ -16,6 +16,19 @@ TEST_CASE("piper_params: default values are sensible", "[unit][piper]") {
     REQUIRE(p.length_scale != 0.0f);
 }
 
+// Defaults-audit / config-parity guard (motivated by #192/#197). Piper reads its
+// VITS knobs from the model (-1 = "use model default"); pin the exact sentinels so
+// a concrete override hard-coded into the default (overriding every voice's tuned
+// value) fails CI.
+TEST_CASE("piper_params: knobs ship the -1 model-default sentinels", "[unit][piper]") {
+    struct piper_tts_params p = piper_tts_default_params();
+
+    REQUIRE(p.noise_scale == Catch::Approx(-1.0f));
+    REQUIRE(p.length_scale == Catch::Approx(-1.0f));
+    REQUIRE(p.noise_w == Catch::Approx(-1.0f));
+    REQUIRE(p.speaker_id == 0);
+}
+
 TEST_CASE("piper_init_from_file: null path returns nullptr", "[unit][piper]") {
     struct piper_tts_params p = piper_tts_default_params();
     struct piper_tts_context* ctx = piper_tts_init_from_file(nullptr, p);

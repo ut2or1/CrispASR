@@ -232,6 +232,11 @@ struct speecht5_tts_context {
     ggml_context* ctx_perm = nullptr;
     ggml_backend_buffer_t buf_perm = nullptr;
 
+    // FASTCONV: baked F32 copies of the vocoder's F16 conv kernels, so the
+    // fork's per-graph F16→F32 cast becomes a no-op (docs/perf-sweep/PLAN.md).
+    // Gated CRISPASR_SPEECHT5_FASTCONV; disabled → legacy path unchanged.
+    core_dac::fastconv_cache voc_fc;
+
     // §202 Cross-attention K/V pre-computed from encoder output (constant per utterance).
     // Shape: [decoder_layers] tensors, each (hidden_size, T_enc) on device.
     ggml_context* ctx_cross_kv = nullptr;
@@ -1251,7 +1256,7 @@ static std::vector<float> run_vocoder(speecht5_tts_context* ctx,
     ggml_set_input(mel_in);
 
     // Run HiFi-GAN — input is (T, C_in) = (T_mel, mel_dim)
-    ggml_tensor* waveform = core_hifigan::forward(gc, mel_in, ts, "voc", vhp, ctx->ups_w_perm);
+    ggml_tensor* waveform = core_hifigan::forward(gc, mel_in, ts, "voc", vhp, ctx->ups_w_perm, &ctx->voc_fc);
 
     ggml_set_name(waveform, "waveform");
 
@@ -1421,6 +1426,19 @@ struct speecht5_tts_context* speecht5_tts_init(const char* path, struct speecht5
                                                   &ctx->buf_perm);
     }
 
+    // FASTCONV: bake one F32 copy of each F16 vocoder conv kernel (default on;
+    // set CRISPASR_SPEECHT5_FASTCONV=0 for the legacy A/B arm).
+    {
+        const char* e = std::getenv("CRISPASR_SPEECHT5_FASTCONV");
+        const bool on = !e || (e[0] != '0');
+        auto convs = core_hifigan::collect_fastconv_kernels(ctx->tensors(), "voc", ctx->voc_hp);
+        ctx->voc_fc.bake(ctx->backend, convs, on);
+        if (std::getenv("CRISPASR_SPEECHT5_FASTCONV_DEBUG")) {
+            fprintf(stderr, "speecht5: FASTCONV %s — baked %zu F32 kernels from %zu voc convs\n",
+                    ctx->voc_fc.enabled ? "ON" : "OFF", ctx->voc_fc.f32.size(), convs.size());
+        }
+    }
+
     if (params.verbosity > 0) {
         fprintf(stderr, "speecht5: backend=%s\n", ggml_backend_name(ctx->backend));
         fprintf(stderr, "speecht5: loaded model — hidden=%d mel=%d enc=%d dec=%d vocab=%d\n", hp.hidden_size,
@@ -1580,6 +1598,7 @@ void speecht5_tts_pcm_free(float* pcm) {
 
 void speecht5_tts_free(struct speecht5_tts_context* ctx) {
     if (ctx) {
+        ctx->voc_fc.free();
         if (ctx->buf_perm)
             ggml_backend_buffer_free(ctx->buf_perm);
         if (ctx->ctx_perm)

@@ -25,6 +25,7 @@ before running this backend.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Dict, Set
 
@@ -123,10 +124,44 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
                 if key in model_sd:
                     model_sd[key].data.copy_(sf.get_tensor(key).float())
 
+    # Workaround #2: some checkpoints (e.g. cohere-transcribe-arabic-07-2026)
+    # ship ~10 encoder LayerNorm weights ZEROED in model.safetensors
+    # (encoder.layers.N.norm_self_att / norm_conv / norm_feed_forward1, ...).
+    # Left as zeros they null those Conformer sub-layers -> the decoder emits a
+    # 🎵/repetition loop instead of a transcript. Patch them from a known-good
+    # GGUF given by CRISPASR_COHERE_NORM_PATCH_GGUF (the corrected converter's
+    # output, whose norms are non-zero). Verified: patching only these 10 makes
+    # both this Python reference and the C++ port transcribe correctly.
+    import torch as _torch
+    _patch_gguf = os.environ.get("CRISPASR_COHERE_NORM_PATCH_GGUF")
+    if _patch_gguf and Path(_patch_gguf).exists():
+        import torch.nn as _nn
+        from gguf import GGUFReader as _GR, dequantize as _dq
+        _gg = {t.name: t for t in _GR(_patch_gguf).tensors}
+        _sfx = {"norm_self_att": "attn.norm", "norm_conv": "conv.norm",
+                "norm_feed_forward1": "ff1.norm", "norm_feed_forward2": "ff2.norm",
+                "norm_out": "out_norm"}
+        _npatch = 0
+        for _n, _mod in model.named_modules():
+            if isinstance(_mod, _nn.LayerNorm) and float(_mod.weight.abs().max()) < 1e-6:
+                _p = _n.split(".")
+                _gn = (f"enc.blk.{_p[2]}.{_sfx[_p[3]]}.weight"
+                       if len(_p) >= 4 and _p[2].isdigit() and _p[3] in _sfx else None)
+                if _gn and _gn in _gg:
+                    _t = _gg[_gn]
+                    _v = np.asarray(_dq(_t.data, _t.tensor_type), dtype=np.float32)
+                    _mod.weight.data.copy_(_torch.from_numpy(_v.copy()).reshape_as(_mod.weight))
+                    _npatch += 1
+        if _npatch:
+            print(f"  patched {_npatch} zeroed encoder LayerNorm weights from "
+                  f"{Path(_patch_gguf).name}")
+
     # ---- Feature extraction (processor handles pre-emphasis + mel + norm) ----
-    # CohereProcessor mirrors WhisperFeatureExtractor's API.
+    # CohereProcessor mirrors WhisperFeatureExtractor's API. Language for the
+    # decoder prompt is overridable (Arabic model needs "ar", not "en").
     inputs = processor(
-        audio, sampling_rate=16000, return_tensors="pt", language="en")
+        audio, sampling_rate=16000, return_tensors="pt",
+        language=os.environ.get("CRISPASR_COHERE_REF_LANG", "en"))
     # Cast to the same dtype as the model to match the rust reference's
     # bf16→f32 path (we load in f32 here so this is a no-op).
     if "input_features" in inputs:

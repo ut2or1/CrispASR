@@ -249,6 +249,57 @@ TEST_CASE("read_wav_mono_pcm16 clamps malicious data_size without over-allocatin
     std::remove(path);
 }
 
+// Reachability regression: a crafted MP4 whose stsz box claims a ~4 billion
+// sample count must flow through crispasr_audio_load -> crispasr_m4a_decode
+// (reached after AudioToolbox/AU/AMR/WebM reject it) without the multi-GB
+// resize() (now clamped to box bytes). Builds the minimal
+// ftyp + moov{trak{mdia{minf{stbl{stsz}}}}} nesting the box parser walks.
+TEST_CASE("crispasr_audio_load survives a malicious MP4 stsz count", "[audio][unit]") {
+    auto box = [](const char* type, const std::vector<uint8_t>& payload) {
+        std::vector<uint8_t> b;
+        uint32_t size = 8u + (uint32_t)payload.size();
+        for (int i = 3; i >= 0; i--)
+            b.push_back((uint8_t)(size >> (8 * i)));
+        for (int i = 0; i < 4; i++)
+            b.push_back((uint8_t)type[i]);
+        b.insert(b.end(), payload.begin(), payload.end());
+        return b;
+    };
+    auto be32 = [](std::vector<uint8_t>& b, uint32_t v) {
+        for (int i = 3; i >= 0; i--)
+            b.push_back((uint8_t)(v >> (8 * i)));
+    };
+
+    std::vector<uint8_t> stsz_p;
+    be32(stsz_p, 0);           // version + flags
+    be32(stsz_p, 0);           // sample_size = 0 (non-uniform)
+    be32(stsz_p, 0xFFFFFFFFu); // sample_count ~4 billion, box has no entries
+    std::vector<uint8_t> moov = box("moov", box("trak", box("mdia", box("minf", box("stbl", box("stsz", stsz_p))))));
+    std::vector<uint8_t> ftyp_p = {'M', '4', 'A', ' ', 'i', 's', 'o', 'm'};
+    std::vector<uint8_t> ftyp = box("ftyp", ftyp_p);
+
+    std::vector<uint8_t> file;
+    file.insert(file.end(), ftyp.begin(), ftyp.end());
+    file.insert(file.end(), moov.begin(), moov.end());
+
+    const char* path = "crispasr_mp4_regression_tmp.m4a";
+    {
+        FILE* f = std::fopen(path, "wb");
+        REQUIRE(f != nullptr);
+        std::fwrite(file.data(), 1, file.size(), f);
+        std::fclose(f);
+    }
+
+    float* pcm = nullptr;
+    int n = 0, sr = 0;
+    // Must return (no ~16 GB resize / crash). Result is an error (no audio data).
+    int rc = crispasr_audio_load(path, &pcm, &n, &sr);
+    if (rc == 0)
+        crispasr_audio_free(pcm);
+    SUCCEED("survived malicious MP4 stsz without over-allocating");
+    std::remove(path);
+}
+
 TEST_CASE("crispasr_audio_load decodes AMR-NB", "[audio][unit][amr]") {
     float* pcm = nullptr;
     int samples = 0, rate = 0;

@@ -13,7 +13,8 @@ RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https:
 COPY . .
 ARG CRISPASR_BUILD_JOBS
 RUN jobs="${CRISPASR_BUILD_JOBS:-$(nproc)}" && \
-  cmake -S . -B build -G Ninja -DCRISPASR_BUILD_TESTS=OFF && \
+  cmake -S . -B build -G Ninja -DCRISPASR_BUILD_TESTS=OFF \
+    -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON && \
   cmake --build build -j"${jobs}" --target crispasr-cli
 
 FROM ubuntu:22.04 AS runtime

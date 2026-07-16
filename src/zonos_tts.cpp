@@ -237,6 +237,9 @@ struct zonos_tts_context {
     std::string dac_codec_path;
     bool dac_loaded = false;
     core_dac::DacWeights dac_w;
+    // FASTCONV (docs/perf-sweep/PLAN.md): baked-F32 decode conv kernels. Gated
+    // CRISPASR_ZONOS_FASTCONV.
+    core_dac::fastconv_cache dac_fc;
     ggml_context* dac_ctx_w = nullptr;
     ggml_backend_buffer_t dac_buf_w = nullptr;
     ggml_context* dac_ctx_perm = nullptr;
@@ -2457,6 +2460,25 @@ static bool load_dac_codec(zonos_tts_context* ctx) {
     }
 
     ctx->dac_loaded = true;
+
+    // FASTCONV (docs/perf-sweep/PLAN.md): bake F32 copies of the decode conv
+    // kernels via the shared cache so the per-graph F16→F32 cast becomes a no-op
+    // (k=1 → matmul). up_w already has an F32 w_perm (decomp path), so baking it is
+    // a no-op there. Gated CRISPASR_ZONOS_FASTCONV (default on); =0 = legacy.
+    {
+        const char* e = std::getenv("CRISPASR_ZONOS_FASTCONV");
+        const bool on = !(e && e[0] == '0');
+        std::vector<ggml_tensor*> convs = {dw.in_conv_w, dw.out_conv_w};
+        for (int b = 0; b < 4; b++) {
+            convs.push_back(dw.blocks[b].up_w);
+            for (int r = 0; r < 3; r++) {
+                convs.push_back(dw.blocks[b].res[r].conv0_w);
+                convs.push_back(dw.blocks[b].res[r].conv1_w);
+            }
+        }
+        ctx->dac_fc.bake(ctx->backend, convs, on);
+    }
+
     if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "zonos_tts: DAC codec loaded (%zu tensors)\n", wl.tensors.size());
     }
@@ -2489,7 +2511,7 @@ static float* dac_decode(zonos_tts_context* ctx, const int32_t* codes, int n_cod
     }
 
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
-    ggml_tensor* pcm_out = core_dac::build_decode_graph(ctx0, dw, codes_in, T, gf);
+    ggml_tensor* pcm_out = core_dac::build_decode_graph(ctx0, dw, codes_in, T, gf, &ctx->dac_fc);
 
     // Allocate + set inputs
     ggml_backend_sched_reset(ctx->sched);
@@ -2671,6 +2693,7 @@ void zonos_tts_free(struct zonos_tts_context* ctx) {
             ggml_free(bk.ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    ctx->dac_fc.free(); // FASTCONV baked-kernel buffer
     if (ctx->dac_buf_perm)
         ggml_backend_buffer_free(ctx->dac_buf_perm);
     if (ctx->dac_ctx_perm)

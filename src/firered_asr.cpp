@@ -35,6 +35,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // ===========================================================================
@@ -255,6 +256,34 @@ struct firered_asr_context {
     ggml_tensor* kv_cross_v = nullptr;
 
     int n_threads = 4;
+
+    // §176k: persistent per-(weight,M) matvec graph cache for the decoder hot
+    // path. The decode step issues ~128 tiny matvecs (8 projections × 16
+    // layers), and the per-call ggml_init + graph build + sched_reset +
+    // sched_alloc_graph dominates the actual Q4_K compute (measured ~45 ms/step,
+    // flat vs history length → dispatch-bound, not attention-bound). A cached
+    // no_alloc graph + one-time gallocr allocation lets each step just
+    // tensor_set(input) → backend_graph_compute → tensor_get(output),
+    // sched-free on backend_cpu (native Q4_K SIMD). Bit-identical output — same
+    // op/backend/weights. Gated by CRISPASR_FIRERED_MATVEC_CACHE (see §Env-var).
+    struct dec_matvec_graph {
+        ggml_context* gctx = nullptr;
+        ggml_cgraph* gf = nullptr;
+        ggml_gallocr_t ga = nullptr;
+        ggml_tensor* inp = nullptr;
+        ggml_tensor* out = nullptr;
+    };
+    bool dec_matvec_cache_on = false;
+    std::unordered_map<uint64_t, dec_matvec_graph> dec_matvec_cache;
+
+    // FIRERED_BENCH-gated dispatch profiler: total wall-time and call count
+    // spent inside the decoder matvec dispatch. The wall-clock A/B for this
+    // change is unreliable on a loaded box, but the dispatch-only time isolates
+    // exactly what the cache affects, so the ON/OFF ratio stays meaningful under
+    // contention (both arms are slowed equally by other load).
+    bool dec_bench = false;
+    double dec_dispatch_us = 0.0;
+    long dec_dispatch_calls = 0;
 };
 
 // ===========================================================================
@@ -341,6 +370,17 @@ extern "C" struct firered_asr_context* firered_asr_init_from_file(const char* pa
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
     if (ggml_backend_is_cpu(ctx->backend))
         ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+
+    // §176k: persistent decoder matvec graph cache (default ON; opt out with
+    // CRISPASR_FIRERED_MATVEC_CACHE=0). Bit-identical to the per-call sched path,
+    // eliminates the per-step dispatch overhead that dominates decode.
+    {
+        const char* e = getenv("CRISPASR_FIRERED_MATVEC_CACHE");
+        ctx->dec_matvec_cache_on = !(e && e[0] == '0');
+        ctx->dec_bench = getenv("FIRERED_BENCH") != nullptr;
+        if (params.verbosity >= 1)
+            fprintf(stderr, "firered_asr: decoder matvec cache %s\n", ctx->dec_matvec_cache_on ? "ON" : "OFF");
+    }
 
     auto& m = ctx->model;
     auto& hp = m.hp;
@@ -584,6 +624,13 @@ extern "C" struct firered_asr_context* firered_asr_init_from_file(const char* pa
 extern "C" void firered_asr_free(struct firered_asr_context* ctx) {
     if (!ctx)
         return;
+    for (auto& kv : ctx->dec_matvec_cache) {
+        if (kv.second.ga)
+            ggml_gallocr_free(kv.second.ga);
+        if (kv.second.gctx)
+            ggml_free(kv.second.gctx);
+    }
+    ctx->dec_matvec_cache.clear();
     if (ctx->kv_buf)
         ggml_backend_buffer_free(ctx->kv_buf);
     if (ctx->kv_ctx)
@@ -829,6 +876,71 @@ static void ggml_matmat(ggml_backend_t be, ggml_backend_sched_t sc, ggml_tensor*
 static void ggml_vecmat(ggml_backend_t be, ggml_backend_sched_t sc, ggml_tensor* weight_w, ggml_tensor* bias_b,
                         const float* input, float* output, int K, int N) {
     ggml_matmat(be, sc, weight_w, bias_b, input, output, 1, K, N);
+}
+
+// §176k: cached counterpart to ggml_matmat for the decoder hot path. Builds a
+// no_alloc single-matvec graph ONCE per (weight, bias-present, M) and reuses it
+// across steps — no per-call ggml_init / graph build / sched_reset /
+// sched_alloc_graph. Runs sched-free directly on backend_cpu (native Q4_K SIMD;
+// the decoder is deliberately CPU-resident to avoid per-token GPU launch
+// overhead). Output is bit-identical to ggml_matmat: same op, same backend,
+// same weights. Per the gallocr aliasing gotcha the single input tensor is
+// re-set on EVERY call (its buffer may be reused as scratch after its last use).
+static void ggml_matmat_cached(firered_asr_context* ctx, ggml_tensor* weight_w, ggml_tensor* bias_b, const float* input,
+                               float* output, int M, int K, int N) {
+    // Key on the weight pointer (unique per K,N,type), whether a bias is
+    // present, and M (n_active shrinks as beams finish → a few M values).
+    uint64_t key = (uint64_t)(uintptr_t)weight_w;
+    key = key * 1099511628211ull + (uint64_t)(unsigned)M;
+    key = key * 1099511628211ull + (bias_b ? 1ull : 0ull);
+
+    auto it = ctx->dec_matvec_cache.find(key);
+    if (it == ctx->dec_matvec_cache.end()) {
+        firered_asr_context::dec_matvec_graph g;
+        size_t mem = ggml_tensor_overhead() * 8 + ggml_graph_overhead();
+        struct ggml_init_params gp = {mem, nullptr, true};
+        g.gctx = ggml_init(gp);
+        g.inp = ggml_new_tensor_2d(g.gctx, GGML_TYPE_F32, K, M);
+        ggml_set_name(g.inp, "vi");
+        ggml_set_input(g.inp);
+        ggml_tensor* cur = ggml_mul_mat(g.gctx, weight_w, g.inp); // (N, M) — row-major (M, N)
+        if (bias_b)
+            cur = ggml_add(g.gctx, cur, bias_b); // (N,) broadcasts over M columns
+        ggml_set_name(cur, "vo");
+        ggml_set_output(cur);
+        g.out = cur;
+        g.gf = ggml_new_graph(g.gctx);
+        ggml_build_forward_expand(g.gf, cur);
+        g.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend_cpu));
+        // Allocate the compute buffer once; the weight is an external leaf with
+        // its own buffer and is not touched by gallocr.
+        ggml_gallocr_alloc_graph(g.ga, g.gf);
+        it = ctx->dec_matvec_cache.emplace(key, g).first;
+    }
+    auto& g = it->second;
+    ggml_backend_tensor_set(g.inp, input, 0, (size_t)M * K * sizeof(float));
+    ggml_backend_graph_compute(ctx->backend_cpu, g.gf);
+    ggml_backend_tensor_get(g.out, output, 0, (size_t)M * N * sizeof(float));
+}
+
+// Dispatcher: cached path when CRISPASR_FIRERED_MATVEC_CACHE is enabled, else
+// the original per-call sched graph (kept as the reference / A-B fallback).
+static inline void fr_matmat(firered_asr_context* ctx, ggml_tensor* weight_w, ggml_tensor* bias_b, const float* input,
+                             float* output, int M, int K, int N) {
+    const int64_t t0 = ctx->dec_bench ? ggml_time_us() : 0;
+    if (ctx->dec_matvec_cache_on)
+        ggml_matmat_cached(ctx, weight_w, bias_b, input, output, M, K, N);
+    else
+        ggml_matmat(ctx->backend_cpu, ctx->sched, weight_w, bias_b, input, output, M, K, N);
+    if (ctx->dec_bench) {
+        ctx->dec_dispatch_us += (double)(ggml_time_us() - t0);
+        ctx->dec_dispatch_calls++;
+    }
+}
+
+static inline void fr_vecmat(firered_asr_context* ctx, ggml_tensor* weight_w, ggml_tensor* bias_b, const float* input,
+                             float* output, int K, int N) {
+    fr_matmat(ctx, weight_w, bias_b, input, output, 1, K, N);
 }
 
 // Read a small ggml tensor (norm weights/biases, d floats) into F32 buffer.
@@ -2195,12 +2307,9 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
 
                         // Q/K/V via ggml_vecmat — uses Q4_K weights directly, no dequant
                         std::vector<float> Q_sa(d), K_cur(d), V_cur(d);
-                        ggml_vecmat(ctx->backend_cpu, ctx->sched, blk.sattn.w_qs, blk.sattn.w_qs_b, xn.data(),
-                                    Q_sa.data(), d, d);
-                        ggml_vecmat(ctx->backend_cpu, ctx->sched, blk.sattn.w_ks, nullptr, xn.data(), K_cur.data(), d,
-                                    d);
-                        ggml_vecmat(ctx->backend_cpu, ctx->sched, blk.sattn.w_vs, blk.sattn.w_vs_b, xn.data(),
-                                    V_cur.data(), d, d);
+                        fr_vecmat(ctx, blk.sattn.w_qs, blk.sattn.w_qs_b, xn.data(), Q_sa.data(), d, d);
+                        fr_vecmat(ctx, blk.sattn.w_ks, nullptr, xn.data(), K_cur.data(), d, d);
+                        fr_vecmat(ctx, blk.sattn.w_vs, blk.sattn.w_vs_b, xn.data(), V_cur.data(), d, d);
 
                         auto& sa_k_hist = *beam.sa_k[li];
                         auto& sa_v_hist = *beam.sa_v[li];
@@ -2229,8 +2338,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
 
                         // Output projection via ggml
                         std::vector<float> sa_fc(d);
-                        ggml_vecmat(ctx->backend_cpu, ctx->sched, blk.sattn.fc_w, blk.sattn.fc_b, sa_out.data(),
-                                    sa_fc.data(), d, d);
+                        fr_vecmat(ctx, blk.sattn.fc_w, blk.sattn.fc_b, sa_out.data(), sa_fc.data(), d, d);
                         for (int i = 0; i < d; i++)
                             x[i] += sa_fc[i];
                     }
@@ -2240,8 +2348,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
                     cpu_layernorm(x.data(), c.xattn_norm_w.data(), c.xattn_norm_b.data(), xn.data(), 1, d);
 
                     std::vector<float> Qx(d);
-                    ggml_vecmat(ctx->backend_cpu, ctx->sched, blk.xattn.w_qs, blk.xattn.w_qs_b, xn.data(), Qx.data(), d,
-                                d);
+                    fr_vecmat(ctx, blk.xattn.w_qs, blk.xattn.w_qs_b, xn.data(), Qx.data(), d, d);
 
                     std::vector<float> attn_out(d, 0);
                     for (int h = 0; h < nh_dec; h++) {
@@ -2262,21 +2369,19 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
                     }
 
                     std::vector<float> fc_out(d);
-                    ggml_vecmat(ctx->backend_cpu, ctx->sched, blk.xattn.fc_w, blk.xattn.fc_b, attn_out.data(),
-                                fc_out.data(), d, d);
+                    fr_vecmat(ctx, blk.xattn.fc_w, blk.xattn.fc_b, attn_out.data(), fc_out.data(), d, d);
                     for (int i = 0; i < d; i++)
                         x[i] += fc_out[i];
 
                     cpu_layernorm(x.data(), c.mlp_norm_w.data(), c.mlp_norm_b.data(), xn.data(), 1, d);
                     std::vector<float> h_up(c.di);
-                    ggml_vecmat(ctx->backend_cpu, ctx->sched, blk.mlp_w1, blk.mlp_b1, xn.data(), h_up.data(), d, c.di);
+                    fr_vecmat(ctx, blk.mlp_w1, blk.mlp_b1, xn.data(), h_up.data(), d, c.di);
                     for (int i = 0; i < c.di; i++) {
                         float v = h_up[i];
                         h_up[i] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
                     }
                     std::vector<float> mlp_out(d);
-                    ggml_vecmat(ctx->backend_cpu, ctx->sched, blk.mlp_w2, blk.mlp_b2, h_up.data(), mlp_out.data(), c.di,
-                                d);
+                    fr_vecmat(ctx, blk.mlp_w2, blk.mlp_b2, h_up.data(), mlp_out.data(), c.di, d);
                     for (int i = 0; i < d; i++)
                         x[i] += mlp_out[i];
                 }
@@ -2287,7 +2392,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
 
                 // Logit projection via ggml (Q4_K native on CPU)
                 std::vector<float> logits(odim);
-                ggml_vecmat(ctx->backend_cpu, ctx->sched, m.dec.prj_w, nullptr, xn.data(), logits.data(), d, odim);
+                fr_vecmat(ctx, m.dec.prj_w, nullptr, xn.data(), logits.data(), d, odim);
                 t_logit += ggml_time_us() - tl0;
 
                 if (getenv("FIRERED_BENCH") && (step < 3 || step == max_len - 1)) {
@@ -2393,7 +2498,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
             auto proj_batch = [&](ggml_tensor* w, ggml_tensor* b, const std::vector<float>& w_f32,
                                   const std::vector<float>& b_f32, const float* in, float* out, int K, int N) {
                 if (!beam_f32) {
-                    ggml_matmat(ctx->backend_cpu, ctx->sched, w, b, in, out, n_active, K, N);
+                    fr_matmat(ctx, w, b, in, out, n_active, K, N);
                     return;
                 }
                 cpu_matmul_bt(in, w_f32.data(), out, n_active, K, N);
@@ -2580,6 +2685,13 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
             }
             beams = std::move(new_beams);
         } // end step loop
+
+        if (ctx->dec_bench && ctx->dec_dispatch_calls > 0) {
+            fprintf(stderr, "firered: decoder matvec dispatch: %.1f ms over %ld calls (%.3f ms/call) [cache %s]\n",
+                    ctx->dec_dispatch_us / 1e3, ctx->dec_dispatch_calls,
+                    ctx->dec_dispatch_us / 1e3 / (double)ctx->dec_dispatch_calls,
+                    ctx->dec_matvec_cache_on ? "ON" : "OFF");
+        }
 
         if (dec_proj_ctx)
             ggml_free(dec_proj_ctx);

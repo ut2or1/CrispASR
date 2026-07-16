@@ -215,6 +215,11 @@ struct nemotron_model {
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
 
+    // Q8_0 repack of the F16 conv pw1/pw2 weights (issue #81, CRISPASR_FC_PW_Q8).
+    // Note: no fuse_qkv here — nemotron's streaming block builder reads the
+    // per-tensor attn weights directly, never core_conformer::build_block.
+    core_conformer::PwRepackBuf pw_q8;
+
     std::map<std::string, ggml_tensor*> tensors;
 };
 
@@ -2385,6 +2390,17 @@ extern "C" struct nemotron_context* nemotron_init_from_file(const char* path_mod
         return nullptr;
     }
 
+    // Repack F16 conv pw1/pw2 to Q8_0 (issue #81 — the 3D conv layout dodges
+    // crispasr-quantize, and the CPU F16 mul_mat path is ~6x slower than Q8_0).
+    {
+        auto& m = ctx->model;
+        std::vector<core_conformer::BlockWeights*> layers;
+        for (auto& e : m.enc)
+            layers.push_back(&e);
+        const bool quantized = !m.enc.empty() && m.enc[0].attn_q_w && ggml_is_quantized(m.enc[0].attn_q_w->type);
+        core_conformer::repack_conv_pw_q8(layers, ctx->backend, quantized, m.pw_q8, "nemotron");
+    }
+
     // CRISPASR_NEMOTRON_CONTEXT_PRESET=N selects attention context preset
     // 0: L=56, R=3  (streaming, chunk=4)
     // 1: L=56, R=0  (left-only)
@@ -2408,6 +2424,7 @@ extern "C" void nemotron_free(struct nemotron_context* ctx) {
 
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    ctx->model.pw_q8.free();
     if (ctx->model.buf)
         ggml_backend_buffer_free(ctx->model.buf);
     if (ctx->model.ctx)

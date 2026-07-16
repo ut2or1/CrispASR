@@ -59,8 +59,17 @@ else()
     set(WASM_THREAD_FLAGS "-s USE_PTHREADS=1 -s PTHREAD_POOL_SIZE=0 -s INITIAL_MEMORY=2GB")
 endif()
 
+# C2PA (opt-in) needs native wasm exceptions at LINK time too — but only when
+# enabled, since the module is compiled with -fwasm-exceptions only then (a
+# mismatch between compile and link EH modes would break the default build).
+set(WASM_C2PA_LINK_FLAGS "")
+if (CRISPASR_C2PA_ENABLED)
+    set(WASM_C2PA_LINK_FLAGS "-fwasm-exceptions -s SUPPORT_LONGJMP=wasm")
+endif()
+
 set_target_properties(${TARGET} PROPERTIES LINK_FLAGS " \
     --bind \
+    ${WASM_C2PA_LINK_FLAGS} \
     -s MODULARIZE=1 \
     -s EXPORT_NAME=\"'whisper_factory'\" \
     -s FORCE_FILESYSTEM=1 \

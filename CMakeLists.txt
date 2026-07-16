@@ -31,6 +31,10 @@ endif()
 # Add path to modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 
+# C2PA (Content Credentials) enablement — defines crispasr_enable_c2pa(<target>),
+# called for both the core lib (src/) and the CLI (examples/cli/).
+include(CrispasrC2pa)
+
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
@@ -102,6 +106,15 @@ option(CRISPASR_USE_SYSTEM_GGML "crispasr: use system-installed GGML library" OF
 option(CRISPASR_SANITIZE_THREAD    "crispasr: enable thread sanitizer"    OFF)
 option(CRISPASR_SANITIZE_ADDRESS   "crispasr: enable address sanitizer"   OFF)
 option(CRISPASR_SANITIZE_UNDEFINED "crispasr: enable undefined sanitizer" OFF)
+
+# libFuzzer harnesses (clang only). Combine with -DCRISPASR_SANITIZE_ADDRESS=ON
+# for OOB detection. `-fsanitize=fuzzer-no-link` instruments every TU compiled
+# after this for coverage; each harness target adds `-fsanitize=fuzzer` for the
+# libFuzzer driver. See tests/fuzz/.
+option(CRISPASR_FUZZ "crispasr: build libFuzzer harnesses (clang only)" OFF)
+if (CRISPASR_FUZZ)
+    add_compile_options(-fsanitize=fuzzer-no-link)
+endif()
 
 # extra artifacts
 option(CRISPASR_BUILD_TESTS    "crispasr: build tests"          ${CRISPASR_STANDALONE})

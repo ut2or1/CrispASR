@@ -783,6 +783,14 @@ static struct ggml_cgraph* cohere_build_graph_encoder(struct cohere_context* ctx
         ggml_build_forward_expand(gf, enc_final_dbg);
     }
 
+    // DEBUG: full-T pre-projection encoder output (analog of transcribe.cpp's
+    // enc.final [T,1280]). ggml_cont forces a fresh buffer so the preceding
+    // in-place norm ops can't be overwritten by downstream buffer reuse.
+    struct ggml_tensor* enc_final_dbg = ggml_cont(ctx0, cur);
+    ggml_set_name(enc_final_dbg, "enc_final_preproj");
+    ggml_set_output(enc_final_dbg);
+    ggml_build_forward_expand(gf, enc_final_dbg);
+
     // Encoder-decoder projection
     cur = ggml_add(ctx0, ggml_mul_mat(ctx0, model.enc_proj_w, cur), model.enc_proj_b);
     ggml_set_name(cur, "enc_out");
@@ -1491,11 +1499,12 @@ static std::vector<float> cohere_compute_features(const cohere_hparams& hp, cons
     p.layout = core_mel::Layout::TimeMels;
     p.log_eps = (float)(1.0 / (1 << 24));
     p.center_pad = true;
-    // NeMo FilterbankFeatures returns feat_len = floor(n_samples/hop)+1 (the
-    // centered first frame adds one). Dropping the last frame flips T_enc down
-    // by one whenever floor(n/hop) is a multiple of the 8x subsampling (e.g. an
-    // 11s clip -> 138 vs the reference's 139), which desyncs cross-attention.
-    // Verified against the transformers reference mel (128, 1105) for 11.04s.
+    // NeMo FilterbankFeatures returns feat_len = floor(n_samples/hop) + 1 (the
+    // centered first frame adds one). Dropping the last frame made T_mel one
+    // short, which flips T_enc down by one whenever floor(n/hop) is a multiple
+    // of the 8x subsampling (e.g. an 11 s clip -> 138 vs the reference's 139).
+    // Verified against the transformers reference mel (128, 1105) for an
+    // 11.04 s clip.
     p.drop_last_frame = false;
 
     auto mel =
@@ -2328,6 +2337,17 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
                 return nullptr;
             }
             ggml_backend_tensor_set(mel_t, mel_c.data(), 0, mel_c.size() * sizeof(float));
+            if (const char* mp = std::getenv("CRISPASR_COHERE_DUMP_MEL")) {
+                FILE* mf = std::fopen(mp, "wb");
+                if (mf) {
+                    int32_t nm = hp.n_mels, tm = T_mel_c; // mel_c layout: [n_mels, T] (n_mels contiguous)
+                    std::fwrite(&nm, 4, 1, mf);
+                    std::fwrite(&tm, 4, 1, mf);
+                    std::fwrite(mel_c.data(), sizeof(float), mel_c.size(), mf);
+                    std::fclose(mf);
+                    fprintf(stderr, "cohere: dumped mel [n_mels=%d, T=%d] to %s\n", nm, tm, mp);
+                }
+            }
 
             int H1c = (T_mel_c + 2 - 3) / 2 + 1;
             int H2c = (H1c + 2 - 3) / 2 + 1;
@@ -2411,6 +2431,59 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
             int T_enc_c = enc_out_t->ne[1];
             T_enc_total += T_enc_c;
             T_enc_chunks.push_back(T_enc_c);
+
+            // Debug: dump mel + pre-proj encoder output as raw [ne0,ne1] f32
+            // (2 int32 header dims + data) to compare against transcribe.cpp's
+            // enc.mel.in / enc.final dumps. CRISPASR_COHERE_DUMP_STAGES=dir.
+            if (const char* sd = std::getenv("CRISPASR_COHERE_DUMP_STAGES")) {
+                auto dump_named = [&](const char* tname, const char* fname) {
+                    struct ggml_tensor* t = ggml_graph_get_tensor(gf_enc, tname);
+                    if (!t)
+                        return;
+                    std::vector<float> v((size_t)t->ne[0] * t->ne[1]);
+                    ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
+                    char path[1024];
+                    std::snprintf(path, sizeof(path), "%s/%s", sd, fname);
+                    if (FILE* f = std::fopen(path, "wb")) {
+                        int32_t d0 = (int32_t)t->ne[0], d1 = (int32_t)t->ne[1];
+                        std::fwrite(&d0, 4, 1, f);
+                        std::fwrite(&d1, 4, 1, f);
+                        std::fwrite(v.data(), sizeof(float), v.size(), f);
+                        std::fclose(f);
+                        fprintf(stderr, "cohere: dumped %s [%d,%d] -> %s\n", tname, d0, d1, path);
+                    }
+                };
+                // mel_c is host-side [n_mels, T_mel] (ggml col-major).
+                char mpath[1024];
+                std::snprintf(mpath, sizeof(mpath), "%s/crisp.mel.bin", sd);
+                if (FILE* f = std::fopen(mpath, "wb")) {
+                    int32_t d0 = (int32_t)hp.n_mels, d1 = (int32_t)T_mel_c;
+                    std::fwrite(&d0, 4, 1, f);
+                    std::fwrite(&d1, 4, 1, f);
+                    std::fwrite(mel_c.data(), sizeof(float), mel_c.size(), f);
+                    std::fclose(f);
+                    fprintf(stderr, "cohere: dumped mel [%d,%d] -> %s\n", d0, d1, mpath);
+                }
+                dump_named("enc_final_preproj", "crisp.enc_final.bin");
+                dump_named("enc_block_0", "crisp.block0.bin");
+                dump_named("enc_block_23", "crisp.block23.bin");
+            }
+
+            // Debug: dump post-enc_proj encoder output to compare against the
+            // reference cross-attention context (CRISPASR_COHERE_DUMP_ENCOUT=path).
+            if (const char* dp = std::getenv("CRISPASR_COHERE_DUMP_ENCOUT")) {
+                std::vector<float> eo((size_t)enc_out_t->ne[0] * enc_out_t->ne[1]);
+                ggml_backend_tensor_get(enc_out_t, eo.data(), 0, eo.size() * sizeof(float));
+                FILE* f = std::fopen(dp, "wb");
+                if (f) {
+                    int32_t d0 = (int32_t)enc_out_t->ne[0], d1 = (int32_t)enc_out_t->ne[1];
+                    std::fwrite(&d0, 4, 1, f);
+                    std::fwrite(&d1, 4, 1, f);
+                    std::fwrite(eo.data(), sizeof(float), eo.size(), f);
+                    std::fclose(f);
+                    fprintf(stderr, "cohere: dumped enc_out [%d, %d] to %s\n", d0, d1, dp);
+                }
+            }
 
             // Extract cross-KV from this chunk's encoder graph into CPU vectors.
             // K shape: [head_dim, T_enc_c, n_heads] (raw F32 from encoder graph)

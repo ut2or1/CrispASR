@@ -21,6 +21,7 @@
 #include "crispasr_chunk_context_gate.h"
 
 using crispasr_chunk_context::backend_allows_chunk_context;
+using crispasr_chunk_context::backend_self_chunks_on_explicit;
 using crispasr_chunk_context::should_use_chunk_context;
 
 TEST_CASE("issue #114: VAD-derived multi-slice run does NOT extend with context", "[unit][chunk-context][issue-114]") {
@@ -49,6 +50,31 @@ TEST_CASE("explicit --chunk-seconds with multiple non-VAD slices uses overlap-sa
 
 TEST_CASE("backend can opt out of external overlap-save context", "[unit][chunk-context][cohere]") {
     REQUIRE_FALSE(should_use_chunk_context(30, 6, 3.0f, false, false));
+}
+
+// Issue #257: routing of an explicit --chunk-seconds for internally-chunking
+// backends (parakeet / canary FastConformer) — bypass dispatcher slicing.
+TEST_CASE("issue #257: CAP_INTERNAL_CHUNKING backend + explicit --chunk-seconds self-chunks",
+          "[unit][chunk-context][issue-257]") {
+    // parakeet (has internal chunking), user passed --chunk-seconds 7 → dispatcher
+    // must NOT slice; hand the whole clip to the backend.
+    REQUIRE(backend_self_chunks_on_explicit(/*has_internal_chunking=*/true, /*explicit=*/true, /*chunk_seconds=*/7));
+}
+
+TEST_CASE("issue #257: non-internal-chunking backend keeps dispatcher chunking", "[unit][chunk-context][issue-257]") {
+    // cohere / granite lack CAP_INTERNAL_CHUNKING → dispatcher chunking is correct
+    // for them (the reporter saw no issue there).
+    REQUIRE_FALSE(backend_self_chunks_on_explicit(/*has_internal_chunking=*/false, /*explicit=*/true, 7));
+}
+
+TEST_CASE("issue #257: internal-chunking backend without explicit --chunk-seconds uses full-audio path",
+          "[unit][chunk-context][issue-257]") {
+    // No explicit --chunk-seconds → the CAP_UNBOUNDED_INPUT full-audio / library
+    // streaming default already applies; not a forced self-chunk decision.
+    REQUIRE_FALSE(backend_self_chunks_on_explicit(/*has_internal_chunking=*/true, /*explicit=*/false, 0));
+    // Explicit but chunk_seconds == 0 (== "library-internal streaming") is also not
+    // a fixed-size self-chunk request.
+    REQUIRE_FALSE(backend_self_chunks_on_explicit(/*has_internal_chunking=*/true, /*explicit=*/true, 0));
 }
 
 TEST_CASE("backend_allows_chunk_context: known offenders opt out, others do not",

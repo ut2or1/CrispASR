@@ -13,6 +13,7 @@
 //              8198 = 8192 vocab + 1 blank + 5 TDT durations {0,1,2,3,4}
 
 #include "parakeet.h"
+#include "parakeet_ja_detect.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -208,6 +209,15 @@ struct parakeet_model {
 
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
+
+    // F32 conv_dw_w copies (created during BN fold, avoids per-forward F16→F32 cast)
+    ggml_context* ctx_f32 = nullptr;
+    ggml_backend_buffer_t buf_f32 = nullptr;
+
+    // Q8_0 repack of the F16 conv pw1/pw2 weights (issue #81, CRISPASR_FC_PW_Q8)
+    core_conformer::PwRepackBuf pw_q8;
+    // Fused Q/K/V weight concat (issue #81, CRISPASR_FC_FUSED_QKV)
+    core_conformer::PwRepackBuf qkv_fused;
 
     std::map<std::string, ggml_tensor*> tensors;
 };
@@ -516,7 +526,12 @@ static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, co
     // a fixed-point repetition loop) — while CTC decode over the same
     // quantised encoder is clean, and q8_0 TDT is byte-identical to F16.
     // Warn so q4_k users don't ship garbage silently.
-    if (model.hparams.vocab_size <= 4096 && j.out_w && ggml_is_quantized(j.out_w->type) &&
+    //
+    // Issue #257: gate on vocab CONTENT (kana/kanji fraction), not vocab_size
+    // <= 4096 — small-vocab ENGLISH models (parakeet-tdt-1.1b, vocab 1024) are
+    // NOT JA and decode cleanly at q4_k, so the size heuristic mis-warned them
+    // that their (correct) output was garbage.
+    if (crispasr_parakeet::vocab_looks_japanese(vocab.id_to_token) && j.out_w && ggml_is_quantized(j.out_w->type) &&
         j.out_w->type != GGML_TYPE_Q8_0) {
         fprintf(stderr,
                 "parakeet: WARNING: JA model with %s weights — TDT decode degrades to repetition "
@@ -696,12 +711,17 @@ static void parakeet_apply_znorm(float* mel, int T, int n_mels, const double* ba
 // the BN block entirely.
 // ===========================================================================
 
-static void parakeet_fold_batchnorm(parakeet_model& model) {
+static void parakeet_fold_batchnorm(parakeet_model& model, ggml_backend_t backend) {
     const int d = (int)model.hparams.d_model;
     const int K = (int)model.hparams.conv_kernel;
     const float eps = 1e-5f;
+    const uint32_t n_layers = model.hparams.n_layers;
 
-    for (uint32_t il = 0; il < model.hparams.n_layers; il++) {
+    // Collect folded F32 weights for F32 pre-cast allocation.
+    std::vector<std::vector<float>> all_w_f32(n_layers);
+    int n_f16_layers = 0;
+
+    for (uint32_t il = 0; il < n_layers; il++) {
         auto& e = model.enc[il];
         if (!e.conv_dw_w || !e.conv_dw_b || !e.conv_bn_w || !e.conv_bn_b || !e.conv_bn_rm || !e.conv_bn_rv) {
             fprintf(stderr, "parakeet: BN fold: missing tensor on layer %u\n", il);
@@ -739,11 +759,13 @@ static void parakeet_fold_batchnorm(parakeet_model& model) {
                 std::vector<ggml_fp16_t> tmp(n);
                 ggml_fp32_to_fp16_row(w_f32.data(), tmp.data(), (int)n);
                 ggml_backend_tensor_set(e.conv_dw_w, tmp.data(), 0, n * sizeof(ggml_fp16_t));
+                // Save F32 for pre-cast
+                all_w_f32[il] = std::move(w_f32);
+                n_f16_layers++;
             }
         }
 
         // Fold into conv_dw_b: b[c] = (existing_b[c] - mean[c]) * s[c] + bn_b[c]
-        // Read existing bias (may be non-zero for models with explicit dw bias)
         std::vector<float> dw_b(d, 0.0f);
         ggml_backend_tensor_get(e.conv_dw_b, dw_b.data(), 0, d * sizeof(float));
         for (int c = 0; c < d; c++)
@@ -751,7 +773,26 @@ static void parakeet_fold_batchnorm(parakeet_model& model) {
         ggml_backend_tensor_set(e.conv_dw_b, dw_b.data(), 0, d * sizeof(float));
     }
 
-    fprintf(stderr, "parakeet: BN folded into conv_dw weights for %u layers\n", model.hparams.n_layers);
+    // Allocate F32 copies of F16 conv_dw_w so build_block skips the per-forward cast.
+    if (n_f16_layers > 0) {
+        ggml_init_params ip = {(size_t)n_f16_layers * ggml_tensor_overhead(), nullptr, true};
+        model.ctx_f32 = ggml_init(ip);
+        for (uint32_t il = 0; il < n_layers; il++) {
+            if (all_w_f32[il].empty())
+                continue;
+            auto& e = model.enc[il];
+            e.conv_dw_w_f32 = ggml_new_tensor_1d(model.ctx_f32, GGML_TYPE_F32, (int64_t)K * d);
+        }
+        model.buf_f32 = ggml_backend_alloc_ctx_tensors(model.ctx_f32, backend);
+        for (uint32_t il = 0; il < n_layers; il++) {
+            if (all_w_f32[il].empty())
+                continue;
+            auto& e = model.enc[il];
+            ggml_backend_tensor_set(e.conv_dw_w_f32, all_w_f32[il].data(), 0, all_w_f32[il].size() * sizeof(float));
+        }
+    }
+
+    fprintf(stderr, "parakeet: BN folded into conv_dw weights for %u layers\n", n_layers);
 }
 
 // ===========================================================================
@@ -804,9 +845,23 @@ static ggml_cgraph* parakeet_build_graph_encoder(parakeet_context* ctx, int T_me
 
     // ----- Local attention mask (rel_pos_local_attn models) -----
     ggml_tensor* local_mask = nullptr;
+    ggml_tensor* window_band_mask = nullptr;
     const bool use_local_attn =
         hp.att_context_left >= 0 && hp.att_context_right >= 0 && T > hp.att_context_left + hp.att_context_right + 1;
-    if (use_local_attn) {
+    // TRUE windowed attention: build the O(T·window) band mask instead of the T×T
+    // full mask when the gate is on and the clip is long enough to benefit.
+    const bool use_windowed_attn =
+        core_conformer::fc_windowed_attn() &&
+        core_conformer::fc_window_attn_applicable(T, hp.att_context_left, hp.att_context_right);
+    if (getenv("CRISPASR_FC_MEM_DEBUG"))
+        fprintf(stderr, "[fc-encode] T=%d windowed=%d local=%d\n", T, (int)use_windowed_attn, (int)use_local_attn);
+    if (use_windowed_attn) {
+        const int BS = core_conformer::fc_window_block_size(hp.att_context_left, hp.att_context_right);
+        const int NB = (T + BS - 1) / BS;
+        window_band_mask = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 3 * BS, BS, NB);
+        ggml_set_name(window_band_mask, "window_band_mask");
+        ggml_set_input(window_band_mask);
+    } else if (use_local_attn) {
         local_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T, T);
         ggml_set_name(local_mask, "local_attn_mask");
         ggml_set_input(local_mask);
@@ -817,8 +872,9 @@ static ggml_cgraph* parakeet_build_graph_encoder(parakeet_context* ctx, int T_me
         (int)hp.d_model, (int)hp.n_heads,     (int)hp.head_dim,     (int)hp.conv_kernel,
         kLayerNormEps,   hp.att_context_left, hp.att_context_right, (int)hp.global_tokens,
     };
+    bp.manual_attn = core_conformer::fc_gpu_manual_attn(ctx->backend);
     for (uint32_t il = 0; il < hp.n_layers; il++) {
-        cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp, local_mask);
+        cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp, local_mask, nullptr, window_band_mask);
     }
 
     ggml_set_name(cur, "enc_out");
@@ -922,6 +978,16 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
         auto lm = core_conformer::make_local_attn_mask(T_enc, hp.att_context_left, hp.att_context_right,
                                                        (int)hp.global_tokens);
         ggml_backend_tensor_set(local_mask_in, lm.data(), 0, lm.size() * sizeof(float));
+    }
+
+    // Windowed-attention band mask (when present in the graph).
+    ggml_tensor* band_mask_in = ggml_graph_get_tensor(gf, "window_band_mask");
+    if (band_mask_in) {
+        const auto& hp = ctx->model.hparams;
+        const int BS = core_conformer::fc_window_block_size(hp.att_context_left, hp.att_context_right);
+        auto bm = core_conformer::make_window_band_mask(T_enc, hp.att_context_left, hp.att_context_right,
+                                                        (int)hp.global_tokens, BS);
+        ggml_backend_tensor_set(band_mask_in, bm.data(), 0, bm.size() * sizeof(float));
     }
 
     // Compute
@@ -2817,7 +2883,19 @@ extern "C" struct parakeet_context* parakeet_init_from_file(const char* path_mod
         return nullptr;
     }
 
-    parakeet_fold_batchnorm(ctx->model);
+    parakeet_fold_batchnorm(ctx->model, ctx->backend);
+
+    // Repack F16 conv pw1/pw2 to Q8_0 (issue #81 — the 3D conv layout dodges
+    // crispasr-quantize, and the CPU F16 mul_mat path is ~6x slower than Q8_0).
+    {
+        auto& m = ctx->model;
+        std::vector<core_conformer::BlockWeights*> layers;
+        for (auto& e : m.enc)
+            layers.push_back(&e);
+        const bool quantized = !m.enc.empty() && m.enc[0].attn_q_w && ggml_is_quantized(m.enc[0].attn_q_w->type);
+        core_conformer::repack_conv_pw_q8(layers, ctx->backend, quantized, m.pw_q8, "parakeet");
+        core_conformer::fuse_qkv(layers, ctx->backend, m.qkv_fused, "parakeet");
+    }
 
     // Hybrid TDT+CTC models with a single-LSTM predictor (parakeet-tdt_ctc-110m
     // has pred_layers=1) can only decode via the CTC head — TDT decode requires
@@ -2834,6 +2912,12 @@ extern "C" void parakeet_free(struct parakeet_context* ctx) {
         return;
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    ctx->model.pw_q8.free();
+    ctx->model.qkv_fused.free();
+    if (ctx->model.buf_f32)
+        ggml_backend_buffer_free(ctx->model.buf_f32);
+    if (ctx->model.ctx_f32)
+        ggml_free(ctx->model.ctx_f32);
     if (ctx->model.buf)
         ggml_backend_buffer_free(ctx->model.buf);
     if (ctx->model.ctx)
@@ -2884,6 +2968,20 @@ extern "C" void parakeet_set_ctc_mode(struct parakeet_context* ctx, bool ctc) {
 
 extern "C" bool parakeet_has_ctc(struct parakeet_context* ctx) {
     return ctx && ctx->model.has_ctc;
+}
+
+// Issue #257: switch the FastConformer encoder to local (windowed) attention at
+// inference time — the equivalent of NeMo's
+// `model.change_attention_model("rel_pos_local_attn", [left, right])`. Bounds
+// encoder self-attention memory to O(T·window) instead of O(T²), for long audio
+// on limited VRAM. Units are encoder frames (1 frame = frame_dur_cs, ~80 ms).
+// left/right < 0 restores full (global) attention. Takes effect on the next
+// transcribe (the mask is rebuilt per encode).
+extern "C" void parakeet_set_att_context(struct parakeet_context* ctx, int left, int right) {
+    if (!ctx)
+        return;
+    ctx->model.hparams.att_context_left = left;
+    ctx->model.hparams.att_context_right = right;
 }
 
 extern "C" void parakeet_set_hotwords(struct parakeet_context* ctx, const char** hotwords, int n_hotwords,
@@ -3256,6 +3354,19 @@ extern "C" void parakeet_result_free(struct parakeet_result* r) {
 extern "C" int parakeet_n_vocab(struct parakeet_context* ctx) {
     return (int)ctx->model.hparams.vocab_size;
 }
+
+// Issue #257: is this a Japanese-only model? Detect by vocab CONTENT, not size.
+// The old `vocab_size <= 4096` heuristic misclassified small-vocab ENGLISH models
+// (e.g. parakeet-tdt-1.1b, vocab ~1024) as Japanese, forcing them onto the JA
+// small-chunk path. JA-only parakeet vocabs are ~97% kana/kanji; multilingual v3
+// (vocab 8192) and English models are ~0%. Returns 1 iff >50% of non-empty tokens
+// contain a Japanese script character (hiragana/katakana U+3040–30FF, CJK
+// ideographs U+4E00–9FFF / ext-A U+3400–4DBF).
+extern "C" int parakeet_vocab_is_japanese(struct parakeet_context* ctx) {
+    if (!ctx)
+        return 0;
+    return crispasr_parakeet::vocab_looks_japanese(ctx->vocab.id_to_token) ? 1 : 0;
+}
 extern "C" int parakeet_blank_id(struct parakeet_context* ctx) {
     return (int)ctx->model.hparams.blank_id;
 }
@@ -3267,6 +3378,21 @@ extern "C" int parakeet_n_mels(struct parakeet_context* ctx) {
 }
 extern "C" int parakeet_sample_rate(struct parakeet_context* ctx) {
     return (int)ctx->model.hparams.sample_rate;
+}
+extern "C" int parakeet_n_heads(struct parakeet_context* ctx) {
+    return ctx ? (int)ctx->model.hparams.n_heads : 0;
+}
+// Approximate encoder-frame count for `n_samples` (mel frames / subsampling).
+// Used by the Phase 2 memory policy to estimate the single-pass O(T^2) rel-pos
+// bias before allocating it — not exact (ignores conv edge arithmetic), which
+// is fine for a conservative memory gate.
+extern "C" int parakeet_est_enc_frames(struct parakeet_context* ctx, int n_samples) {
+    if (!ctx || n_samples <= 0)
+        return 0;
+    const auto& hp = ctx->model.hparams;
+    const int hop = (int)hp.hop_length > 0 ? (int)hp.hop_length : 160;
+    const int sub = (int)hp.subsampling_factor > 0 ? (int)hp.subsampling_factor : 8;
+    return (n_samples / hop) / sub;
 }
 
 extern "C" const char* parakeet_token_to_str(struct parakeet_context* ctx, int id) {
@@ -3322,6 +3448,142 @@ extern "C" float* parakeet_encode(struct parakeet_context* ctx, const float* sam
     return out;
 }
 
+// Group r->tokens into r->words (issue #257). Shared by parakeet_transcribe_ex
+// (single-pass) and parakeet_decode_frames (streamed / chunked) so every path
+// emits a word list — previously decode_frames left r->words null and the CLI
+// adapter only *copies* r->words, so streamed/chunked output had no words.
+static void parakeet_group_words(parakeet_result* r, int frame_dur_cs) {
+    // ----- Group sub-word tokens into words -----
+    //
+    // Latin SentencePiece convention: a token starting with U+2581 (▁ → ' ')
+    // begins a new word. Punctuation tokens attach to the previous word.
+    //
+    // Japanese parakeet (and other no-space tokenizers) emit no leading-space
+    // markers because written Japanese has no inter-word spaces. In that
+    // mode every non-punctuation token is its own "word" — sufficient
+    // granularity for word-level SRT (issue #37).
+    std::vector<parakeet_word_data> words;
+    words.reserve(r->n_tokens);
+
+    // Detect tokenizer style: count tokens that look like real
+    // word-starts (leading space + at least one more char). A
+    // standalone " " token (BOS-ish) doesn't count.
+    int n_space_word_starts = 0;
+    for (int i = 0; i < r->n_tokens; i++) {
+        const char* t = r->tokens[i].text;
+        if (t[0] == ' ' && t[1] != '\0')
+            n_space_word_starts++;
+    }
+    const bool space_prefix_style = (n_space_word_starts >= 2);
+
+    auto is_punct_only = [](const char* s) {
+        if (!s || !*s)
+            return false;
+        const unsigned char* p = (const unsigned char*)s;
+        while (*p) {
+            unsigned char c = *p;
+            if (c < 0x80) {
+                if (!(c == '.' || c == ',' || c == '?' || c == '!' || c == ';' || c == ':' || c == '\'' || c == '"' ||
+                      c == '(' || c == ')' || c == '-'))
+                    return false;
+                p++;
+            } else if (c == 0xE3 && p[1] == 0x80 && p[2] >= 0x80 && p[2] <= 0xBF) {
+                p += 3; // U+3000–U+303F CJK Symbols and Punctuation
+            } else if (c == 0xE3 && p[1] == 0x83 && p[2] == 0xBB) {
+                p += 3; // U+30FB ・
+            } else if (c == 0xEF && p[1] == 0xBC && ((p[2] >= 0x81 && p[2] <= 0x8F) || p[2] == 0x9F)) {
+                p += 3; // U+FF01–U+FF0F, U+FF1F
+            } else {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto ends_with_sentence_punct = [](const char* s) {
+        size_t len = s ? strlen(s) : 0;
+        if (len == 0)
+            return false;
+        unsigned char last = (unsigned char)s[len - 1];
+        if (last == '.' || last == '!' || last == '?')
+            return true;
+        if (len >= 3) {
+            const unsigned char* tail = (const unsigned char*)(s + len - 3);
+            if (tail[0] == 0xE3 && tail[1] == 0x80 && tail[2] == 0x82)
+                return true;
+            if (tail[0] == 0xEF && tail[1] == 0xBC && (tail[2] == 0x81 || tail[2] == 0x9F))
+                return true;
+        }
+        return false;
+    };
+
+    parakeet_word_data cur = {};
+    bool have_cur = false;
+    float cur_p_sum = 0.0f;
+    int cur_p_cnt = 0;
+
+    auto flush_cur = [&]() {
+        if (cur_p_cnt > 0)
+            cur.p = cur_p_sum / (float)cur_p_cnt;
+        words.push_back(cur);
+    };
+
+    for (int i = 0; i < r->n_tokens; i++) {
+        const auto& td = r->tokens[i];
+        if (!td.text[0])
+            continue;
+        if (td.text[0] == ' ' && td.text[1] == '\0')
+            continue; // standalone space / BOS marker
+
+        const bool has_leading_space = (td.text[0] == ' ');
+        const bool is_punct = is_punct_only(td.text);
+        const bool is_new_word = !is_punct && (has_leading_space || !space_prefix_style);
+
+        if (is_new_word && have_cur) {
+            flush_cur();
+            cur = {};
+            cur_p_sum = 0.0f;
+            cur_p_cnt = 0;
+            have_cur = false;
+        }
+
+        if (!have_cur) {
+            cur.t0 = td.t0;
+            have_cur = true;
+        }
+        cur.t1 = td.t1;
+        cur_p_sum += td.p;
+        cur_p_cnt += 1;
+
+        const char* src = td.text + (has_leading_space ? 1 : 0);
+        size_t cur_len = strlen(cur.text);
+        size_t cap = sizeof(cur.text) - cur_len - 1;
+        size_t add = strlen(src);
+        if (add > cap)
+            add = cap;
+        memcpy(cur.text + cur_len, src, add);
+        cur.text[cur_len + add] = '\0';
+    }
+    if (have_cur)
+        flush_cur();
+
+    // Insert minimum gaps after sentence-ending punctuation (subtitle spacing).
+    for (size_t wi = 0; wi + 1 < words.size(); wi++) {
+        if (!ends_with_sentence_punct(words[wi].text))
+            continue;
+        if (words[wi].t1 >= words[wi + 1].t0 && words[wi].t1 > words[wi].t0) {
+            int64_t shrunk = words[wi].t1 - frame_dur_cs;
+            if (shrunk > words[wi].t0)
+                words[wi].t1 = shrunk;
+        }
+    }
+
+    r->n_words = (int)words.size();
+    r->words = (parakeet_word_data*)calloc(r->n_words > 0 ? r->n_words : 1, sizeof(parakeet_word_data));
+    for (int i = 0; i < r->n_words; i++)
+        r->words[i] = words[i];
+}
+
 extern "C" struct parakeet_result* parakeet_decode_frames(struct parakeet_context* ctx, const float* enc_frames,
                                                           int T_enc, int d_model, int64_t t_offset_cs) {
     if (!ctx || !enc_frames || T_enc <= 0)
@@ -3369,13 +3631,9 @@ extern "C" struct parakeet_result* parakeet_decode_frames(struct parakeet_contex
         text = text.substr(1);
     r->text = strdup(text.c_str());
 
-    // Word grouping — reuse the logic from parakeet_transcribe_ex.
-    // (Simplified: delegate to the existing result builder by calling
-    // parakeet_transcribe_ex's word-grouping code. For now, skip word
-    // grouping in the split path — the backend adapter builds words
-    // from tokens anyway.)
-    r->words = nullptr;
-    r->n_words = 0;
+    // Word grouping (issue #257): the streamed / chunked paths funnel through
+    // here, so build words too — otherwise those paths emit none.
+    parakeet_group_words(r, frame_dur_cs);
 
     return r;
 }
@@ -3468,7 +3726,7 @@ extern "C" struct parakeet_result* parakeet_transcribe_chunked(struct parakeet_c
         // vocab < 4000 ⇒ JA-only model (small chunks work best), else
         // multilingual / v3 (needs ~30 s of context for the Conformer
         // encoder to produce in-distribution features).
-        chunk_seconds = (ctx->model.hparams.vocab_size < 4000) ? 8 : 30;
+        chunk_seconds = parakeet_vocab_is_japanese(ctx) ? 8 : 30; // #257: content, not vocab size
     }
     if (overlap_seconds < 0)
         overlap_seconds = 2;
@@ -3588,7 +3846,7 @@ extern "C" struct parakeet_result* parakeet_transcribe_streamed(struct parakeet_
         // multilingual / v3 / etc. variants (vocab >= 4096) via vocab_size.
         // The override env var CRISPASR_PARAKEET_STREAM_CHUNK is honoured
         // upstream of this default.
-        chunk_seconds = (ctx->model.hparams.vocab_size < 4000) ? 8 : 30;
+        chunk_seconds = parakeet_vocab_is_japanese(ctx) ? 8 : 30; // #257: content, not vocab size
     }
     if (overlap_seconds < 0)
         overlap_seconds = 2;
@@ -3758,162 +4016,7 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
         text = text.substr(1);
     r->text = strdup(text.c_str());
 
-    // ----- Group sub-word tokens into words -----
-    //
-    // Latin SentencePiece convention: a token starting with U+2581 (▁ → ' ')
-    // begins a new word. Punctuation tokens attach to the previous word.
-    //
-    // Japanese parakeet (and other no-space tokenizers) emit no leading-space
-    // markers because written Japanese has no inter-word spaces. In that
-    // mode every non-punctuation token is its own "word" — sufficient
-    // granularity for word-level SRT (issue #37).
-    {
-        std::vector<parakeet_word_data> words;
-        words.reserve(r->n_tokens);
-
-        // Detect tokenizer style: count tokens that look like real
-        // word-starts (leading space + at least one more char). A
-        // standalone " " token (BOS-ish) doesn't count.
-        int n_space_word_starts = 0;
-        for (int i = 0; i < r->n_tokens; i++) {
-            const char* t = r->tokens[i].text;
-            if (t[0] == ' ' && t[1] != '\0')
-                n_space_word_starts++;
-        }
-        const bool space_prefix_style = (n_space_word_starts >= 2);
-
-        // Pure-punctuation detector. Recognises ASCII punct plus the
-        // common CJK punctuation (。、？！「」『』・,) so JA tokens
-        // like "、" attach to the previous word instead of forming their
-        // own subtitle entry.
-        auto is_punct_only = [](const char* s) {
-            if (!s || !*s)
-                return false;
-            const unsigned char* p = (const unsigned char*)s;
-            while (*p) {
-                unsigned char c = *p;
-                if (c < 0x80) {
-                    if (!(c == '.' || c == ',' || c == '?' || c == '!' || c == ';' || c == ':' || c == '\'' ||
-                          c == '"' || c == '(' || c == ')' || c == '-'))
-                        return false;
-                    p++;
-                } else if (c == 0xE3 && p[1] == 0x80 && p[2] >= 0x80 && p[2] <= 0xBF) {
-                    // U+3000–U+303F: CJK Symbols and Punctuation (。、「」『』 etc.)
-                    p += 3;
-                } else if (c == 0xE3 && p[1] == 0x83 && p[2] == 0xBB) {
-                    // U+30FB ・ (katakana middle dot)
-                    p += 3;
-                } else if (c == 0xEF && p[1] == 0xBC && ((p[2] >= 0x81 && p[2] <= 0x8F) || p[2] == 0x9F)) {
-                    // U+FF01–U+FF0F (full-width !"#$%&'()*+,-./) and U+FF1F (？)
-                    p += 3;
-                } else {
-                    return false;
-                }
-            }
-            return true;
-        };
-
-        // True end-of-sentence punct (for the gap-insertion pass below).
-        auto ends_with_sentence_punct = [](const char* s) {
-            size_t len = s ? strlen(s) : 0;
-            if (len == 0)
-                return false;
-            unsigned char last = (unsigned char)s[len - 1];
-            if (last == '.' || last == '!' || last == '?')
-                return true;
-            if (len >= 3) {
-                const unsigned char* tail = (const unsigned char*)(s + len - 3);
-                // U+3002 。 = E3 80 82, U+FF01 ！ = EF BC 81, U+FF1F ？ = EF BC 9F
-                if (tail[0] == 0xE3 && tail[1] == 0x80 && tail[2] == 0x82)
-                    return true;
-                if (tail[0] == 0xEF && tail[1] == 0xBC && (tail[2] == 0x81 || tail[2] == 0x9F))
-                    return true;
-            }
-            return false;
-        };
-
-        parakeet_word_data cur = {};
-        bool have_cur = false;
-        // Per-word probability: arithmetic mean of contributing tokens'
-        // softmax probabilities. Tracked alongside `cur`.
-        float cur_p_sum = 0.0f;
-        int cur_p_cnt = 0;
-
-        auto flush_cur = [&]() {
-            if (cur_p_cnt > 0)
-                cur.p = cur_p_sum / (float)cur_p_cnt;
-            words.push_back(cur);
-        };
-
-        for (int i = 0; i < r->n_tokens; i++) {
-            const auto& td = r->tokens[i];
-            if (!td.text[0])
-                continue;
-            // Skip standalone space tokens (e.g. an initial " " BOS marker).
-            // Without this they leak through as empty word entries in
-            // no-space mode.
-            if (td.text[0] == ' ' && td.text[1] == '\0')
-                continue;
-
-            const bool has_leading_space = (td.text[0] == ' ');
-            const bool is_punct = is_punct_only(td.text);
-
-            // A token starts a new word if either:
-            //   - it has a Latin-style leading-space marker, or
-            //   - the segment is no-space style (e.g. JA) and the token
-            //     is not pure punctuation (so 、 attaches to prev word).
-            const bool is_new_word = !is_punct && (has_leading_space || !space_prefix_style);
-
-            if (is_new_word && have_cur) {
-                flush_cur();
-                cur = {};
-                cur_p_sum = 0.0f;
-                cur_p_cnt = 0;
-                have_cur = false;
-            }
-
-            if (!have_cur) {
-                cur.t0 = td.t0;
-                have_cur = true;
-            }
-            cur.t1 = td.t1;
-            cur_p_sum += td.p;
-            cur_p_cnt += 1;
-
-            // Append, dropping the leading space.
-            const char* src = td.text + (has_leading_space ? 1 : 0);
-            size_t cur_len = strlen(cur.text);
-            size_t cap = sizeof(cur.text) - cur_len - 1;
-            size_t add = strlen(src);
-            if (add > cap)
-                add = cap;
-            memcpy(cur.text + cur_len, src, add);
-            cur.text[cur_len + add] = '\0';
-        }
-        if (have_cur)
-            flush_cur();
-
-        // Post-process: insert minimum gaps after sentence-ending punctuation.
-        // The TDT decoder often produces contiguous timestamps even across
-        // sentence boundaries (e.g. "code." t1==6.400, "In" t0==6.400).
-        // When a word ends with .!?。！？ and the next word starts at the
-        // exact same frame, shrink the punctuated word's t1 by one frame
-        // duration to create a visible gap in subtitles.
-        for (size_t wi = 0; wi + 1 < words.size(); wi++) {
-            if (!ends_with_sentence_punct(words[wi].text))
-                continue;
-            if (words[wi].t1 >= words[wi + 1].t0 && words[wi].t1 > words[wi].t0) {
-                int64_t shrunk = words[wi].t1 - frame_dur_cs;
-                if (shrunk > words[wi].t0)
-                    words[wi].t1 = shrunk;
-            }
-        }
-
-        r->n_words = (int)words.size();
-        r->words = (parakeet_word_data*)calloc(r->n_words > 0 ? r->n_words : 1, sizeof(parakeet_word_data));
-        for (int i = 0; i < r->n_words; i++)
-            r->words[i] = words[i];
-    }
+    parakeet_group_words(r, frame_dur_cs);
 
     return r;
 }

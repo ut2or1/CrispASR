@@ -189,6 +189,12 @@ struct canary_qwen_model {
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
     ggml_backend_buffer_t buf_cpu = nullptr;
+
+    // Q8_0 repack of the F16 conv pw1/pw2 weights (issue #81, CRISPASR_FC_PW_Q8)
+    core_conformer::PwRepackBuf pw_q8;
+    // Fused Q/K/V weight concat for the encoder blocks (CRISPASR_FC_FUSED_QKV)
+    core_conformer::PwRepackBuf qkv_fused;
+
     std::map<std::string, ggml_tensor*> tensors;
 };
 
@@ -471,13 +477,18 @@ static bool canary_qwen_load_model(canary_qwen_model& model, canary_qwen_vocab& 
             for (int c = 0; c < d; c++)
                 s[c] = bn_w[c] / sqrtf(bn_var[c] + eps);
             std::vector<float> w_f32 = core_cpu::to_f32(e.conv_dw_w);
-            std::vector<ggml_fp16_t> w_f16(w_f32.size());
             for (int c = 0; c < d; c++)
                 for (int ki = 0; ki < K; ki++)
                     w_f32[ki + c * K] *= s[c];
-            for (size_t j = 0; j < w_f16.size(); j++)
-                w_f16[j] = ggml_fp32_to_fp16(w_f32[j]);
-            ggml_backend_tensor_set(e.conv_dw_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
+            // Write back in native dtype — don't clobber an F32 conv_dw_w with F16 (c9a4de65).
+            if (e.conv_dw_w->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(e.conv_dw_w, w_f32.data(), 0, w_f32.size() * sizeof(float));
+            } else {
+                std::vector<ggml_fp16_t> w_f16(w_f32.size());
+                for (size_t j = 0; j < w_f16.size(); j++)
+                    w_f16[j] = ggml_fp32_to_fp16(w_f32[j]);
+                ggml_backend_tensor_set(e.conv_dw_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
+            }
             for (int c = 0; c < d; c++)
                 dw_b[c] = (dw_b[c] - bn_mean[c]) * s[c] + bn_b[c];
             ggml_backend_tensor_set(e.conv_dw_b, dw_b.data(), 0, d * sizeof(float));
@@ -600,6 +611,7 @@ static ggml_cgraph* canary_qwen_build_graph_encoder(canary_qwen_context* ctx, in
     core_conformer::BlockParams bp = {
         (int)hp.enc_d_model, (int)hp.enc_n_heads, (int)hp.enc_head_dim, (int)hp.conv_kernel, kLayerNormEps,
     };
+    bp.manual_attn = core_conformer::fc_gpu_manual_attn(ctx->backend);
     for (uint32_t il = 0; il < hp.enc_n_layers; il++) {
         cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp);
     }
@@ -1271,6 +1283,18 @@ extern "C" struct canary_qwen_context* canary_qwen_init_from_file(const char* pa
         return nullptr;
     }
 
+    // Repack F16 conv pw1/pw2 to Q8_0 + fuse encoder Q/K/V (issue #81 — the 3D
+    // conv layout dodges crispasr-quantize; fusion is bit-identical).
+    {
+        auto& m = ctx->model;
+        std::vector<core_conformer::BlockWeights*> layers;
+        for (auto& e : m.enc)
+            layers.push_back(&e);
+        const bool quantized = !m.enc.empty() && m.enc[0].attn_q_w && ggml_is_quantized(m.enc[0].attn_q_w->type);
+        core_conformer::repack_conv_pw_q8(layers, ctx->backend, quantized, m.pw_q8, "canary_qwen");
+        core_conformer::fuse_qkv(layers, ctx->backend, m.qkv_fused, "canary_qwen");
+    }
+
     return ctx;
 }
 
@@ -1285,6 +1309,8 @@ extern "C" void canary_qwen_free(struct canary_qwen_context* ctx) {
         ggml_free(ctx->cached_enc_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    ctx->model.pw_q8.free();
+    ctx->model.qkv_fused.free();
     if (ctx->model.buf)
         ggml_backend_buffer_free(ctx->model.buf);
     if (ctx->model.buf_cpu)

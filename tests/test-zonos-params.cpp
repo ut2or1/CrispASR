@@ -15,6 +15,20 @@ TEST_CASE("zonos_params: default values are sensible", "[unit][zonos]") {
     REQUIRE(p.max_audio_tokens >= 0);
 }
 
+// Defaults-audit / config-parity guard (motivated by #192/#197). The "sensible"
+// case only bounds these; pin the exact shipped values. Zonos ships raw logits
+// (temperature 1.0, equivalent to upstream's min_p=0.1) and REQUIRES cfg_scale>1
+// for meaningful output, so cfg_scale=2.0 is load-bearing.
+TEST_CASE("zonos_params: value knobs match the shipped defaults", "[unit][zonos]") {
+    struct zonos_tts_params p = zonos_tts_default_params();
+
+    REQUIRE(p.temperature == Catch::Approx(1.0f)); // raw logits (upstream min_p=0.1)
+    REQUIRE(p.cfg_scale == Catch::Approx(2.0f));   // CFG required for coherent output
+    REQUIRE(p.seed == 0);
+    REQUIRE(p.max_audio_tokens == 0); // 0 = default (86*30=2580)
+    REQUIRE(p.flash_attn == false);
+}
+
 TEST_CASE("zonos_init_from_file: null path returns nullptr", "[unit][zonos]") {
     struct zonos_tts_params p = zonos_tts_default_params();
     struct zonos_tts_context* ctx = zonos_tts_init_from_file(nullptr, p);

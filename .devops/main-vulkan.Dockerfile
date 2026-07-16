@@ -6,7 +6,8 @@ RUN apt-get update && \
   && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 COPY . .
-RUN cmake -B build -DCRISPASR_BUILD_TESTS=OFF -DGGML_VULKAN=1 && \
+RUN cmake -B build -DCRISPASR_BUILD_TESTS=OFF -DGGML_VULKAN=1 \
+    -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON && \
   cmake --build build -j"$(nproc)" --target crispasr-cli
 
 FROM ubuntu:24.04 AS runtime

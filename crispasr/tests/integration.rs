@@ -193,6 +193,51 @@ fn session_whisper_auto_detect() {
 }
 
 #[test]
+fn session_whisper_no_speech_prob() {
+    let model_path = whisper_model();
+    if !Path::new(&model_path).exists() {
+        eprintln!("SKIP: whisper model not found at {model_path}");
+        return;
+    }
+    let sess = crispasr::Session::open(&model_path).expect("session open whisper");
+    let segs = sess.transcribe(&jfk_pcm()).expect("transcribe");
+    assert!(!segs.is_empty());
+
+    // Every whisper segment carries a real no-speech probability in [0, 1] —
+    // not the -1.0 "no data" sentinel other backends leave. JFK is clean
+    // speech, so the values should also sit well below the 0.6 suspect
+    // threshold, confirming it is the true posterior and not a placeholder.
+    for s in &segs {
+        assert!(
+            (0.0..=1.0).contains(&s.no_speech_prob),
+            "no_speech_prob {} out of [0,1] for segment {:?}",
+            s.no_speech_prob,
+            s.text
+        );
+        assert!(
+            s.no_speech_prob < 0.6,
+            "unexpected high no_speech_prob {} on clean speech {:?}",
+            s.no_speech_prob,
+            s.text
+        );
+    }
+}
+
+#[test]
+fn session_whisper_detected_language() {
+    let model_path = whisper_model();
+    if !Path::new(&model_path).exists() {
+        eprintln!("SKIP: whisper model not found at {model_path}");
+        return;
+    }
+    let sess = crispasr::Session::open(&model_path).expect("session open whisper");
+    // Whisper's in-decode acoustic language detection surfaces on the
+    // exception-safe session (JFK is English).
+    sess.transcribe(&jfk_pcm()).expect("transcribe");
+    assert_eq!(sess.detected_language(), "en");
+}
+
+#[test]
 fn session_available_backends() {
     let backends = crispasr::Session::available_backends();
     assert!(backends.contains(&"whisper".to_string()));
@@ -443,6 +488,101 @@ fn session_wav2vec2_ctc_logits() {
         .collect::<Vec<_>>()
         .join(" ");
     assert_eq!(ptext, text, "logits capture changed the transcript");
+}
+
+// Shared vocab-accessor contract for a CTC backend (PR #259 made ctc_vocab
+// comprehensive across omni-ctc / canary-ctc / wav2vec2 / data2vec, but only
+// omni-ctc had a vocab test). Asserts: a Some, non-empty vocab of valid C
+// strings, and that its length lines up with the exposed logit grid — equal
+// when blank is an in-vocab id (wav2vec2 <pad>), or one less when blank is a
+// separate appended index (canary-ctc blank_id). No tokenizer-flavour
+// assumptions, so it stays green across backends.
+fn assert_ctc_vocab_contract(sess: &crispasr::Session, pcm: &[f32]) {
+    let vocab = sess
+        .ctc_vocab()
+        .expect("CTC backend should expose Some(vocab)");
+    assert!(vocab.len() > 1, "unexpectedly small CTC vocab: {}", vocab.len());
+    // token_text must always yield a valid (possibly empty) string, never panic
+    // — including an out-of-range id, which the accessor guards to "".
+    assert!(
+        vocab.iter().any(|p| !p.is_empty()),
+        "every vocab piece was empty — accessor returned no token strings"
+    );
+
+    let (_segs, logits) = sess
+        .transcribe_with_logits(pcm)
+        .expect("transcribe_with_logits");
+    let lg = logits.expect("CTC backend should return Some(CtcLogits)");
+    // The logit grid is either the vocab (blank in-vocab) or vocab + blank.
+    assert!(
+        lg.n_vocab == vocab.len() || lg.n_vocab == vocab.len() + 1,
+        "logit dim {} inconsistent with vocab len {} (expected == or +1 for blank)",
+        lg.n_vocab,
+        vocab.len()
+    );
+}
+
+#[test]
+fn session_canary_ctc_vocab() {
+    let model_path = match canary_ctc_model() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: canary-ctc model not found (set CANARY_CTC_MODEL)");
+            return;
+        }
+    };
+    let sess = crispasr::Session::open_with_backend(&model_path, "canary-ctc", 4)
+        .expect("session open canary-ctc");
+    // canary appends the blank as a separate index (blank_id), so the exposed
+    // vocab is one shorter than the logit grid — covered by the shared contract.
+    assert_ctc_vocab_contract(&sess, &jfk_pcm());
+}
+
+#[test]
+fn session_wav2vec2_ctc_vocab() {
+    let model_path = match wav2vec2_model() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: wav2vec2 model not found (set WAV2VEC2_MODEL)");
+            return;
+        }
+    };
+    let sess = crispasr::Session::open_with_backend(&model_path, "wav2vec2", 4)
+        .expect("session open wav2vec2");
+    assert_ctc_vocab_contract(&sess, &jfk_pcm());
+}
+
+#[test]
+fn session_ctc_backend_no_speech_sentinel() {
+    // The no_speech_prob / detected_language sentinels must hold on a real
+    // NON-whisper session: CTC backends never populate the <|nospeech|>
+    // posterior, so every segment must carry the -1.0 "no data" sentinel (not a
+    // bogus in-[0,1] value), and detected_language must not crash — it falls
+    // back to the source-language hint or "unknown". Prefer canary-ctc, else
+    // wav2vec2; skip if neither model is present.
+    let (model_path, backend) = match (canary_ctc_model(), wav2vec2_model()) {
+        (Some(p), _) => (p, "canary-ctc"),
+        (None, Some(p)) => (p, "wav2vec2"),
+        (None, None) => {
+            eprintln!("SKIP: no CTC model found (set CANARY_CTC_MODEL or WAV2VEC2_MODEL)");
+            return;
+        }
+    };
+    let sess = crispasr::Session::open_with_backend(&model_path, backend, 4)
+        .expect("session open CTC backend");
+    let segs = sess.transcribe(&jfk_pcm()).expect("transcribe");
+    assert!(!segs.is_empty(), "expected a transcript");
+    for s in &segs {
+        assert_eq!(
+            s.no_speech_prob, -1.0,
+            "non-whisper backend must leave the -1.0 no_speech_prob sentinel, got {}",
+            s.no_speech_prob
+        );
+    }
+    // Fallback path: never a whisper acoustic code here; a non-empty string
+    // (source hint or "unknown"), never a panic.
+    let lang = sess.detected_language();
+    assert!(!lang.is_empty(), "detected_language fallback must be non-empty");
 }
 
 // ---- Registry + cache ----

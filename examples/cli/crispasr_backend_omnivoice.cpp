@@ -93,6 +93,13 @@ public:
             fprintf(stderr, "crispasr[omnivoice]: code generation will work; audio decode requires the tokenizer.\n");
         }
 
+        // Diff-harness: OMNIVOICE_ENCODE_DIFF=<ref.gguf> runs the encode-path
+        // stage diff and exits (#254 voice-clone port validation).
+        if (const char* rp = getenv("OMNIVOICE_ENCODE_DIFF")) {
+            int rc = omnivoice_encode_diff(ctx_, rp);
+            exit(rc == 0 ? 0 : 1);
+        }
+
         // Language
         if (!p.language.empty() && p.language != "auto") {
             omnivoice_set_language(ctx_, p.language.c_str());
@@ -111,12 +118,34 @@ public:
             omnivoice_set_instruct(ctx_, p.tts_instruct.c_str());
         }
 
+        // Speaking-rate multiplier (--tts-speed): scales the estimated target
+        // length. >1 = faster/shorter, <1 = slower/longer. Handy to trim an
+        // over-long estimate from a slow reference voice (#254).
+        if (p.tts_speed > 0.0f && p.tts_speed != 1.0f) {
+            omnivoice_set_speed(ctx_, p.tts_speed);
+        }
+
+        // Diffusion step count (--tts-steps): stage0 = num_steps × 2 backbone
+        // forwards — the dominant cost. Default 32; lower trades refinement for
+        // speed (ASR-clean to ~16). tts_num_steps is -1 unless the user set it.
+        if (p.tts_num_steps >= 1) {
+            omnivoice_set_num_steps(ctx_, p.tts_num_steps);
+        }
+
         return true;
     }
 
     std::vector<float> synthesize(const std::string& text, const whisper_params& params) override {
         if (!ctx_ || text.empty())
             return {};
+
+        // Apply the diffusion step count PER CALL, not just at init: the server
+        // reuses one backend instance and passes tts_num_steps per request, so a
+        // per-request "num_steps" only takes effect if set here. Read live by the
+        // runtime (no reload). tts_num_steps is -1 unless the caller set it. (#254)
+        if (params.tts_num_steps >= 1) {
+            omnivoice_set_num_steps(ctx_, params.tts_num_steps);
+        }
 
         int n_samples = 0;
         float* pcm = omnivoice_synthesize(ctx_, text.c_str(), &n_samples);

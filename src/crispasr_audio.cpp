@@ -115,11 +115,15 @@ ma_decoding_backend_vtable* g_crispasr_opus_backends[] = {ma_decoding_backend_li
 // pulling in the full crispasr.h header (which conflicts with
 // miniaudio's implementation-mode defines in this TU).
 CA_EXPORT int crispasr_audio_load(const char*, float**, int*, int*);
+CA_EXPORT int crispasr_audio_load_at_rate(const char*, int, float**, int*, int*);
 CA_EXPORT int crispasr_audio_load_stereo(const char*, float**, float**, int*, int*, int*);
 CA_EXPORT void crispasr_audio_free(float*);
 
 namespace {
-constexpr int kTargetSampleRate = 16000;
+// Thread-local so crispasr_audio_load_at_rate can set the target rate for
+// the current decode without affecting other threads.  Default is 16 kHz
+// (Whisper-compatible) — overridden by crispasr_audio_load_at_rate().
+static thread_local int kTargetSampleRate = 16000;
 constexpr int kTargetChannels = 1;
 } // namespace
 
@@ -1348,8 +1352,10 @@ int crispasr_webm_decode(const char* path, int want_channels, float** out_buf, i
                         remaining = 0;
                     }
                 }
-                // Packet data
-                std::memcpy(data.data() + page_start + hdr_size, pkt_data, pkt_size);
+                // Packet data (the EOS page is empty: pkt_data=nullptr, pkt_size=0
+                // — memcpy(dst, nullptr, 0) is UB, so guard it).
+                if (pkt_data && pkt_size > 0)
+                    std::memcpy(data.data() + page_start + hdr_size, pkt_data, pkt_size);
 
                 // Compute and fill CRC
                 uint32_t crc = ogg_crc(data.data() + page_start, hdr_size + pkt_size);
@@ -2849,7 +2855,7 @@ CA_EXPORT int crispasr_audio_load(const char* path, float** out_pcm, int* out_sa
     // fail on MP3 / streaming sources; chunked-read is what the CLI uses
     // and sidesteps that. The total allocation grows geometrically so we
     // don't re-alloc every chunk.
-    constexpr ma_uint64 kChunkFrames = (ma_uint64)kTargetSampleRate; // 1 s
+    const ma_uint64 kChunkFrames = (ma_uint64)kTargetSampleRate; // 1 s
     float* buf = nullptr;
     size_t capacity = 0;
     size_t used = 0;
@@ -2894,6 +2900,19 @@ CA_EXPORT int crispasr_audio_load(const char* path, float** out_pcm, int* out_sa
     if (out_sample_rate)
         *out_sample_rate = kTargetSampleRate;
     return 0;
+}
+
+/// Like crispasr_audio_load but resamples to `target_rate` instead of 16 kHz.
+/// When the source already matches `target_rate`, no resampling is performed.
+/// Avoids the quality-degrading down-then-up path that occurs when a backend
+/// needs non-16 kHz audio (e.g. 24 kHz for Kyutai / IndexTTS / Mimi).
+CA_EXPORT int crispasr_audio_load_at_rate(const char* path, int target_rate, float** out_pcm, int* out_samples,
+                                          int* out_sample_rate) {
+    const int prev = kTargetSampleRate;
+    kTargetSampleRate = (target_rate > 0) ? target_rate : 16000;
+    const int rc = crispasr_audio_load(path, out_pcm, out_samples, out_sample_rate);
+    kTargetSampleRate = prev;
+    return rc;
 }
 
 /// Decode an audio file into stereo (2-channel) float32 PCM at 16 kHz.
@@ -3053,7 +3072,7 @@ CA_EXPORT int crispasr_audio_load_stereo(const char* path, float** out_left, flo
     if (ma_decoder_init_file(path, &cfg, &decoder) != MA_SUCCESS)
         return -2;
 
-    constexpr ma_uint64 kChunkFrames = (ma_uint64)kTargetSampleRate; // 1 s
+    const ma_uint64 kChunkFrames = (ma_uint64)kTargetSampleRate; // 1 s
     float* buf = nullptr;
     size_t capacity = 0; // in frames
     size_t used = 0;     // in frames

@@ -8,6 +8,7 @@
 #include "crispasr_aligner.h"
 #include "align.h"
 #include "canary_ctc.h"
+#include "core/uroman.h"
 #include "gguf.h"
 #include "qwen3_asr.h"
 #include "wav2vec2-ggml.h"
@@ -448,17 +449,30 @@ std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner
     if (aligner_model.empty() || transcript.empty() || !samples || n_samples <= 0)
         return out;
 
+    // #252: auto-romanize non-Latin reference text for CTC aligners with Latin vocab.
+    // Disable with CRISPASR_ALIGN_NO_ROMANIZE=1 to pass raw script through.
+    std::string eff_transcript = transcript;
+    {
+        const char* no_rom = std::getenv("CRISPASR_ALIGN_NO_ROMANIZE");
+        if (!(no_rom && no_rom[0] == '1') && core_uroman::needs_romanization(transcript)) {
+            eff_transcript = core_uroman::romanize(transcript);
+            const char* dbg = std::getenv("CRISPASR_ALIGN_DEBUG");
+            if (dbg && dbg[0] == '1')
+                fprintf(stderr, "crispasr[aligner]: romanized → \"%s\"\n", eff_transcript.c_str());
+        }
+    }
+
     const bool is_qwen3_fa = path_contains_ci(aligner_model, "forced-aligner") ||
                              path_contains_ci(aligner_model, "qwen3-fa") ||
                              path_contains_ci(aligner_model, "qwen3-forced");
     if (is_qwen3_fa) {
-        const auto words = tokenise_words(transcript);
+        const auto words = tokenise_words(eff_transcript);
         return align_qwen3_fa(aligner_model, words, samples, n_samples, t_offset_cs, n_threads);
     }
 
     const std::string arch = gguf_architecture(aligner_model);
     if (is_wav2vec2_aligner_model(aligner_model, arch)) {
-        const auto words = tokenise_words(transcript);
+        const auto words = tokenise_words(eff_transcript);
         return align_wav2vec2_ctc(aligner_model, words, samples, n_samples, t_offset_cs, n_threads);
     }
 
@@ -488,7 +502,7 @@ std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner
         return out;
     }
 
-    const auto words = tokenise_words(transcript);
+    const auto words = tokenise_words(eff_transcript);
     if (words.empty()) {
         free(ctc_logits);
         return out;

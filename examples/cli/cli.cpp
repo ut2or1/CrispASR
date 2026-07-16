@@ -448,6 +448,18 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.no_warmup = true;
     } else if (arg == "--parakeet-decoder") {
         params.parakeet_decoder = ARGV_NEXT;
+    } else if (arg == "--att-context") {
+        // Issue #257: parakeet/canary local-attention window "L,R" (encoder
+        // frames, 1 ≈ 80 ms) — NeMo change_attention_model. Bounds long-audio
+        // encoder memory to O(T·window). "-1,-1" = full attention.
+        const std::string v = ARGV_NEXT;
+        int l = INT_MIN, r = INT_MIN;
+        if (std::sscanf(v.c_str(), "%d,%d", &l, &r) == 2) {
+            params.att_context_left = l;
+            params.att_context_right = r;
+        } else {
+            fprintf(stderr, "crispasr: --att-context expects \"L,R\" (e.g. 128,128 or -1,-1), got '%s'\n", v.c_str());
+        }
     } else if (arg == "--lid-backend") {
         params.lid_backend = ARGV_NEXT;
     } else if (arg == "--lid-model") {
@@ -564,6 +576,12 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
             params.tts_cfg_scale = 0.0f;
         if (params.tts_cfg_scale > 10.0f)
             params.tts_cfg_scale = 10.0f;
+    } else if (arg == "--tts-speed") {
+        params.tts_speed = std::stof(ARGV_NEXT);
+        if (params.tts_speed <= 0.0f)
+            params.tts_speed = 1.0f;
+        if (params.tts_speed > 4.0f)
+            params.tts_speed = 4.0f;
     } else if (arg == "--codec-model") {
         params.tts_codec_model = ARGV_NEXT;
         std::string auto_base;
@@ -621,6 +639,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.tts_consent_attestation = "CLI --i-have-rights flag";
     } else if (arg == "--no-spoken-disclaimer") {
         params.tts_no_spoken_disclaimer = true;
+    } else if (arg == "--no-watermark") {
+        params.tts_no_watermark = true;
     } else if (arg == "--cors-origin") {
         params.server_cors_origin = ARGV_NEXT;
     } else if (arg == "--chat-model") {
@@ -1132,6 +1152,11 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr, "             --chunk-overlap F      [%-7.1f] overlap context (sec) at chunk boundaries\n",
             params.chunk_overlap_seconds);
     fprintf(stderr,
+            "             --att-context L,R      [%-7s] parakeet/canary local-attention window in encoder "
+            "frames (~80ms ea) — true windowed attn (O(T*window) mem, NeMo rel_pos_local_attn); "
+            "-1,-1 = full. CRISPASR_FC_WINDOWED_ATTN=0 forces legacy masked-full\n",
+            "model");
+    fprintf(stderr,
             "             --lcs-dedup VAL        [%-7s] sub-word LCS dedup across chunk boundaries: auto|on|off\n",
             params.lcs_dedup.c_str());
     fprintf(stderr,
@@ -1162,7 +1187,9 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "             --i-have-rights                    required for voice cloning (.wav); attests consent\n"
             "                                                 of the cloned speaker or that it is your own voice\n"
             "             --no-spoken-disclaimer              skip audible AI-disclosure prefix on voice-cloned\n"
-            "                                                 output (watermark + C2PA provenance still applied)\n");
+            "                                                 output (watermark + C2PA provenance still applied)\n"
+            "             --no-watermark                     disable AI-content watermark on TTS output; marking\n"
+            "                                                 responsibility then rests with the operator\n");
     fprintf(stderr,
             "             --ref-text \"TEXT\"        reference transcription (qwen3-tts/f5-tts; auto-transcribed "
             "if omitted)\n");
@@ -1200,13 +1227,14 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "             --g2p-dict SOURCE        [%-7s] G2P dict: 'olaph' (MIT), 'open-dict' (CC-BY-SA), or path to "
             "file\n",
             params.g2p_dict.empty() ? "olaph" : params.g2p_dict.c_str());
-    fprintf(stderr, "             --watermark-model PATH           AudioSeal GGUF for neural watermarking "
-                    "(upgrades built-in spread-spectrum)\n");
+    fprintf(stderr, "             --watermark-model PATH|auto      AudioSeal GGUF for neural watermarking "
+                    "('auto' downloads it; upgrades built-in spread-spectrum)\n");
     fprintf(stderr, "             --detect-watermark PATH          read WAV file and detect AI watermark "
                     "(prints confidence + exits)\n");
     fprintf(stderr, "             --c2pa-cert PATH                 X.509 cert for C2PA Content Credentials signing\n"
-                    "             --c2pa-key PATH                  private key for C2PA signing "
-                    "(generate both with scripts/generate-c2pa-cert.sh)\n");
+                    "             --c2pa-key PATH                  private key for C2PA signing. When built with "
+                    "C2PA and no cert is given, WAV/MP3 output is signed by default with a bundled self-signed "
+                    "cert (AAC/Opus can't embed C2PA). Provide your own CA-issued cert for a trusted identity\n");
     fprintf(stderr, "             --cors-origin ORIGIN     server: opt-in CORS for browser clients "
                     "('*' for any, or scheme://host[:port])\n");
     fprintf(stderr, "             --chat-model PATH        server: enable POST /v1/chat/completions backed by "
@@ -1228,6 +1256,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
         "irodori: text CFG (default 3.0); speaker CFG via CRISPASR_IRODORI_CFG_SPEAKER; "
         "vibevoice: 0 = model default, try 1.5 or a new --seed to re-roll BGM onsets)\n",
         "default");
+    fprintf(stderr,
+            "             --tts-speed X            [%-7.2f] speaking-rate multiplier (omnivoice/f5/piper/melotts/"
+            "fastpitch): >1 faster/shorter, <1 slower/longer\n",
+            params.tts_speed);
     fprintf(stderr, "             --tts-trim-silence       [%-7s] trim leading silence from TTS output\n",
             params.tts_trim_silence ? "true" : "false");
     fprintf(stderr, "             --tts-play               [%-7s] play synthesised audio on the local speaker\n",

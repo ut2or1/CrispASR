@@ -98,6 +98,11 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # PatchEncoder decode_patch in isolation (penc_in_patch0 -> penc_out_patch0).
     # Text comes from $DOTS_TEXT; the --audio arg is ignored (TTS).
     "dots-tts":   "reference_backends.dots_tts_reference",
+    # MOSS-TTS-v1.5 (MossTTSDelay) TTS: Qwen3-8B backbone + 32 RVQ codebooks
+    # under a delay pattern + 1.6B transformer codec. The greedy code grid
+    # ("codes") is the Phase-3 byte-parity target; "waveform" (needs the codec)
+    # is the Phase-4 decoded reference. Text from $MOSS_TTS_TEXT; --audio ignored.
+    "moss-tts":   "reference_backends.moss_tts",
     "qwen3":      "reference_backends.qwen3",
     "higgs-stt":  "reference_backends.higgs_stt",
     "voxtral":    "reference_backends.voxtral",

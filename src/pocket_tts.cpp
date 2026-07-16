@@ -3400,7 +3400,33 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     {
         pocket_tts_bench_stage _bs("mimi_decode");
         // use_gpu=false forces the manual CPU Mimi path; env POCKET_MANUAL_MIMI=1 also.
-        if (!ctx->params.use_gpu || getenv("POCKET_MANUAL_MIMI")) {
+        bool force_cpu_mimi = !ctx->params.use_gpu || getenv("POCKET_MANUAL_MIMI");
+
+        // Vulkan workgroup-limit guard (issue #256). The Mimi decoder transformer
+        // dispatches ~T_xfmr^2 workgroups over the causal attention (T_xfmr scales
+        // with n_gen_frames); on constrained iGPUs (e.g. AMD 780M / gfx1103) this
+        // exceeds maxComputeWorkGroupCount[0] and ggml-vulkan aborts. Fall back to
+        // the (validated) CPU Mimi path for long generations. Threshold is
+        // conservative and overridable: POCKET_VULKAN_MIMI_MAX_FRAMES=<n> tunes it,
+        // <=0 disables the guard (always attempt GPU).
+        if (!force_cpu_mimi && ctx->backend) {
+            const char* be_name = ggml_backend_name(ctx->backend);
+            if (be_name && strstr(be_name, "Vulkan")) {
+                int max_frames = 120;
+                if (const char* env = getenv("POCKET_VULKAN_MIMI_MAX_FRAMES"))
+                    max_frames = atoi(env);
+                if (max_frames > 0 && n_gen_frames > max_frames) {
+                    force_cpu_mimi = true;
+                    if (ctx->verbosity >= 1)
+                        fprintf(stderr,
+                                "pocket_tts: Vulkan workgroup-limit guard triggered (%d frames > %d), "
+                                "falling back to CPU Mimi decode\n",
+                                n_gen_frames, max_frames);
+                }
+            }
+        }
+
+        if (force_cpu_mimi) {
             mimi_decode(ctx, latent_sequence.data(), n_gen_frames, &pcm, &pcm_samples);
         } else {
             mimi_decode_ggml(ctx, latent_sequence.data(), n_gen_frames, &pcm, &pcm_samples);

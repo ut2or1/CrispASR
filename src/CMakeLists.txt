@@ -124,6 +124,11 @@ add_library(crispasr-lib
             # playback mode, mirrors crispasr_mic.cpp. Used by the CLI's
             # --tts-play flag; server mode routes audio via HTTP.
             crispasr_speaker.cpp
+            # CPU instruction-set self-check (#261). Compares the compile-time
+            # ISA baseline (AVX2/FMA/F16C ...) against runtime cpuid so callers
+            # can fail fast / soft-degrade instead of SIGILL-crashing on a CPU
+            # that lacks an instruction the ggml kernels emit.
+            crispasr_cpu_isa.cpp
             # Silero-VAD-driven segmentation + crispasr.cpp-style stitching.
             # Consumed by the CLI and by the C-ABI `crispasr_session_transcribe_vad`
             # wrapper so every language binding benefits without re-implementing.
@@ -220,6 +225,41 @@ set_target_properties(crispasr-lib PROPERTIES
 )
 
 target_include_directories(crispasr-lib PUBLIC . ../include)
+
+# C2PA (Content Credentials) signing in the core C API — so wasm / bindings /
+# server get provenance too, not just the CLI. No-op when C2PA isn't available.
+crispasr_enable_c2pa(crispasr-lib)
+
+# Native pure-C++ C2PA signer (uECC ES256 + hand-built CBOR/JUMBF/COSE). Small,
+# permissively licensed (BSD-2 micro-ecc), zero external deps — always compiled
+# in so WAV provenance works on EVERY platform (desktop/mobile/wasm) without the
+# c2pa-rs Rust lib. Built as its own C++17 static lib so the C++11 crispasr-lib
+# language contract is untouched. Set CRISPASR_NO_C2PA_NATIVE=ON to opt out.
+option(CRISPASR_NO_C2PA_NATIVE "Disable the built-in pure-C++ C2PA WAV signer" OFF)
+if (CRISPASR_NO_C2PA_NATIVE)
+    target_compile_definitions(crispasr-lib PUBLIC CRISPASR_NO_C2PA_NATIVE)
+else()
+    # Sources vendored from the standalone c2pa-audio repo (git submodule).
+    set(_c2pa_audio_dir ${CMAKE_SOURCE_DIR}/third_party/c2pa-audio)
+    add_library(crispasr_c2pa_native STATIC
+        ${_c2pa_audio_dir}/src/c2pa_native.cpp
+        ${_c2pa_audio_dir}/third_party/uecc/uECC.c)
+    # src/ is PUBLIC — the shim headers (src/core/crispasr_c2pa_native.h etc.)
+    # and crispasr_c2pa.h include the submodule's c2pa_native.h / sha256.h, so
+    # every consumer that links crispasr_c2pa_native needs it on the path. uecc
+    # is PRIVATE (only the .cpp needs it).
+    target_include_directories(crispasr_c2pa_native PUBLIC ${_c2pa_audio_dir}/src)
+    target_include_directories(crispasr_c2pa_native PRIVATE ${_c2pa_audio_dir}/third_party/uecc)
+    # Vendored micro-ecc — silence its warnings so CRISPASR_FATAL_WARNINGS builds
+    # don't trip on third-party code we don't modify.
+    if (NOT MSVC)
+        set_source_files_properties(${_c2pa_audio_dir}/third_party/uecc/uECC.c
+            PROPERTIES COMPILE_OPTIONS "-w")
+    endif()
+    target_compile_features(crispasr_c2pa_native PRIVATE cxx_std_17)
+    set_target_properties(crispasr_c2pa_native PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(crispasr-lib PUBLIC crispasr_c2pa_native)
+endif()
 
 set(CRISPASR_LIB_CXX_STANDARD cxx_std_11)
 if (GGML_CUDA AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
@@ -937,6 +977,8 @@ endif()
 add_library(parakeet STATIC
             parakeet.h
             parakeet.cpp
+            parakeet_orchestrate.h
+            parakeet_orchestrate.cpp
             )
 target_include_directories(parakeet PUBLIC . ../include)
 target_compile_features   (parakeet PUBLIC cxx_std_17)
@@ -1333,6 +1375,50 @@ target_compile_features   (moss_audio PUBLIC cxx_std_17)
 target_link_libraries     (moss_audio PUBLIC crispasr-core ggml ggml-base ggml-cpu)
 if(NOT MSVC)
     target_compile_options(moss_audio PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# moss_tts — OpenMOSS-Team/MOSS-TTS-v1.5 (MossTTSDelay: Qwen3-8B backbone + 32
+#            RVQ audio codebooks under a delay pattern + transformer codec)
+# ---------------------------------------------------------------------------
+add_library(moss_tts STATIC moss_tts.h moss_tts.cpp moss_tts_codec.h moss_tts_codec.cpp)
+set_target_properties(moss_tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(moss_tts PUBLIC .)
+target_compile_features   (moss_tts PUBLIC cxx_std_17)
+target_link_libraries     (moss_tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(moss_tts PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(moss_tts PRIVATE GGML_USE_METAL)
+    target_link_libraries(moss_tts PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(moss_tts PRIVATE GGML_USE_CUDA)
+    target_link_libraries(moss_tts PUBLIC ggml-cuda)
+endif()
+
+# ---------------------------------------------------------------------------
+# moss_tts_local — OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 (MossTTSLocal:
+#            Qwen3-4B backbone + 1-layer local/depth transformer that AR-generates
+#            12 RVQ codebooks per frame + 48 kHz codec-v2) — #249 second deliverable
+# ---------------------------------------------------------------------------
+add_library(moss_tts_local STATIC moss_tts_local.h moss_tts_local.cpp
+            moss_tts_local_codec.h moss_tts_local_codec.cpp)
+set_target_properties(moss_tts_local PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(moss_tts_local PUBLIC .)
+target_compile_features   (moss_tts_local PUBLIC cxx_std_17)
+target_link_libraries     (moss_tts_local PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(moss_tts_local PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(moss_tts_local PRIVATE GGML_USE_METAL)
+    target_link_libraries(moss_tts_local PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(moss_tts_local PRIVATE GGML_USE_CUDA)
+    target_link_libraries(moss_tts_local PUBLIC ggml-cuda)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -2304,6 +2390,12 @@ if (TARGET mimo_asr)
 endif()
 if (TARGET moss_audio)
     target_link_libraries(crispasr-lib PUBLIC moss_audio)
+endif()
+if (TARGET moss_tts)
+    target_link_libraries(crispasr-lib PUBLIC moss_tts)
+endif()
+if (TARGET moss_tts_local)
+    target_link_libraries(crispasr-lib PUBLIC moss_tts_local)
 endif()
 if (TARGET moss_transcribe)
     target_link_libraries(crispasr-lib PUBLIC moss_transcribe)

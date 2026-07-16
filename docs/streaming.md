@@ -334,8 +334,9 @@ crispasr --backend irodori-tts -m model.gguf --codec-model dacvae-ja-32dim-f16.g
 ```
 
 The spoken AI-disclosure (voice-cloned output) is emitted first, each chunk is
-watermarked before emit, and a 200 ms gap separates chunks. Works with every TTS
-backend.
+watermarked before emit (unless disabled process-wide via `--no-watermark` /
+`CRISPASR_NO_WATERMARK`), and a 200 ms gap separates chunks. Works with every
+TTS backend.
 
 ### Server (`stream: true`)
 
@@ -351,7 +352,10 @@ curl -N http://localhost:8080/v1/audio/speech \
 ### C ABI (`crispasr_session_synthesize_streaming`)
 
 For embedders/bindings — fires a callback per sentence chunk with that chunk's
-watermarked PCM (backend-native sample rate, owned by the call):
+watermarked PCM (backend-native sample rate, owned by the call). As with the
+other bindings, this path watermarks unconditionally; the `--no-watermark` /
+`CRISPASR_NO_WATERMARK` opt-out does not apply here (see
+[`bindings.md`](bindings.md)):
 
 ```c
 void on_chunk(const float* pcm, int n, int is_final, void* user) { /* play/queue */ }

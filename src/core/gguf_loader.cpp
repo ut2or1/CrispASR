@@ -620,7 +620,12 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
                         if (tid < 0)
                             continue;
                         const size_t off = gguf_get_tensor_offset(gctx, tid);
-                        if (data_off + off + ggml_nbytes(t) > leaked_size) {
+                        // Overflow-safe: a crafted GGUF can set off/nbytes near SIZE_MAX
+                        // so the additive data_off+off+nbytes wraps and passes. Compare
+                        // subtractively.
+                        const size_t nb = ggml_nbytes(t);
+                        if (data_off > leaked_size || off > leaked_size - data_off ||
+                            nb > leaked_size - data_off - off) {
                             fprintf(stderr,
                                     "%s: GPU mmap bounds check failed for tensor '%s' "
                                     "(data_off=%zu + off=%zu + nbytes=%zu > file_size=%zu) — "
@@ -743,7 +748,10 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
             const size_t off = gguf_get_tensor_offset(gctx, tid);
             const size_t nbytes = ggml_nbytes(t);
             // Bounds check: prevent segfault on truncated GGUF files
-            if (data_off + off + nbytes > mf.size) {
+            // Overflow-safe: a crafted GGUF can set off/nbytes near SIZE_MAX so the
+            // additive data_off+off+nbytes wraps and passes the check. Compare
+            // subtractively (each subtraction is valid once the prior guard holds).
+            if (data_off > mf.size || off > mf.size - data_off || nbytes > mf.size - data_off - off) {
                 fprintf(stderr,
                         "%s: mmap legacy path: tensor '%s' exceeds file bounds "
                         "(off=%zu + nbytes=%zu > file_size=%zu) — file truncated?\n",
@@ -943,7 +951,10 @@ bool load_weights_split(const char* path, ggml_backend_t gpu_backend, ggml_backe
             // GGUF whose tensor offset+size runs past the mapping would SIGBUS, or
             // copy adjacent memory into the tensor buffer (info leak). This split
             // mmap path was the only one of the four missing the guard.
-            if (data_off + off + nbytes > mf.size) {
+            // Overflow-safe: a crafted GGUF can set off/nbytes near SIZE_MAX so the
+            // additive data_off+off+nbytes wraps and passes the check. Compare
+            // subtractively (each subtraction is valid once the prior guard holds).
+            if (data_off > mf.size || off > mf.size - data_off || nbytes > mf.size - data_off - off) {
                 fprintf(stderr,
                         "%s: split mmap path: tensor '%s' exceeds file bounds "
                         "(off=%zu + nbytes=%zu > file_size=%zu) — file truncated?\n",

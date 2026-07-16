@@ -630,6 +630,35 @@ Qwen3 talker LM + 12 Hz RVQ speech tokenizer. Three variants:
 - `qwen3-tts-1.7b-base` — 1.7B talker, higher quality
 - `qwen3-tts-1.7b-voicedesign` — natural-language voice description via `--instruct`
 
+### moss-tts
+
+`OpenMOSS-Team/MOSS-TTS-v1.5` (MossTTSDelay, Apache-2.0) — a **Qwen3-8B**
+backbone (36L, 4096d, 32Q/8KV, head_dim 128, QK-norm, SwiGLU, NEOX RoPE θ=1e6)
+that autoregressively emits **32 RVQ audio codebooks under a delay pattern**,
+decoded by a **1.6B pure-transformer codec** to 24 kHz mono.
+
+- **Input embedding** per position = text-token embedding + Σ of the 32 audio
+  codebook embeddings (`moss.audio_embed.{i}`); the backbone exposes the
+  per-token last hidden state, projected by **33 heads** (1 text lm_head + 32
+  audio codebook heads `moss.audio_head.{i}`).
+- **Delay pattern** (`MossTTSDelay`): codebook *i* is delayed *i* steps, with a
+  slot/flush state machine driving column 0 (delay-slot → audio-end) — the same
+  family as dia's staggered emit.
+- **Codec** (`OpenMOSS-Team/MOSS-Audio-Tokenizer`): RVQ (32×1024, dim 8) →
+  weight-normed 1×1 projections → 4 ProjectedTransformer decoder stages
+  (pre-LN, fused-QKV, adjacent-pair RoPE θ=1e4, **sliding-window** causal
+  attention 125/250/500/1000 keys, GELU FFN, per-channel LayerScale) → patch
+  upsamples (2/2/2/240) → waveform. Ships as a separate F16 GGUF
+  (`--codec-model`).
+- Two GGUFs: quantizable backbone (`moss-tts`) + F16 codec (`moss-tts-codec`).
+  `--backend moss-tts -m <backbone> --codec-model <codec> --tts "..."`.
+- Runtime clones CrispASR's in-house Qwen3 (`moss_audio.cpp`) — no libllama.
+  Voice cloning is supported via `--voice ref.wav` — the codec **encoder** (mirror
+  of the decoder: patch_downsample → 4 enc stages → quantizer iproj → 32-step
+  residual LFQ with cosine-sim argmax) encodes the reference to codes, which are
+  delay-pattern-spliced into the prompt's reference block. The 4B `MossTTSLocal`
+  variant (48 kHz stereo, depth-transformer) is a follow-up.
+
 ### omnivoice
 
 k2-fsa/OmniVoice (Apache-2.0) — masked iterative multi-codebook TTS.

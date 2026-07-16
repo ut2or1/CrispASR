@@ -279,6 +279,45 @@ catch_discover_tests(test-cpu-ops-to-f32
     PROPERTIES LABELS "unit"
 )
 
+# ─── test-core-rvq — core_rvq::encode_euclidean vs full-distance reference ─────
+# Proves the 2·x·E−‖E‖² shootout selects the same codes as a direct argmin
+# (the correctness property behind §176l routing kyutai through core_rvq).
+# rvq.cpp is dep-free (rvq.h + cstdio) so compile it straight into the test.
+add_executable(test-core-rvq
+    test-core-rvq.cpp
+    ${PROJECT_SOURCE_DIR}/src/core/rvq.cpp
+)
+target_include_directories(test-core-rvq PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/src/core
+)
+target_link_libraries(test-core-rvq PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-core-rvq
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-gguf-bounds — regression guard for the GGUF load_weights OOB fix ─────
+# Untrusted-input hardening: a truncated/crafted GGUF must be rejected by
+# core_gguf::load_weights, not SIGBUS the mmap loader. Needs crispasr-lib (the
+# loader) + ggml (gguf writer).
+add_executable(test-gguf-bounds test-gguf-bounds.cpp)
+target_include_directories(test-gguf-bounds PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-gguf-bounds PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+    ggml
+)
+catch_discover_tests(test-gguf-bounds
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
 # ─── test-vibevoice-quant-carveout — regression guard for issue #171 ──────────
 # Asserts crispasr-quantize keeps the VibeVoice diffusion prediction head and
 # connectors/EOS (pred.*, at_conn.*, se_conn.*, tts_eos.*, tts_types.*) at source
@@ -1338,6 +1377,40 @@ catch_discover_tests(test-qwen3tts-params
     PROPERTIES LABELS "unit;qwen3_tts"
 )
 
+# ─── test-moss-tts-params — Catch2 unit tests for moss_tts_context_params /
+# moss_tts_synth_params defaults + null-guards. No GGUF required. ───────────────
+add_executable(test-moss-tts-params
+    test-moss-tts-params.cpp
+)
+target_include_directories(test-moss-tts-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-moss-tts-params PRIVATE
+    Catch2::Catch2WithMain
+    moss_tts
+)
+catch_discover_tests(test-moss-tts-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;moss_tts"
+)
+
+# ─── test-moss-tts-local-params — Catch2 unit tests for the 4B MossTTSLocal
+# context/synth param defaults + null-guards. No GGUF required. ─────────────────
+add_executable(test-moss-tts-local-params
+    test-moss-tts-local-params.cpp
+)
+target_include_directories(test-moss-tts-local-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-moss-tts-local-params PRIVATE
+    Catch2::Catch2WithMain
+    moss_tts_local
+)
+catch_discover_tests(test-moss-tts-local-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;moss_tts_local"
+)
+
 # ─── test-tada-params — Catch2 unit tests for tada_context_params defaults
 # and null-guard coverage. No GGUF required. ───────────────────────────────────
 add_executable(test-tada-params
@@ -1791,6 +1864,26 @@ catch_discover_tests(test-issue-114-chunk-context-gate
     PROPERTIES LABELS "unit;chunk-context;issue-114"
 )
 
+# ─── test-parakeet-ja-detect — issue #257 regression guard
+#
+# Pins crispasr_parakeet::vocab_looks_japanese so the JA-model detection keys on
+# vocab content (kana/kanji), not vocab size — a small-vocab English model
+# (parakeet-tdt-1.1b, vocab 1024) must not be misclassified as Japanese. Pure
+# CPU, no model load.
+add_executable(test-parakeet-ja-detect
+    test-parakeet-ja-detect.cpp
+)
+target_include_directories(test-parakeet-ja-detect PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-parakeet-ja-detect PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-parakeet-ja-detect
+    TEST_SPEC "[issue-257]"
+    PROPERTIES LABELS "unit;parakeet;issue-257"
+)
+
 # ─── test-issue-89-long-audio-fallback — issue #89 regression guard
 #
 # Pins crispasr_long_audio::should_auto_chunk_long so a future refactor
@@ -1856,6 +1949,80 @@ catch_discover_tests(test-internal-chunking-gate
     PROPERTIES LABELS "unit;internal-chunking;issue-89"
 )
 
+# ─── test-segment-group — output-segment grouping (issue #257)
+#
+# Pins core_segment::group_by_window, which splits parakeet's single coherent
+# decode into ~N-second output segments for `--chunk-seconds N` without
+# re-running the encoder on quality-degrading small windows.
+add_executable(test-segment-group
+    test-segment-group.cpp
+)
+target_include_directories(test-segment-group PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-segment-group PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-segment-group
+    TEST_SPEC "[segment-group]"
+    PROPERTIES LABELS "unit;segment-group;issue-257"
+)
+
+# ─── test-asr-parity — canonical cross-surface parity predicate (improvements Phase 0)
+#
+# Pins core_parity::segments_equal, the rule the surface-parity harness uses to
+# assert CLI / server / session produce the same transcription, and the
+# acceptance gate for the Phase 1 dispatch unification.
+add_executable(test-asr-parity
+    test-asr-parity.cpp
+)
+target_include_directories(test-asr-parity PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-asr-parity PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-asr-parity
+    TEST_SPEC "[parity]"
+    PROPERTIES LABELS "unit;parity;improvements"
+)
+
+# ─── test-parakeet-strategy — pure long-audio routing decision (improvements
+# Phase 1). Header-only: pins parakeet_pick_strategy so the CLI adapter and the
+# session C-ABI can't diverge on which path to take.
+add_executable(test-parakeet-strategy
+    test-parakeet-strategy.cpp
+)
+target_include_directories(test-parakeet-strategy PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-parakeet-strategy PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-parakeet-strategy
+    TEST_SPEC "[parakeet-strategy]"
+    PROPERTIES LABELS "unit;parakeet-strategy;improvements"
+)
+
+# ─── test-worker-pool — bounded blocking resource pool (improvements Phase 4).
+# Pins core_pool::WorkerPool behind the server worker-pool.
+find_package(Threads REQUIRED)
+add_executable(test-worker-pool
+    test-worker-pool.cpp
+)
+target_include_directories(test-worker-pool PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-worker-pool PRIVATE
+    Catch2::Catch2WithMain
+    Threads::Threads
+)
+catch_discover_tests(test-worker-pool
+    TEST_SPEC "[worker-pool]"
+    PROPERTIES LABELS "unit;worker-pool;improvements"
+)
+
 # ─── test-lcs-chunk-merge — Catch2 unit tests for LCS chunk-merge dedup
 #
 # Ports of NeMo's `longest_common_subsequence_merge` test cases
@@ -1910,6 +2077,22 @@ target_link_libraries(test-ngram-loop-fix PRIVATE
 catch_discover_tests(test-ngram-loop-fix
     TEST_SPEC "[ngram-loop]"
     PROPERTIES LABELS "unit;ngram-loop"
+)
+
+# ─── test-uroman — Catch2 unit tests for core/uroman.h romanization.
+# Validates Arabic + Cyrillic romanization for CTC forced alignment (#252).
+add_executable(test-uroman
+    test-uroman.cpp
+)
+target_include_directories(test-uroman PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-uroman PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-uroman
+    TEST_SPEC "[uroman]"
+    PROPERTIES LABELS "unit;uroman"
 )
 
 # ─── test-generation-health — Catch2 unit tests for the generation-health
@@ -2030,6 +2213,28 @@ catch_discover_tests(test-session-setters
     PROPERTIES LABELS "unit"
 )
 
+# ─── test-session-introspection — Catch2 unit tests for the exception-safe
+# session introspection accessors added in PR #259 (CTC vocab + whisper
+# no_speech_prob + detected_language).
+#
+# Verifies the null-handle / bad-arg / OOB sentinel contract (return
+# -1 / -1.0 / 0 / ""). No model loaded — pure guard path, sub-millisecond.
+add_executable(test-session-introspection
+    test-session-introspection.cpp
+)
+target_include_directories(test-session-introspection PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-session-introspection PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+catch_discover_tests(test-session-introspection
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
 # ─── test-session-beam — functional beam-search regression test (§90).
 #
 # [unit][beam]  — setter API (null guard, width clamping). No model.
@@ -2112,6 +2317,7 @@ catch_discover_tests(test-companion-resolve
 add_executable(test_server_wav_writer test_server_wav_writer.cpp)
 target_include_directories(test_server_wav_writer PRIVATE
     ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
 )
 target_link_libraries(test_server_wav_writer PRIVATE
     Catch2::Catch2WithMain
@@ -2136,17 +2342,49 @@ catch_discover_tests(test_watermark
     PROPERTIES LABELS "unit"
 )
 
+# ─── test_c2pa_native — Catch2 unit tests for the native C++ C2PA signer
+#(CBOR/JUMBF/COSE/ES256 via uECC). Hermetic — no c2pa-rs, no network, no model.
+#The [emit] case writes a signed WAV for the live parity ctest below.
+if (NOT CRISPASR_NO_C2PA_NATIVE)
+    add_executable(test_c2pa_native test_c2pa_native.cpp)
+    target_include_directories(test_c2pa_native PRIVATE
+        ${PROJECT_SOURCE_DIR}/src/core
+    )
+    target_compile_definitions(test_c2pa_native PRIVATE
+        CRISPASR_TEST_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets")
+    target_link_libraries(test_c2pa_native PRIVATE
+        Catch2::Catch2WithMain
+        crispasr_c2pa_native
+    )
+    catch_discover_tests(test_c2pa_native
+        TEST_SPEC "[unit]"
+        PROPERTIES LABELS "unit;c2pa"
+    )
+
+    # Live parity: emit a signed WAV and validate it in the c2pa-rs reference
+    # reader (via c2pa-python). Skips cleanly when python/c2pa is unavailable.
+    add_test(NAME test-c2pa-native-parity
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/c2pa_native_parity.sh $<TARGET_FILE:test_c2pa_native>)
+    set_tests_properties(test-c2pa-native-parity PROPERTIES LABELS "live;c2pa;parity" TIMEOUT 120)
+endif()
+
 # ─── test_tts_provenance — Catch2 unit tests for TTS AI-provenance
 #compliance (WAV LIST/INFO, ID3v2, MP3/glint encode, C2PA, consent gate,
 #watermark edge cases). Pure CPU, no model dependencies.
 add_executable(test_tts_provenance test_tts_provenance.cpp)
 target_include_directories(test_tts_provenance PRIVATE
     ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
 )
 target_link_libraries(test_tts_provenance PRIVATE
     Catch2::Catch2WithMain
     glint
 )
+# crispasr_c2pa.h routes WAV signing through the native signer; link it so this
+# test (which includes the header directly, not via crispasr-lib) resolves.
+if (NOT CRISPASR_NO_C2PA_NATIVE)
+    target_link_libraries(test_tts_provenance PRIVATE crispasr_c2pa_native)
+endif()
 catch_discover_tests(test_tts_provenance
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit"
@@ -2374,6 +2612,38 @@ target_link_libraries(test-core-seanet PRIVATE
 catch_discover_tests(test-core-seanet
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit"
+)
+
+# ─── test-fastconv — core_dac::fastconv_cache + conv1d fast path (ggml graph) ──
+# Shared FASTCONV (docs/perf-sweep/PLAN.md item 1): baked-F32 kernel + k=1→matmul
+# must equal the legacy conv1d, and a disabled cache must be byte-identical.
+add_executable(test-fastconv test-fastconv.cpp)
+target_include_directories(test-fastconv PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-fastconv PRIVATE
+    Catch2::Catch2WithMain
+    ggml ggml-base ggml-cpu
+)
+catch_discover_tests(test-fastconv
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── cosyvoice3-hift-fastconv-ab — manual A/B harness (needs local GGUF models) ─
+# Drives the deterministic HiFT vocoder with fixed mel+noise so the
+# CRISPASR_COSYVOICE3_FASTCONV cast-kill can be byte-diffed ON vs OFF. Not a
+# ctest (requires cosyvoice3-{llm,hift} GGUFs); run manually. See
+# docs/perf-sweep/PLAN.md TODO-A.
+add_executable(cosyvoice3-hift-fastconv-ab cosyvoice3-hift-fastconv-ab.cpp)
+target_include_directories(cosyvoice3-hift-fastconv-ab PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(cosyvoice3-hift-fastconv-ab PRIVATE
+    cosyvoice3_tts
+    chatterbox
 )
 
 # ─── test-audio-formats — Catch2 unit tests for crispasr_audio_load format coverage
@@ -2692,6 +2962,17 @@ set_tests_properties(test-speaker-id-live PROPERTIES
     TIMEOUT 600)
 endif()
 
+# ─── test-surface-parity — cross-surface parity harness (improvements Phase 0):
+# CLI adapter vs session C-ABI produce the same transcription. Skips unless a
+# parakeet model + libcrispasr shared lib + python are present.
+add_test(NAME test-surface-parity
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-surface-parity.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-surface-parity PROPERTIES
+    LABELS "live;parity;improvements"
+    SKIP_RETURN_CODE 2
+    TIMEOUT 300)
+
 # ─── test-progress-output — live test: -pp/--print-progress emits per-slice
 # progress on stderr for unified backends (issue #130).
 add_test(NAME test-progress-output
@@ -2841,3 +3122,52 @@ add_test(NAME test-granite-maxlen
 set_tests_properties(test-granite-maxlen PROPERTIES
     LABELS "live;granite;max-len"
     TIMEOUT 300)
+
+# ─── libFuzzer harness over crispasr_audio_load (opt-in, clang only) ─────────
+# Build: cmake -B build-fuzz -DCRISPASR_FUZZ=ON -DCRISPASR_SANITIZE_ADDRESS=ON \
+#          -DCRISPASR_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug
+#        cmake --build build-fuzz --target crispasr-fuzz-audio
+# Run:   ./build-fuzz/bin/crispasr-fuzz-audio -max_len=65536 tests/fuzz/corpus
+if (CRISPASR_FUZZ)
+    add_executable(crispasr-fuzz-audio fuzz/fuzz_audio_load.cpp)
+    target_link_libraries(crispasr-fuzz-audio PRIVATE crispasr-lib)
+    target_compile_options(crispasr-fuzz-audio PRIVATE -fsanitize=fuzzer)
+    target_link_options(crispasr-fuzz-audio PRIVATE -fsanitize=fuzzer)
+
+    # GGUF metadata parser harness (seed from a real .gguf — see tests/fuzz/README).
+    add_executable(crispasr-fuzz-gguf fuzz/fuzz_gguf_meta.cpp)
+    target_include_directories(crispasr-fuzz-gguf PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(crispasr-fuzz-gguf PRIVATE crispasr-lib)
+    target_compile_options(crispasr-fuzz-gguf PRIVATE -fsanitize=fuzzer)
+    target_link_options(crispasr-fuzz-gguf PRIVATE -fsanitize=fuzzer)
+
+    # Text tokenizer harness — core_bpe + core_wordpiece over untrusted
+    # prompt / reference-text strings (header-only; needs the ggml headers
+    # transitively via src include path).
+    add_executable(crispasr-fuzz-tokenizer fuzz/fuzz_tokenizer.cpp)
+    target_include_directories(crispasr-fuzz-tokenizer PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(crispasr-fuzz-tokenizer PRIVATE crispasr-lib)
+    target_compile_options(crispasr-fuzz-tokenizer PRIVATE -fsanitize=fuzzer)
+    target_link_options(crispasr-fuzz-tokenizer PRIVATE -fsanitize=fuzzer)
+endif()
+
+# ─── C2PA native-JS signer — unit + live parity tests (node --test) ──────────
+# The signer (bindings/javascript/c2pa.mjs) re-implements C2PA signing in pure
+# WebCrypto so the wasm build needs no c2pa-rs. Unit tests are hermetic (CBOR
+# vectors, JUMBF layout, tamper); the parity test validates a JS-signed WAV in
+# the c2pa-rs reference reader and is skipped (still exit 0) when node or the
+# c2pa python package is unavailable.
+find_program(NODE_EXECUTABLE NAMES node nodejs)
+if (NODE_EXECUTABLE)
+    set(_c2pa_js_dir ${PROJECT_SOURCE_DIR}/bindings/javascript)
+
+    add_test(NAME test-c2pa-js-unit
+        COMMAND ${NODE_EXECUTABLE} --test test/c2pa.unit.test.mjs
+        WORKING_DIRECTORY ${_c2pa_js_dir})
+    set_tests_properties(test-c2pa-js-unit PROPERTIES LABELS "unit;c2pa;js" TIMEOUT 60)
+
+    add_test(NAME test-c2pa-js-parity
+        COMMAND ${NODE_EXECUTABLE} --test test/c2pa.parity.test.mjs
+        WORKING_DIRECTORY ${_c2pa_js_dir})
+    set_tests_properties(test-c2pa-js-parity PROPERTIES LABELS "live;c2pa;js;parity" TIMEOUT 120)
+endif()

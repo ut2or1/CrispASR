@@ -11,6 +11,14 @@ TEST_CASE("nemotron_params: default values are sensible", "[unit][nemotron]") {
     REQUIRE(p.verbosity >= 0);
 }
 
+// Defaults-audit / config-parity guard (motivated by #192/#197 + PLAN #89). Pin
+// the shipped use_flash/use_gpu defaults so a silent flip fails CI.
+TEST_CASE("nemotron_params: gpu/flash defaults are pinned", "[unit][nemotron]") {
+    struct nemotron_context_params p = nemotron_context_default_params();
+    REQUIRE(p.use_gpu == false);
+    REQUIRE(p.use_flash == false);
+}
+
 TEST_CASE("nemotron_init_from_file: null path returns nullptr", "[unit][nemotron]") {
     struct nemotron_context_params p = nemotron_context_default_params();
     struct nemotron_context* ctx = nemotron_init_from_file(nullptr, p);

@@ -51,9 +51,14 @@ def main():
         from safetensors.torch import load_file
         import json
 
-        sf_path = hf_hub_download(args.input, "model.safetensors")
-        cfg_path = hf_hub_download(args.input, "config.json")
-        vocab_path = hf_hub_download(args.input, "vocab.json")
+        if is_local:
+            sf_path = os.path.join(args.input, "model.safetensors")
+            cfg_path = os.path.join(args.input, "config.json")
+            vocab_path = os.path.join(args.input, "vocab.json")
+        else:
+            sf_path = hf_hub_download(args.input, "model.safetensors")
+            cfg_path = hf_hub_download(args.input, "config.json")
+            vocab_path = hf_hub_download(args.input, "vocab.json")
 
         sd_raw = load_file(sf_path)
         with open(cfg_path, encoding="utf-8") as f:

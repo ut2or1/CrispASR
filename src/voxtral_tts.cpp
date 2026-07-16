@@ -45,7 +45,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <unistd.h> // mkdtemp (crispasr-diff LLM stage)
+#include <filesystem> // crispasr-diff LLM stage temp dir (portable; replaces POSIX mkdtemp/unistd.h — no unistd.h on MSVC, breaks the Windows build)
 #include <map>
 #include <memory>
 #include <numeric>
@@ -1875,20 +1875,31 @@ extern "C" int voxtral_tts_llm_diff(const char* model_gguf, const char* ref_gguf
     }
     const int D = ctx->hp.llm_dim;
 
-    char tmpl[] = "/tmp/vtts_diff_XXXXXX";
-    char* dir = mkdtemp(tmpl);
-    if (!dir) {
+    // Portable unique temp dir (replaces POSIX mkdtemp + hardcoded "/tmp" — Windows has neither).
+    std::error_code _ec;
+    std::filesystem::path dir =
+        std::filesystem::temp_directory_path(_ec) / ("vtts_diff_" + std::to_string((unsigned long long)ggml_time_us()));
+    if (_ec || (!std::filesystem::create_directories(dir, _ec) && _ec)) {
         voxtral_tts_free(ctx);
         return 2;
     }
-    setenv("CRISPASR_VOXTRAL_TTS_DIFF_DUMP", dir, 1);
+    const std::string dir_s = dir.string();
+#if defined(_WIN32)
+    _putenv_s("CRISPASR_VOXTRAL_TTS_DIFF_DUMP", dir_s.c_str());
+#else
+    setenv("CRISPASR_VOXTRAL_TTS_DIFF_DUMP", dir_s.c_str(), 1);
+#endif
     const char* text = getenv("VOXTRAL_TTS_TEXT") ? getenv("VOXTRAL_TTS_TEXT") : "Hello world.";
     const char* voice = getenv("VOXTRAL_TTS_VOICE") ? getenv("VOXTRAL_TTS_VOICE") : "neutral_female";
     int n_samples = 0;
     float* pcm = voxtral_tts_synthesize(ctx, text, voice, &n_samples); // dumps mine.c1.<stage> (frame 0)
     if (pcm)
         voxtral_tts_pcm_free(pcm);
+#if defined(_WIN32)
+    _putenv_s("CRISPASR_VOXTRAL_TTS_DIFF_DUMP", "");
+#else
     unsetenv("CRISPASR_VOXTRAL_TTS_DIFF_DUMP");
+#endif
 
     std::vector<std::string> stages = {"embed"};
     for (int i = 0; i < ctx->hp.llm_n_layers; i++)
@@ -1900,7 +1911,7 @@ extern "C" int voxtral_tts_llm_diff(const char* model_gguf, const char* ref_gguf
     for (const auto& s : stages) {
         std::vector<float> a(D), b(D);
         char pth[512];
-        snprintf(pth, sizeof(pth), "%s/mine.c1.%s.bin", dir, s.c_str());
+        snprintf(pth, sizeof(pth), "%s/mine.c1.%s.bin", dir_s.c_str(), s.c_str());
         FILE* fp = fopen(pth, "rb");
         // Use load_weights' canonical name→tensor map, not ggml_get_tensor(rw.ctx, ...)
         // which scans the ctx and (observed) could return the wrong tensor's data for

@@ -130,8 +130,18 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `split_on_word` | `true`/`false` — split segments on word boundaries |
 | `max_len` | Maximum segment length in characters |
 | `chunk_seconds` | Maximum chunk duration for long audio (default: 30) |
+| `chunk_overlap` | Overlap context (seconds) around chunk boundaries |
 
 The `/inference` endpoint accepts the same CrispASR extension fields.
+
+> **Parakeet segmentation (issue #257).** Backends that chunk internally
+> (parakeet/canary — full-attention FastConformer) now receive the whole clip
+> instead of dispatcher-pre-sliced pieces (per-slice transcribe corrupts this
+> encoder). With an explicit `chunk_seconds=N`, the non-JA Parakeet response is
+> split into **~N-second segments** of the complete transcript (each with
+> `start`/`end`/`words`); without it, one coherent segment (or the silence-split
+> longform above the memory cap). VAD, when requested, still provides
+> silence-bounded slices. Matches the CLI's `--chunk-seconds` behaviour.
 
 ### Server startup flags (resident post-processors)
 
@@ -276,6 +286,13 @@ curl http://localhost:8080/v1/audio/speech \
 | `consent_attestation` | empty | Required when `voice` ends in `.wav` (voice cloning). A free-text statement attesting speaker consent, e.g. `"I have the speaker's consent"`. Logged for audit. |
 | `spoken_disclaimer` | `true` | Set to `false` to skip the audible AI-disclosure prefix on voice-cloned output. Machine-readable provenance (watermark + C2PA) is always applied. When `false`, the caller assumes responsibility for providing appropriate AI-disclosure to end users. |
 
+> **Watermarking.** Every response is watermarked by default. There is **no
+> per-request watermark toggle** — the mark is disabled only at the process
+> level by starting the server with `--no-watermark` (or `CRISPASR_NO_WATERMARK=1`),
+> which turns it off for **all** responses and logs a one-time warning that the
+> AI-content marking responsibility then rests with the operator. See
+> [`tts.md`](tts.md#disabling-the-watermark-operator-opt-out).
+
 **Returns:**
 
 | Status | Content-Type | Body |
@@ -410,7 +427,8 @@ curl http://localhost:8080/v1/audio/speech-to-speech \
 
 The intermediate ASR transcript (if the backend produces one) is
 returned in the `X-Transcript` response header (URL-encoded). Output
-audio is watermarked automatically, same as TTS.
+audio is watermarked by default, same as TTS (process-level opt-out via
+`--no-watermark` / `CRISPASR_NO_WATERMARK`).
 
 ### Deferred
 
@@ -628,6 +646,7 @@ You can override the loaded model and startup flags through `.env`:
 | `CRISPASR_CACHE_DIR` | Where auto-downloaded models live (defaults to `/cache`) |
 | `CRISPASR_API_KEYS` | Comma-separated API keys (see [API keys](#api-keys)) |
 | `CRISPASR_EXTRA_ARGS` | Forwarded verbatim to the server CLI (e.g. `--no-punctuation`) |
+| `CRISPASR_SERVER_WORKERS` | `N>1` loads N independent ASR backend instances so **pure-ASR** requests (explicit `language`, no aligner, no punctuation/truecaser) run concurrently instead of serializing on the single model. Costs N× model memory. Only a throughput win where a single request under-utilises the box (spare cores, a GPU not saturated by one stream, smaller models); a *net loss* on a saturated memory-bandwidth-bound CPU model, where the instances contend. Requests using shared LID/aligner/post-processing stay serialized. `/load` is disabled while a pool is active (restart to change models). Default `1` = single instance. |
 
 The service is configured to avoid serving as root by default:
 - `user: "${CRISPASR_UID:-1000}:${CRISPASR_GID:-1000}"`

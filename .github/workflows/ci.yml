@@ -155,6 +155,50 @@ jobs:
         run: ./build-asan/bin/test-audio-formats "[audio]"
 
   # ===========================================================================
+  # Linux x86_64 — libFuzzer smoke run over crispasr_audio_load (untrusted input)
+  # ===========================================================================
+  # tests/fuzz/fuzz_audio_load.cpp fuzzes the one entry point that reaches every
+  # hand-rolled audio parser (AU/AMR/WebM/MP4 + miniaudio). Build it with clang
+  # (Linux clang ships the libFuzzer runtime; Apple Clang does not) and run a
+  # short, seeded smoke pass under ASan/UBSan — a new crash fails CI. This is a
+  # regression gate, not a fuzzing campaign; run it longer out of band for depth.
+  linux-fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libopenblas-dev libopusfile-dev
+
+      - name: Configure (fuzzer + ASan/UBSan, clang)
+        env:
+          CC: clang
+          CXX: clang++
+        run: >
+          cmake -S . -B build-fuzz
+          -DCMAKE_BUILD_TYPE=Debug
+          -DGGML_NATIVE=OFF
+          -DCRISPASR_BUILD_TESTS=ON
+          -DCRISPASR_FUZZ=ON
+          -DCRISPASR_SANITIZE_ADDRESS=ON
+          -DCRISPASR_SANITIZE_UNDEFINED=ON
+
+      - name: Build the fuzz harness
+        run: cmake --build build-fuzz --target crispasr-fuzz-audio -j $(nproc)
+
+      - name: Smoke fuzz (seeded from samples/, ~45s; a crash fails CI)
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+        run: |
+          mkdir -p fuzz-corpus
+          cp samples/jfk.wav samples/jfk.au samples/jfk.amr samples/jfk.webm \
+             samples/jfk-vorbis.webm samples/jfk.m4a fuzz-corpus/ 2>/dev/null || true
+          ./build-fuzz/bin/crispasr-fuzz-audio -max_total_time=45 -max_len=1048576 \
+             -rss_limit_mb=4096 fuzz-corpus
+
+  # ===========================================================================
   # Linux x86_64 + Vulkan
   # ===========================================================================
   linux-vulkan:

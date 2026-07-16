@@ -30,6 +30,7 @@
 #include "crispasr_output.h"
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_vad_cli.h"
+#include "crispasr_cpu_isa.h" // #261: CPU instruction-set self-check (soft-degrade VAD/diarize)
 #include "crispasr_aligner_cli.h"
 #include "whisper_params.h"
 #include "fireredpunc.h"                 // server-mode punctuation restoration (--punc-model)
@@ -44,12 +45,13 @@
 #include "../server/ws_stream.h"       // real-time WebSocket ASR streaming (--ws-port)
 #include "../server/realtime_server.h" // vLLM Realtime API
 #include "wyoming.h"                   // Wyoming protocol for Home Assistant Assist (--wyoming-port)
-#include "crispasr_c2pa.h"
+#include "core/crispasr_c2pa.h"
 #include "crispasr_tts_chunking.h"
 #include "crispasr_tts_disclaimer.h"
 #include "crispasr_watermark.h"
 #include "crispasr_watermark_dispatch.h"
-#include "crispasr_wav_writer.h"
+#include "core/crispasr_wav_writer.h"
+#include "core/worker_pool.h"     // improvements Phase 4b: concurrent ASR worker pool
 #include "crispasr_mp3_writer.h"  // MP3 output via in-tree glint encoder
 #include "crispasr_aac_writer.h"  // AAC-LC (ADTS) output via in-tree glint encoder
 #include "crispasr_opus_writer.h" // Ogg Opus output via in-tree glint encoder
@@ -60,6 +62,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -129,6 +132,22 @@ static std::string scratch_dir() {
 // The caller is responsible for calling std::remove() on the returned path.
 // Preserve the original file extension so ffmpeg and miniaudio can detect
 // the container format (critical for m4a/aac/opus/webm uploads).
+// Sanitise an untrusted, request-supplied string before it goes into a stderr
+// log line: cap the length and replace control bytes (incl. CR/LF and terminal
+// escape sequences) so a crafted filename / voice / attestation can't forge log
+// lines or inject escapes into an operator's terminal.
+static std::string log_sanitize(const std::string& s, size_t cap = 256) {
+    std::string o;
+    o.reserve(s.size() < cap ? s.size() : cap);
+    for (size_t i = 0; i < s.size() && i < cap; i++) {
+        unsigned char c = (unsigned char)s[i];
+        o += (c < 0x20 || c == 0x7f) ? '?' : (char)c;
+    }
+    if (s.size() > cap)
+        o += "...";
+    return o;
+}
+
 static std::string write_temp_audio(const char* data, size_t size, const std::string& original_filename = "") {
     // Extract extension from original filename
     std::string ext;
@@ -379,6 +398,21 @@ static std::string add_ctc_logits_to_json(const std::string& base, const crispas
     }
 }
 
+// Per-thread breadcrumb of the current processing stage (#261). Synchronous
+// fault signals (SIGILL/SIGSEGV/…) are delivered to the faulting thread, so the
+// fatal-signal handler runs on that thread and reads its own TLS — the crashing
+// stage. Reading a const char* is async-signal-safe. See the fatal-signal
+// handler further down for how this is used.
+static thread_local const char* g_current_stage = nullptr;
+
+struct stage_scope {
+    const char* prev;
+    explicit stage_scope(const char* s) : prev(g_current_stage) { g_current_stage = s; }
+    ~stage_scope() { g_current_stage = prev; }
+    stage_scope(const stage_scope&) = delete;
+    stage_scope& operator=(const stage_scope&) = delete;
+};
+
 // Load audio from a multipart file upload, transcribe it, return result.
 // Acquires model_mutex internally.
 static transcription_result do_transcribe(const httplib::MultipartFormData& audio_file, CrispasrBackend* backend,
@@ -391,7 +425,7 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
     result.language = rp.language;
 
     if (rp.verbose)
-        fprintf(stderr, "crispasr-server: processing '%s' (%zu bytes)\n", audio_file.filename.c_str(),
+        fprintf(stderr, "crispasr-server: processing '%s' (%zu bytes)\n", log_sanitize(audio_file.filename).c_str(),
                 audio_file.content.size());
 
     // Write to a secure temporary file for audio decoding.
@@ -446,7 +480,25 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
         (effective_chunk_seconds == 0 || effective_chunk_seconds > vad_cap)) {
         effective_chunk_seconds = vad_cap;
     }
-    const auto slices = crispasr_compute_audio_slices(pcmf32.data(), n_samples, SR, effective_chunk_seconds, rp);
+    // Issue #257: backends that chunk internally (parakeet/canary — full-
+    // attention FastConformer) are corrupted by the dispatcher's per-slice
+    // transcribe + merge. Hand them the whole clip so their coherent internal
+    // decode runs — and, for an explicit --chunk-seconds request, emits
+    // ~N-second segments (the CLI adapter's issue #257 path) instead of one
+    // blob. Mirrors the CLI dispatcher (crispasr_run.cpp
+    // backend_self_chunks_on_explicit + CAP_INTERNAL_CHUNKING gate). VAD still
+    // provides silence-bounded slices when the caller requested it.
+    if ((backend->capabilities() & CAP_INTERNAL_CHUNKING) && !rp.vad) {
+        effective_chunk_seconds = 0;
+    }
+    // #261: Silero/MarbleNet VAD runs on the CPU ggml backend inside slicing —
+    // breadcrumb it so a native-instruction fault (SIGILL) is attributed
+    // correctly by the fatal-signal handler.
+    std::vector<crispasr_audio_slice> slices;
+    {
+        stage_scope _stg(rp.vad ? "vad (silero/marblenet CPU inference)" : "audio slicing");
+        slices = crispasr_compute_audio_slices(pcmf32.data(), n_samples, SR, effective_chunk_seconds, rp);
+    }
     if (slices.empty()) {
         result.ok = true;
         return result;
@@ -547,61 +599,81 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
         // Diarization post-step (#143): assign speaker labels to segments.
         // Mirrors the CLI path in crispasr_run.cpp:732-743.
         if (rp.diarize && !result.segs.empty()) {
-            const bool have_stereo = pcmf32s.size() == 2 && !pcmf32s[0].empty() && !pcmf32s[1].empty();
+            // #261: diarization (pyannote-seg / sherpa / embedding) runs on the
+            // CPU ggml backend. Breadcrumb the stage for the fatal-signal
+            // handler, and wrap the whole step so a throwing failure (e.g.
+            // std::bad_alloc on a very long clip) degrades to "transcription
+            // without speaker labels" instead of failing the request — the
+            // server must not lose a good ASR result over an optional post-step.
+            stage_scope _stg("diarization (cpu inference)");
+            try {
+                const bool have_stereo = pcmf32s.size() == 2 && !pcmf32s[0].empty() && !pcmf32s[1].empty();
 
-            // Pre-compute global caches for cross-slice consistency.
-            CrispasrPyannoteCache pyannote_cache;
-            if (rp.diarize_method == "pyannote" && !pcmf32.empty()) {
-                crispasr_compute_pyannote_cache(pcmf32.data(), n_samples, rp, pyannote_cache);
-            }
-            CrispasrSherpaCache sherpa_cache;
-            if ((rp.diarize_method == "sherpa" || rp.diarize_method == "sherpa-onnx" || rp.diarize_method == "ecapa") &&
-                !pcmf32.empty()) {
-                crispasr_compute_sherpa_cache(pcmf32.data(), n_samples, rp, sherpa_cache);
-            }
-            const CrispasrPyannoteCache* pya_ptr = pyannote_cache.valid() ? &pyannote_cache : nullptr;
-            const CrispasrSherpaCache* shp_ptr = sherpa_cache.valid() ? &sherpa_cache : nullptr;
-
-            // Apply diarize per-slice. We re-walk the slices and apply
-            // diarize to the corresponding range of result.segs.
-            size_t seg_offset = 0;
-            for (size_t i = 0; i < slices.size(); ++i) {
-                const auto& sl = slices[i];
-                // Count how many segments belong to this slice (by timestamp range).
-                size_t seg_count = 0;
-                for (size_t j = seg_offset; j < result.segs.size(); ++j) {
-                    // Segments from the next slice will have t0 >= next slice's t0_cs.
-                    if (i + 1 < slices.size() && result.segs[j].t0 >= slices[i + 1].t0_cs)
-                        break;
-                    seg_count++;
+                // Pre-compute global caches for cross-slice consistency.
+                CrispasrPyannoteCache pyannote_cache;
+                if (rp.diarize_method == "pyannote" && !pcmf32.empty()) {
+                    crispasr_compute_pyannote_cache(pcmf32.data(), n_samples, rp, pyannote_cache);
                 }
+                CrispasrSherpaCache sherpa_cache;
+                if ((rp.diarize_method == "sherpa" || rp.diarize_method == "sherpa-onnx" ||
+                     rp.diarize_method == "ecapa") &&
+                    !pcmf32.empty()) {
+                    crispasr_compute_sherpa_cache(pcmf32.data(), n_samples, rp, sherpa_cache);
+                }
+                const CrispasrPyannoteCache* pya_ptr = pyannote_cache.valid() ? &pyannote_cache : nullptr;
+                const CrispasrSherpaCache* shp_ptr = sherpa_cache.valid() ? &sherpa_cache : nullptr;
 
-                if (seg_count > 0) {
-                    std::vector<crispasr_segment> slice_segs(result.segs.begin() + (ptrdiff_t)seg_offset,
-                                                             result.segs.begin() + (ptrdiff_t)(seg_offset + seg_count));
-                    if (have_stereo) {
-                        std::vector<float> sl_l(pcmf32s[0].begin() + sl.start, pcmf32s[0].begin() + sl.end);
-                        std::vector<float> sl_r(pcmf32s[1].begin() + sl.start, pcmf32s[1].begin() + sl.end);
-                        crispasr_apply_diarize(sl_l, sl_r, /*is_stereo=*/true, sl.t0_cs, slice_segs, rp, pya_ptr,
-                                               shp_ptr);
-                    } else {
-                        std::vector<float> mono_slice(pcmf32.begin() + sl.start, pcmf32.begin() + sl.end);
-                        crispasr_apply_diarize(mono_slice, mono_slice,
-                                               /*is_stereo=*/false, sl.t0_cs, slice_segs, rp, pya_ptr, shp_ptr);
+                // Apply diarize per-slice. We re-walk the slices and apply
+                // diarize to the corresponding range of result.segs.
+                size_t seg_offset = 0;
+                for (size_t i = 0; i < slices.size(); ++i) {
+                    const auto& sl = slices[i];
+                    // Count how many segments belong to this slice (by timestamp range).
+                    size_t seg_count = 0;
+                    for (size_t j = seg_offset; j < result.segs.size(); ++j) {
+                        // Segments from the next slice will have t0 >= next slice's t0_cs.
+                        if (i + 1 < slices.size() && result.segs[j].t0 >= slices[i + 1].t0_cs)
+                            break;
+                        seg_count++;
                     }
-                    // Copy back the diarized segments.
-                    for (size_t j = 0; j < seg_count; ++j)
-                        result.segs[seg_offset + j] = std::move(slice_segs[j]);
-                }
-                seg_offset += seg_count;
-            }
 
-            // Global embedding-based re-clustering (issue #107 P3).
-            if (!rp.diarize_embedder.empty() && !pcmf32.empty()) {
-                auto embedder = crispasr_make_speaker_embedder(rp.diarize_embedder, rp.n_threads, rp.cache_dir);
-                if (embedder) {
-                    crispasr_remap_speakers_via_embeddings(result.segs, pcmf32.data(), n_samples, embedder.get(), rp);
+                    if (seg_count > 0) {
+                        std::vector<crispasr_segment> slice_segs(result.segs.begin() + (ptrdiff_t)seg_offset,
+                                                                 result.segs.begin() +
+                                                                     (ptrdiff_t)(seg_offset + seg_count));
+                        if (have_stereo) {
+                            std::vector<float> sl_l(pcmf32s[0].begin() + sl.start, pcmf32s[0].begin() + sl.end);
+                            std::vector<float> sl_r(pcmf32s[1].begin() + sl.start, pcmf32s[1].begin() + sl.end);
+                            crispasr_apply_diarize(sl_l, sl_r, /*is_stereo=*/true, sl.t0_cs, slice_segs, rp, pya_ptr,
+                                                   shp_ptr);
+                        } else {
+                            std::vector<float> mono_slice(pcmf32.begin() + sl.start, pcmf32.begin() + sl.end);
+                            crispasr_apply_diarize(mono_slice, mono_slice,
+                                                   /*is_stereo=*/false, sl.t0_cs, slice_segs, rp, pya_ptr, shp_ptr);
+                        }
+                        // Copy back the diarized segments.
+                        for (size_t j = 0; j < seg_count; ++j)
+                            result.segs[seg_offset + j] = std::move(slice_segs[j]);
+                    }
+                    seg_offset += seg_count;
                 }
+
+                // Global embedding-based re-clustering (issue #107 P3).
+                if (!rp.diarize_embedder.empty() && !pcmf32.empty()) {
+                    auto embedder = crispasr_make_speaker_embedder(rp.diarize_embedder, rp.n_threads, rp.cache_dir);
+                    if (embedder) {
+                        crispasr_remap_speakers_via_embeddings(result.segs, pcmf32.data(), n_samples, embedder.get(),
+                                                               rp);
+                    }
+                }
+            } catch (const std::exception& e) {
+                fprintf(stderr,
+                        "crispasr-server: warning: diarization failed (%s) — returning transcription "
+                        "without speaker labels\n",
+                        e.what());
+            } catch (...) {
+                fprintf(stderr, "crispasr-server: warning: diarization failed (unknown error) — returning "
+                                "transcription without speaker labels\n");
             }
         }
 
@@ -736,16 +808,121 @@ static std::string crispasr_opus_response(const float* pcm, int n_samples, int s
 }
 
 // ---------------------------------------------------------------------------
+// Fatal-signal diagnostics (#261)
+//
+// The CPU ggml backend runs Silero VAD and pyannote diarization (GPU ASR does
+// not touch it). If an image is mistakenly built with `-march=native`
+// (GGML_NATIVE=ON) on a host with wider CPU extensions than the deployment
+// host, those CPU kernels raise SIGILL and the process dies with NO message —
+// httplib's exception handler only catches C++ exceptions, not signals, so the
+// container just restarts silently (the exact report in #261).
+//
+// The real fix is building with -DGGML_NATIVE=OFF (see .devops/*.Dockerfile).
+// This handler is the safety net: it turns the silent death into an
+// actionable, async-signal-safe diagnostic that names the stage that was
+// running, then re-raises so the process still terminates with the correct
+// signal (core-dump / restart semantics preserved). It uses only
+// async-signal-safe calls (write(2); no printf/malloc). The g_current_stage
+// breadcrumb and stage_scope RAII helper are defined earlier (before
+// do_transcribe, which sets them).
+// ---------------------------------------------------------------------------
+
+static void crispasr_sig_write(const char* s) {
+    if (!s)
+        return;
+    size_t n = 0;
+    while (s[n])
+        ++n;
+#ifdef _WIN32
+    (void)fwrite(s, 1, n, stderr);
+#else
+    ssize_t rc = write(STDERR_FILENO, s, n);
+    (void)rc;
+#endif
+}
+
+static void crispasr_fatal_signal_handler(int sig) {
+    const char* name = "fatal signal";
+    switch (sig) {
+    case SIGILL:
+        name = "SIGILL (illegal instruction)";
+        break;
+    case SIGSEGV:
+        name = "SIGSEGV (segmentation fault)";
+        break;
+    case SIGFPE:
+        name = "SIGFPE (floating-point exception)";
+        break;
+#ifdef SIGBUS
+    case SIGBUS:
+        name = "SIGBUS (bus error)";
+        break;
+#endif
+    default:
+        break;
+    }
+    crispasr_sig_write("\n*** crispasr-server: FATAL ");
+    crispasr_sig_write(name);
+    crispasr_sig_write(" during stage: ");
+    crispasr_sig_write(g_current_stage ? g_current_stage : "unknown");
+    crispasr_sig_write(" ***\n");
+    if (sig == SIGILL) {
+        crispasr_sig_write("This almost always means the binary uses CPU instructions this host does\n"
+                           "not support (e.g. AVX-512 baked in by -march=native). The CPU ggml backend\n"
+                           "used by VAD / diarization hit an unsupported instruction. Use an image built\n"
+                           "with -DGGML_NATIVE=OFF (portable AVX2), or run plain ASR without vad/diarize\n"
+                           "(that path executes on the GPU). See issue #261.\n");
+    }
+    // Restore the default disposition and re-raise so the process terminates
+    // with the original signal (SA_NODEFER lets the re-raise re-enter).
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void crispasr_install_fatal_signal_handlers() {
+#ifndef _WIN32
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = crispasr_fatal_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_NODEFER;
+    sigaction(SIGILL, &sa, nullptr);
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGFPE, &sa, nullptr);
+#ifdef SIGBUS
+    sigaction(SIGBUS, &sa, nullptr);
+#endif
+#else
+    signal(SIGILL, crispasr_fatal_signal_handler);
+    signal(SIGSEGV, crispasr_fatal_signal_handler);
+    signal(SIGFPE, crispasr_fatal_signal_handler);
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // Server entry point
 // ---------------------------------------------------------------------------
 
 int crispasr_run_server(whisper_params& params, const std::string& host, int port) {
     using namespace httplib;
 
+    crispasr_install_fatal_signal_handlers();
+
+    // #261: compare the build's CPU instruction-set baseline against this host.
+    // If they mismatch, the CPU-only paths (VAD / diarization) would raise
+    // SIGILL — log a loud banner now and refuse those requests below (soft
+    // degrade) instead of crashing mid-request. Computed once; read by handlers.
+    const crispasr_cpu_isa::IsaCheck cpu_isa = crispasr_cpu_isa::check();
+    fprintf(stderr, "%s\n", crispasr_cpu_isa::banner(cpu_isa).c_str());
+
     crispasr_c2pa_startup_check();
     if (!params.watermark_model.empty()) {
         crispasr_wm_dispatch::init(params.watermark_model);
     }
+    // Honor the --no-watermark opt-out (equivalent to CRISPASR_NO_WATERMARK).
+    // A server operator that disables it takes on the AI-content marking duty
+    // for every response the process serves.
+    crispasr_wm_dispatch::set_disabled(params.tts_no_watermark);
 
     std::vector<std::string> api_keys = split_api_keys(params.server_api_keys);
     if (const char* env_keys = getenv("CRISPASR_API_KEYS")) {
@@ -757,6 +934,20 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     std::mutex model_mutex;
     std::atomic<bool> ready{false};
     std::string backend_name = params.backend;
+
+    // Improvements Phase 4b: concurrent ASR worker pool. The primary `backend`
+    // above (+ model_mutex) still handles streaming/TTS/load and any request
+    // that touches SHARED state (auto-LID model, aligner, punctuation/truecaser
+    // contexts) — those must stay serialized. A "pure ASR" request (explicit
+    // language, no aligner, no post-processing) touches only its backend, so it
+    // can run on a pooled worker concurrently. Each worker owns its backend and
+    // a private mutex; different workers never contend. Built only when
+    // CRISPASR_SERVER_WORKERS>1 (default 1 = single instance, unchanged).
+    struct AsrWorker {
+        std::unique_ptr<CrispasrBackend> backend;
+        std::mutex mtx;
+    };
+    std::unique_ptr<core_pool::WorkerPool<AsrWorker>> asr_pool;
 
     // Initial model load
     {
@@ -829,6 +1020,38 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                 fprintf(stderr, "crispasr-server: warning: warmup failed — continuing without warmup\n");
             }
         }
+        // Phase 4b: build the concurrent ASR worker pool. Each worker is an
+        // independent backend used ONLY for pure-ASR requests (explicit
+        // language, no aligner, no post-processing) so it shares no mutable
+        // state with other workers. N=1 (default) leaves `asr_pool` null →
+        // every request uses the primary backend + model_mutex (unchanged).
+        int n_workers = 1;
+        if (const char* e = std::getenv("CRISPASR_SERVER_WORKERS"))
+            n_workers = std::max(1, atoi(e));
+        if (n_workers > 1) {
+            std::vector<std::unique_ptr<AsrWorker>> workers;
+            for (int i = 0; i < n_workers; ++i) {
+                auto w = std::make_unique<AsrWorker>();
+                w->backend = crispasr_create_backend(backend_name);
+                if (!w->backend || !w->backend->init(params)) {
+                    fprintf(stderr, "crispasr-server: worker %d init failed — running single-instance\n", i);
+                    workers.clear();
+                    break;
+                }
+                if (!skip_warmup) {
+                    try {
+                        w->backend->warmup();
+                    } catch (...) {
+                    }
+                }
+                workers.push_back(std::move(w));
+            }
+            if (!workers.empty()) {
+                asr_pool = std::make_unique<core_pool::WorkerPool<AsrWorker>>(std::move(workers));
+                fprintf(stderr, "crispasr-server: ASR worker pool = %zu workers (pure-ASR requests run concurrently)\n",
+                        asr_pool->size());
+            }
+        }
         ready.store(true);
         fprintf(stderr, "crispasr-server: backend '%s' loaded, model '%s'\n", backend_name.c_str(),
                 params.model.c_str());
@@ -884,34 +1107,69 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
 
     Server svr;
 
-    // CORS support — opt-in via --cors-origin. Browser clients calling our
-    // /v1/* endpoints from a different origin need:
-    //   1. Access-Control-Allow-Origin on every response (set on each route)
-    //   2. A 204 reply to OPTIONS preflights with Allow-{Methods,Headers}
-    // The pre-routing handler runs on every request before route dispatch;
-    // we use it to attach the response headers and short-circuit the
-    // OPTIONS preflight without touching individual routes.
-    if (!params.server_cors_origin.empty()) {
-        const std::string cors_origin = params.server_cors_origin;
-        svr.set_pre_routing_handler([cors_origin](const Request& req, Response& res) {
+    // Security: bound the request body so an unbounded multipart upload cannot
+    // buffer gigabytes into RAM (OOM DoS) before auth/routing even run — the
+    // body is read (and, for multipart, fully accumulated) BEFORE the route
+    // handler + require_auth. set_payload_max_length makes httplib's read_content
+    // reject an over-cap Content-Length with 413 and skip the body WITHOUT
+    // buffering it — the clean fix for the normal (Content-Length) upload path.
+    const size_t max_upload_bytes = 512ull * 1024 * 1024; // 512 MB — far above any real audio upload
+    svr.set_payload_max_length(max_upload_bytes);
+
+    // A pre-routing handler runs before body read + route dispatch (httplib
+    // routing() calls it before read_content). httplib's CHUNKED reader does
+    // NOT honour payload_max_length (only the Content-Length path does), so a
+    // Transfer-Encoding: chunked upload would bypass the cap and buffer
+    // unbounded — reject chunked bodies on mutating requests here. When
+    // --cors-origin is set this handler also attaches CORS + answers OPTIONS.
+    const std::string cors_origin = params.server_cors_origin;
+    svr.set_pre_routing_handler([cors_origin](const Request& req, Response& res) {
+        if ((req.method == "POST" || req.method == "PUT") && req.has_header("Transfer-Encoding")) {
+            // Chunked/streamed upload — not bounded by set_payload_max_length.
+            res.status = 411; // Length Required — resend with a Content-Length.
+            return Server::HandlerResponse::Handled;
+        }
+        if (!cors_origin.empty()) {
             res.set_header("Access-Control-Allow-Origin", cors_origin);
-            res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE");
             res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key");
             res.set_header("Access-Control-Max-Age", "86400");
             if (req.method == "OPTIONS") {
                 res.status = 204;
                 return Server::HandlerResponse::Handled;
             }
-            return Server::HandlerResponse::Unhandled;
-        });
+        }
+        return Server::HandlerResponse::Unhandled;
+    });
+    if (!cors_origin.empty())
         fprintf(stderr, "crispasr-server: CORS enabled (Allow-Origin: %s)\n", cors_origin.c_str());
-    }
 
     auto require_auth = [&](const Request& req, Response& res) -> bool {
         if (is_authorized(req, api_keys))
             return true;
         auth_error(res);
         return false;
+    };
+
+    // Phase 4b: route a transcription to a concurrent pooled worker when it is
+    // "pure ASR" — explicit language (no shared LID model), no aligner, and no
+    // punctuation/truecaser post-processing (those contexts are shared and
+    // non-re-entrant). Such a request touches only its own backend, so pooled
+    // workers run without contending. Everything else stays on the primary
+    // backend + model_mutex (serialized, unchanged). asr_pool is null unless
+    // CRISPASR_SERVER_WORKERS>1.
+    auto dispatch_transcribe = [&](const httplib::MultipartFormData& audio_file, whisper_params rp,
+                                   bool need_ts) -> transcription_result {
+        const bool lang_explicit = !rp.language.empty() && rp.language != "auto";
+        const bool no_post = !punc_ctx && !pcs_ctx && !tc_ctx && !tc_crf_ctx && !tc_lstm_ctx;
+        const bool pure_asr = lang_explicit && rp.aligner_model.empty() && no_post;
+        if (asr_pool && pure_asr) {
+            auto lease = asr_pool->acquire();
+            return do_transcribe(audio_file, lease->backend.get(), lease->mtx, rp, need_ts, nullptr, nullptr, nullptr,
+                                 nullptr, nullptr);
+        }
+        return do_transcribe(audio_file, backend.get(), model_mutex, rp, need_ts, punc_ctx.get(), pcs_ctx.get(),
+                             tc_ctx.get(), tc_crf_ctx.get(), tc_lstm_ctx.get());
     };
 
     // -----------------------------------------------------------------------
@@ -930,8 +1188,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         }
 
         auto audio_file = req.get_file_value("file");
-        fprintf(stderr, "crispasr-server: /inference received '%s' (%zu bytes)\n", audio_file.filename.c_str(),
-                audio_file.content.size());
+        fprintf(stderr, "crispasr-server: /inference received '%s' (%zu bytes)\n",
+                log_sanitize(audio_file.filename).c_str(), audio_file.content.size());
 
         // Per-request parameter overrides.
         whisper_params rp = params;
@@ -991,12 +1249,31 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.lcs_dedup = form_string(req, "lcs_dedup", rp.lcs_dedup);
         rp.lcs_min_length = form_int(req, "lcs_min_length", rp.lcs_min_length);
         rp.parakeet_decoder = form_string(req, "parakeet_decoder", rp.parakeet_decoder);
+        {
+            // Issue #257: parakeet/canary local-attention window "L,R" (encoder
+            // frames) — NeMo rel_pos_local_attn, bounds long-audio VRAM.
+            const std::string ac = form_string(req, "att_context", "");
+            int l = INT_MIN, r = INT_MIN;
+            if (!ac.empty() && std::sscanf(ac.c_str(), "%d,%d", &l, &r) == 2) {
+                rp.att_context_left = l;
+                rp.att_context_right = r;
+            }
+        }
         rp.no_auto_aligner = form_bool(req, "no_auto_aligner", rp.no_auto_aligner);
         rp.show_alternatives = form_bool(req, "show_alternatives", rp.show_alternatives);
         rp.n_alternatives = form_int(req, "alt_n", rp.n_alternatives);
 
-        auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp, /*need_timestamps=*/true,
-                                    punc_ctx.get(), pcs_ctx.get(), tc_ctx.get(), tc_crf_ctx.get(), tc_lstm_ctx.get());
+        // #261: soft-degrade — refuse CPU-only VAD/diarize on an ISA-mismatched
+        // host rather than SIGILL-crashing the server (see /v1/audio/transcriptions).
+        if (!cpu_isa.ok && (rp.vad || rp.diarize)) {
+            json_error(res, 400,
+                       "this server build requires CPU instructions this host lacks (" + cpu_isa.missing +
+                           "), so VAD/diarization cannot run without crashing. Retry without "
+                           "vad/diarize, or deploy a portable image built with -DGGML_NATIVE=OFF (issue #261).");
+            return;
+        }
+
+        auto result = dispatch_transcribe(audio_file, rp, /*need_timestamps=*/true);
         if (!result.ok) {
             json_error(res, 400, result.error);
             return;
@@ -1149,11 +1426,33 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.lcs_dedup = form_string(req, "lcs_dedup", rp.lcs_dedup);
         rp.lcs_min_length = form_int(req, "lcs_min_length", rp.lcs_min_length);
         rp.parakeet_decoder = form_string(req, "parakeet_decoder", rp.parakeet_decoder);
+        {
+            // Issue #257: parakeet/canary local-attention window "L,R" (encoder
+            // frames) — NeMo rel_pos_local_attn, bounds long-audio VRAM.
+            const std::string ac = form_string(req, "att_context", "");
+            int l = INT_MIN, r = INT_MIN;
+            if (!ac.empty() && std::sscanf(ac.c_str(), "%d,%d", &l, &r) == 2) {
+                rp.att_context_left = l;
+                rp.att_context_right = r;
+            }
+        }
         rp.no_auto_aligner = form_bool(req, "no_auto_aligner", rp.no_auto_aligner);
         rp.show_alternatives = form_bool(req, "show_alternatives", rp.show_alternatives);
         rp.n_alternatives = form_int(req, "alt_n", rp.n_alternatives);
         if (!prompt.empty())
             rp.prompt = prompt;
+
+        // #261: soft-degrade. When the build's CPU ISA baseline exceeds this
+        // host, the CPU-only VAD / diarization kernels would SIGILL and kill
+        // the server. Refuse those requests with a clear 400 instead; plain
+        // ASR (GPU) still works, so a client can retry with vad=false&diarize=false.
+        if (!cpu_isa.ok && (rp.vad || rp.diarize)) {
+            json_error(res, 400,
+                       "this server build requires CPU instructions this host lacks (" + cpu_isa.missing +
+                           "), so VAD/diarization cannot run without crashing. Retry without "
+                           "vad/diarize, or deploy a portable image built with -DGGML_NATIVE=OFF (issue #261).");
+            return;
+        }
 
         bool stream = form_bool(req, "stream", false);
 
@@ -1217,8 +1516,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
 
         const bool need_timestamps = response_format == "verbose_json" || response_format == "srt" ||
                                      response_format == "vtt" || response_format == "diarized_json";
-        auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp, need_timestamps, punc_ctx.get(),
-                                    pcs_ctx.get(), tc_ctx.get(), tc_crf_ctx.get(), tc_lstm_ctx.get());
+        auto result = dispatch_transcribe(audio_file, rp, need_timestamps);
         if (!result.ok) {
             json_error(res, 400, result.error);
             return;
@@ -1264,6 +1562,14 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     svr.Post("/load", [&](const Request& req, Response& res) {
         if (!require_auth(req, res))
             return;
+        // Phase 4b: the worker pool is built once at startup; a runtime model
+        // swap would leave pooled workers serving the old model. Reject the swap
+        // rather than silently serve a stale model (restart to change models
+        // when running with CRISPASR_SERVER_WORKERS>1).
+        if (asr_pool) {
+            json_error(res, 409, "/load is not supported with CRISPASR_SERVER_WORKERS>1 — restart to change models");
+            return;
+        }
         std::lock_guard<std::mutex> lock(model_mutex);
         ready.store(false);
 
@@ -1544,7 +1850,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             char ts[64];
             std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
             fprintf(stderr, "[CONSENT] ts=%s voice=%s attestation=\"%s\" spoken_disclaimer=%s\n", ts,
-                    voice_name.c_str(), consent_attestation.c_str(), spoken_disclaimer ? "yes" : "no");
+                    log_sanitize(voice_name).c_str(), log_sanitize(consent_attestation).c_str(),
+                    spoken_disclaimer ? "yes" : "no");
         }
         std::string response_format = body.value("response_format", std::string("wav"));
         if (response_format != "wav" && response_format != "pcm" && response_format != "f32" &&
@@ -1576,8 +1883,20 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         // when they're using gpt-4o-mini-tts and shouldn't see errors
         // when pointed at a base TTS server.
         whisper_params rp = params;
-        if (!voice_name.empty())
+        if (!voice_name.empty()) {
+            // Path-traversal guard: `voice` is resolved by the backend as a
+            // filesystem path (bare name relative to --voice-dir, or a path).
+            // Over the network that must not escape the voice dir or read an
+            // absolute path — reject `..`, absolute/home paths, NUL and
+            // backslashes (a legitimate bare name / speaker / preset has none).
+            if (voice_name.find("..") != std::string::npos || voice_name.front() == '/' || voice_name.front() == '~' ||
+                voice_name.find('\\') != std::string::npos || voice_name.find('\0') != std::string::npos) {
+                json_error(res, 400, "'voice' must not contain '..', a leading '/' or '~', or path separators",
+                           "invalid_voice", "voice");
+                return;
+            }
             rp.tts_voice = voice_name;
+        }
         if (!instructions.empty())
             rp.tts_instruct = instructions;
         if (body.contains("seed") && body["seed"].is_number_integer())
@@ -1922,7 +2241,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             std::string wav = crispasr_make_wav_int16(pcm.data(), (int)pcm.size(), sr_out);
             // C2PA Content Credentials signing (when c2pa-c is available
             // and --c2pa-cert / --c2pa-key are configured)
-            crispasr_c2pa_sign_wav(wav, params.c2pa_cert, params.c2pa_key);
+            crispasr_c2pa_sign_auto(wav, "audio/wav", params.c2pa_cert, params.c2pa_key, params.cache_dir);
             res.set_content(std::move(wav), "audio/wav");
         }
     });
@@ -2065,7 +2384,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             res.set_content(std::move(opus), ct);
         } else {
             std::string wav = crispasr_make_wav_int16(pcm.data(), (int)pcm.size(), sr_out);
-            crispasr_c2pa_sign_wav(wav, params.c2pa_cert, params.c2pa_key);
+            crispasr_c2pa_sign_auto(wav, "audio/wav", params.c2pa_cert, params.c2pa_key, params.cache_dir);
             res.set_content(std::move(wav), "audio/wav");
         }
     });
@@ -2118,6 +2437,13 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     svr.Post("/v1/voices", [&](const Request& req, Response& res) {
         if (!require_auth(req, res))
             return;
+        // CAP_TTS gate (documented CAP_TTS-only; matches the GET /v1/voices guard).
+        if (!(backend->capabilities() & CAP_TTS)) {
+            json_error(res, 400,
+                       "loaded backend '" + backend_name +
+                           "' does not support TTS (no CAP_TTS); load a TTS backend via POST /load");
+            return;
+        }
         if (params.tts_voice_dir.empty()) {
             json_error(res, 400, "server has no --voice-dir configured; cannot store voice files");
             return;
@@ -2194,6 +2520,13 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     svr.Delete(R"(/v1/voices/([a-zA-Z0-9_-]+))", [&](const Request& req, Response& res) {
         if (!require_auth(req, res))
             return;
+        // CAP_TTS gate (documented CAP_TTS-only; matches the GET /v1/voices guard).
+        if (!(backend->capabilities() & CAP_TTS)) {
+            json_error(res, 400,
+                       "loaded backend '" + backend_name +
+                           "' does not support TTS (no CAP_TTS); load a TTS backend via POST /load");
+            return;
+        }
         if (params.tts_voice_dir.empty()) {
             json_error(res, 400, "server has no --voice-dir configured");
             return;

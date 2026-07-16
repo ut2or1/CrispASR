@@ -34,6 +34,7 @@
 #include "core/bpe.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
+#include "core/dac_decoder.h" // core_dac::fastconv_cache (FASTCONV kernel bake)
 #include "core/audio_resample.h"
 #include "core/fft.h"
 #include "core/mel.h"
@@ -371,6 +372,10 @@ struct cv3_hift {
     ggml_context* ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
+
+    // FASTCONV: baked F32 copies of the F16 hift conv kernels (cast-kill).
+    // Owns its own ctx+buffer; freed in cosyvoice3_tts_free before the backend.
+    core_dac::fastconv_cache hift_fc;
 };
 
 } // namespace
@@ -1102,6 +1107,7 @@ extern "C" void cosyvoice3_tts_free(struct cosyvoice3_tts_context* ctx) {
         ggml_backend_buffer_free(ctx->flow.buf_w);
     if (ctx->flow.ctx_w)
         ggml_free(ctx->flow.ctx_w);
+    ctx->hift.hift_fc.free(); // FASTCONV baked kernels (before the backend is freed)
     if (ctx->hift.buf_w)
         ggml_backend_buffer_free(ctx->hift.buf_w);
     if (ctx->hift.ctx_w)
@@ -4565,6 +4571,65 @@ extern "C" int cosyvoice3_tts_init_hift_from_file(struct cosyvoice3_tts_context*
     }
     hf.f0_classifier_w = require_t("cosyvoice3.hift.f0.classifier.w");
     hf.f0_classifier_b = require_t("cosyvoice3.hift.f0.classifier.b");
+
+    // ---- FASTCONV: bake one F32 copy of each F16 hift conv kernel at load,
+    // then re-point the named fields to the baked copies. The fork's
+    // ggml_conv_1d casts an F16 kernel → F32 inside EVERY graph when the
+    // activations are F32; baking that cast once and swapping the pointer makes
+    // it a no-op, bitwise-equivalent (the one-time F16→F32 conversion is the
+    // exact same conversion the per-graph cast performs). Zero graph change —
+    // every hift graph reads these fields via `const auto& h = ctx->hift`.
+    // ⚠ cosyvoice3 upsamples with a REGULAR conv1d (cv3_causal_conv1d), NOT a
+    // conv_transpose, so ups_w[] ARE baked (unlike the HiFi-GAN / chatterbox
+    // `.ups` exclusion). The 2D linears (m_source.l_linear, f0.classifier) and
+    // the 1D biases/alphas are not conv kernels and are left untouched (the CPU
+    // source path reads l_linear as raw F32 — must not be swapped).
+    // Gated CRISPASR_COSYVOICE3_FASTCONV (default on — numerically equivalent).
+    {
+        const char* env = getenv("CRISPASR_COSYVOICE3_FASTCONV");
+        const bool fc_on = !env || env[0] != '0';
+        std::vector<ggml_tensor**> fields;
+        fields.push_back(&hf.conv_pre_w);
+        fields.push_back(&hf.conv_post_w);
+        for (int i = 0; i < 3; i++)
+            fields.push_back(&hf.ups_w[i]);
+        for (auto& rb : hf.resblocks)
+            for (int j = 0; j < 3; j++) {
+                fields.push_back(&rb.c1_w[j]);
+                fields.push_back(&rb.c2_w[j]);
+            }
+        for (int i = 0; i < 3; i++)
+            fields.push_back(&hf.src_down_w[i]);
+        for (auto& rb : hf.src_resblocks)
+            for (int j = 0; j < 3; j++) {
+                fields.push_back(&rb.c1_w[j]);
+                fields.push_back(&rb.c2_w[j]);
+            }
+        for (int i = 0; i < 5; i++)
+            fields.push_back(&hf.f0_condnet_w[i]);
+
+        std::vector<ggml_tensor*> kernels;
+        kernels.reserve(fields.size());
+        for (ggml_tensor** f : fields)
+            kernels.push_back(*f);
+        hf.hift_fc.bake(ctx->backend, kernels, fc_on);
+        int swapped = 0;
+        for (ggml_tensor** f : fields) {
+            ggml_tensor* baked = hf.hift_fc.get(*f);
+            if (baked != *f) {
+                *f = baked;
+                swapped++;
+            }
+        }
+        if (getenv("CRISPASR_COSYVOICE3_FASTCONV_DEBUG")) {
+            int f16 = 0;
+            for (ggml_tensor* k : kernels)
+                if (k && k->type == GGML_TYPE_F16)
+                    f16++;
+            fprintf(stderr, "cosyvoice3_tts:hift FASTCONV %s: %d/%zu conv kernels F16, %d baked+swapped\n",
+                    fc_on ? "ON" : "OFF", f16, kernels.size(), swapped);
+        }
+    }
 
     hf.loaded = true;
     if (ctx->params.verbosity >= 1) {

@@ -903,29 +903,35 @@ float* audioseal_detect(struct audioseal_ctx* ctx, const float* pcm, int n_sampl
         head_out = conv1d(ctx0, latent, ctx->det_head.w, ctx->det_head.b, 1, 0, 1);
     }
 
-    // Softmax on detection channels (first 2), take index 1 (watermark present)
-    // head_out shape: (18, T)
-    ggml_tensor* det_logits = ggml_view_2d(ctx0, head_out, 2, (int)head_out->ne[1], head_out->nb[1], 0);
-    det_logits = ggml_cont(ctx0, det_logits);
-    det_logits = ggml_soft_max(ctx0, det_logits);
-    // Take channel 1 (watermark probability)
-    ggml_tensor* det_probs =
-        ggml_view_2d(ctx0, det_logits, 1, (int)det_logits->ne[1], det_logits->nb[1], sizeof(float));
-    det_probs = ggml_cont(ctx0, det_probs);
+    // head_out layout is (T, C=18): ne[0]=time, ne[1]=channel — the ggml conv
+    // output convention (same as the generator, whose decoder crops along ne[0]
+    // = time). Channels 0-1 = detection logits, 2-17 = the 16 message bits.
+    //
+    // #260: the previous code assumed (C, T) and sliced 2 elements along ne[0]
+    // (i.e. 2 time samples) then read ne[1]=18 (the channel count) as the frame
+    // count — so softmax ran over the wrong axis and detection was chance-level
+    // (~0.4988). The Python reference detector output is (1, 18, 16000); per-frame
+    // detection is a softmax over the 2 detection channels at each of T frames.
+    const int T = (int)head_out->ne[0];
+
+    // Detection: channels 0,1 → view (T,2), transpose to (2,T), softmax over the
+    // 2 classes per frame, take class 1 (watermark present) → (1,T).
+    ggml_tensor* det2 = ggml_view_2d(ctx0, head_out, T, 2, head_out->nb[1], 0);
+    det2 = ggml_cont(ctx0, ggml_transpose(ctx0, det2)); // (2, T)
+    det2 = ggml_soft_max(ctx0, det2);                   // softmax over ne[0]=2 classes
+    ggml_tensor* det_probs = ggml_view_2d(ctx0, det2, 1, T, det2->nb[1], sizeof(float));
+    det_probs = ggml_cont(ctx0, det_probs); // (1, T): ne[1] = T frames
     ggml_set_name(det_probs, "det_probs");
     ggml_set_output(det_probs);
     ggml_build_forward_expand(gf, det_probs);
 
-    // Message head: channels 2-17 → sigmoid → decoded bits
+    // Message: channels 2-17 → view (T,16) at channel offset 2 → average over
+    // time (ne[0]=T) → (1,16) → sigmoid → decoded bits.
     ggml_tensor* msg_out = nullptr;
-    if (out_message && (int)head_out->ne[0] >= 18) {
-        ggml_tensor* msg_logits =
-            ggml_view_2d(ctx0, head_out, 16, (int)head_out->ne[1], head_out->nb[1], 2 * sizeof(float));
-        msg_logits = ggml_cont(ctx0, msg_logits);
-        // Average over time → (16,)
-        // For now: take mean over time dimension
-        msg_out = ggml_pool_1d(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, msg_logits)), GGML_OP_POOL_AVG,
-                               (int)msg_logits->ne[1], (int)msg_logits->ne[1], 0);
+    if (out_message && (int)head_out->ne[1] >= 18) {
+        ggml_tensor* msg_logits = ggml_view_2d(ctx0, head_out, T, 16, head_out->nb[1], (size_t)2 * head_out->nb[1]);
+        msg_logits = ggml_cont(ctx0, msg_logits);                            // (T, 16)
+        msg_out = ggml_pool_1d(ctx0, msg_logits, GGML_OP_POOL_AVG, T, T, 0); // (1, 16)
         msg_out = ggml_sigmoid(ctx0, msg_out);
         ggml_set_name(msg_out, "msg_out");
         ggml_set_output(msg_out);

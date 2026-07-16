@@ -1,6 +1,7 @@
 // test-dots-tts-params.cpp — unit tests for dots_tts_context_params defaults
 // and null-guard coverage. No GGUF required.
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include "dots_tts.h"
@@ -17,6 +18,23 @@ TEST_CASE("dots_tts_params: default values are sensible", "[unit][dots-tts]") {
     REQUIRE(p.cfg_scale >= 1.0f); // CFG scale of 1 = no guidance; default amplifies
     REQUIRE(p.eos_threshold > 0.0f);
     REQUIRE(p.eos_threshold <= 1.0f);
+}
+
+// Defaults-audit / config-parity guard (motivated by #192/#197). The "sensible"
+// case above only bounds these knobs; a drift that stays in-range (ode_steps
+// 16→8, cfg_scale 3.0→1.5) would slip through and silently change every
+// synthesis. Pin the exact upstream dots.tts inference defaults (documented in
+// dots_tts.h) so any change to a shipped default has to update this test on
+// purpose.
+TEST_CASE("dots_tts_params: value knobs match upstream inference defaults", "[unit][dots-tts]") {
+    struct dots_tts_context_params p = dots_tts_context_default_params();
+
+    REQUIRE(p.temperature == Catch::Approx(0.7f));
+    REQUIRE(p.seed == 42u);
+    REQUIRE(p.max_patches == 256);                   // ≈40 s of audio patches
+    REQUIRE(p.ode_steps == 16);                      // flow-matching ODE steps
+    REQUIRE(p.cfg_scale == Catch::Approx(3.0f));     // classifier-free guidance scale
+    REQUIRE(p.eos_threshold == Catch::Approx(0.8f)); // stop-prob threshold
 }
 
 TEST_CASE("dots_tts_init_from_file: null path returns nullptr", "[unit][dots-tts]") {

@@ -116,3 +116,24 @@ SESSION_HANDOVER.md
 /handover-prompts/
 /docs/prompts/
 .ccache/
+tools/kaggle/q8-quantize/kaggle_harness.py
+
+# Fuzzer / parser-test runtime artifacts (tests/fuzz + the crafted-input tests)
+crispasr_fuzz_input.bin
+crispasr_*_regression_tmp.*
+crash-*
+leak-*
+timeout-*
+/tests/fuzz/corpus/
+tools/kaggle/fc-pw-requant/kaggle_harness.py
+tools/kaggle/fc-unified-graph-ab/kaggle_harness.py
+tools/kaggle/fc-pw-requant/only.txt
+/handover-*.md
+
+# #254 omnivoice reference artifacts (belong on HF fixtures, not git)
+*.encode-ref.gguf
+omnivoice-encode-ref.gguf
+/third_party/c2pa/
+a.out
+a.out.js
+a.out.wasm

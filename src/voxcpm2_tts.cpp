@@ -102,13 +102,21 @@ static double vox_now_ms() {
 }
 
 // ---------------------------------------------------------------------------
-// Shared CPU backend for tiny ggml graph matmuls. Note: tried switching to
-// ggml_backend_init_best (Metal/CUDA) here but the current matmul_mv_ggml
-// allocates input tensors in a CPU-side mem buffer that Metal can't read
-// → SIGSEGV on first kernel dispatch. The proper fix is the per-step graph
-// refactor (build_locdit_graph, build_tslm_step_graph) with
-// ggml_backend_tensor_set / ggml_backend_alloc_ctx_tensors — those WILL
-// pick up Metal automatically once they're in place.
+// Dedicated CPU backend for the remaining tiny scalar-ish helper matmuls
+// (matmul_mv_ggml et al.). These allocate their inputs in a CPU-side mem buffer
+// (ggml_init no_alloc=false), so they MUST stay on this CPU backend — a Metal
+// backend cannot dereference those host pointers.
+//
+// §176n (2026-07-12): the heavy pipeline no longer depends on that. The per-step
+// FUSED graphs (build_tslm_step_graph / build_ralm_step_graph / build_locdit_graph
+// + the VAE encode/decode graphs) are gated `VOXCPM2_USE_GRAPH=1` (default ON) and
+// run on `ctx->backend` via ggml_gallocr + ggml_backend_tensor_set, so they DO
+// pick up Metal automatically when use_gpu is set. Verified on M1: basic +
+// voice-clone synthesis run fully on Metal (VAE-encode graph, AR loop, VAE
+// decode), no SIGSEGV, ASR round-trip correct, ~3.75x faster than CPU. The old
+// "init_best here → SIGSEGV" note referred to routing THESE CPU helpers through
+// Metal, which is neither needed nor a win (30 tiny matvecs/step would be
+// launch-bound). See PLAN §176n / LEARNINGS.
 // ---------------------------------------------------------------------------
 
 static ggml_backend_t g_cpu_backend = nullptr;

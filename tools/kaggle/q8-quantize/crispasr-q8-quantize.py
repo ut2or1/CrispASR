@@ -77,8 +77,25 @@ assert CRISPASR.is_file() and QUANT.is_file(), "binaries missing"
 step("binary-download.done")
 
 WAV = REPO / "samples" / "jfk.wav"
-MODELS = WORK / "models"
-MODELS.mkdir(exist_ok=True)
+
+# /kaggle/working is capped ~20 GB, too small for vibevoice F16(16.7)+Q8(8.85)=
+# 25.5 GB. Pick the mount with the most free space (Kaggle GPU instances have
+# ~50-60 GB on / or /tmp). Files are uploaded straight to HF, so they don't need
+# to live in /kaggle/working.
+def _free(p):
+    try:
+        return shutil.disk_usage(p).free / 1e9
+    except Exception:
+        return 0.0
+
+
+_cands = [("/tmp/models", "/tmp"), ("/kaggle/temp/models", "/kaggle/temp"),
+          (str(WORK / "models"), str(WORK)), ("/models", "/")]
+_best = max(_cands, key=lambda c: _free(c[1]))
+MODELS = Path(_best[0])
+MODELS.mkdir(parents=True, exist_ok=True)
+step("models-dir.chosen", dir=str(MODELS), free_gb=round(_free(_best[1]), 1),
+     probe={d: round(_free(d), 1) for _, d in _cands})
 
 # whisper-tiny.en for the TTS round-trip check (small; only for voxcpm2)
 WHISPER = None
@@ -104,7 +121,7 @@ def _norm(s):
 
 
 def free_gb():
-    return round(shutil.disk_usage(str(WORK)).free / 1e9, 1)
+    return round(shutil.disk_usage(str(MODELS)).free / 1e9, 1)
 
 
 def quantize(f16_path, q8_path):

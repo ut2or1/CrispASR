@@ -31,6 +31,12 @@ namespace CrispASR
         internal static extern int crispasr_session_available_backends(
             byte[] outCsv, int outCap);
 
+        // Acoustic detected language (Whisper) as an ISO-639-1 code into outBuf;
+        // other backends fall back to the source-language hint, then "unknown".
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_detected_language(
+            IntPtr session, byte[] outBuf, int outCap);
+
         // CTC vocabulary access (Omni CTC backend). n_vocab is the piece count;
         // token_text returns a model-owned const char* (do not free) or "" when
         // out of range / unsupported.
@@ -244,6 +250,11 @@ namespace CrispASR
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern float crispasr_session_result_word_p(IntPtr result, int iSeg, int iWord);
+
+        // Whisper's per-segment no-speech probability in [0, 1]; -1.0 sentinel
+        // ("no data") for other backends and out-of-range indices.
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern float crispasr_session_result_segment_no_speech_prob(IntPtr result, int iSeg);
 
         // Per-frame CTC logits (opted in via crispasr_session_set_return_logits)
         // for backends with a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,

@@ -224,9 +224,11 @@ struct tada_context {
         ggml_cgraph* gf = nullptr;
     };
     // §215b follow-up: smaller buckets prepended for short generations. The
-    // eligible floor is gated at runtime (tada_pick_bucket); the default floor
-    // (512) makes {64,128,256} inert — never picked, never built — so default
-    // behaviour is byte- AND perf-identical to the original §176b set.
+    // eligible floor is gated at runtime (tada_pick_bucket): backend-conditional
+    // by default (64 on Metal/CPU where a tighter Lk is a measured byte-identical
+    // win, 512 on discrete GPU where it is marginal + not bit-identical), and
+    // CRISPASR_TADA_BUCKET_MIN overrides. On CUDA the 512 floor keeps {64,128,256}
+    // inert, reproducing the original §176b set byte-for-byte.
     static constexpr int kBucketN = 7;
     static constexpr int kBucketLks[kBucketN] = {64, 128, 256, 512, 1024, 2048, 4096};
     std::array<TadaBucket, kBucketN> ar_buckets{};
@@ -1160,19 +1162,38 @@ static float* build_step_embedding(tada_context* c, int32_t token_id, const floa
 }
 
 // §176b: Lk-bucketed single-step AR decode helpers.
+// §215b: default bucket floor, chosen by backend. Metal + CPU -> 64 (a tighter Lk
+// is a MEASURED byte-identical win there: the -inf-masked padding is Lk-invariant
+// AND those backends reduce it deterministically, so a shorter/tighter attention
+// is output-identical, just faster — Metal 1.07-1.21x). Discrete GPU backends
+// (CUDA/ROCm/Vulkan/WebGPU) -> 512: their parallel reduction ORDER over the masked
+// padding makes the output NOT bit-identical across a bucket-width change (benign
+// FP, still intelligible) and the win is marginal (CUDA A/B 1.02-1.06x), so their
+// default output is left byte-for-byte unchanged. CRISPASR_TADA_BUCKET_MIN overrides.
+static int tada_default_bucket_min(tada_context* c) {
+    if (!c->backend || ggml_backend_is_cpu(c->backend))
+        return 64;
+    const char* name = ggml_backend_name(c->backend);
+    if (name && (strstr(name, "CUDA") || strstr(name, "ROCm") || strstr(name, "Vulkan") || strstr(name, "WebGPU") ||
+                 strstr(name, "Kompute")))
+        return 512;
+    return 64; // Metal (and any other deterministic / CPU-like backend)
+}
+
 static int tada_pick_bucket(tada_context* c, int needed_lk) {
-    // §215b follow-up: smallest ELIGIBLE bucket. The floor gates out buckets below
-    // CRISPASR_TADA_BUCKET_MIN (default 512 = original §176b behaviour). Lowering it
-    // (e.g. =64) lets a short generation (n_past << 512) use a tighter Lk and waste
-    // far less padded attention. Output-identical — padding positions are masked
-    // to -inf in run_talker_kv_bucket — so this is a pure speed A/B, default OFF.
-    static const int s_bucket_min = []() {
+    // §215b follow-up: smallest ELIGIBLE bucket. Buckets below the floor are gated
+    // out. CRISPASR_TADA_BUCKET_MIN overrides; otherwise the floor is backend-
+    // conditional (tada_default_bucket_min). A tighter floor lets a short
+    // generation (n_past << 512) use a tighter Lk and waste far less padded
+    // attention — masked to -inf, so output-neutral on the deterministic backends.
+    static const int s_env_min = []() {
         const char* e = std::getenv("CRISPASR_TADA_BUCKET_MIN");
-        return (e && e[0]) ? atoi(e) : 512;
+        return (e && e[0]) ? atoi(e) : -1;
     }();
+    const int floor = (s_env_min >= 0) ? s_env_min : tada_default_bucket_min(c);
     for (int i = 0; i < tada_context::kBucketN; i++) {
         const int lk = tada_context::kBucketLks[i];
-        if (lk < s_bucket_min)
+        if (lk < floor)
             continue;
         if (lk >= needed_lk && lk <= c->kv_max_ctx)
             return i;

@@ -42,6 +42,13 @@ struct ExtraList {
 constexpr Entry k_registry[] = {
     {"whisper", "ggml-base.bin",
      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin", "~147 MB", nullptr, nullptr},
+    // AudioSeal (Meta FAIR) — optional NEURAL watermark model (MIT code + weights).
+    // Not a transcription/TTS backend: resolved by the name "audioseal" when the
+    // user passes `--watermark-model auto`. CrispASR's built-in zero-dependency
+    // spread-spectrum watermark stays the always-on default; this is the opt-in
+    // SOTA upgrade (imperceptible + robust neural watermark). #260.
+    {"audioseal", "audioseal.gguf",
+     "https://huggingface.co/cstr/audioseal-GGUF/resolve/main/audioseal.gguf", "~89 MB", nullptr, nullptr},
     {"nemotron", "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
      "https://huggingface.co/cstr/nemotron-3.5-asr-streaming-0.6b-GGUF/resolve/main/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
      "~458 MB", nullptr, nullptr},
@@ -556,6 +563,28 @@ constexpr Entry k_registry[] = {
      "qwen3-tts-tokenizer-12hz.gguf",
      "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf",
      "~60 MB"},
+    // MOSS-TTS-v1.5 (MossTTSDelay): Qwen3-8B backbone + 32 RVQ audio codebooks
+    // + a 1.6B transformer codec companion (kept F16 — quantising the codec
+    // degrades audio earlier than the backbone). Default download is the Q4_K
+    // backbone (~5 GB) paired with the F16 codec. (URLs populated at ship after
+    // the GGUF upload — see Phase 6.)
+    {"moss-tts", "moss-tts-v1.5-q4_k.gguf",
+     "https://huggingface.co/cstr/moss-tts-v1.5-GGUF/resolve/main/moss-tts-v1.5-q4_k.gguf",
+     "~5 GB",
+     "moss-tts-v1.5-codec.gguf",
+     "https://huggingface.co/cstr/moss-tts-v1.5-GGUF/resolve/main/moss-tts-v1.5-codec.gguf",
+     "~3.4 GB"},
+    // MOSS-TTS-Local-Transformer-v1.5 (4B, arch "moss-tts-local"): Qwen3-4B
+    // backbone + MOSS-Audio-Tokenizer-v2 codec (48 kHz stereo, decode-only
+    // companion). Apache-2.0. Default = F16 backbone: the acceptance target
+    // (P5 round-trip overlap 0.969). Q4_K exists but its long trajectory runs away
+    // (intrinsic quantized-AR drift) — F16 is the reliable config, fits a 16 GB GPU.
+    {"moss-tts-local", "moss-tts-local-v1.5-f16.gguf",
+     "https://huggingface.co/cstr/moss-tts-local-v1.5-GGUF/resolve/main/moss-tts-local-v1.5-f16.gguf",
+     "~9.1 GB",
+     "moss-tts-local-v1.5-codec.gguf",
+     "https://huggingface.co/cstr/moss-tts-local-v1.5-GGUF/resolve/main/moss-tts-local-v1.5-codec.gguf",
+     "~2.1 GB"},
     // gwen-tts-0.6B: Vietnamese-optimized Qwen3-TTS-0.6B-Base finetune
     // (MIT, g-group-ai-lab). Same architecture as qwen3-tts-0.6B-Base,
     // trained on ~1000h Vietnamese TikTok audio. Supports all 10 Qwen3-TTS
@@ -619,6 +648,10 @@ constexpr Entry k_registry[] = {
     // OmniVoice: k2-fsa/OmniVoice — Qwen3-0.6B backbone with masked
     // iterative multi-codebook TTS (8 codebooks × 1025 vocab, 600+
     // languages). Uses HiggsAudioV2 audio tokenizer for encode/decode.
+    // cstr/omnivoice-GGUF also hosts base quants omnivoice-{q8_0,q4_k}.gguf and a
+    // smaller TTS-ONLY omnivoice-tokenizer-q8_0.gguf (320 MB) — the Q8 tokenizer
+    // decodes fine but voice-clone ENCODE needs F16 (RVQ nearest-neighbor is
+    // quant-sensitive), so the default tokenizer stays f16.
     {"omnivoice", "omnivoice-f16.gguf",
      "https://huggingface.co/cstr/omnivoice-GGUF/resolve/main/omnivoice-f16.gguf",
      "~1.2 GB",

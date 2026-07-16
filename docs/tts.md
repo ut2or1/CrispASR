@@ -10,6 +10,8 @@ trade-off:
 | **`piper`** | Tiniest footprint (30 MB). rhasspy/piper VITS; 250+ community voices across 30+ languages. Built-in G2P (CMUdict + LTS rules) for English — no espeak-ng needed. Optional espeak-ng for other langs (loaded via dlopen). 22 kHz output. Use `--g2p-dict` to select dictionary source. | No (per-voice GGUF) | Manual `wget` |
 | **`kokoro`** | Smallest + fastest. 82 M-param StyleTTS2-derived model. Multilingual via built-in G2P or espeak-ng (dlopen/popen fallback). | No (preset voice packs) | Manual `wget` (no `-m auto`) |
 | **`qwen3-tts`** | Highest fidelity / strongest cloning. Speech-LLM (talker + code predictor + 12 Hz codec). Default voice auto-downloaded with `-m auto`; or supply your own WAV + ref-text. | Optional (auto default voice; or WAV + ref-text or baked voice GGUF) | ~1.3 GB via `-m auto` |
+| **`moss-tts`** | MOSS-TTS-v1.5 (MossTTSDelay): Qwen3-8B backbone emitting 32 RVQ audio codebooks under a delay pattern, decoded by a 1.6B transformer codec. Needs the codec companion (`--codec-model`, or auto-downloaded/sibling). | Yes — `--voice ref.wav` (the codec encoder clones the reference speaker) | ~5 GB Q4_K backbone + ~3.5 GB F16 codec via `-m auto` |
+| **`moss-tts-local`** | MOSS-TTS-Local-Transformer-v1.5 (MossTTSLocal, 4B): Qwen3-4B backbone + a 1-layer local/depth transformer that autoregressively emits 12 RVQ codebooks per frame (RQ-Transformer; no delay pattern), decoded to 48 kHz stereo by MOSS-Audio-Tokenizer-v2 (downmixed to mono). Needs the codec companion (`--codec-model`, or auto-downloaded/sibling). | Not yet (the v2 codec encoder is a follow-up) | ~9.1 GB F16 backbone + ~2.1 GB codec via `-m auto` (F16 is the reliable target; Q4_K long-form runs away) |
 | **`omnivoice`** | 600+ languages. Qwen3-0.6B backbone with masked iterative 8-codebook TTS (SoundStorm-style). Zero-shot voice cloning from reference audio. Supports finetunes (omnivoice-singing). | Yes (`--voice <wav> --ref-text "..."`) | ~1.2 GB F16 + ~400 MB tokenizer |
 | **`vibevoice-tts`** | Lowest-latency streaming TTS, designed for realtime. | Preset voice packs | ~636 MB via `-m auto` |
 | **`vibevoice-1.5b`** | Base VibeVoice TTS model with WAV cloning. | Yes (`VIBEVOICE_VOICE_AUDIO=<wav>` or `--voice <wav>`) | ~1.6 GB via `-m auto` |
@@ -520,6 +522,23 @@ defaults reproduce the validated, end-to-end-tested code path.
 | `QWEN3_TTS_CODEC_CHUNK` | `150` (`64` on CUDA) | Maximum generated codec frames per decode chunk. CUDA clamps values above `64` and treats `0` as `64` unless `QWEN3_TTS_CODEC_ALLOW_FULL=1` is also set, avoiding oversized `mul_mat+col2im_1d` allocations on 10 GB cards. |
 | `QWEN3_TTS_CODEC_CTX` | `128` (`96` on CUDA) | Left-context codec frames prepended to each chunk. Values below the codec sliding window are raised; CUDA clamps larger values unless `QWEN3_TTS_CODEC_ALLOW_FULL=1` is set. |
 | `QWEN3_TTS_SKIP_REF_DECODE` | **on** (set `=0` to opt out) | Skip the codec decode of the reference audio in `qwen3_tts_synthesize`. The default-on path emits `codec_decode_codes(gen)` directly; the opt-out path concatenates `ref_codes + gen_codes`, decodes both, then trims the ref portion. With a 26 s reference (~334 codec frames at 12 Hz), the ref half adds ~16 s of constant codec compute regardless of how much new audio is generated (Jetson Orin AGX, issue #64). End-to-end RTF on Orin drops from ~7-9 → ~1.5; the win compounds N× under `/v1/audio/speech` long-form chunking. Bit-identity verified 2026-05-05 on Apple Silicon Metal, qwen3-tts-customvoice 0.6B Q8_0: max\|diff\| = 0, cosine similarity = 1.0 — equivalence holds because the codec is a straight-line forward pass with no rolling state. Set `QWEN3_TTS_SKIP_REF_DECODE=0` only for A/B verification or if a future codec graph variant grows rolling state. |
+
+### pocket-tts voices and environment switches
+
+Voice cloning takes a reference WAV via `--voice`. Three forms are accepted:
+
+- **Absolute/relative path** — `--voice /path/to/ref.wav` (requires `--i-have-rights`).
+- **Bare name + `--voice-dir`** — `--voice alice --voice-dir voices/` resolves to
+  `voices/alice.wav`. This is what `--server` / `{"voice": "<name>"}` requests use,
+  so a single server can serve multiple voices from one directory (issue #255).
+- **Unset** — auto-loads `samples/jfk.wav` as a default; without any voice the
+  output is near-silent.
+
+| Variable | Default | Effect when set |
+|---|---|---|
+| `POCKET_MANUAL_MIMI` | unset | Force the CPU Mimi decoder path (bypass the ggml/GPU decode). |
+| `POCKET_MANUAL_BACKBONE` | unset | Force the CPU FlowLM backbone path. |
+| `POCKET_VULKAN_MIMI_MAX_FRAMES` | `120` | Vulkan-only guard (issue #256): fall back to the CPU Mimi decoder when a generation exceeds this many frames, avoiding the `maxComputeWorkGroupCount` abort on constrained iGPUs (e.g. AMD 780M / gfx1103). Set `<=0` to disable the guard and always attempt the GPU decode. No effect on non-Vulkan backends. |
 
 ## VibeVoice — realtime streaming TTS
 
@@ -1140,8 +1159,9 @@ auto-transcribed reference transcript separately, next to the voice file.)
 
 Pass `--tts-play` to play TTS output through the local speaker immediately
 after synthesis, in addition to (or instead of) writing a file. The
-spread-spectrum watermark is always embedded before playback, so the audio
-leaving the speaker carries the provenance marker.
+spread-spectrum watermark is embedded before playback (unless disabled via
+`--no-watermark` / `CRISPASR_NO_WATERMARK`), so the audio leaving the speaker
+carries the provenance marker.
 
 ```bash
 # Synthesize and play through default speaker
@@ -1165,10 +1185,13 @@ miniaudio's 4× upsampler artefacts on devices that run natively at 96 kHz
 
 ## AI-generated audio provenance & watermarking
 
-All TTS output is automatically marked as AI-generated through multiple
-complementary layers. This is non-optional and cannot be bypassed.
+All TTS output is marked as AI-generated by default through multiple
+complementary layers. The waveform watermark is on by default and can be turned
+off by an operator who takes on the marking responsibility themselves (see
+[Disabling the watermark](#disabling-the-watermark-operator-opt-out) below); the
+file-metadata tags are always written.
 
-### Spread-spectrum watermark (built-in, always active)
+### Spread-spectrum watermark (built-in, on by default)
 
 A frequency-domain watermark embedded in the PCM signal after synthesis.
 Survives re-encoding, volume normalization, and moderate compression.
@@ -1196,23 +1219,134 @@ crispasr --tts "hello" -m kokoro.gguf --watermark-model audioseal.gguf
 # Debug: AUDIOSEAL_DEBUG=1 for shape traces, AUDIOSEAL_DUMP_STAGES=1 for binary dumps
 ```
 
+### Disabling the watermark (operator opt-out)
+
+The waveform watermark is on by default. It can be turned off two equivalent
+ways — neither is more "official" than the other:
+
+- **CLI flag**: `--no-watermark`
+- **Env var**: `CRISPASR_NO_WATERMARK=1`
+
+Either one disables watermark embedding for the whole process and logs, once:
+
+```
+crispasr: warning: watermarking disabled. AI usage marking responsibility rests with the operator.
+```
+
+**Rationale.** Disabling the mark does not remove any AI-disclosure obligation
+that may apply to the generated audio — it transfers responsibility for meeting
+it to whoever runs the binary. The warning text is deliberately
+jurisdiction-neutral and names no statute at runtime, because the marking
+obligation is jurisdiction-specific (e.g. EU AI Act Art. 50, and analogous US
+state and other rules) and CrispASR is a tool/component, not the "provider" that
+those rules bind. A downstream operator that ships synthetic media is that
+provider. Keeping the mark on is the zero-config default so the compliant path
+is the path of least resistance; the opt-out exists for legitimate cases
+(content not represented as authentic, research/testing, or an operator that
+substitutes its own compliant marking scheme). See
+[`docs/issue-260/PLAN.md`](issue-260/PLAN.md) for the full background.
+
+> **Scope.** The flag/env opt-out applies to the `crispasr` CLI and the server
+> (process-wide — there is no per-request toggle). It does **not** affect the
+> C-API/language bindings: `synthesize()` always watermarks. Binding consumers
+> that need unwatermarked PCM call `synthesize_raw()` and skip
+> `watermark_embed()`, thereby assuming the marking responsibility themselves
+> (see [`bindings.md`](bindings.md)).
+
 ### File metadata (always active)
 
 - **WAV**: `LIST`/`INFO` chunk with `ISFT="CrispASR (AI-generated audio)"` and `ICMT` notice
 - **MP3**: ID3v2 `TXXX` frames: `AI_GENERATED=true`, `GENERATOR=CrispASR`
 
-### C2PA Content Credentials (optional, compile-time)
+### C2PA Content Credentials
 
-Signed provenance manifests with `digitalSourceType=trainedAlgorithmicMedia`.
-Requires `c2pa-c` library and a self-signed certificate:
+Cryptographically-signed provenance manifests with
+`digitalSourceType=trainedAlgorithmicMedia` (a C2PA `c2pa.created` action),
+embedded directly in the output file. This is the "signed metadata" layer that
+complements the waveform watermark.
+
+**Build.** WAV signing needs **no build flags and no external library** — it is
+handled by the built-in native signer (`src/core/crispasr_c2pa_native.{h,cpp}`),
+a pure-C++ implementation of C2PA (hand-built CBOR / JUMBF / COSE_Sign1, ES256
+via the vendored BSD-2 micro-ecc + a header-only SHA-256). It compiles into
+`crispasr-lib` on every platform with zero dependencies. Its output validates
+in the c2pa-rs reference reader. To additionally sign **MP3/M4A/FLAC**, fetch the
+optional c2pa-rs library:
 
 ```bash
-# Generate certificate
-./scripts/generate-c2pa-cert.sh
+./scripts/fetch-c2pa.sh          # downloads the prebuilt c2pa-rs lib → third_party/c2pa
+# then cmake reconfigure; look for "C2PA signing enabled" at configure time
+```
 
-# Use with TTS
+(Set `-DCRISPASR_NO_C2PA_NATIVE=ON` to drop the built-in signer, e.g. a build
+that wants only the c2pa-rs path.)
+
+**On by default (self-signed), on every platform.** Output is signed
+automatically — no flags needed. Signing uses a fixed self-signed certificate
+**baked into the binary** (`crispasr_c2pa_default_cert.h`), so it works
+identically on desktop, mobile, and in the **WASM browser sandbox** (no
+filesystem or openssl needed at runtime). Self-signed manifests are valid and
+machine-readable (EU AI Act Art. 50); C2PA verifiers show "unverified signer".
+The bundled private key is intentionally public — it only marks content as
+AI-generated, it is not a trust anchor. (Regenerate with
+`scripts/gen-default-cert-header.sh`.)
+
+```bash
+crispasr --tts "hello" -m kokoro.gguf --tts-output out.wav   # signed automatically
+crispasr --detect-watermark out.wav                          # (or verify at contentcredentials.org)
+```
+
+**Bring your own cert** for a *trusted* signer identity (a CA-issued
+code-signing cert; verifiers then show the named issuer):
+
+```bash
+./scripts/generate-c2pa-cert.sh   # or use your CA-issued cert + key
 crispasr --tts "hello" --c2pa-cert crispasr-c2pa.crt --c2pa-key crispasr-c2pa.key
 ```
+
+**Format support.** **WAV** is signed by the built-in native signer (always
+available). **MP3** and **M4A/MP4/FLAC** are signed via the optional c2pa-rs lib
+(`fetch-c2pa.sh`). **AAC (ADTS)** and **Opus (Ogg)** cannot carry a C2PA manifest
+— those outputs are written unsigned but still carry the watermark +
+file-metadata tag.
+
+**Bindings / mobile.** C2PA lives in the core C API (`crispasr_c2pa_sign` /
+`crispasr_c2pa_free`, and `c2paSign()` in the wasm/JS binding), so any consumer
+of `crispasr-lib` can sign — pass a WAV/MP3 container and get signed bytes back.
+Build the library for the target with `-DCRISPASR_C2PA_FETCH=ON`:
+- **Android**: links `libc2pa_c.so`; bundle it in the APK `jniLibs/<abi>/` next to
+  `libwhisper.so` (verified: the arm64 prebuilt links cleanly with the NDK).
+- **iOS**: links `libc2pa_c.a` statically; `crispasr_enable_c2pa` auto-links the
+  required Apple frameworks (Security / CoreFoundation / SystemConfiguration)
+  (verified: the arm64 prebuilt links cleanly with the iOS SDK).
+- **WASM** — WAV signing works out of the box (no `--c2pa`, no ~10 MB c2pa-rs).
+  Three ways, in order of preference:
+  1. **Native-JS signer (module-free).** `bindings/javascript/c2pa.mjs`
+     re-implements C2PA signing in **pure WebCrypto** (ECDSA P-256/ES256 + SHA-256,
+     hand-built canonical CBOR / JUMBF / COSE_Sign1 / RIFF embedding) — **no
+     c2pa-rs, no wasm module at all**. Runs in any browser, Node ≥16, Deno, or a
+     Worker. Usage:
+     ```js
+     import { c2paSignWav } from 'crispasr/c2pa';
+     const wav    = Module.pcmToWav(float32Pcm, 24000);          // interop WAV + AI tag
+     const signed = await c2paSignWav(wav, certPem, keyPem);      // full C2PA manifest
+     ```
+     Covered by `npm test` in `bindings/javascript/` — 12 hermetic unit tests
+     plus a live parity test through the c2pa-python reference reader.
+  2. **Built-in native C++ signer via `c2paSign()`.** The native signer
+     (`crispasr_c2pa_native`) compiles into every wasm build, so
+     `Module.c2paSign(wavBytes, "audio/wav")` works **without `--c2pa`** and adds
+     no c2pa-rs weight — use this if you already hold a wasm `Module`. Both 1 and
+     2 emit the same manifest and validate in the c2pa-rs reference reader (only
+     status `signingCredential.untrusted`, expected for the self-signed cert).
+  3. **c2pa-rs in wasm (opt-in, MP3/M4A only)** via `./build-wasm.sh --c2pa` —
+     adds ~10 MB (the full Rust stack), off by default. When enabled, the module
+     is built with **`-fwasm-exceptions`** + **`-sSUPPORT_LONGJMP=wasm`** because the
+     prebuilt c2pa-rs emscripten lib uses **native wasm exceptions** (it imports the
+     `__cpp_exception` tag — provided only by native wasm EH, not the default
+     no-exceptions runtime nor JS-based `-fexceptions`); needs a wasm-EH browser
+     (all modern browsers, 2023+). Only needed for `c2paSign(bytes, "audio/mpeg")`
+     and other non-WAV containers in the browser.
 
 ### Voice cloning consent gate
 

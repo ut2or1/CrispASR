@@ -641,6 +641,17 @@ CRISPASR_API int crispasr_session_set_hotwords(struct crispasr_session* s, const
 // when the last call succeeded. Pointer owned by the session.
 CRISPASR_API const char* crispasr_session_last_synth_error(struct crispasr_session* s);
 
+// Sample rate the backend expects for input PCM. Use with
+// crispasr_audio_load_at_rate to load audio at the model's native rate,
+// avoiding a lossy down-then-up resample. Returns 16000 for Whisper-family
+// backends and 0 on error.
+CRISPASR_API int crispasr_session_input_sample_rate(struct crispasr_session* s);
+
+// Tell the session what sample rate the next transcribe call's PCM is at.
+// Backends that normally resample (e.g. 16 kHz → 24 kHz) will skip the
+// step when the rate already matches. Defaults to 16000 for back-compat.
+CRISPASR_API int crispasr_session_set_pcm_sample_rate(struct crispasr_session* s, int rate);
+
 // CTC vocabulary access. Returns 0 / "" for backends without an exposed CTC
 // vocabulary. The token text pointer is model-owned and must not be freed.
 CRISPASR_API int crispasr_session_n_vocab(struct crispasr_session* s);
@@ -853,6 +864,26 @@ CRISPASR_API float crispasr_watermark_detect(const float* pcm, int n_samples);
 // when AudioSeal is loaded.
 CRISPASR_API void crispasr_watermark_embed(float* pcm, int n_samples, float alpha);
 
+// C2PA (Content Credentials) signing of an in-memory audio CONTAINER (WAV/MP3
+// bytes, not raw PCM). Signs with the user cert/key (PEM file paths) when both
+// are non-NULL, else a bundled self-signed default cert (works with no
+// filesystem, including the browser). `format` is a C2PA MIME string, e.g.
+// "audio/wav" or "audio/mpeg". Returns malloc'd signed bytes (free with
+// crispasr_c2pa_free) and sets *out_len, or NULL when C2PA is unavailable, the
+// container can't embed a manifest (AAC/Opus), or signing fails. Available to
+// wasm / bindings / server, not just the CLI.
+CRISPASR_API unsigned char* crispasr_c2pa_sign(const unsigned char* data, size_t len, const char* format,
+                                               const char* cert_path, const char* key_path, size_t* out_len);
+CRISPASR_API void crispasr_c2pa_free(unsigned char* p);
+
+// Wrap float32 mono PCM into a 16-bit WAV carrying the AI-generated provenance
+// metadata tag (standard WAV LIST/INFO chunk — interoperable, any tool reads it).
+// The zero-cost provenance floor for wasm/bindings that only get raw PCM from
+// synthesis. Returns malloc'd WAV bytes (free with crispasr_c2pa_free), *out_len
+// set, or NULL on bad input. Feed to crispasr_c2pa_sign() to also embed a C2PA
+// manifest.
+CRISPASR_API unsigned char* crispasr_pcm_to_wav(const float* pcm, int n_samples, int sample_rate, size_t* out_len);
+
 // Load an AudioSeal GGUF model for neural watermarking. Call once at
 // startup. Returns 0 on success, -1 on failure (falls back to
 // spread-spectrum). The model is shared across all subsequent
@@ -875,6 +906,13 @@ CRISPASR_API void crispasr_reset_progress(void);
 // *out_sample_rate (always 16000), or a negative error. No ffmpeg needed for
 // the common formats (glint AAC/Opus, miniaudio, AudioToolbox/fdk, libopus, …).
 CRISPASR_API int crispasr_audio_load(const char* path, float** out_pcm, int* out_samples, int* out_sample_rate);
+
+// Like crispasr_audio_load but resamples to `target_rate` instead of 16 kHz.
+// When the source audio already matches `target_rate`, no resampling occurs —
+// avoids the quality-degrading down-then-up path for non-16 kHz backends.
+CRISPASR_API int crispasr_audio_load_at_rate(const char* path, int target_rate, float** out_pcm, int* out_samples,
+                                             int* out_sample_rate);
+
 CRISPASR_API void crispasr_audio_free(float* pcm);
 
 // ─── Stereo audio decode ─────────────────────────────────────────────

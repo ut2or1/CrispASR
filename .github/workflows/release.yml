@@ -75,7 +75,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
             -DGGML_OPENBLAS=ON \
             -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCRISPASR_OPUS_FETCH=ON
@@ -86,6 +86,7 @@ jobs:
           mkdir -p release/crispasr-linux-x86_64
           cp build/bin/crispasr release/crispasr-linux-x86_64/
           cp build/bin/crispasr-quantize release/crispasr-linux-x86_64/
+          bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64 || true
           cd release && tar czf crispasr-linux-x86_64.tar.gz crispasr-linux-x86_64/
 
       - uses: actions/upload-artifact@v4
@@ -111,6 +112,8 @@ jobs:
 
       - name: Setup emsdk
         uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.2  # 6.0.3 regressed WASM ISel (voxtral_tts crash); pin last-good
 
       - name: Build WASM (all backends)
         run: ./build-wasm.sh --clean
@@ -158,7 +161,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
               -DGGML_OPENBLAS=ON \
               -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON \
               -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
@@ -170,6 +173,7 @@ jobs:
           mkdir -p release/crispasr-linux-x86_64-avx512
           cp build/bin/crispasr release/crispasr-linux-x86_64-avx512/
           cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-avx512/
+          bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64-avx512 || true
           cd release && tar czf crispasr-linux-x86_64-avx512.tar.gz \
               crispasr-linux-x86_64-avx512/
 
@@ -214,7 +218,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build \
+          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_CUDA=ON \
@@ -232,6 +236,7 @@ jobs:
           mkdir -p release/crispasr-linux-x86_64-cuda
           cp build/bin/crispasr release/crispasr-linux-x86_64-cuda/
           cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-cuda/
+          bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64-cuda || true
           cd release && tar czf crispasr-linux-x86_64-cuda.tar.gz crispasr-linux-x86_64-cuda/
           ls -lh crispasr-linux-x86_64-cuda.tar.gz
 
@@ -276,7 +281,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build \
+          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_CUDA=ON \
@@ -294,6 +299,7 @@ jobs:
           mkdir -p release/crispasr-linux-x86_64-cuda13
           cp build/bin/crispasr release/crispasr-linux-x86_64-cuda13/
           cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-cuda13/
+          bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64-cuda13 || true
           cd release && tar czf crispasr-linux-x86_64-cuda13.tar.gz crispasr-linux-x86_64-cuda13/
           ls -lh crispasr-linux-x86_64-cuda13.tar.gz
 
@@ -336,7 +342,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build \
+          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_HIP=ON \
@@ -356,6 +362,7 @@ jobs:
           mkdir -p release/crispasr-linux-x86_64-hip
           cp build/bin/crispasr release/crispasr-linux-x86_64-hip/
           cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-hip/
+          bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64-hip || true
           cd release && tar czf crispasr-linux-x86_64-hip.tar.gz crispasr-linux-x86_64-hip/
           ls -lh crispasr-linux-x86_64-hip.tar.gz
 
@@ -479,7 +486,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build \
+          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_VULKAN=ON \
@@ -496,6 +503,7 @@ jobs:
           mkdir -p release/crispasr-linux-x86_64-vulkan
           cp build/bin/crispasr release/crispasr-linux-x86_64-vulkan/
           cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-vulkan/
+          bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64-vulkan || true
           cd release && tar czf crispasr-linux-x86_64-vulkan.tar.gz crispasr-linux-x86_64-vulkan/
           ls -lh crispasr-linux-x86_64-vulkan.tar.gz
 
@@ -529,7 +537,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_OPENBLAS=ON \
+          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_OPENBLAS=ON \
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j $(nproc)
 
@@ -538,6 +546,7 @@ jobs:
           mkdir -p release/crispasr-linux-arm64
           cp build/bin/crispasr release/crispasr-linux-arm64/
           cp build/bin/crispasr-quantize release/crispasr-linux-arm64/
+          bash scripts/bundle-c2pa.sh release/crispasr-linux-arm64 || true
           cd release && tar czf crispasr-linux-arm64.tar.gz crispasr-linux-arm64/
 
       - uses: actions/upload-artifact@v4
@@ -707,7 +716,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON \
+          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON \
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j $(sysctl -n hw.logicalcpu)
 
@@ -716,6 +725,7 @@ jobs:
           mkdir -p release/crispasr-macos
           cp build/bin/crispasr release/crispasr-macos/
           cp build/bin/crispasr-quantize release/crispasr-macos/
+          bash scripts/bundle-c2pa.sh release/crispasr-macos || true
           cd release && tar czf crispasr-macos.tar.gz crispasr-macos/
 
       - uses: actions/upload-artifact@v4

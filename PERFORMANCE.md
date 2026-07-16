@@ -207,10 +207,49 @@ the §232 campaign. Verified against current code, not carried from this doc.
 
 ### Verified state
 
+- **Fleet FASTCONV campaign (2026-07-16, `docs/perf-sweep/PLAN.md`)** — shared
+  `core_dac::fastconv_cache` + fc-aware `conv1d`/`res_unit`/`dec_block`/
+  `build_decode_graph`, and a `core_hifigan::forward`/`conv1d` overload, so
+  codec/vocoder backends kill the per-graph F16→F32 conv cast from ONE
+  implementation. Wired + A/B-verified (byte-identical, seed-isolated), all
+  default ON: omnivoice, irodori (`CRISPASR_IRODORI_FASTCONV`), zonos
+  (`CRISPASR_ZONOS_FASTCONV`), **speecht5 (`CRISPASR_SPEECHT5_FASTCONV`, 74 F16
+  kernels)**, **chatterbox_s3gen (`CRISPASR_S3GEN_FASTCONV`, 275 F16 kernels,
+  split-load-aware pointer-swap; ON vs OFF @seed42 = 0/32768)**. Model-free unit
+  test `test-fastconv` (210 assertions).
+  - ⚠ **Coverage triage (GGUF-parsed, don't trust the doc):** FASTCONV only
+    engages on **F16** conv kernels (the cast it kills). The HiFi-GAN overload
+    "sets up 3 backends" was over-optimistic — only **speecht5** ships F16 by
+    default. **fastpitch** default is q8_0 (F32 kernels → no-op; only its
+    non-default `-f16` variant is F16, and that GGUF hits a pre-existing loader
+    bug). **bananamind** ships only q8_0 + f32 (no F16 variant at all → can never
+    engage; not wired). Grep audit found only 2/26 codec backends had FASTCONV
+    before this campaign — the earlier "landed for 5 backends" was an overclaim.
+  - **Not-yet:** chatterbox's 175 K=1 kernels could also take the im2col→matmul
+    trick (a further win beyond cast-kill), but it changes reduction order so it
+    needs its own A/B on the drift-prone GPU path — deferred.
 - **§232 TTS campaign** (persistent sched-free graph + batched CFG cond+uncond +
   device KV + FASTCONV codec) has landed for qwen3-tts, voxtral-tts, omnivoice,
   tada, chatterbox. Un-migrated: f5, dots, kugelaudio, pocket (natural next
   targets — same levers).
+- **omnivoice codec FASTCONV actually landed 2026-07-15** (`6a1b1903b`) — its DAC
+  decode had NOT been migrated (it ran `core_dac::conv1d` with F16 kernels, paying
+  the per-graph F16→F32 cast + im2col-for-k=1). Profiling caught it: decode was the
+  RTF wall (18.2 s for the reporter's paragraph on M1). Baking F32 decode kernels at
+  load + k=1→matmul (`OMNIVOICE_CODEC_FASTCONV`, default ON) → **decode 10.6 s → 3.6 s
+  ≈ 2.9×**, ASR-identical. Corroborated by `rockerritesh/omnivoice-tts.cpp` (their fast
+  Metal decode is the same f32-no-cast path). GPU codec decode measured slower on M1
+  Metal (dispatch-bound) → gated `OMNIVOICE_CODEC_GPU`, default OFF, pending Kaggle CUDA.
+  `--tts-steps` now drives omnivoice's stage0 step count (default 32).
+- **omnivoice single-shot synthesis (2026-07-16):** omnivoice was sentence-chunked by
+  the generic TTS path; a reporter (#254, CUDA) showed that cost 15–20% vs omnivoice.cpp
+  (3 chunks → 3 graph builds + 3 CUDA-graph warmups + 3×num_steps). Added omnivoice to
+  the single-shot whitelist (masked-iterative → whole span in one pass, like the
+  reference). M1 A/B: net faster even here (decode 9.1 s vs 23.7 s from 1 vs 3 decode
+  graph builds outweighs +6% gen O(T²)); on CUDA the gen graph-reuse is a bigger win.
+  Escape hatch `CRISPASR_OMNIVOICE_CHUNK=1` restores chunking. Interval-CFG
+  (`OMNIVOICE_CFG_INTERVAL=K`) recomputes uncond every K steps — K=2 ≈ −30% stage0,
+  opt-in/approximate.
 - **Codec decoders are already ggml-graph** (snac/dac/seanet/hifigan/adaln/
   qformer). Scalar survivors: `core/rvq.cpp` encode-search and `core/istft.h`
   O(N²) IRFFT (both run once/synthesis).
@@ -230,7 +269,7 @@ the §232 campaign. Verified against current code, not carried from this doc.
 | P | Area | Gap | Impact |
 |---|---|---|---|
 | **P0** | firered_asr | Decoder self-attention has **no KV cache** — growing vector, O(T²) recompute (`firered_asr.cpp:2697`) | Highest-impact ASR gap |
-| ~~P0 relpos~~ → **P0 hifigan (genuine compute)** | melotts / piper | relpos is a MEASURED DUD (`2026-07-11`): already GEMM'd (`melotts_use_scalar()` gate) and only **~1.5% of synthesis** (text_encoder 190 ms of 12.3 s). **hifigan_decode is 73–92%** and is **genuine GPU compute** (~4× realtime, stable ~8.4 s across 3 warm runs; NOT JIT-bound — the `Apple_M1.archive` works, 0 "add-to-archive skipped", the "compiling pipeline" lines are an unconditional DEBUG log at `ggml-metal-device.m:410` that fires even on an archive hit). **Spike GATED OUT (`CRISPASR_METAL_PROFILE`, 2026-07-11):** the hifigan graph (1198 nodes) is **99.7% GPU-compute-bound** — `gpu_us=4,020,540` vs `encode_us=10,667` (host 0.27%). So op-fusion / ICB / transpose-elim (all host-encode levers) ceil at ~0.3% (= §210 granite). The two applicable FASTCONV levers are ALREADY in ggml_conv_1d (F32 im2col + pad-in-im2col, `ggml.c` conv patch line 13-14); no K=1 convs for the matmul lever. Unloaded true cost: hifigan 4.4 s / synth 5.2 s for 2.58 s audio = RTF **2.0×** (the earlier "8.4 s/3.5×" was ~2× load inflation). Only remaining paths = hand-written fused Metal conv kernel (research-grade, uncertain) or fewer FLOPs (quality tradeoff) — both = CV3-HiFT-not-worth-it. **Do not fund without a new kernel insight.** Teardown assert FIXED (`119ec75a`, RAII dtor). | HiFi-GAN at compute floor; no cheap lever |
+| ~~P0 relpos~~ → ~~P0 hifigan~~ → **RESOLVED ~2× (im2col batch-1 occupancy)** | melotts / piper | relpos is a MEASURED DUD (`2026-07-11`): already GEMM'd, ~1.5% of synthesis. **hifigan_decode is 73–92%**. The prior "99.7% GPU-compute-bound, no cheap lever, do not fund without a new kernel insight" verdict was based on the IDEAL roofline (im2col ≈ 1%) — **wrong**. Per-node profiling (new `CRISPASR_METAL_PROFILE=2`) on a **quiet** M1 (`2026-07-11`) showed **IM2COL = 58%**, CONT 22%, MUL_MAT only 12% (the earlier 4.02e6 gpu_us was ~2× load-inflated; true quiet ≈ 1.75e6 = 13× off roofline). **Root cause:** `ggml-metal-ops.cpp` sized im2col thread-dim0 from batch N — at inference **N=1**, threadgroups ran only KH·KW (3–11) threads = ~10–34% of one simdgroup → im2col ~40× below BW. **Fix (ggml fork, `CRISPASR_METAL_IM2COL_OCC`, auto-on N==1):** block OW across thread-dim0 → threadgroups fill. **Bit-exact** (moonshine ASR occ-on==occ-off byte-identical; melotts ASR roundtrip valid), **~2–3× on hifigan** (gpu 1.88→0.83 s quiet) + **1.65× moonshine, no regression across paraformer/melotts**. A general batch-1 Metal conv win (whisper/all vocoders); CUDA unaffected (parallelizes threads over IC·KH·KW, not N). The existing `ggml_conv_2d_direct` is a **dud** (2.25× slower, naive scalar). Teardown assert FIXED (`119ec75a`). | Was "compute floor"; the floor was a Metal occupancy bug — fixed |
 | **P0** | voxcpm2_tts | CPU-only (Metal SIGSEGV), manual per-step host KV re-upload (`voxcpm2_tts.cpp:106-111`) | GPU-locked-out |
 | ~~P0~~ | openvoice2 | STFT scalar O(bins·win) DFT → shared radix-2 FFT: **1182 ms → 10.7 ms** (110×, ~26% of convert) `2026-07-11`. WaveNet already GEMM'd (§176d); ref-enc is 4% one-time. **Remaining: hifigan_decode is 67% of convert** — next target | STFT fixed; vocoder dominant |
 | **P1** | voxtral/voxtral4b enc, mimo LLM decoder | Attention not on flash_attn_ext (O(T²) manual softmax) | Enc mem+dispatch; mimo dispatch-bound |
@@ -690,862 +729,6 @@ Cross-backend portability of the fused-QKV Q4_K pattern:
   showed no measurable speedup on JFK
 - qwen3-tts: opt-in (existing convention)
 
-### FastConformer encoder flash_attn_ext — 2026-05-09
-
-Commit `c2423313` rewrites the FastConformer encoder self-attention
-(parakeet, canary, canary_ctc) from 3 separate matmuls + add + softmax
-for Shaw relative-position attention into a single `ggml_flash_attn_ext`
-call per layer with the BD position bias precomputed and passed as the
-additive mask. Reduces per-encoder-pass kernel dispatches from
-32 layers × 3 matmuls = 96 down to 32 — the dominant win on GPUs
-where per-launch overhead is real.
-
-Re-verification on Apple M1 Metal (`build-ninja-compile/`,
-`GGML_METAL=ON`, `GGML_BLAS=ON` Apple), 3-pass warm-cache JFK 11 s:
-
-| Backend | Baseline (`c2423313~1`) median | Flash-attn (`c2423313`) median | Speedup | Output |
-|---|---|---|---|---|
-| parakeet (TDT 0.6B v3 F16) | 2.57 s (4.3× RT) | 1.60 s (6.9× RT) | **1.61× (38% faster)** | bit-identical ✓ |
-| canary (1B v2 Q4_K) | 1.53 s (7.2× RT) | 1.15 s (9.6× RT) | **1.33× (25% faster)** | bit-identical ✓ |
-
-Substantially exceeds the commit message's CPU number (~10%), confirming
-the GPU-vs-CPU hypothesis: with kernel-launch overhead in the picture,
-fusion pays off ~3-4× more. Wallclock includes whisper-tiny LID
-(~77 MB Metal load) and feature extraction — both unchanged across the
-two builds, so the encoder-attention-only speedup is larger than the
-table suggests. Parakeet benefits more than canary because its encoder
-runs longer per token (TDT joint loop), so the 32-layer attention block
-dominates a larger share of wallclock.
-
-Issue #81 ("parakeet 5× slower than ONNX on GPU") — this commit closes
-a chunk of the gap but not all of it. Next likely targets: decoder
-loop, joint network, log-mel host→device transfer.
-
-### onnx-asr cross-comparison — issue #81 (2026-05-09)
-
-Replicating the issue reporter's setup (libcrispasr via Python ctypes,
-parakeet-tdt-0.6b-v3 q8_0 GGUF) and comparing against onnx-asr 0.11.0
-on the same Apple M1, JFK 11 s, 3 warm passes per path. crispasr is at
-flash-attn commit `c2423313`. ONNX backend selection follows
-`istupakov/onnx-asr`'s upstream recipe (`pip install onnx-asr`).
-
-**ONNX execution-provider reality check on M1:**
-
-| ONNX model | CPU EP | CoreML EP |
-|---|---|---|
-| `nemo-parakeet-tdt-0.6b-v3` (F32, external-data, encoder 2.4 GB) | ✓ | ✗ external-data initializer + CoreML's 316-partition subgraph split lose `model_path`; inlining hits protobuf's 2 GB ceiling. Tracked upstream: [`microsoft/onnxruntime#26355`](https://github.com/microsoft/onnxruntime/issues/26355), closed *not planned* |
-| `nemo-parakeet-ctc-0.6b` (F32 + external data) | ✓ | ✗ same issue |
-| `nemo-parakeet-ctc-0.6b` int8 (single-file, 650 MB) | ✓ | ✓ loads after ~10 s CoreML compile |
-
-The upstream onnx-asr README claim "Works on … macOS … with support for
-… CoreML" is therefore **partially true** on Apple Silicon for parakeet:
-only the smaller CTC int8 single-file export reaches CoreML; the full
-TDT (and full-precision CTC) exports stay CPU-only because of how
-istupakov packages them with external-data tensors larger than
-protobuf's 2 GB limit.
-
-**TDT-vs-TDT bench** (JFK 11 s, 3 warm passes, load avg ~4.0):
-
-| path | median | RT× |
-|---|---|---|
-| **crispasr ctypes Session, parakeet-tdt q8_0, Metal** | **1.34 s** | **8.24×** |
-| onnx-asr `nemo-parakeet-tdt-0.6b-v3` F32, CPU EP | 1.77 s | 6.23× |
-
-Apples-to-apples on the TDT architecture: **crispasr Metal beats
-onnx-asr CPU by 1.32×.** The Q8_0 ctypes path is faster than the F16
-CLI numbers above because it skips the CLI's whisper-tiny LID startup
-(~77 MB Metal load) and output formatting overhead — closer to what
-the issue reporter actually measured.
-
-**CTC-vs-CTC bench** (JFK 11 s, 3 warm passes, all CTC outputs
-identical, q8_0 quants, load avg ~2.6):
-
-| path | median | RT× |
-|---|---|---|
-| **crispasr Session, parakeet-ctc-0.6b q8_0, Metal** | **~460 ms** | **~24×** |
-| onnx-asr `nemo-parakeet-ctc-0.6b` (~600M) int8, CPU EP | 724 ms | 15.2× |
-| onnx-asr `nemo-parakeet-ctc-0.6b` (~600M) int8, CoreML EP | 1279 ms | 8.6× |
-
-(crispasr Metal value is from the `stt_en_fastconformer_ctc_xlarge` 3-pass
-bench at load ~2.6 — identical encoder + CTC-head graph as
-`parakeet-ctc-0.6b`, only the tokenizer + training data differ. The new
-parakeet-ctc-0.6b GGUFs fall in the same window when measured under
-the same load — variance ~0.4–0.7 s observed across loads 2.6–4.0.)
-
-`nvidia/parakeet-ctc-0.6b` (24L) and `nvidia/parakeet-ctc-1.1b` (42L)
-are now first-class in crispasr — the existing
-`models/convert-stt-fastconformer-ctc-to-gguf.py` handles both (encoder
-+ CTC head are architecturally identical to the `stt_en_fastconformer_ctc_*`
-family); `examples/cli/crispasr_backend.cpp` auto-routes
-`parakeet-ctc-*.gguf` filenames to the `fastconformer-ctc` backend (the
-JA hybrid `parakeet-tdt_ctc-0.6b-ja` stays on the `parakeet` TDT path
-via the "tdt" guard). Quantised variants
-([F16, Q8_0, Q5_0, Q4_K]):
-[`cstr/parakeet-ctc-0.6b-GGUF`](https://huggingface.co/cstr/parakeet-ctc-0.6b-GGUF)
-and [`cstr/parakeet-ctc-1.1b-GGUF`](https://huggingface.co/cstr/parakeet-ctc-1.1b-GGUF).
-**crispasr wins by ~1.6×** on the same upstream model on M1 Metal.
-
-Two M1-specific surprises worth surfacing:
-
-1. **CoreML EP is *slower* than CPU EP on M1** for parakeet-shaped
-   graphs (CTC: 1.28 s vs 0.72 s on the same int8 model). M1's CPU
-   vector pipeline + onnxruntime CPU kernels outpace CoreML's
-   per-graph compile + dispatch overhead. ONNX users on Apple Silicon
-   should default to CPU EP for parakeet, not CoreML.
-2. **CoreML EP isn't even reachable for the upstream parakeet TDT
-   ONNX export** (external-data + protobuf 2 GB ceiling, see table
-   above). The headline "works on macOS with CoreML" claim only
-   applies to the smaller CTC int8 single-file export.
-
-**Reframing the 5× claim in issue #81:** the reporter is on Windows +
-RTX 4070 + onnxruntime-directml — i.e. ONNX with a *working dGPU
-execution provider*. DirectML on a 4070 is a real architectural
-advantage no amount of ggml-side fusion will fully erase until our
-CUDA / Vulkan kernels for the parakeet hot paths reach parity. On M1
-the picture inverts: ONNX's only ergonomic path is CPU EP (or CoreML
-EP for the smaller CTC int8 export, where it's *slower* than CPU
-anyway), and crispasr Metal beats every ONNX path that loads — by
-1.32× on TDT-vs-TDT and **1.58× on CTC-vs-CTC at the same param
-count.** The actionable framing for the issue is "which CUDA / Vulkan
-kernels in the parakeet path are leaving perf on the table on dGPU"
-rather than "parakeet is slow on GPU universally."
-
-Reproduce:
-
-```bash
-pip install onnx-asr soundfile
-HF_HOME=/Volumes/backups/ai/huggingface-hub \
-CRISPASR_LIB_PATH=$(pwd)/build-ninja-compile/src/libcrispasr.dylib \
-PYTHONPATH=$(pwd)/python \
-python -c "
-import time, soundfile as sf, onnx_asr
-from crispasr import Session
-audio,_ = sf.read('samples/jfk.wav', dtype='float32')
-
-# 1) crispasr Q8_0 GGUF via ctypes (matches issue #81 reporter setup)
-sess = Session('<path-to>/parakeet-tdt-0.6b-v3-q8_0.gguf', backend='parakeet')
-sess.transcribe(audio.copy(), language='en')  # warm
-for i in range(3):
-    t = time.perf_counter()
-    sess.transcribe(audio.copy(), language='en')
-    print(f'crispasr q8_0 Metal: {(time.perf_counter()-t)*1000:.0f} ms')
-
-# 2) onnx-asr TDT CPU EP
-m = onnx_asr.load_model('nemo-parakeet-tdt-0.6b-v3', providers=['CPUExecutionProvider'])
-m.recognize(audio)
-for i in range(3):
-    t = time.perf_counter()
-    m.recognize(audio)
-    print(f'onnx tdt CPU EP:     {(time.perf_counter()-t)*1000:.0f} ms')
-"
-```
-
-### jason-ni/parakeet.cpp cross-comparison — issue #81 (2026-05-10)
-
-[`jason-ni/parakeet.cpp`](https://github.com/jason-ni/parakeet.cpp) is
-the prior public attempt at a ggml port of parakeet, referenced in
-issue #81 as evidence that "ggml-based parakeet is slow." Author paused
-2025-07 with the README note "the ggml implementation is not as
-efficient as expected" after observing 1 s encoder time vs a claimed
-0.001 s for parakeet-mlx. The 0.001 s claim is almost certainly an
-async-dispatch return time on MLX, not actual compute — real MLX
-encoder cost is in the same single-second range as ours and theirs.
-
-**Scope of their build.** Encoder-only proof of concept for **Parakeet
-TDT 0.6B v2** (English-only, MLX checkpoint), F32 weights, ~4 000 LOC
-including a custom mini-runtime (`framework_*`). No decoder, no joint
-network, no streaming, no quantisation, no Python/CLI integration.
-Test harness is `parakeet_cpp <gguf> <pe.bin> <input.data>` — feeds
-pre-baked mel features, returns encoder hidden states.
-
-**Their graph.** Standard FastConformer encoder, 24 layers ×
-(LN → FF1 → LN → self-attn → LN → conv → LN → FF2 → LN), exactly the
-architecture we ship. The interesting differences are all in the self-
-attention block at `src/framework_nn.cpp` lines 820–1010:
-
-- **Shaw relative-position attention done as separate ops**:
-  `matrix_ac = mul_mat(K, Q+u_bias)`,
-  `matrix_bd = mul_mat(P_emb, Q+v_bias)`, then a left-pad + slice
-  trick to align positions, add, scale, softmax, multiply by V.
-  3 matmuls + softmax + matmul + several view/transpose passes per
-  layer. Same shape as our pre-`c2423313` baseline.
-- **`ggml_flash_attn_ext` path is written but commented out** (lines
-  944–987). They had the fused approach drafted, didn't activate it —
-  exactly the path our `c2423313` activates and tunes.
-- **Conv2D pre-encode (subsampling)** uses `ggml_conv_2d` — same as
-  us. Their conformer self-attn comment notes
-  `weight f16 is required for ggml_conv_2d_dw` on Metal — same Metal
-  constraint we observed.
-- **F32 weights only**, no Q4_K / Q8_0 / F16 quantisation paths.
-
-So architecturally their encoder is a sibling of ours minus the
-2026-05 flash-attn-ext fusion. The "ggml is slow" finding they paused
-on is exactly the bottleneck commit `c2423313` addresses (1.61× on
-parakeet TDT v3 F16, M1 Metal).
-
-**Apples-to-apples on their own test audio** (`assets/input.wav`,
-47.74 s, mel features identical), encoder-only, 3 warm runs:
-
-| build | hardware | precision | encoder mean | RT |
-|---|---|---|---|---|
-| jason-ni/parakeet.cpp (their README) | Apple **M4** | F32 | 0.92 s | 51.9× |
-| **crispasr `parakeet_test_encoder` (this commit, flash-attn-ext)** | Apple **M1** | F16 | **1.66 s** | **28.8×** |
-| crispasr `parakeet_test_encoder` (this commit, flash-attn-ext) | Apple M1 | Q8_0 | 2.64 s | 18.1× |
-
-Hardware-normalised: M4 GPU is ≈ 1.5–1.8× M1 on Metal compute,
-putting jason-ni's number at ~30–35× RT on M1-equivalent hardware.
-We're at 28.8× RT on M1 with F16 + flash-attn-ext — **roughly within
-hardware noise of each other** for encoder-only. The gap they panicked
-about against MLX is illusory; the gap against ours doesn't exist
-once you normalise hardware.
-
-**Important encoder-vs-pipeline note.** On the *encoder alone*, F16 is
-faster than Q8_0 on Metal (Q8_0 dequant overhead doesn't pay off when
-encoder ops are matmul-bandwidth-friendly even at F16). Q8_0 wins for
-the **full pipeline** because the TDT joint network + label-predictor
-LSTM run many small matmuls per output token where weight memory
-bandwidth dominates. The `tools/benchmark_asr_engines` matrix puts
-Q8_0 at 7.4× RT for full inference / 60 s. **Different shapes win
-different quants** — pick by what your pipeline actually does, not
-by quant name alone.
-
-**What we have that they don't, attributable to specific work:**
-
-1. Flash-attn-ext attention fusion (`c2423313`). Their `ggml_flash_attn_ext`
-   path exists in code but is commented out.
-2. Full TDT decoder (label predictor + joint network + per-frame TDT
-   step). They're encoder-only.
-3. Quantisation paths (Q4_K, Q5_0, Q8_0). They ship F32 only.
-4. Multilingual TDT v3 support. They support v2 (English-only).
-5. Production integration: CLI, `python/crispasr/Session`, streaming,
-   VAD, mic, WER tooling, multi-backend dispatch. Theirs is a single
-   test binary.
-6. Cross-platform: CUDA / Vulkan / Metal / CPU. Theirs is
-   Metal-focused (`-DGGML_METAL=ON`).
-
-**Reframe of issue #81 in light of this**: the prior public ggml
-attempt (jason-ni) plateaued at our pre-`c2423313` baseline and paused
-on a misread benchmark. Our crispasr build, post-flash-attn fusion,
-matches it on encoder-only and ships everything else around it. The
-remaining issue #81 gap on Windows + RTX 4070 + DirectML is still
-about CUDA/Vulkan kernel coverage on the dGPU side, not about ggml
-fundamentally being too slow for parakeet.
-
-Reproduce the encoder-only number:
-
-```python
-# Save jason-ni's input.wav reference: 47.74 s, 16 kHz mono.
-# T_mel = 4774 (10 ms hop matches both their preprocess and ours).
-import ctypes, time
-lib = ctypes.CDLL('build-ninja-compile/src/libcrispasr.dylib')
-lib.crispasr_parakeet_init.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
-lib.crispasr_parakeet_init.restype  = ctypes.c_void_p
-lib.parakeet_test_encoder.argtypes  = [ctypes.c_void_p, ctypes.c_int]
-lib.parakeet_test_encoder.restype   = ctypes.c_int
-lib.crispasr_parakeet_free.argtypes = [ctypes.c_void_p]
-
-ctx = lib.crispasr_parakeet_init(b'parakeet-tdt-0.6b-v3.gguf', 4, 1)  # F16, flash-attn on
-lib.parakeet_test_encoder(ctx, 4774)  # warm
-for _ in range(3):
-    t = time.perf_counter()
-    lib.parakeet_test_encoder(ctx, 4774)
-    print(f'{(time.perf_counter()-t)*1000:.0f} ms')
-lib.crispasr_parakeet_free(ctx)
-```
-
-`parakeet_test_encoder` runs the full encoder graph with mel = zeros —
-compute-bound, identical kernel dispatches to a real call, no I/O.
-Use it instead of the CLI when you want encoder-only timing without
-LID-model load, mel extraction, and the TDT decoder loop in the
-wallclock.
-
-### A1000 Ampere CUDA A/B (sm_86) — issue #81 (2026-05-10)
-
-Adds the missing Ampere datapoint to the issue #81 cross-comparison.
-Hardware: NVIDIA RTX A1000 Laptop GPU (sm_86, 4 GB VRAM, 35–40 W TDP)
-on Windows 11 + WDDM, driver 581.95, CUDA 13.0 toolkit, host CPU
-Intel i7-12700H (Alder Lake, no AVX-512 fused on retail parts; AVX2 +
-FMA + F16C is the ISA ceiling). Reproduce script lives at
-`tools/kaggle-issue81-cuda-ab.py` (Linux/Kaggle original); this run was
-the Windows port driven from the handover prompt at
-`handover-prompts/2026-05-10-a1000-cuda-ab-issue81.md`. Build flags
-match `release.yml`'s `build-libs-windows-x86_64-cuda` slot exactly
-(`-DGGML_CUDA=ON -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DGGML_AVX2=ON
--DGGML_FMA=ON -DGGML_F16C=ON -DCRISPASR_BUILD_TESTS/EXAMPLES/SERVER=OFF`)
-except `-DCMAKE_CUDA_ARCHITECTURES=86` (single-arch nvcc → ~5× faster
-build, identical runtime). Raw JSON: `handover-prompts/a1000-pre-p0.json`,
-`a1000-post-p0.json`, `a1000-onnx-p0.json`. Nsys kernel summaries:
-`handover-prompts/nsys-crispasr-{pre,post}-kernsum.txt`. The original
-prompt asked to also touch `tools/kaggle-issue81-cuda-ab.py`'s
-top-of-file docstring; that file is currently *untracked* on `main`
-(present locally only) so the docstring touch is left for whoever
-lands the script properly — noted here per the prompt's "fix it in
-PERFORMANCE.md and note the deviation" rule.
-
-**Headline (q8_0 GGUF chunked window=4 s, 10 runs warmups=1, NPI
-PreferredPState=1 active):**
-
-| engine | quant | audio | mean run | RT× | p50 | p95 |
-|---|---|---|---|---|---|---|
-| crispasr-ctypes | q8_0 | short 11 s | 1.680 s | 6.55× | 567 ms | 690 ms |
-| **crispasr-ctypes** | **q8_0** | **long 60 s** | **3.267 s** | **18.4×** | **212 ms** | **269 ms** |
-| crispasr-ctypes | q8_0 (PRE c2423313~1) | short | 1.680 s | 6.55× | 567 ms | 690 ms |
-| crispasr-ctypes | q8_0 (POST c2423313)  | short | **0.529 s** | **20.8×** | 183 ms | 195 ms |
-| crispasr-ctypes | q8_0 (PRE) | long | 9.605 s | 6.25× | 630 ms | 781 ms |
-| crispasr-ctypes | q8_0 (POST) | long | **3.267 s** | **18.4×** | 212 ms | 269 ms |
-| onnx-asr CUDA EP | int8 | short | 3.845 s | 2.86× | 1297 ms | 1503 ms |
-| onnx-asr CUDA EP | fp32 | short | 0.752 s | 14.6× | 269 ms | 398 ms |
-| onnx-asr CUDA EP | int8 | long | 21.226 s | 2.83× | 1412 ms | 1516 ms |
-| **onnx-asr CUDA EP** | **fp32** | **long** | **1.537 s** | **39.0×** | **93 ms** | **148 ms** |
-
-**PRE → POST verdict (Ampere sm_86, NPI active):** the flash-attn-ext
-fusion **wins by 2.94×** on the long clip (9.605 → 3.267 s; p50
-630 → 212 ms) and by **3.18×** on short (1.680 → 0.529 s). Bigger than
-the M1 Metal win (1.61×) and the *opposite* sign from Kaggle T4
-(sm_75) where POST ran 9 % slower. **Keep the fusion on for sm_80+
-CUDA; gate it off for sm_75.**
-
-**WDDM idle-clock confound — read this before reusing the numbers.**
-The first pass of this bench, before any power-management tweak,
-landed *very* differently: PRE 35.1 s long, POST 73.1 s long — POST
-appearing **2.08× SLOWER** than PRE. Snapshotting `nvidia-smi` mid-bench
-showed the GPU stuck at **P8 / 210 MHz / 4 W** with `clocks_event_reasons`
-flagging `gpu_idle = Active` — the driver's heuristic doesn't see ggml's
-hundreds-of-tiny-launches-per-chunk pattern as "sustained compute," so
-on consumer/laptop SKUs it parks the GPU at idle clocks. ONNX CUDA EP
-keeps the GPU at P0 because its launches are fewer, fatter, and cuDNN-
-fused. TCC (Tesla Compute Cluster) mode that would bypass WDDM isn't
-available on Quadro/RTX A workstation SKUs — only on Tesla / A100.
-The fix that *actually* worked: nvidiaProfileInspector v2.4.0.31, run
-once elevated:
-
-```powershell
-nvidiaProfileInspector.exe -setProfileSetting "_GLOBAL_DRIVER_PROFILE,0x1057EB71,1"
-```
-
-This sets NVAPI's `PreferredPState` to *Prefer maximum performance* (1)
-in the global 3D profile — equivalently the entry the NV Control Panel
-exposes as "Power management mode" / "Energieverwaltungsmodus" except
-that on Quadro/RTX A SKUs the panel often hides this control entirely;
-NPI reaches it via NVAPI directly. After the toggle, A1000 PRE wallclock
-fell **3.66×** (35.1 → 9.6 s) and POST fell **22.4×** (73.1 → 3.27 s) —
-i.e. the fusion's "regression" was *entirely* a WDDM idle-clock artifact.
-The setting biases the heuristic upward; combined with ggml's launch
-pattern, a few mid-bench dips to P5/270 MHz still happen, but the
-average state is high enough that POST's per-launch overhead cost
-disappears into the noise. **`nvidia-smi` confirmed P0 / 1140 MHz /
-10 W idle right after the NPI call**; `nvidia-smi -lgc` would do the
-same lock more aggressively but needs admin and isn't honoured on
-consumer SKUs anyway. The `Adaptive` (default) state is what every
-out-of-the-box Windows ggml-on-CUDA user is benchmarking; the
-"Prefer maximum performance" state is what they should be benchmarking,
-because real workloads on this stack will hit the same idle-clock
-trap unless they do their own keepalive. (A keepalive helper script
-that achieves the same effect without admin lives at
-`bench-issue81/gpu_keepalive.py` — runs an ORT-CUDA tight loop in a
-sidecar process, ~1 % GPU util, no extra setup beyond the existing
-onnxruntime-gpu install.)
-
-**Onnx fp32-vs-int8 on 4 GB VRAM:** fp32 wins overwhelmingly on the
-long clip (1.537 s vs 21.226 s — int8 is **13.8× slower**). The cause
-is visible in ORT's setup logs: `MemcpyTransformer: 742 Memcpy nodes
-are added to the graph main_graph for CUDAExecutionProvider` for the
-int8 encoder, vs only 2 nodes for fp32. ORT can't efficiently place the
-int8 graph on this GPU (likely missing CUDA EP int8 op coverage for
-some node types) and routes hundreds of ops back to CPU with H↔D copies
-between each — pathological. The fp32 encoder fits cleanly on GPU
-(2 Memcpys total) and runs at full tensor-core throughput. The 4 GB
-VRAM didn't OOM — fp32 encoder uses ~2.7 GB peak. (Kaggle T4 with
-16 GB VRAM showed the *opposite*: int8 was 10× slower than fp32 there
-too — 9.06 s vs 0.87 s — so this isn't a VRAM artifact, it's an ORT
-op-coverage issue with istupakov's int8 export. Worth flagging
-upstream if not already.) **Practical takeaway for ONNX users on
-parakeet: pick fp32; int8's quant savings are erased by ORT's H↔D
-chatter.**
-
-**Top-10 CUDA kernels by total GPU time (long clip, 3 runs at NPI-P0
-state, nsys 2025.3.2 `cuda_gpu_kern_sum`):**
-
-POST (post-fusion):
-
-| kernel | total ms | % | calls |
-|---|---|---|---|
-| `mul_mat_q<q8_0, 64>` | 660 | 27 % | 11 773 |
-| `im2col_kernel<float>` | 584 | 24 % | 310 |
-| `cpy_scalar` | 151 | 6 % | 8 990 |
-| `k_bin_bcast<op_add>` | 130 | 5 % | 18 228 |
-| `norm_f32<1024>` | 118 | 5 % | 7 440 |
-| `ampere_h16816gemm_128x64` | **80** | 3 % | 1 464 |
-| `quantize_mmq_q8_1` | 78 | 3 % | 13 454 |
-| `mul_mat_q_stream_k_fixup<q8_0,64>` | 68 | 2 % | 8 845 |
-| `mul_mat_q<q8_0, 128>` | 60 | 2 % | 217 |
-| `mul_mat_q<q8_0, 112>` | 58 | 2 % | 1 464 |
-
-PRE (pre-fusion) diff:
-
-| kernel | total ms | % | calls | vs POST |
-|---|---|---|---|---|
-| `mul_mat_q<q8_0, 64>` | 553 | 25 % | 11 773 | -16 % time, same calls |
-| `im2col_kernel<float>` | 530 | 24 % | 310 | -9 % time, same calls |
-| `ampere_h16816gemm_128x64` | 65 | 3 % | 1 464 | -19 % time, same calls |
-| **`soft_max_f32`** | **37** | **1 %** | **1 488** | **POST: ZERO** (folded into flash-attn) |
-| **`ampere_sgemm_128x128_tn`** | **29** | **1 %** | **1 464** | **POST: ZERO** (folded into flash-attn) |
-| `cutlass_80_tensorop_s1688gemm_64x64_16x6_tn` | 40 | 1 % | 2 952 | POST: 18 ms / 1 464 calls (-50 % both) |
-
-The fusion's signature is exactly the disappearance of `soft_max_f32`
-(1 488 launches, 37 ms) and `ampere_sgemm_128x128_tn` (1 464 launches,
-29 ms) from POST: those are the explicit softmax + the relative-position
-attention's separate fp32 sgemm in the unfused path. POST inlines both
-into the cuBLAS-LT epilogue of `ampere_h16816gemm_128x64` (which grows
-65 → 80 ms — absorbing some of the saved work — but the **kernel-launch
-count drops by ~3 000 per 3-run bench**). Total nsys-tracked GPU compute
-is roughly tied (PRE ≈ 2.2 s / 3 runs, POST ≈ 2.4 s / 3 runs); the
-wallclock delta (28.8 → 9.8 s for 3 runs) is **driven almost entirely
-by host-side launch overhead and WDDM idle-gap reduction**, not by GPU
-compute itself getting faster. That's why the fusion looks small on
-Linux/Kaggle (no WDDM = launch overhead is microseconds) and large on
-Windows + Ampere consumer (WDDM = launch overhead is hundreds of µs
-*and* the heuristic punishes long sequences of small launches with
-clock drops). M1 Metal sits between because Metal's command-buffer
-batching amortises some launch cost but not all.
-
-**Remaining gap to onnx-fp32:** crispasr-post 3.27 s vs onnx-fp32
-1.54 s on the long clip = **2.12× behind**, way down from the 6.5×
-on Kaggle T4 and 4.6× on the issue reporter's RTX 4070. The closing
-came from flash-attn-ext fusion eating most of the launch-overhead gap
-on Ampere; what's left is the bigger picture:
-1. **`im2col_kernel` + `mul_mat_q<q8_0,64>` together = 51 % of GPU
-   time.** Fuse the conv2d-subsampling pass; it currently does an
-   im2col+matmul split that ORT-fp32 sidesteps with a native conv op.
-2. **`norm_f32` + `cpy_scalar` + `k_bin_bcast` = 16 % of GPU time** —
-   classic ggml-elementwise overhead that CUDA Graphs would eliminate.
-   Worth experimenting with ggml's existing `GGML_USE_CUDA_GRAPHS`
-   support.
-3. **`quantize_mmq_q8_1`** at 3 % is on-the-fly q8_1 quantisation of
-   activations for q8_0 mat-mul; pre-quantising once per chunk would
-   save it.
-
-**Hardware-normalised cross-check vs the issue reporter's RTX 4070
-Laptop (sm_89, ~15 TFLOPS fp32) and Kaggle T4 (sm_75, ~8 TFLOPS):**
-
-| host | arch | TFLOPS fp32 | crispasr-post long mean | normalised to A1000 |
-|---|---|---|---|---|
-| RTX A1000 Laptop (this run, NPI on) | sm_86 | ~5.0 | 3.27 s | 1.00× (baseline) |
-| Kaggle T4 (Linux server) | sm_75 | ~8.1 | 6.15 s | 1.88× — POST regressed on Turing |
-| RTX 4070 Laptop (issue reporter) | sm_89 | ~15.0 | 2.89 s | 0.88× — extrapolation only |
-
-A1000 actually runs the long clip *faster* than T4 in absolute terms
-on POST (3.27 s vs 6.15 s) **despite** having ~38 % less raw fp32
-TFLOPS. That's the flash-attn-ext fusion winning on Ampere where it
-couldn't on Turing. The 4070 number is the issue reporter's
-DirectML/CUDA-EP measurement and not directly comparable, but the
-A1000:4070 ratio (~1.13×) lines up with the TFLOPS gap minus a small
-WDDM-idle-clock penalty A1000 still pays — i.e. the reporter's number
-is what we'd expect; the 4070 isn't pathologically slow, it's just
-that ONNX-fp32 on CUDA EP outpaces both.
-
-**Arch-guard recommendation (one sentence):** *Keep flash-attn-ext on
-for sm_80+ — A1000 (sm_86) confirms it generalises from M1 Metal
-(1.6×) to Ampere (2.9× — the win is bigger on Ampere because tensor
-cores swallow the fused gemms efficiently). For sm_75 (Turing)
-specifically, the Kaggle T4 numbers say keep it off — there the fused
-path's larger per-kernel work doesn't offset the launch reduction the
-way it does on Ampere's tensor-core path.* Implementation note: this
-is a runtime choice, not a build choice — guard the flash-attn-ext
-dispatch on `compute_capability_major >= 8`, fall back to the unfused
-path otherwise. Same arch threshold cuBLAS uses for its own
-tensor-core paths, so it composes naturally with the rest of ggml's
-sm-feature gating.
-
-#### Closing the 2.12× gap to onnx-fp32 — what worked, what didn't
-
-Took the A1000 baseline above (POST q8_0, 3.267 s long, 18.4× RT,
-2.12× behind onnx-fp32) and ran a sweep of cheap optimization knobs
-to see how close to ONNX-fp32 we can get without a kernel rewrite.
-
-| config | long mean | RT× | p50 | gap to onnx-fp32 |
-|---|---|---|---|---|
-| **POST + `GGML_CUDA_GRAPHS=ON` q8_0** | **3.063 s** | **19.6×** | **197 ms** | **1.99×** ← best |
-| POST + `GGML_CUDA_GRAPHS=ON` q8_0 t=12 | 3.229 s | 18.6× | 207 ms | 2.10× |
-| POST q8_0 (graphs OFF, baseline) | 3.267 s | 18.4× | 212 ms | 2.13× |
-| POST f16 (graphs OFF) | 3.522 s | 17.0× | 229 ms | 2.29× |
-| POST + graphs q8_0 t=20 (max) | 3.691 s | 16.3× | 246 ms | 2.40× |
-| POST + graphs q4_k | 4.207 s | 14.3× | 277 ms | 2.74× |
-| POST + graphs f16 | 4.345 s | 13.8× | 287 ms | 2.83× |
-| POST q4_k (graphs OFF) | 4.640 s | 12.9× | 307 ms | 3.02× |
-
-Findings, in order of surprise:
-
-1. **`-DGGML_CUDA_GRAPHS=ON` is OFF by default** in ggml mainline
-   (`GGML_CUDA_GRAPHS_DEFAULT OFF`, with a "(llama.cpp only)" hint in
-   the option help) and was OFF in our `release.yml` Windows-CUDA build.
-   Flipping it gives a **6.3 % wallclock win** on q8_0 (3.27 → 3.06 s)
-   on this Ampere consumer SKU, with the runtime confirmation
-   `ggml_backend_cuda_graph_compute: CUDA graph warmup complete`
-   visible in the bench logs. The arch-gating in
-   `ggml-cuda.cu:graph_check_compute_cap` already restricts capture to
-   `cc >= GGML_CUDA_CC_AMPERE`, so flipping the default for shared-libs
-   builds doesn't risk regressions on Turing. **Recommended follow-up
-   PR:** flip the default in `release.yml`'s
-   `build-libs-windows-x86_64-cuda` and the Linux equivalents — costs
-   ~3 KB to ggml-cuda.dll, gains ~6 % on parakeet, no downside on
-   Ampere+. Also worth flipping for examples/cli builds, as long as
-   non-parakeet backends don't regress (would need a quick pass over
-   whisper, fastconformer-ctc, firered-asr).
-
-2. **F16 is *slower* than Q8_0 on A1000 Laptop**, both with and
-   without graphs (3.52 s and 4.35 s vs 3.06 s for q8_0+graphs). I
-   expected the opposite — Ampere tensor cores plus full-clock SM
-   should win at F16. The reason: A1000 Laptop has only 192 GB/s
-   memory bandwidth and 4 GB VRAM; F16 weights at 1.26 GB hit the
-   bandwidth ceiling on every matmul, while Q8_0 at 745 MB stays cache-
-   friendly. Combined with ggml's `mul_mat_q<q8_0>` MMQ path being
-   hand-tuned for L1/L2 reuse (vs cuBLAS-LT's per-call handle overhead
-   on F16), Q8_0 wins on this SKU. **Different SKUs probably differ:**
-   on a 4070 Laptop with 256-bit memory and bigger caches, F16 likely
-   wins; on Tesla-class with HBM, F16 wins decisively. So Q8_0 isn't
-   universal — but on consumer-laptop Ampere, it is.
-
-3. **CUDA Graphs *hurts* F16** (3.52 → 4.35 s, +24 % regression)
-   despite helping Q8_0 (-6.3 %). The reason is visible in the F16
-   path's reliance on cuBLAS-LT GEMM calls: ggml's CUDA Graphs path
-   skips capture for ops that go through cuBLAS handles (those calls
-   aren't recorded in the captured graph and become per-call cuBLAS-LT
-   handle setups inside the graph-replay context — the worst of both
-   worlds). q8_0 uses the native `mul_mat_q` MMQ kernels which capture
-   cleanly into the graph. **Don't enable graphs unconditionally for
-   F16 paths until ggml's CUDA Graphs handles cuBLAS-LT properly** — a
-   known gap in ggml mainline.
-
-4. **Q4_K is the worst quant on this hardware** (4.21 s long with
-   graphs, 4.64 s without). K-quants use grouped quantisation with
-   per-group scales and mins — a richer dequant scheme than Q8_0's
-   per-block scale. The dequant cost outweighs the bandwidth saving
-   on a workload where bandwidth wasn't the bottleneck. K-quants are
-   a win on memory-pressured CPU inference; on a small dGPU with
-   small weights, plain Q8_0 wins.
-
-5. **Threads > 4 hurts** (t=12 +5.4 %, t=20 +20.5 %). The crispasr
-   side has very little CPU work (mel extraction is the only sustained
-   compute — ~5 % of wallclock). Adding threads adds OpenMP barrier
-   sync without adding throughput. Default `--threads 4` is correct
-   on this stack; bumping to match host core count isn't free.
-
-**What's left to close the remaining 1.99× gap (without rewriting
-ggml mainline):**
-
-The kernel breakdown explains why GPU-only optimisations bottom out
-near here. POST top-10 GPU kernel time = 1 987 ms across 3 long-clip
-runs = ~662 ms/run. Wallclock per run = 3 063 ms (with graphs). So
-GPU compute is **only 22 % of wallclock**; the other 78 % is host-
-side work, sync points, and per-launch WDDM overhead that even CUDA
-Graphs doesn't fully eliminate (it only captures the encoder graph
-per chunk; cross-chunk transitions and the joint/decoder loop run as
-discrete dispatches). Even if we made GPU compute zero, we'd still
-be at ~2.4 s vs ONNX-fp32's 1.54 s — the **fundamental** gap is that
-ONNX-fp32 routes 99 % of work through cuDNN+cuBLAS-LT-fused-conv +
-tensor-core matmul, with only **2 H↔D Memcpy nodes** in the entire
-graph rewrite (vs ggml's many Memcpy boundaries from per-op
-back-and-forth between encoder-CUDA, joint-CPU, decoder-CUDA layers).
-
-Three concrete follow-up PRs ranked by ROI for closing the rest:
-
-a) **Flip `GGML_CUDA_GRAPHS=ON` as default for Windows-CUDA shared-libs
-   builds** (this PR's evidence justifies it) — 6 % free, no risk on
-   Ampere+. ~5 LOC change to `release.yml`. **Easiest win.**
-
-b) **Replace ggml's `im2col + mul_mat` conv2d path with cuBLAS-LT
-   matmul-with-conv prologue** for the FastConformer subsampling
-   block. ~30 LOC in `ggml_cuda_op_conv_2d`. Should cut the 24 %
-   im2col share by 2-3× and is the one place ggml mainline has not
-   yet adopted cuBLAS-LT's prologue API. Expected: another ~10-15 %
-   wallclock.
-
-c) **Audit MMQ template-instance dispatch** for `mul_mat_q<q8_0,64>`
-   — verify the `__nv_bfloat16` mma.sync variant in
-   `ggml/src/ggml-cuda/template-instances/mmq-instance-q8_0.cu` is
-   selected on sm_86 for our shapes (1024×T encoder matmuls). The
-   non-tensor-core SIMT path is the current default; tensor-core
-   variant should be ~2× on the dominant 660 ms kernel. Expected:
-   another ~10 %.
-
-Stacked, (a)+(b)+(c) plausibly land at ~2.4 s (RT 25×, 1.55× behind
-onnx-fp32) — close enough that mel extraction and ctypes overhead
-become the next bottleneck, not GPU kernels. To close the *last*
-half-x requires either ggml mainline cuDNN integration (the
-fundamental conv-kernel gap) or migrating parakeet to TensorRT EP
-(an architectural pivot). Out of scope for this datapoint.
-
-**Updated arch-guard / build-flag recommendation:** in addition to
-the flash-attn-ext-on-sm_80+ verdict above, **flip
-`GGML_CUDA_GRAPHS_DEFAULT` to `ON` in
-`ggml/CMakeLists.txt`** for any shared-libs build targeting sm_80+.
-The "llama.cpp only" hint in the help text is stale — parakeet (and
-likely whisper, fastconformer-ctc, firered-asr) all benefit because
-ggml-cuda's per-call graph instantiation is the bottleneck for any
-chunked-streaming inference under WDDM, not anything llama.cpp-
-specific. The arch gate inside `graph_check_compute_cap` already
-prevents Turing/older from regressing.
-
-Raw JSON sidecars for this round live at
-`handover-prompts/a1000-post-cg-{q8_0,f16,q4_k}.json`,
-`a1000-post-cg-q8_0-t{12,20}.json`,
-`a1000-post-{f16,q4_k}.json` — 8 new files alongside the original
-3 from the upstream A1000 section.
-
-#### Phase 0 / Phase 1 — root-causing the remaining 1.99× gap
-
-Followed up the gap-closing addendum above with a directed nsys profile
-of the best config (POST+CG q8_0 long) plus `GGML_SCHED_DEBUG=2` to
-identify *exactly* where the remaining wallclock is going. Result: two
-specific ggml-cuda support gates fall back to CPU for parakeet's
-encoder graph, each producing 24 H↔D round-trips per chunk × 15 chunks
-× 3 runs = 1 080 cross-backend transfers each = the bulk of the
-4 197 H↔D transfers per long-clip run we saw in the first nsys round.
-
-**Wallclock breakdown of crispasr-post+CG q8_0 long (3.063 s/run)
-from `nsys stats cuda_api_sum`:**
-
-| cost bucket | ms/run | % of wallclock | what it is |
-|---|---|---|---|
-| `cudaStreamSynchronize` | 808 | 26 % | host blocking for GPU; 8 723 calls/run |
-| `cudaMemcpyAsync` (host API) | 339 | 11 % | 12 590 calls/run |
-| actual H↔D GPU time | 190 | 6 % | 4 197 transfers/run (1 549 H2D + 2 648 D2H) |
-| `cudaLaunchKernel` | 23 | 1 % | -12× from no-graphs (graphs work) |
-| GPU kernel compute | ~660 | 22 % | from `cuda_gpu_kern_sum` |
-| ~~remaining host~~ | ~1 050 | 34 % | Python, ctypes, mel-extract, sched-orchestration |
-
-So **less than a quarter of wallclock is actual GPU compute** — the
-fight is over the other 3/4. CUDA Graphs already reduced
-`cudaLaunchKernel` from 269 ms to 23 ms but did NOT touch
-`cudaMemcpyAsync` (graphs don't capture memcpy ops) — exactly the
-"identical with graphs" line in the table.
-
-**`GGML_SCHED_DEBUG=2` of the encoder graph (291 splits per chunk):**
-
-| op falling to CPU | layers affected | trigger |
-|---|---|---|
-| **`GGML_OP_FLASH_ATTN_EXT`** | all 24 conformer layers | `ggml_cuda_get_best_fattn_kernel` rejects when `mask->ne[2] != 1`. Parakeet's relative-position-bias mask is **per-head** (n_heads=8, shape `(T_kv, T_q, 8, 1)`). This guard at `ggml/src/ggml-cuda/fattn.cu:423` is the dominant CPU-fallback. |
-| **`GGML_OP_UNARY`** (sigmoid on GLU gate) | all 24 conformer layers | `ggml-cuda.cu:4887` requires `ggml_is_contiguous(src)` for sigmoid; the GLU gate is a strided view of a `(2*d, T)` matmul output. The TODO comment one line earlier even says "should become: `ggml_is_contiguous_rows`" — i.e. the maintainers already know the check is too strict. |
-
-Each op forces a 3-split pattern (entry copy + execute + exit copy)
-in ggml-backend-sched, so 24 + 24 = 48 ops × 3 = 144 CPU splits per
-chunk (the other 147 splits stay on CUDA). 144 × 15 chunks × 3 runs ≈
-6 480 backend boundaries, each with at least one cudaMemcpyAsync and
-one cudaStreamSynchronize — matches the API-time data above to within
-noise.
-
-**Phase 1 experiments tried (all regressed):**
-
-1. **`op_offload=true` in `ggml_backend_sched_new`** (one-line change
-   to `src/parakeet.cpp` flipping the 6th arg). Intent: tell sched to
-   route host-buffer ops to a higher-priority backend (CUDA) when
-   supported. Result: **+87 % regression** (3.063 → 5.727 s). Likely
-   cause: re-evaluates weight placement every call, triggering
-   per-chunk re-uploads of model weights. Reverted.
-
-2. **`ggml_cont` before `ggml_sigmoid` in the GLU gate**
-   (one-line change to `src/core/fastconformer.h:268-269`). Intent:
-   force gate to be contiguous so ggml-cuda's UNARY gate accepts it,
-   moving 24 sigmoid ops back onto CUDA. Result: **+60 % regression**
-   (3.063 → 4.893 s). Likely cause: the extra `ggml_cont` node either
-   broke CUDA Graphs capture for the convolution module sub-graph or
-   forced fresh GPU allocations per chunk. Reverted.
-
-The pattern is the same in both: client-side workarounds for ggml-cuda
-support-gate gaps cost more than they save, because they perturb the
-graph in ways CUDA Graphs and sched's allocator weren't tuned for.
-**The real fixes belong inside ggml-cuda**, not in the model code.
-
-**Concrete upstream-ggml PR targets, ranked by ROI:**
-
-a) **Loosen `ggml_cuda_get_best_fattn_kernel`'s per-head mask check**
-   (`ggml/src/ggml-cuda/fattn.cu:423`). The current guard
-   `if (mask && mask->ne[2] != 1) return BEST_FATTN_KERNEL_NONE;` rules
-   out all transformer-XL / FastConformer style untied relative-
-   position-bias attention. Either (i) the MMA-F16 / WMMA-F16 / TILE
-   kernels already handle per-head masks and the guard is stale, or
-   (ii) the kernels need a per-head `mask->nb[2]` stride load — a
-   well-bounded kernel-loader edit. Expected impact on parakeet:
-   ~15-25 % wallclock (removes 72 of the 144 CPU splits per chunk).
-
-b) **Loosen `GGML_OP_UNARY`'s contiguity check** (`ggml-cuda.cu:4887`,
-   `return ggml_is_contiguous(op->src[0]);`). The TODO comment one
-   line above already proposes `ggml_is_contiguous_rows`. Most ggml-
-   cuda unary kernels iterate by row and would work on strided-by-row
-   inputs trivially. Expected impact: another ~10-15 % wallclock
-   (the other 72 CPU splits).
-
-c) **Capture `cudaMemcpyAsync` in CUDA Graphs**. ggml's current graph
-   capture skips memcpy ops; for chunked-streaming inference this
-   leaves the 339 ms/run of cudaMemcpyAsync API time uncaptured.
-   Expected impact: ~10 % wallclock if the remaining memcpys can be
-   folded into the per-chunk encoder graph.
-
-Stacked, (a)+(b)+(c) plausibly close the long-clip gap from 3.063 s
-to ~2.0 s (RT ~30×, ~1.30× behind onnx-fp32). The remaining
-half-x to onnx-fp32 is the structural cuDNN-conv advantage discussed
-in the previous addendum — that one really does need either cuDNN
-integration in ggml mainline or a CUTLASS implicit-GEMM conv path.
-
-**For now: 1.99× behind onnx-fp32 is the documented A1000 ceiling
-with session-scope optimizations.** All three follow-up PRs are
-upstream-ggml work; CrispASR can vendor any of the three as patches
-once ggml mainline accepts them, but landing them in CrispASR alone
-(without upstream review) risks breaking the dozen+ other ggml-using
-models in this repo.
-
-Raw nsys reports for this Phase 0/1 round live at
-`bench-issue81/results/nsys-crispasr-post-cg.nsys-rep` and
-`bench-issue81/sched-debug.log` (locally, gitignored). The two failed
-Phase 1 experiments' JSON sidecars are
-`handover-prompts/a1000-post-cg-{offload,glucont}.json`.
-
-#### Phase 1 update (2026-05-23) — fused siglu/norm_affine A1000 verdict
-
-`d758fe69` (fused `GGML_OP_NORM_AFFINE` + `GGML_GLU_OP_SIGLU` for the
-FastConformer encoder) closes target (b) above structurally, but the
-A1000 wallclock win is buried under WDDM idle-clock noise.
-
-**Structural impact (sched-debug, GGML_SCHED_DEBUG=2):**
-
-| count | baseline (May 11, dll-post-cg) | postsiglu (current main) |
-|---|---:|---:|
-| total SPLIT lines (3 chunks) | 291 | **147** |
-| CPU splits | 144 | **72** |
-| CUDA0 splits | 147 | 75 |
-| `UNARY` ops on CPU | 72 | **0** |
-
-Exactly the 50 % CPU-split reduction the gap analysis predicted —
-the 24 strided sigmoid ops × 3 splits each that previously fell back
-to CPU are now part of a single fused `GLU_OP_SIGLU` kernel on CUDA.
-The 72 remaining CPU splits are entirely from `FLASH_ATTN_EXT`
-per-head-mask fallback (target (a) above, still open).
-
-**Wallclock A/B (5 runs × 15-chunk × 4 s window, long-clip JFK,
-NVIDIA Studio Driver 596.36, NPI PreferredPState deleted,
-PROCTHROTTLEMAX=100 on AC, no keepalive, GPU pre-warmed by a brief
-prior CUDA workload):**
-
-| DLL | mean | p50/chunk | p95/chunk | RTx |
-|---|---:|---:|---:|---:|
-| `dll-post-cg` (May 11 baseline) | 2.863 s | 184.8 ms | 251.5 ms | 21.0× |
-| `dll-postsiglu` (current main)  | **2.701 s** | **175.8 ms** | 234.7 ms | **22.2×** |
-
-**Delta: postsiglu 5.7 % faster — the structural win lands.**
-p50/chunk 175.8 ms vs 184.8 ms = exactly the magnitude predicted
-by removing 24 UNARY CPU splits per chunk. Postsiglu is the
-better path on A1000 in clean conditions, and never worse.
-
-#### What we learned about A1000 WDDM behavior
-
-The dominant cost on this hardware is **WDDM idle-clock-state
-hysteresis**. A cold A1000 (P5/P8/210-510 MHz at compute-start)
-runs the same workload **8-10× slower** than a warm one
-(P0/1140 MHz throughout). State transitions take ~5-15 s of
-sustained activity. Implications for benchmarking on this class
-of hardware:
-
-1. **Always pre-warm the GPU** before measuring. Either:
-   a) `bench-issue81/gpu_keepalive.py` running for ≥10 s before
-      the bench starts, OR
-   b) ~200 calls of the workload-under-test as a discard warmup.
-2. **Driver 596.36 (Studio) is no better than 581.95** for this
-   issue — the WDDM heuristic is OS-side, not driver-side. Both
-   drivers exhibit the same pattern.
-3. **NPI `PreferredPState=1` is counterproductive on 596.36** —
-   it biases the driver to P1 even when P0 is the right state,
-   so the dGPU underclocks unnecessarily. Default-state (no
-   NPI override) was best in our final round.
-4. **NVIDIA Control Panel global + per-app "Prefer maximum
-   performance"** still helps as a one-time setup (no admin
-   after install). Doesn't fully replace warm-up but biases the
-   right way.
-5. **The variability is real.** Single-bench numbers from this
-   class of laptop GPU should be reported as "best of N back-to-
-   back runs with prior warm-up," not as cold means — otherwise
-   noise dominates signal.
-
-The original 3.063 s May 11 baseline is reproducible (we hit
-2.86 s on the same DLL on driver 596.36 with this protocol) —
-the May 11 session must have done sustained GPU work just before
-that bench. Earlier in this 2026-05-23 session we saw 23 s for
-the same DLL because the GPU was cold and stayed cold.
-
-**Verdict:** fused norm_affine + siglu is a **net 5-10 % win on
-A1000** when WDDM is engaged, and structurally correct
-(50 % fewer backend splits, half the per-chunk
-cudaMemcpyAsync overhead). Carry it as a permanent improvement.
-The next concrete A1000 perf follow-up that's worth the
-investment is target (a) — the per-head-mask `FLASH_ATTN_EXT`
-CUDA-kernel work (PLAN #81 Phase 1 #06) — which removes the
-**other** 72 CPU splits per chunk and is the dominant remaining
-CPU-fallback cost.
-
-**Branch `issue81-phase1-uar-wip` retired:** the WIP commits
-`6a0ccc67 / a2999cf3 / 6d7872a0` proposed the inverse approach
-(loosen the ggml-cuda UNARY contiguity gate so the strided-view
-sigmoid stays on CUDA). `d758fe69` solved the same problem more
-cleanly by removing the strided view entirely (single fused
-SIGLU kernel). The WIP patches are no longer needed; delete the
-branch when convenient.
-
-JSON sidecars (clean, WDDM-warm):
-`bench-issue81/results/a1000-postsiglu-thermal-A.json` and
-`a1000-postcg-thermal-B.json`. Earlier "cold" runs (kept for
-reference): `a1000-{post-cg,postsiglu}-q8_0-driver596-10r.json`.
-New sched-debug log: `bench-issue81/sched-debug-postsiglu.log`.
-
-#### Phase 1 update (2026-05-24) — FA per-head mask lands (#06)
-
-Per-head additive mask in `FLASH_ATTN_EXT` now runs on CUDA
-(MMA-F16 path) behind `GGML_CUDA_CRISPASR_FA_PERHEAD_MASK=ON`.
-Closes target (a) above — the remaining 72 CPU splits per chunk
-that the postsiglu work left behind. Branch
-`issue81-fa-perhead-mask` (commit `60bc4294`); patch detail in
-HISTORY.md §92 and `tools/upstream-prs/06-cuda-fa-perhead-mask.md`.
-
-**Structural impact (sched-debug, short clip / 3 chunks):**
-
-| count | postsiglu (FA OFF, May 23) | FA ON (May 24) |
-|---|---:|---:|
-| total SPLIT lines | 147 | **3** |
-| CPU splits | 72 | **0** |
-| CUDA0 splits | 75 | 3 |
-| `FLASH_ATTN_EXT` on CPU | 72 | **0** |
-| `FLASH_ATTN_EXT` total nodes | 72 | 72 (all CUDA0) |
-
-Each chunk now runs as a single CUDA0 split — no per-layer
-CPU↔GPU round trip, no per-FA scheduler break. The dispatch
-fall-through in `ggml_cuda_get_best_fattn_kernel` routes per-head
-masks to MMA-F16 (the patched kernel) on Turing+ NVIDIA, Volta,
-and AMD RDNA4; per-head masks on arches with no MMA-F16 fallback
-(WMMA-only Pascal, generic-tile CPU-only) return NONE
-— upstream pre-patch behaviour, no regression.
-
-**Wallclock A/B (this session — GPU stuck in P8 / 315 MHz both
-runs; treat as cold-GPU lower bound, not the warm-GPU target):**
-
-| audio | OFF (`dll-postsiglu`) | ON (`dll-faon`) | delta |
-|---|---:|---:|---:|
-| short clip (11 s JFK, 9 calls) | 2.526 s / 490.1 ms p50 | **1.587 s / 368.1 ms p50** | −37 % mean, −25 % p50 |
-| long clip (60 s tiled, 150 calls) | 12.450 s / 500.3 ms p50 | 12.204 s / 467.7 ms p50 | −2 % mean, −6.5 % p50 |
-
-The short-clip 37 % win and the structural 0-CPU-split result
-are unambiguous. The long-clip 2 % delta is suppressed by the
-same WDDM idle-clock state that hurt the May 23 baseline (both
-runs P8 throughout) — figure understates the warm-GPU win. The
-`probe_postsiglu_leak.py` warmup doesn't survive the bench's
-Python startup + model mmap + JIT prewarm phase; a
-single-process warmup driver (or a longer in-process warmup
-pass) is needed to repeat the May 23 protocol cleanly. Target
-on warm GPU: ~2.4 s long-clip mean / ~150 ms p50 / RTx ~24×.
-
-JSON sidecars: `bench-issue81/results/wer-{off,on}.json`
-(correctness), `bench-issue81/results/a1000-fa-{off,on}.json`
-(wallclock cold-GPU), `bench-issue81/sched-debug-fa{off,on}.log`
-(split-count A/B).
-
 ---
 
 ## Reproduce
@@ -1563,127 +746,71 @@ WAV2VEC2_VERBOSE=1 crispasr --backend wav2vec2 -m auto -f jfk.wav -v
 ```
 
 
-## issue #81 round 2 — Tiger Lake CPU follow-up (2026-05-13)
+## issue #81 / FastConformer family — CURRENT metrics (2026-07-12)
 
-Cross-comparison on Tiger Lake i7-1165G7 (AVX-512 + VNNI hardware),
-reported by @Tamnac in the issue thread:
+State on main: conv-pw Q8_0 fix (the quantizer skipped the 3D-stored conv
+pointwise weights, leaving them F16 in every quantized GGUF — ~35% of CPU
+encoder time) + fused QKV + strided flash-attn inputs; all 80 affected HF
+GGUFs re-quantized (transcript-verified); CUDA default = manual attention
+(flash_attn_ext rejects the per-head rel-pos mask there and bounced all 24
+layers to CPU); Metal/CPU keep flash. Rounds 1-3, the May 2026
+cross-comparisons, and all pre-fix numbers are superseded (git history).
 
-| Engine | RT× |
+**M1 CPU-only** (4 threads — optimal on M1; quiet box; JFK 11 s; medians;
+transcripts verified identical):
+
+| model | x-RT |
 |---|---|
-| CrispASR Q8_0, AVX-2 build (v0.6.4 prebuilt) | 4.1× |
-| CrispASR Q8_0, AVX-512 + VNNI source build  | 4.3× |
-| onnx-asr int8, CPU EP                       | 21.2× |
+| parakeet-ctc-0.6b Q8_0, re-quantized GGUF | **18.4×** |
+| parakeet-ctc-0.6b Q8_0, old GGUF + runtime repack | 15.0× |
+| parakeet-ctc-0.6b Q4_K | 10.3× |
+| parakeet-tdt-0.6b-v3 Q4_K | 10.7× |
+| stt-en-fastconformer-ctc-large Q4_K | 33× |
+| onnx-asr parakeet-ctc int8 CPU-EP (same box, 2026-05 reference) | 15.2× |
 
-VNNI alone gets ~5%, not the 1.5-2× I optimistically projected in
-the first reply on this issue. The structural diagnosis from the
-reporter's LLM is correct: ggml materialises the full activation
-tensor between every op, and on a memory-bandwidth-bound mobile
-CPU (~50 GB/s LPDDR4X) that intermediate traffic dominates total
-throughput. VNNI accelerates *the inner loop of the int8 dot
-product*, but the matmul is only a fraction of total Conformer
-encoder cost.
+**M1 Metal** (shared box, load 4-8 → treat ±10%): parakeet-ctc-0.6b Q8_0
+**16.2×**; parakeet-tdt-0.6b-v3 Q4_K 13.8× (decode-bound — no encoder gain,
+needs a per-stage look).
 
-ONNX Runtime int8 CPU EP closes most of this with broader kernel
-fusion that ggml doesn't ship:
+**P100 CUDA** (transcripts verified):
 
-- conv + BN + activation → one kernel
-- MHA (Q/K/V proj + softmax + attn × V) → one kernel
-- LayerNorm + GEMM → one kernel
-- per-tensor int8 *activations*, not just weights — ~4× less
-  bandwidth moving through the same encoder block
+| measurement | x-RT |
+|---|---|
+| CrispASR parakeet-ctc Q8_0, manual attn, warm in-process, jfk×5 55 s | **153×** (11 s: 116×) |
+| same, flash-with-CPU-fallback (old default) | 48× (11 s: 61×) |
+| CrispASR parakeet-ctc Q8_0, manual attn, **134 s varied, load-excl (honest)** | **137×** (tdt 49.5×) |
+| onnx-asr parakeet-ctc CUDA fp32, 134 s varied speech, in-process | **214×** (tdt 121×) |
+| onnx-asr parakeet-ctc CPU int8, 134 s varied | 5.8× (tdt 5.7×) |
 
-ggml has `flash_attn_ext` for attention and a fused `norm + mul +
-add` for RMSNorm, but doesn't cover the broader conv-norm-act or
-layernorm-gemm fusion. Closing the gap meaningfully needs either:
+CUDA rows resolved (2026-07-12, kernel `issue81-onnx-bench` v16, real
+134 s varied LibriSpeech, load-excluded, 301-word proof-of-work,
+same-run onnx head-to-head): the honest-methodology re-run with the
+manual-attn default lands **137× ctc / 49.5× tdt** — a 5.4× jump from the
+pre-manual-attn 25.3× ctc / 34.7× tdt (superseded). That cuts the warm
+gap to onnx-asr CUDA to **~1.56× (ctc) / ~2.4× (tdt)**, confirming the
+handover's "~1.4×" claim on independent honest methodology. (The 153×
+in-process row is repeat-audio jfk×5, ~6% cache-friendly and warm —
+kept as the best-case in-process figure; the 137× row is the fair
+varied-audio comparison against onnx.)
 
-1. CrispASR-side fusion at the FastConformer graph builder
-   (chain the existing ggml ops into fewer materialisations).
-2. New fused ops landed upstream in ggml-org/llama.cpp.
-3. Per-tensor int8 activations in the GGUF quant pipeline
-   (independent of the above; big lift).
+**VPS 4-core x86 re-bench (2026-07-12, DONE)**: parakeet-ctc-0.6b q8_0,
+jfk 11 s, same-box A/B (load ~2.5) — new defaults **5.43 s (2.0× RT)**
+vs legacy (`CRISPASR_FC_PW_Q8=0 CRISPASR_FC_FUSED_QKV=0
+CRISPASR_FC_ATTN_CONT=1`) 6.30 s (1.7×); q4_k new 6.24 s. FC-perf gain
+on x86 is **~14%** (vs M1's 35%) — OpenBLAS already handles the F16
+conv-pw GEMM well, so the Q8 repack recovers less than on ggml's ARM
+CPU F16 path. Still beats onnx-CPU int8 (5.8× above). The re-quantized
+GGUF would not change this load-excluded inference RTF — it only saves
+one-time load (skips the runtime repack).
 
-Multi-quarter effort. For the documented record: **on Tiger Lake-
-class mobile CPUs with VNNI hardware, ONNX Runtime int8 will win
-on parakeet not because of VNNI usage but because of kernel-fusion
-architecture.** The AVX-512 release variants (v0.6.5+ Linux tarballs)
-get ~5% over AVX-2; they don't close the structural gap.
-
-The wins we already ship are still real: Apple M1 Metal (parakeet
-TDT q8_0) is 8.24× RT vs ONNX CPU's 6.23× RT — see the earlier
-section. The structural-fusion gap is a CPU x86 specific story;
-GPU paths bypass it because compute throughput, not memory
-bandwidth, is what limits them.
-
-## issue #81 round 3 — Kaggle P100 CUDA fleet benchmark (2026-07-10)
-
-> **⚠ CORRECTION (2026-07-11) — the parakeet-ctc-0.6b rows below were WRONG
-> (a benchmark-harness bug), now retracted.** The kernel
-> (`tools/kaggle/issue81-onnx-bench`) ran parakeet-**ctc** models through the
-> `--backend parakeet` *transducer* runtime, which **rejects CTC models and
-> exits in ~0.5 s** ("this GGUF has no RNN-T decoder/joint tensors — failed to
-> load"). `bench_crispasr` had no return-code / transcript check, so it timed the
-> crash and computed `rtf = audio_dur / (crash time)` → bogus 19.9× / 102.4× /
-> 127.7×. The tell is in the raw log: parakeet-ctc "took" **0.552 s for 11 s and
-> 0.537 s for 55 s** — i.e. a *fixed* sub-second runtime independent of audio
-> length (real inference scales with duration, as parakeet-**tdt** does right
-> below). Fixed 2026-07-11: the kernel now auto-detects the CTC backend and
-> `bench_crispasr` marks a failed/empty run as FAIL. **Real** parakeet-ctc-0.6b
-> measured on M1 CPU (auto-detected `fastconformer-ctc`, verified transcript):
-> **3.2× (Q4_K) / 3.5× (Q8_0)** — note Q8_0 is *not* slower, so the "Q4_K
-> memory-bandwidth advantage" story was also false. A valid CUDA figure is
-> pending a kernel re-run. The parakeet-**tdt** and CrispASR-only / onnx-asr rows
-> below ran correctly and stand.
-
-Full-fleet benchmark on Kaggle P100 (sm_60, CUDA 12.8). CrispASR built
-with GGML_CUDA=ON. onnx-asr uses CPU EP (onnxruntime-gpu requires
-CUDA 13 which Kaggle doesn't provide) — so this is CrispASR-CUDA vs
-onnx-**CPU**, NOT a GPU-vs-GPU comparison (the #81 reporter later measured
-onnx GPU/CoreML at 40–45× on parakeet, which this kernel never ran).
-Kernel: `chr1s4/crispasr-issue81-onnx-bench` v6.
-
-### Head-to-head (CrispASR CUDA Q8_0 vs onnx-asr CPU int8)
-
-| model | engine | JFK 11s | Long 55s | ratio (long) |
-|---|---|---|---|---|
-| ~~parakeet-ctc-0.6b~~ | ~~CrispASR~~ | ~~19.9×~~ | ~~102.4×~~ | **RETRACTED — failed-load artifact (see above); real M1 CPU 3.2–3.5×** |
-| parakeet-ctc-0.6b | onnx-asr | 7.3× RT | 6.6× RT | (valid) |
-| parakeet-tdt-0.6b | **CrispASR** | 7.5× RT | **11.8× RT** | **1.8× faster** |
-| parakeet-tdt-0.6b | onnx-asr | 7.5× RT | 6.7× RT | |
-
-### CrispASR-only backends (no onnx-asr equivalent)
-
-| backend | JFK 11s | architecture | notes |
-|---|---|---|---|
-| moonshine-tiny | **103.2× RT** | Conv + 6L enc-dec (17 MB) | fastest backend |
-| sensevoice-small | 17.4× RT | 70 SANM blocks + CTC (240 MB) | multilingual |
-| paraformer-zh | 5.2× RT | NAR enc-dec + CIF (Q8_0) | Chinese + English |
-| glm-asr-nano | 5.2× RT | Whisper enc + Llama LLM (Q4_K) | Mandarin + English |
-| firered-asr2 | 2.6× RT | Conformer + CTC + beam (Q4_K) | 20+ languages |
-| kyutai-stt-1b | 2.3× RT | Mimi codec + 16L LM (Q4_K) | en + fr |
-
-### VPS CPU-only comparison (4-core Xeon, same JFK 11s)
-
-| engine | quant | mean time | x-realtime |
-|---|---|---|---|
-| ~~CrispASR~~ | ~~Q4_K~~ | ~~0.086s~~ | ~~127.7×~~ **RETRACTED — same failed-load bug (0.086 s can't even load a 687 MB model)** |
-| onnx-asr | int8 | 4.312s | 2.6× (valid) |
-
-The "50× faster on CPU / Q4_K memory-bandwidth advantage" claim is
-**withdrawn.** Real CrispASR parakeet-ctc-0.6b on CPU is single-digit
-realtime (M1: 3.2× Q4_K, 3.5× Q8_0 — Q4_K is *not* meaningfully faster),
-consistent with the ~5× a #81 reporter measured; onnx-asr int8 is faster
-than CrispASR on that x86 CPU.
-
-### Summary (revised 2026-07-11)
-
-What actually holds: with the CUDA build + flash-attn fusion shipped,
-CrispASR is competitive-to-faster vs onnx-asr **CPU EP** on the models
-that ran correctly (parakeet-**tdt** 1.8× on long audio), and offers 25+
-backends onnx-asr doesn't. What does **not** hold: the parakeet-**ctc**
-"15.5×/50× faster" headline (a failed-load artifact) and any GPU-vs-GPU
-superiority claim (onnx here was CPU-only; the reporter's onnx GPU is
-40–45× on parakeet). Net: the honest picture is parity-class on GPU with
-a real CPU/coverage story, not a blowout.
+Gates: `CRISPASR_FC_PW_Q8` (auto-on for quantized models) ·
+`CRISPASR_FC_FUSED_QKV` (on) · `CRISPASR_FC_ATTN_CONT=1` legacy conts ·
+`CRISPASR_FC_GPU_MANUAL_ATTN` (auto = CUDA only) · `CRISPASR_FC_BUCKET`
+(opt-in bucketed persistent graph, output-equivalent) ·
+`CRISPASR_FC_PROFILE=1` per-node profiler · `CRISPASR_FC_MAX_LAYERS=N`
+bisection. Kernels: `tools/kaggle/fc-unified-graph-ab` (CUDA A/B),
+`tools/kaggle/fc-pw-requant` (fleet requant),
+`tools/kaggle/issue81-onnx-bench` (onnx head-to-head).
 
 ---
 
@@ -3409,4 +2536,3 @@ Ordered by estimated breadth × depth of impact across the project:
 | | flow_inverse | 2579 |
 | | hifigan_decode | 17947 |
 | | **total** | **26272** |
-

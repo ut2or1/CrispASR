@@ -331,7 +331,7 @@ def merge_lora(base: np.ndarray, lora_a: np.ndarray, lora_b: np.ndarray,
 # ---------------------------------------------------------------------------
 
 
-def convert(input_dir: Path, out_path: Path) -> None:
+def convert(input_dir: Path, out_path: Path, f32_encoder: bool = False) -> None:
     print(f"Loading: {input_dir}")
 
     # Read config.json for architecture params
@@ -503,7 +503,7 @@ def convert(input_dir: Path, out_path: Path) -> None:
                     # Preprocessor fb: NeMo stores (1, 128, 257), flatten to (128, 257)
                     if enc_name == "preprocessor.fb" and len(arr.shape) == 3:
                         arr = arr.squeeze(0)
-                    if is_f32_tensor(enc_name, arr.shape):
+                    if is_f32_tensor(enc_name, arr.shape) or (f32_encoder and enc_name.startswith("encoder.")):
                         arr = arr.astype(np.float32)
                         n_f32 += 1
                     else:
@@ -651,9 +651,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--input", required=True, type=Path, help="HF model directory")
     p.add_argument("--output", required=True, type=Path, help="output GGUF path")
+    p.add_argument("--f32-encoder", action="store_true",
+                   help="emit encoder weights (incl. conv.dw) as F32 — for diff-harness "
+                        "parity and to exercise the F32 BN-fold path")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    convert(args.input, args.output)
+    convert(args.input, args.output, args.f32_encoder)

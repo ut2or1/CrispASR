@@ -21,6 +21,14 @@ TEST_CASE("canary_qwen_params: default values are sensible", "[unit][canary-qwen
     REQUIRE(p.verbosity >= 0);
 }
 
+// Defaults-audit / config-parity guard (motivated by #192/#197 + PLAN #89). Pin
+// the shipped gpu/flash defaults so a silent flip fails CI.
+TEST_CASE("canary_qwen_params: gpu/flash defaults are pinned", "[unit][canary-qwen]") {
+    struct canary_qwen_context_params p = canary_qwen_context_default_params();
+    REQUIRE(p.use_gpu == true);
+    REQUIRE(p.flash_attn == false);
+}
+
 TEST_CASE("canary_qwen_init_from_file: null path returns nullptr", "[unit][canary-qwen]") {
     struct canary_qwen_context_params p = canary_qwen_context_default_params();
     REQUIRE(canary_qwen_init_from_file(nullptr, p) == nullptr);

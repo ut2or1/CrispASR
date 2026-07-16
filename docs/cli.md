@@ -289,9 +289,24 @@ multilingual / v3 / EN models behave very differently:
 | `CRISPASR_PARAKEET_INTERNAL_CHUNKING` | non-JA on, JA off | `0` = revert to the dispatcher's chunk-30 + overlap-save + LCS-merge path (A/B). |
 | `CRISPASR_PARAKEET_STREAM_CHUNK` | 0 (auto: 8 JA / 30 non-JA) | Streamed-path encoder chunk size (seconds). |
 | `CRISPASR_PARAKEET_STREAM_OVERLAP` | 2 | Streamed-path encoder overlap (seconds). |
+| `CRISPASR_PARAKEET_VRAM_BUDGET_MB` | 0 (off) | Proactive memory policy: if single-pass full attention's estimated O(T²) rel-pos bias exceeds this, use the streamed (bounded-window) encoder *before* allocating — avoids the OOM spike on small GPUs. 0 = disabled (single-pass as before; the reactive OOM fallback still backstops). |
+| `CRISPASR_PARAKEET_MEM_POLICY` | `auto` | `auto` honours the VRAM budget; `single`/`streamed` force that path; `off` disables the proactive check (reactive-only). |
+| `CRISPASR_PARAKEET_MEM_COEFF` | 8.0 | O(T²) estimate coefficient. Default calibrated so a ~4 min clip (T≈2800, 8 heads) estimates ~1.9 GiB, matching a measured CUDA allocation. |
+| `CRISPASR_SESSION_UNIFIED_DISPATCH` | 0 | `1` routes the session/bindings parakeet path through the shared CLI orchestration (improvements Phase 1) instead of the legacy inline copy. Default off until parity-flipped. |
 
 CLI escape hatches (no env needed): `--chunk-seconds N` forces the dispatcher's
 N-second chunk + merge; `--vad` forces the VAD path.
+
+For **parakeet** (non-JA, `CAP_INTERNAL_CHUNKING`), `--chunk-seconds N` does *not*
+go through the dispatcher's per-slice merge (which corrupts this full-attention
+FastConformer). Instead it runs one coherent internal-streamed decode — encoded
+at the model's quality window (30 s, bounded VRAM), so the full transcript is
+preserved — and then groups the resulting words into **~N-second output
+segments** with per-segment `offsets`/`words`/`tokens` (issue #257). So
+`--chunk-seconds 7` yields ~7-second segments of the *complete* transcript, not a
+truncated single blob. The encoder window can be overridden independently with
+`CRISPASR_PARAKEET_STREAM_CHUNK`. (For bounded-VRAM *single-pass* long audio with
+no segmentation, use `--att-context L,R` instead.)
 
 **Examples:**
 
@@ -1278,18 +1293,32 @@ for the full layer-offload and KV-spill knobs — both are supported.
 
 ### TTS provenance & watermarking flags
 
-All TTS output is automatically watermarked. Additional flags control
-the neural watermark, C2PA signing, and voice-cloning consent:
+All TTS output is watermarked by default. Additional flags control
+the neural watermark, C2PA signing, voice-cloning consent, and the opt-out:
 
 | Flag | Description |
 |------|-------------|
 | `--watermark-model PATH` | Load AudioSeal GGUF for neural watermarking (upgrades built-in spread-spectrum) |
+| `--no-watermark` | Disable the AI-content watermark on TTS output. Equivalent to the `CRISPASR_NO_WATERMARK` env var; both emit a one-time stderr warning and shift the AI-content marking responsibility onto the operator (see below) |
 | `--detect-watermark PATH` | Read a WAV file, run watermark detection, print confidence + verdict (`>0.65` = AI-GENERATED, `0.4–0.65` = UNCERTAIN, `<0.4` = none), then exit |
 | `--i-have-rights` | Required for voice cloning (`--voice <file.wav>`); attests speaker consent |
 | `--no-spoken-disclaimer` | Skip the audible AI-disclosure prefix on voice-cloned output (watermark + C2PA still applied; caller assumes disclosure responsibility) |
 | `--g2p-dict SOURCE` | G2P pronunciation dictionary: `olaph` (MIT, default), `open-dict` (CC-BY-SA), or path to a custom dict file. Auto-downloads on first use. See [`tts.md`](tts.md) for details. |
 | `--c2pa-cert PATH` | X.509 certificate for C2PA Content Credentials signing |
 | `--c2pa-key PATH` | Private key for C2PA signing (generate both with `scripts/generate-c2pa-cert.sh`) |
+
+**Disabling the watermark.** `--no-watermark` and `CRISPASR_NO_WATERMARK=1` are
+equal-status opt-outs (neither is more "official"). Either one turns the mark
+off for the whole process and logs, once:
+
+```
+crispasr: warning: watermarking disabled. AI usage marking responsibility rests with the operator.
+```
+
+The message is deliberately jurisdiction-neutral — no statute is named at
+runtime. Turning the mark off does not remove any legal AI-disclosure obligation
+that may apply to the output; it transfers responsibility for meeting it to
+whoever runs the binary. See [`tts.md`](tts.md) for the full rationale.
 
 Debug env vars:
 - `AUDIOSEAL_DEBUG=1` — print AudioSeal tensor shapes during graph build

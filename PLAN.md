@@ -26,39 +26,128 @@ effort estimate. Completed items have been moved to `HISTORY.md`.
   already caches the graph and uses a dedicated sched. Skip-realloc is broken on
   CUDA+Metal. The bottleneck is pure matmul compute; perf wins require GPU where
   the ~5ms overhead becomes significant. Handover removed.
+- **Untrusted-input parser hardening**: SHIPPED — multi-agent security audit of the
+  audio demuxers + GGUF loader found 6 DoS/OOB defects (MP4 stsz/stco/co64 count +
+  co64 offset overflow, WebM lacing, WAV + AU size clamps, GGUF split mmap bounds),
+  all fixed + ASan-validated. See `HISTORY.md` + `LEARNINGS.md`.
+
+## Untrusted-input parser hardening — follow-ups (MOSTLY DONE)
+
+The memory-safety fixes shipped (see HISTORY 2026-07-11). Test/tooling state:
+- **DONE**: AU + WAV crafted-input regression tests (ASan/UBSan-clean); the
+  `linux-asan-audio` CI job builds the decoders under ASan and decodes the
+  samples on every change.
+- **DONE**: MP4 crafted-input *reachability* test (malicious `stsz` count)
+  through the full `crispasr_audio_load` dispatch → `crispasr_m4a_decode`.
+- **DONE**: libFuzzer harness over `crispasr_audio_load` (`tests/fuzz/`, gated
+  `-DCRISPASR_FUZZ=ON`, clang) — seed from `samples/`; mutation covers the
+  AU/AMR/WebM/MP4/WAV dispatch under ASan, so WebM/AU/AMR get reachability
+  coverage there rather than as separate hand-crafted tests.
+- **DONE**: `crispasr_server` security audit (multi-agent) — 7 fixes: unbounded
+  upload DoS (`set_payload_max_length` + chunked reject), `/v1/audio/speech`
+  voice path-traversal, CAP_TTS gates on POST/DELETE `/v1/voices`, log-injection
+  sanitisation. See HISTORY.
+- **DONE**: GGUF loader + tokenizer audit (multi-agent) — GGUF mmap bounds
+  checks made overflow-safe (subtractive, 3 sites in `gguf_loader.cpp`; a crafted
+  GGUF declaring a `SIZE_MAX` tensor wrapped `data_off+off+nbytes` → SIGBUS on
+  Metal), and sentencepiece input-length clamp (`tokenize`/`tokenize_bpe`).
+- **DONE**: `linux-fuzz-smoke` CI job (audio fuzzer, seeded, ASan) + a second
+  harness `tests/fuzz/fuzz_gguf_meta.cpp` (`crispasr-fuzz-gguf`) over the GGUF
+  metadata path.
+- **DONE (ggml fork `1dc4cb93`)**: the GGUF fuzzer found a real DoS — a malformed
+  GGUF with an **empty KV key** hit `GGML_ASSERT(!key.empty())` in
+  `ggml/src/gguf.cpp` → `ggml_abort` → `abort()`, so ANY untrusted model load
+  (incl. server `POST /load`) could crash the process. Fixed in the
+  `CrispStrobe/ggml` fork: `gguf_init_from_file`'s KV loop now rejects an empty
+  key (log + `ok=false` → returns nullptr) the same way a duplicate key is
+  rejected. Validated on the saved reproducer (`gguf-empty-key-abort.crash`):
+  now returns nullptr, valid models still load. Submodule pointer bumped here.
+  Then re-fuzzed `gguf_init_from_file` against the fixed ggml on BOTH paths —
+  metadata (`no_alloc=true`, 384K runs, cov→7548) and tensor-data
+  (`no_alloc=false`, 497K runs, cov→10051, `-malloc_limit_mb=2048` clean) —
+  **~880K runs total, zero findings**. The parser is robust under fuzzing (no
+  further asserts, no unbounded alloc from declared tensor sizes). **Open (your
+  call):** upstream the empty-key fix to ggml-org — it's a general robustness
+  bug worth contributing back (an outbound public PR, so left for a human).
+- **DONE 2026-07-12**: the `bpe.h`/`wordpiece.h` fuzz harness —
+  `tests/fuzz/fuzz_tokenizer.cpp` (`crispasr-fuzz-tokenizer`, gated
+  `-DCRISPASR_FUZZ=ON`). Fuzzes `core_bpe::tokenize_simple` +
+  `core_wordpiece::Tokenizer::tokenize` over arbitrary text (the untrusted
+  prompt/`--ref-text`/caption surface; vocab pinned benign since GGUF vocab is
+  covered by `fuzz_gguf_meta`). Validated locally: **138,705 runs / 16 s clean**
+  under `-fsanitize=fuzzer,address,undefined` (adversarial UTF-8, lone 0xFF/
+  continuation bytes, embedded NULs) — confirms the audit's "clean" verdict with
+  a runnable harness.
+- **DONE 2026-07-12**: the deterministic GGUF `load_weights` bounds regression
+  test — `tests/test-gguf-bounds.cpp` (`test-gguf-bounds`, `[unit]`). Writes a
+  valid 1-tensor GGUF, truncates it to 8 bytes short of the tensor data (metadata
+  fully parses; the declared 256-byte tensor overruns the file), and asserts
+  `load_weights(..., backend_cpu)` returns `false` — no SIGBUS. Verified it hits
+  the exact hardened path (the run logs the subtractive `mmap legacy path: tensor
+  exceeds file bounds` check), plus a positive control (intact file loads). A fast
+  always-on CI guard for the `SIZE_MAX`/truncated-tensor regression, complementary
+  to `fuzz_gguf_meta` (~880K runs clean).
 
 ## Scoped next items (for a new agent picking up)
 
-### qwen3-tts code predictor fused graph (#245, GPU-ONLY)
+### qwen3-tts code predictor fused graph (#245, GPU-ONLY) — DONE (CP_DIRECT), verified 2026-07-12
 
-**What:** The 15-codebook AR loop in `code_pred_generate_15()` (`src/qwen3_tts.cpp:2352`)
-dispatches 15 separate ggml graphs per frame. On GPU the dispatch overhead (sched
-reset+alloc) becomes significant (~5ms × 15 = 75ms vs ~100ms compute). On CPU the
-overhead is negligible (<5ms vs 5000ms compute).
+**Status:** DONE. This was superseded by **CP_DIRECT** (§232/#245,
+`src/qwen3_tts.cpp` ~L1912) — the sched-free persistent code_pred dispatch that
+Option C wanted but without the O15_SKIP_REALLOC breakage. It builds the two
+per-frame code_pred graph shapes (T=2 prefill + T=1 step) once, gallocr-allocates
+on the dedicated code_pred backend, and each of the 15 dispatches is just
+blit-lm_head-slot + tensor_set + one `ggml_backend_graph_compute` (no
+`sched_reset`/`alloc`). **Default ON when code_pred runs on a GPU backend**
+(`QWEN3_TTS_CP_DIRECT`, else per-backend default); md5-identical WAV validated
+2026-07-10.
 
-**Option A (unrolled graph):** Build one graph with 15 × 5 = 75 transformer blocks,
-KV cache growing from pos 0→14. Fixed topology since n_steps=15. Large but bounded.
-Eliminates all inter-step dispatch. Needs GPU to measure impact.
+**Verified on M1 Metal 2026-07-12** (`qwen3-tts-12hz-0.6b-base-q8_0.gguf`, quiet
+box, `QWEN3_TTS_BENCH=1`): `cp_direct active`; per-frame code_pred bench
+**set≈2-4 ms, compute≈45-60 ms, read≈0.1 ms** — dispatch is now ~5% (the pre-CP_DIRECT
+sched path was ~25 ms × 15 ≈ 375 ms/frame of pure dispatch). ar_loop 76 ms/frame,
+**RTF 1.2×**, ASR round-trip correct ("and so my fellow americans"). code_pred is now
+**compute-bound** (15 sequential T=1 steps of a 5L/d=1024 transformer), so
+**Option A (unrolled 75-block graph) would buy ~nothing** — it can't parallelize
+the sequential steps and dispatch is already ~zero. The O15_SKIP_REALLOC path
+(Option C) remains the broken predecessor; CP_DIRECT is the shipped replacement.
 
-**Option C (skip sched reset):** The `O15_SKIP_REALLOC` path (`src/qwen3_tts.cpp:2270`)
-already attempts this but is broken on CUDA (#56 illegal memory access) and Metal
-(nil-buffer inputs). Root cause is ggml sched not supporting graph reuse across
-`sched_reset` boundaries. Would need an ggml-level fix or a dedicated gallocr
-(the chatterbox_s3gen pattern).
+**Load-dependence (same as §176k):** the CP_DIRECT comment records "M1 Metal
+~equal on an idle box, ~3× under load" — confirmed compute-bound at idle here.
+Nothing further to do on Metal. **CUDA: RE-VALIDATED PASS 2026-07-12** (Kaggle
+P100/T4, `chr1s4/crispasr-qwen3-cp-direct-cuda` reached `COMPLETE` = base/o15/
+direct/direct_lk all rc=0, md5/PCM-equivalent, ASR round-trip intact) — on top of
+the prior "11% faster on P100" datum. Re-run after any code_pred change:
+`kaggle kernels push -p tools/kaggle/qwen3-tts-cp-direct-cuda` (chr1s4;
+base/o15/direct/direct_lk matrix, md5 + ASR-roundtrip acceptance, `CRISPASR_REF=main`).
 
-**Test:** needs a GPU machine (Kaggle P100 or Metal Mac). CPU benchmarking shows
-the fix would save <1% on CPU. Model files: `qwen3-tts-12hz-0.6b-base-q8_0.gguf`
-(941 MB) + `qwen3-tts-tokenizer-12hz.gguf` (342 MB).
-
-### Defaults-audit generalisation (VPS-doable)
+### Defaults-audit generalisation (VPS-doable) — LARGELY DONE (2026-07-12)
 
 **What:** Extend the tada-params defaults-audit pattern (`tests/test-tada-params.cpp`)
 across backends that have params structs with documented upstream defaults.
 
 **How:** For each backend with a `*_context_default_params()` function, write a Catch2
-test asserting key defaults match the upstream Python reference. Priority backends:
-chatterbox (cfg_weight, ve_steps), vibevoice (tts_steps, cfg_scale), dots-tts
-(ode_steps, cfg_scale, eos_threshold), f5-tts (n_steps), kokoro (speed).
+test asserting key defaults match the upstream Python reference.
+
+**Status (2026-07-12):** The `test-<backend>-params.cpp` files were already
+*registered* for ~52 backends but were **hollow** — only 5 (tada, chatterbox,
+orpheus, voxtral-tts, dots-tts) asserted actual value knobs; the other ~47 only
+smoke-checked `n_threads>=1` / `verbosity>=0`, which structurally cannot catch a
+#192-class silent default drift. Swept the meaningful backends and added
+grounded value-knob assertions (now **37/52** assert value knobs), in three
+commits:
+- TTS priority set: vibevoice, kokoro, f5-tts, dots-tts (exact upstream).
+- TTS/audio-gen: bark, cosyvoice3 (RAS), csm, dia, indextts, outetts, zonos,
+  fastpitch, melotts, piper, speecht5, qwen3-tts, parler, pocket-tts.
+- ASR: firered-asr (beam), glm-asr, kyutai-stt, funasr, gemma4-e2b, mimo-asr
+  (greedy temp 0); flash/gpu guards (PLAN #89 class) for qwen3-asr, voxtral,
+  voxtral4b, granite-speech, canary-qwen, nemotron, parakeet, canary.
+
+**Deliberately left smoke-only:** granitenle, m2m100, sensevoice, t5translate,
+canaryctc (pure infra — no perceptual/decode knob to pin); firered + the two
+moonshine-stream tests (duplicate the firered-asr / moonshine_streaming structs
+already covered); openvoice2 (single `tau` knob). Skipped as owned/blocked:
+cohere, voxcpm2, voxcpm2-tts (concurrent work), kugelaudio (CFG is a TODO).
 
 **Files:** One test file per backend in `tests/test-<backend>-params.cpp`, registered
 in `tests/CMakeLists.txt` with label `[unit]`. Read upstream defaults from the
@@ -133,6 +222,16 @@ the library default (`tada_context_default_params` → 1), so the existing
 defaults-audit test now guards all three paths. The only deliberate adapter
 override left is `text_do_sample=true`.
 
+**Full adapter-parity audit DONE (2026-07-12).** Swept all ~40 c_api adapter
+blocks + the CLI adapters for hardcoded perceptual/decode-knob overrides that
+diverge from — or wrongly ignore session config vs — the library default. CLI
+adapters were clean; two real c_api bugs found + fixed: cosyvoice3 hardcoded
+`temperature=0.8` (ignoring `crispasr_session_set_temperature`; the CLI + siblings
+gate on the session temp) and f5-tts hardcoded `seed=42` (ignoring the session
+seed). Both now honour session config, falling back to the working default.
+outetts/dots/parler re-state their library temp default as the fallback literal —
+redundant but correct + session-gated, left as-is.
+
 Three larger extensions remain:
 
 1. **Per-step talker logits in the diff.** Dump the talker logits at each
@@ -142,9 +241,14 @@ Three larger extensions remain:
 2. **Generation-health regression gate (non-diff). DONE (2026-07-11).**
    `src/core/generation_health.h` — shared header with check_not_empty,
    check_duration_plausibility, check_no_ngram_loop, check_not_truncated,
-   check_tts_duration. 16 Catch2 unit tests in `tests/test-generation-health.cpp`.
-   Backends can integrate these into live tests. The en/fr/de suite and
-   trailing-silence check remain as future per-backend instantiation work.
+   check_tts_duration. Catch2 unit tests in `tests/test-generation-health.cpp`.
+   Backends can integrate these into live tests. **en/fr/de suite +
+   trailing-silence check DONE (2026-07-12):** added `check_trailing_silence`
+   (windowed-RMS backward scan — flags TTS dead-air / EOS-overrun / untrimmed
+   padding) plus French/German plausible-duration, UTF-8 accented + German
+   word-loop, and mixed-language no-false-positive cases (25 unit cases total).
+   Remaining: wiring the checks into individual backends' *live* tests (needs
+   models).
 3. **Replay-token dual-mode reference.** Dump the Python *sampled* token ids and
    replay them in C++ (instead of re-sampling) so the sampling-enabled
    downstream stages can be diffed deterministically despite torch-vs-`mt19937`
@@ -783,7 +887,7 @@ landed, CUDA-validated). Deliberately-open threads, in priority order:
 |---|---|---|---|
 | **HIGH** | [#221 Issue #89 hardening + v0.8.8](#221-issue-89-hardening--v088-release) | Medium | 5 steps: CI regression guard (a), server-path mirror (b), Vulkan sanity (c), q4_k registry/UX (d), release (e). |
 | **DONE** | CPU weight-read hardening + Mimi codec causal default | Medium | **DONE 2026-07.** Routed ~14 CPU-side weight readers through the quantized-safe `core_cpu::to_f32` (`src/core/cpu_ops.h`); unit (`test-cpu-ops-to-f32`) + live tested on Metal + CUDA. wav2vec2 conv_w left as-is (zero-copy hot path, never quantized). **Mimi codec:** `kyutai_stt` now **defaults to causal+sliding-window** — a >250-frame WER A/B (3× jfk ≈412 frames) showed the old full non-causal attention truncates long audio ~25%; opt out with **`CRISPASR_MIMI_NONCAUSAL=1`**. `csm_tts` **also defaults to causal** (opt out `CRISPASR_MIMI_NONCAUSAL=1`) after a TTS→ASR A/B (~256 dec frames) gave causal 9.3% vs non-causal 12.0% WER (a modest single-sample win — non-causal TTS stayed intelligible rather than truncating like STT). → HISTORY, LEARNINGS. |
-| **HIGH** | [§176 Runtime optimization pass](#176-runtime-optimization-pass--2026-06-20-audit) | Phased | 20 sub-items (§176a–§176t). **16 DONE or MOSTLY DONE**: §176a (flash-attn via core_attn), §176b (bucket cache 8 backends), §176d (BLAS 9 backends), §176e (context cache all support runtimes), §176f (mel BLAS+OMP), §176g (embd cache 3 backends), §176h (F5-TTS fused graph), §176i (cross-KV F16, 5 backends), §176j (iterative FFT), §176m (nemotron memmove), §176o (embed fast path), §176p (MOSS flash), §176q (greedy alloc), §176r (beam top-K), §176s (encoder cache 16/17), §176t (weight pre-cache). **4 OPEN**: §176c (device-resident KV), §176k (FireRed KV), §176l (Kyutai RVQ), §176n (VoxCPM2 Metal). |
+| **DONE / LOW** (audited 2026-07-12) | [§176 Runtime optimization pass](#176-runtime-optimization-pass--2026-06-20-audit) | Phased | **Cluster audit 2026-07-12: 18/20 done; the 2 remaining are low-value (measure-first).** §176k shipped (matvec cache), §176n/§245 were stale-but-already-done (reclassified), §176c Dia measured ~1.2% → deferred, §176l needs a model to validate. Do not treat §176 as HIGH anymore. 20 sub-items (§176a–§176t). **16 DONE or MOSTLY DONE**: §176a (flash-attn via core_attn), §176b (bucket cache 8 backends), §176d (BLAS 9 backends), §176e (context cache all support runtimes), §176f (mel BLAS+OMP), §176g (embd cache 3 backends), §176h (F5-TTS fused graph), §176i (cross-KV F16, 5 backends), §176j (iterative FFT), §176m (nemotron memmove), §176o (embed fast path), §176p (MOSS flash), §176q (greedy alloc), §176r (beam top-K), §176s (encoder cache 16/17), §176t (weight pre-cache). **2 OPEN (both low-value/measure-first)**: §176c (device-resident KV — **Dia measured ~1.2% of decode, DEFERRED**; compute-bound decoders make this a <2% win, not the "dominant bottleneck" originally claimed), §176l (Kyutai RVQ — genuinely scalar, but no local model to validate). **§176k (FireRed) MOSTLY DONE 2026-07-12** — profiling debunked the "KV/flash" framing (decode is dispatch-bound, not attention-bound); shipped an env-gated persistent matvec graph cache (`CRISPASR_FIRERED_MATVEC_CACHE`, default ON, bit-identical, pure Pareto). **§176n (VoxCPM2 Metal) DONE 2026-07-12** — stale entry: Metal already works via `VOXCPM2_USE_GRAPH` fused graphs, verified 3.75× on M1 with correct ASR roundtrip; **CUDA validated PASS 2026-07-12** (Kaggle P100/T4 mirror-path roundtrip). |
 | **MEDIUM** | [#52 Qwen3-TTS](#52-qwen3-tts) — perf pass | Medium | talker + code_predictor + codec + ECAPA + codec_encoder all done; step-4 perf pass open (~137 ms/frame → real-time). **O15 broken on CUDA and default-OFF** (`61c42bfb`) — main perf lever disabled. **2026-06-13 Kaggle P100:** dedicated-sched fix (`baef21aa`) didn't help — O15=ON still rc=-6 SIGABRT at 6.0s. Crash is on the *first* code_pred call (not cached reuse), so root cause is `ggml_set_rows`-based KV scatter or the fixed-Lk causal mask on CUDA, not sched sharing. Baseline O15=OFF: 27.4 ms/frame, WAV OK. |
 | **HIGH** | [#57 Commercial-friendly TTS expansion](#57-commercial-friendly-tts-backend-expansion) | Phased | Phases 1–3 + Turbo + native voice cloning shipped (→ HISTORY §82). **#83 S3Gen production fix LANDED** — UNet weight-residency split + `parallel=true` sched cache-coherency fix; M1 Metal diff cos_min 0.940→0.999976, intelligible at all T. **Remaining:** Kartoffelbox_Turbo DE. → see HISTORY + upstream-prs/09–11. |
 | **MEDIUM** | [#51c MiMo-V2.5-ASR F16 step decode](#51c-f16-step-decode) | Small | F16 step-decode validation blocked behind ≥32 GB box (see PLAN #51c); base runtime + Q4_K shipped → HISTORY §56 |
@@ -973,7 +1077,7 @@ duplicated in `ensure_t3_b2_f16_weights` + s3gen `dequant_cfm_f16`) into a
 `core_*` helper if a third backend needs it — but only on the third consumer, per
 the "don't extract single-consumer helpers" rule.
 
-### §215b follow-up — tada talker §176b bucket floor (PARITY DONE, timing PENDING)
+### §215b follow-up — tada talker §176b bucket floor (RESOLVED: keep opt-in, do NOT flip)
 
 The §215b measurement above found the real tada talker lever: the §176b decode
 bucket floors Lk at **512**, so a short generation (n_past ≪ 512) wastes ~500
@@ -993,21 +1097,62 @@ step; the bucket caches + reuses it. A tight-floor bucket should be the best of
 both — tight padding AND no per-step rebuild — so it should beat both the
 512-floor bucket and NO_BUCKET. That is the hypothesis to confirm.
 
-**PENDING — timing A/B on a QUIET box (loadavg < ~6) or Kaggle CUDA.** This
-session's box ran loadavg 31→137 the whole time; no trustworthy timing was
-possible, so the default is NOT flipped. Recipe (each config a SEPARATE process,
-discard cold run, median of ≥3, `CRISPASR_TADA_TALKER_TIMING=1` for ms/step):
-```
-# A: default floor      (baseline)
-# B: CRISPASR_TADA_BUCKET_MIN=64   (tight bucket)
-# C: CRISPASR_TADA_NO_BUCKET=1     (exact-Lk, no cache — the ceiling on padding win)
-```
-**Guard the regression the bucket was built for:** also measure a LONG utterance
-(n_past approaching/ crossing 512+ so multiple buckets build) — if crossing more
-bucket boundaries (more one-time graph builds) costs more than the padding it
-saves there, the tight floor must stay opt-in / short-utterance-only. Flip the
-default to a tighter floor only if it wins on BOTH short and long inputs (or gate
-the floor by expected length). Then update this note + HISTORY.
+**RESOLVED on clean CUDA (P100), 2026-07-11 — DECISION: keep opt-in, do NOT flip
+the default.** Kaggle kernel `chr1str/crispasr-tada-bucket-ab`
+(`tools/kaggle/tada-bucket-ab/`) ran the 3-way A/B (default / floor64 / nobucket)
+× short(17 steps)/long(174 steps), REPS=3, on tada-1b q4_k. Two findings kill the
+default-flip:
+
+1. **The big Metal win does NOT transfer to CUDA.** The 266→49 ms/call (5.4×) pos
+   penalty above is **Metal-specific** — masked attention over Lk=512 padding is
+   expensive on M1 but cheap on a GPU. On P100 pos_ss is only 9.37 (default) vs
+   6.56 (nobucket) = 1.43×, and at LOOP level floor64 is just **1.058× (short),
+   1.016× (long)** vs default — marginal (LEARNING 34/35: a Metal win doesn't
+   generalise; measure the other platform before flipping).
+2. **The tighter bucket is NOT byte-identical on CUDA** (it IS on Metal — md5
+   `265b9798…`). On P100 the md5s diverge with a *coherent, deterministic*
+   signature: short `floor64 == nobucket ≠ default` (both tight/exact reductions
+   agree, differ from the 512-padded one); long all-three-differ (default=512,
+   floor64 crosses into the 256 bucket, nobucket exact). Cause: `soft_max_ext`
+   sums the −inf-masked padding as exp→0 terms, and the GPU reduction *order* over
+   Lk=512 vs a tight Lk flips a borderline FP bit → a different acoustic frame,
+   AR-amplified. It's a **benign FP-reduction difference** (roundtrip ASR of the
+   default output was 6/6 intelligible; the divergent output was not re-ASR'd but
+   the ~2–6 % win doesn't justify it either way), NOT a logic bug — but it means
+   "byte-identical AND faster", the bar to flip a GPU default, is **not met on
+   CUDA**.
+
+**Clean M1/Metal A/B (loadavg ~5, 2026-07-11) — the load-137 numbers were ~3.7×
+inflated; here are the trustworthy ones.** floor64 vs default:
+- short (17 steps): loop 249.3→**206.2 ms/step (1.21×)**, pos_ss 70.8→28.7 (2.46×)
+- long  (114 steps): loop 249.1→**233.2 ms/step (1.07×)**, pos_ss 69.2→33.1 (2.09×)
+- **byte-identical on Metal** (all arms md5-equal per input: short `a5ce6e08…`,
+  long `d396e8bf…`) — re-confirmed clean.
+- **"best of both" hypothesis CONFIRMED:** on long, **nobucket is SLOWER than
+  default (255.7 > 249.1 ms/step)** — its per-step graph rebuild finally costs more
+  than the padding it saves — while **floor64 (233.2) beats BOTH**: tight padding
+  AND graph caching. Exactly the regression the §176b bucket was built to avoid,
+  and the tight-floor bucket sidesteps it where raw NO_BUCKET does not.
+
+**Decision — SHIPPED a backend-conditional default (2026-07-11).**
+`tada_default_bucket_min()` sets the floor by backend: **Metal + CPU → 64**
+(byte-identical win), **CUDA/ROCm/Vulkan/WebGPU → 512** (output left bit-for-bit
+unchanged — reduction order makes a bucket-width change non-bit-identical there,
+and the win is marginal). `CRISPASR_TADA_BUCKET_MIN` still overrides. The platform
+split drove it: Metal floor64 is byte-identical AND 1.07–1.21× (bigger on short
+utterances); CUDA is marginal (1.02–1.06×) AND changes output bytes → a global flip
+would be wrong, so the default is conditional. Discrete-GPU backends other than the
+measured CUDA (Vulkan/WebGPU) stay on 512 conservatively (unmeasured → keep original).
+
+Validation (all gates passed): **Metal** default(64) == `BUCKET_MIN=512` == golden
+`a5ce6e08` (3/3 consistent — the flip does NOT change existing Metal output, just
+speeds it up); **CPU** default(64) == 512 == `68ad4ce4` byte-identical AND **1.53×
+faster** (1203 vs 1843 ms/step — CPU was unmeasured before, now confirmed); **CUDA**
+unchanged by construction (512 preserved, no re-run needed); roundtrip clean ("the
+quick brown fox…"). NOTE: Metal runs are flaky under GPU contention (transient
+no-output/`MISSING` at rc=0) — a correctness signal only when the box is quiet; the
+3/3 golden match was taken at loadavg ~2–5. Kernel md5 caveat (fixed): the Kaggle
+kernel now gates on ASR keyword-recall of ALL arms, md5 informational only.
 
 ---
 
@@ -1062,6 +1207,31 @@ than granite's 1.8 %, which would change the calculus — so don't assume, measu
   (L1507–1522). Good second reference for the set_rows path.
 
 ### Already done (no work): `granite_speech`, `mimo_asr`, `dots_tts` (Metal gallocr, `ec74c5a0`).
+
+### irodori-tts DiT — persistent fixed-shape graph (issue #243, 2026-07-12)
+
+Simpler than the growing-KV ASR case: the RF-DiT is a **fixed-shape diffusion** — one
+generation runs `run_dit_forward` ~100× (40 ODE steps × up to 4 independent-CFG
+passes) and the graph shape is **constant** across all of them (T_latent/T_text/
+T_ref/T_cap fixed; only input data + the attn-mask values change). The old code
+rebuilt the whole graph **and a fresh `gallocr` every call**, so on Ampere+ the CUDA
+graph's tensor addresses changed each step → "properties changed" → warmup
+resets/re-completes **every step** (ggml-cuda.cu:4361; the reporter's "CUDA graph
+warmup complete" spam). A persistent cached graph (build once, reuse, re-set ALL
+inputs each call for the §234 gotcha) makes warmup complete **once** and replay.
+
+- **Implemented**, gated `CRISPASR_IRODORI_PERSIST_GRAPH` (default OFF), + a
+  `CRISPASR_IRODORI_DIT_TIMING` construct/setinput/compute split.
+- **Parity PROVEN byte-identical** persist vs rebuild: CPU `6c3e16d0`, Metal
+  `1c7f9f27` (default==persist on each). No hang.
+- **Metal/CPU: no throughput win** — STEP-0 shows the DiT is **98.2% compute-bound**
+  (graph construct+alloc only 1.7%), matching the §210 "no Metal win" rule. So the
+  default stays OFF there.
+- **CUDA (Ampere+) win is UNMEASURABLE on available hardware** — ggml disables CUDA
+  graphs below Ampere (cc<800, ggml-cuda.cu:4329) and Kaggle only has P100 (600) /
+  T4 (750), so the re-warm can't be reproduced. The reporter (Ampere+) can confirm
+  warmup-once + any speedup via `CRISPASR_IRODORI_PERSIST_GRAPH=1`. Flip the default
+  (or gate it to `cc>=800`) only once a real Ampere A/B shows a win.
 
 ### Candidates — growing-shape (`Lk = n_past + T`) + naive per-step rebuild + `sched_reset`/`alloc`
 
@@ -5926,49 +6096,202 @@ items, kept verbatim:
 
 #### §176c Migrate host-side KV to device-resident 4D tensors
 
-**Status:** OPEN
-**Effort:** Medium per backend
-**Backends:** SpeechT5 (cross-attn KV DONE §202; self-attn KV still host-side), Dia,
-Pocket-TTS, VoxCPM2 (all use `std::vector<float>` KV that grows and re-uploads every step).
-Parler DONE (§176b+c 2026-06-21, opt-in — see §176b note).
-LFM2 and KugelAudio already have device-resident KV (no §176c work needed there).
+**Status:** OPEN but LOW-VALUE — **the "dominant bottleneck" premise is WRONG for
+compute-bound transformer decoders** (measured on Dia 2026-07-12). Do NOT
+implement without measuring the KV round-trip fraction on the specific backend
+first (`DIA_BENCH`-style instrument).
+**Dia — MEASURED, then DEFERRED (2026-07-12):** instrumented the host↔device
+self-attn KV round-trip (`DIA_BENCH: self_kv_roundtrip`, kept in `dia_tts.cpp`).
+On M1 Metal, `dia-1.6b-q4_k`, 120 steps: **upload 166 ms + readback 35 ms =
+201.6 ms out of 17435 ms decode = ~1.2%**. The 1.6B transformer forward (×B=2 CFG)
+dominates; the KV round-trip is negligible. A device-resident-KV rewrite is
+non-bit-identical + high-risk (ggml KV write/read ordering on Metal — the
+codebase's most bug-prone pattern) for a ≤1.2% ceiling → **not worth it; not
+implemented.** Same lesson as §176k/§208/§214: profile before optimizing.
+**SpeechT5 + Pocket-TTS:** almost certainly the same story (compute-bound
+decoders) — **measure the fraction first** before any rewrite; likely also <5%.
+**Effort:** Medium per backend (but expected <2% payoff — deprioritize).
+**Backends (verified 2026-07-12 by code read — genuinely still host-side):**
+- **SpeechT5** self-attn KV: OPEN. `decoder_kv_cache` is host `std::vector<float>`
+  that GROWS per step (`insert`, `speecht5_tts.cpp:246-265`), re-uploaded whole
+  every step via `ggml_backend_tensor_set` (`:1035-1041,1084`). Cross-attn KV
+  already device-resident/precomputed (§202, `precompute_cross_kv` :568-644). No
+  env-gated device path.
+- **Dia** self-attn KV: host-side (confirmed), but **MEASURED at ~1.2% of decode →
+  DEFERRED, not worth a device-KV rewrite** (see status block above). Host
+  `std::vector<std::vector<float>>` grows via `insert`
+  (`dia_tts.cpp:1594-1595,1955-1956`); whole past window reordered + re-uploaded
+  per step (`:1891-1902`).
+- **Pocket-TTS** self-attn KV: OPEN (nuance: does NOT grow — pre-sized to
+  `max_seq` on the HOST, `pocket_tts.cpp:311-319,1000-1001`, advanced by
+  `offset`) but still host-resident and the reordered past window is re-uploaded
+  to per-step graph inputs every step (`:1207-1228`). `POCKET_MANUAL_BACKBONE`
+  gates CPU-vs-graph but both use the same host KV.
+
+**Already DONE (do NOT re-chase):** VoxCPM2 — the default `VOXCPM2_USE_GRAPH` GPU
+path uses device-resident backend tensors `tslm_kv_k/v` + `ralm_kv_k/v`
+(`voxcpm2_tts.cpp:488-505`), seeded once from the legacy vector then written
+in-graph (no per-step full re-upload); the `std::vector` KV survives only as the
+CPU-path/seed. Parler DONE (§176b+c 2026-06-21, opt-in). LFM2 + KugelAudio already
+device-resident.
+
 **Approach:** Follow IndexTTS/CSM pattern: 4D on-device tensor
 `[head_dim, max_ctx, n_heads, n_layers]` with `ggml_view_4d` +
 `ggml_cpy` writes. Eliminates O(step × layers × hidden) host↔device
 bandwidth per step.
-**Impact:** Eliminates the dominant data-movement bottleneck for these
-backends at long output sequences.
+**Impact (REVISED by Dia measurement):** the original "eliminates the *dominant*
+data-movement bottleneck" claim is FALSE for compute-bound transformer decoders —
+Dia's KV round-trip is ~1.2%, not dominant. It could matter only for a small/fast
+decoder with very long outputs where the transformer forward is cheap relative to
+KV bandwidth; verify with a per-fraction measurement before investing. Judge by
+the decoded round-trip, keep both paths gated, and expect a low-single-digit-%
+ceiling on typical transformer TTS.
 
-#### §176k FireRed ASR: add KV cache for decoder self-attention
+#### §176k FireRed ASR: decoder self-attention — PROFILED + partial fix (2026-07-12)
 
-**Status:** OPEN
-**Effort:** Medium
+**Status:** MOSTLY DONE — the handover framing was WRONG; profiled + shipped the
+real lever (env-gated matvec graph cache, default ON). A residual algorithmic
+item stays open.
 **File:** `src/firered_asr.cpp`
-**Approach:** Currently grows `std::vector<float>` per beam per layer
-and does O(T²) scalar attention. Add pre-allocated 4D KV cache
-(`core_attn` pattern) with flash_attn_ext. Highest-impact single-backend
-optimization remaining.
+
+**Handover framing (debunked by profiling):** "grows `std::vector<float>` per
+beam per layer and does O(T²) scalar attention; add a 4D KV cache + flash_attn —
+highest-impact optimization." Per-node profiling (`FIRERED_BENCH` per-step +
+per-dispatch timers) shows:
+- The self-attention KV is **already cached** (`beam.sa_k/sa_v` grow by appending
+  only the *current* token's K/V — no history recompute). The scalar scoring loop
+  is genuinely O(T²) *cumulative* but negligible for real transcripts (n_hist is
+  small; per-step time is **flat vs history length** → NOT attention-bound).
+- The decode step is **dispatch-bound**: each step issues ~3741/dec ≈ 90+ tiny
+  matvecs (8 projections × 16 layers, greedy M=1 / beam M=n_active), and each
+  `ggml_matmat` did a full `ggml_init` + graph build + `sched_reset` +
+  `sched_alloc_graph` + `ggml_free`. That per-call overhead — not attention —
+  dominates (~45 ms/step baseline on jfk).
+
+**Shipped:** a persistent per-`(weight, M)` matvec graph cache
+(`ggml_matmat_cached`) — builds the no_alloc graph once, gallocr-allocates once,
+then each call is just `tensor_set → ggml_backend_graph_compute (sched-free on
+backend_cpu, native Q4_K SIMD) → tensor_get`. Bit-identical (same op/backend/
+weights; jfk + multispeaker byte-identical transcript, all 3 gate states, md5
+match). Gated `CRISPASR_FIRERED_MATVEC_CACHE` (default ON; `=0` = old sched path,
+kept for A/B + bisection). **Pure Pareto: never slower (strict work-subset).**
+A/B (per-call dispatch, `FIRERED_BENCH` timer, min-of-N — contention-robust):
+- **quiet box (load ~3.7):** OFF ~0.188 vs ON ~0.178 ms/call → marginal ~5%.
+- **loaded box (load 20–50):** OFF up to 22 vs ON up to 20 ms/call; min OFF 1.15
+  vs min ON 0.71 → up to ~1.6×. The gap **grows with load** because the removed
+  ops (malloc / sched_reset / sched_alloc) are the ones contention penalizes.
+  → [[firered-matvec-cache-load-dependent]], the "noisy box fabricates wins" rule.
+
+**Still OPEN (LOW):** the self-attn KV is a growing `std::vector<float>` with a
+scalar scoring loop. For very long single-pass decodes (hundreds of tokens) the
+O(T²) scoring + realloc churn could start to matter — a pre-allocated 4D device
+KV + BLAS/ggml scoring would help *there*, but it is NOT the "highest-impact"
+lever for typical clips. Measure on a long clip before investing.
 
 #### §176l Kyutai STT: vectorized RVQ encode
 
-**Status:** OPEN
-**Effort:** Medium
-**File:** `src/kyutai_stt.cpp`
-**Approach:** Brute-force O(T×32×2048×256) codebook search is the
-dominant cost. Options: SIMD-vectorized exhaustive search, or product
-quantization / FAISS-style IVF for approximate nearest-neighbor.
+**Status:** MOSTLY DONE 2026-07-12 — optimized encoder proven correct AND kyutai
+routing SHIPPED behind `CRISPASR_KYUTAI_RVQ_FAST` (default OFF); only the
+end-to-end model code-identity check + default-flip remain (see "Routing SHIPPED"
+below).
+**Effort:** Small (DRY refactor, done); remaining is a one-clip validation on a model.
+**Files:** `src/kyutai_stt.cpp` (still scalar), `src/core/rvq.h` + `rvq.cpp` (the
+fast helper), `tests/test-core-rvq.cpp` (new proof).
 
-#### §176n VoxCPM2: fix Metal buffer type mismatch
+**The fast search is already written.** `core_rvq::encode_euclidean` (used by
+`mimo_tokenizer`) implements exactly the recipe below — the `2·x·E[k] − ‖E[k]‖²`
+shootout (argmin over `‖x−E[k]‖²` dropping the per-frame-constant `‖x‖²`), with
+pre-computed `‖E[k]‖²`. **Kyutai just doesn't call it** — `rvq_encode_group()`
+(`kyutai_stt.cpp:768`, scalar triple loop `:809-828`) still does the naive
+`Σ(x−e)²` argmin per (frame × 2048 entries × dim). Same stale-infra pattern as the
+rest of the 2026-07-12 audit.
 
-**Status:** OPEN
-**Effort:** Medium (investigation)
-**File:** `src/voxcpm2_tts.cpp`
-**Approach:** Currently CPU-only due to SIGSEGV from `matmul_mv_ggml`
-allocating input tensors in CPU-side mem buffer. Root cause is likely a
-buffer type mismatch in `ggml_backend_sched` allocation strategy. Fixing
-unlocks GPU for the entire pipeline + flash attn.
+**Proven correct with no model (2026-07-12):** `tests/test-core-rvq.cpp`
+(`test-core-rvq`, LABELS unit) compares `encode_euclidean` to a double-precision
+full-distance reference across 5 shapes (K up to 512, dim 32, 8 stages) —
+**codes identical** (every disagreement certified a genuine <1e-4 near-tie), plus
+malformed-input rejection. So the shootout is a correct drop-in for the scalar
+argmin; the algorithmic risk is retired.
+
+**Routing SHIPPED (gated, 2026-07-12):** `rvq_encode_group` now has a fast path
+(env `CRISPASR_KYUTAI_RVQ_FAST=1`, **default OFF**) that extracts all codebooks to
+F32, checks they share `cdim`, and calls the new `core_rvq::encode_euclidean_per_stage`
+(‖E[k]‖² precompute + `encode_euclidean` + transpose into `out_codes[q][t]`); any
+non-uniform dim or failure falls back to the scalar path. The mechanical
+extraction+transpose is unit-tested — `test-core-rvq` now covers
+`encode_euclidean_per_stage` vs the scalar reference (identical codes, near-ties
+certified), so the only thing NOT verified is end-to-end behaviour on a real
+model. **To flip the default:** run kyutai on a Kyutai STT GGUF with the flag on vs
+off and assert the emitted RVQ codes are byte-identical (a clip through
+`tools/kaggle/kyutai-stt-2.6b-convert`), then measure the speedup. Until then the
+scalar path stays default + reference.
+
+#### §176n VoxCPM2: Metal — ALREADY WORKS, VERIFIED (was a stale entry)
+
+**Status:** DONE 2026-07-12 — the premise was stale. VoxCPM2 already runs on Metal
+GPU correctly and is a **3.75× win**; the SIGSEGV described here predates the
+`VOXCPM2_USE_GRAPH` fused-graph infra that has since shipped. No code fix needed
+(only a misleading comment corrected). **CUDA still unvalidated** (Metal-only).
+
+**What was actually true (empirically, on M1):** `crispasr --backend voxcpm2-tts`
+already sets `use_gpu` via `should_use_gpu` (as does the session ABI via
+`g_open_use_gpu_tls`), so `ctx->backend` IS Metal by default. The heavy pipeline
+runs on it: the per-step fused graphs (`build_tslm_step_graph` / `_ralm_` /
+`build_locdit_graph`) + VAE encode/decode graphs are gated `VOXCPM2_USE_GRAPH=1`
+(default ON) on `ctx->backend` via `ggml_gallocr` + `ggml_backend_tensor_set`. The
+old SIGSEGV was about routing the *tiny CPU helper* matmuls (`matmul_mv_ggml`,
+raw host pointers) through Metal — which is neither done nor wanted (30 tiny
+matvecs/step = launch-bound; the graph path is the win).
+
+**Verification (M1, `voxcpm2-q4_k.gguf`, load ~2.7 — quiet):**
+- Basic synth "and so my fellow americans": GPU total **5772 ms** (AR 4392 + VAE
+  1005) vs CPU **21647 ms** (AR 8987 + VAE 3537) → **3.75×**. Both round-trip via
+  firered-asr to the exact input text (correct, not garbage).
+- Voice-clone (`--voice jfk.wav`): runs fully on Metal — VAE-**encode** graph
+  (2166 ms) + AR (13069 ms) + VAE-decode (4174 ms), no SIGSEGV / NaN / unsupported
+  op. So even the VAE-encode path is Metal-clean.
+
+**CUDA validation — DONE + PASS (2026-07-12, Kaggle P100/T4).** Kernel
+`tools/kaggle/voxcpm2-176n-cuda/` (`chr1s4/crispasr-voxcpm2-176n-cuda`) builds on
+CUDA, runs CPU vs GPU(default `USE_GRAPH`), and asserts both round-trip through
+parakeet ASR (recall ≥0.6), the GPU actually ran (weight mirror, not a silent CPU
+fallback), and no crash/NaN/unsupported-op — else it `SystemExit`s. It reached
+`COMPLETE` (= verdict PASS), so the **discrete-GPU mirror path is correct on CUDA**;
+the LEARNING-35 contiguity risk did NOT materialize. §176n CUDA gap CLOSED. Re-run
+after any voxcpm2 change: `kaggle kernels push -p tools/kaggle/voxcpm2-176n-cuda`
+(chr1s4; clones `CRISPASR_REF=main`).
+
+**Note:** the lib `default_params`
+keeps `use_gpu=false` — that is the **conventional** conservative default (dia,
+bark, csm, piper, irodori, tada, chatterbox all do the same); it's overridden by
+CLI + session, so all real consumers already get the Metal win. Don't flip it
+without the CUDA roundtrip.
 
 ## §ARK — ARK-ASR-3B support (⚠️ EXPERIMENTAL / WIP; branch feat/arkasr-3b)
+
+**#253 FIXED 2026-07-12 (drops transcriptions on long audio).** Reporter: a 118 s
+LibriSpeech clip produced NO transcription; `--chunk-seconds 10` dropped scattered
+windows incl. a stray "p". Two root causes, both reproduced + fixed in
+`src/ark_asr.cpp`:
+1. **Long single pass degenerates.** The whole-audio pass extrapolates the
+   Whisper encoder's RoPE far past its 1500-frame / 30 s training window; the
+   decoder then emits `<im_end>` as the FIRST token → empty. Repro: 118 s → empty;
+   same clip in 30 s windows → full transcript. **Fix:** cap single-pass at 30 s
+   (was 300) and decode longer audio in 30 s windows with the existing cross-chunk
+   language conditioning. `CRISPASR_ARKASR_MAX_SINGLE_PASS_S` still overrides.
+2. **Windows degenerate to an immediate `<im_end>` (empty/"p").** Some windows
+   (esp. short) emit `<im_end>` first → empty for clearly-audible speech; the
+   leading-"." cleanup turned a stray `. p` into "p". **Fix:** suppress `<im_end>`
+   on the FIRST decode step (Whisper's suppress-EOT-at-start); later steps allow
+   it, and a truly-silent window's forced first token is the model's "." which
+   cleanup strips back to empty (opt out `CRISPASR_ARKASR_NO_EOS_SUPPRESS=1`).
+**Verified on M1 (q8_0):** reporter's exact default command on the 118 s clip now
+yields the full correct transcript ("mr quilter is the apostle of the middle
+classes…"), 1.7× RT; jfk 11 s unchanged (no spurious words from suppression).
+Residual: explicit `--chunk-seconds 10` still isn't ideal (10 s ≪ the 30 s
+training window — one slice recovered only "paragraph"), but the default no longer
+needs it. `CRISPASR_ARKASR_DEBUG_GEN=1` prints per-window raw gen for future
+triage.
 
 **STATUS 2026-06-29**: ⚠️ **experimental / WIP** — wired through CLI, session C
 ABI, model registry, and docs; shipped to main + GGUF published
@@ -7954,3 +8277,91 @@ conditioning via `--instruct`. Three-way independent CFG (text/speaker/caption).
 - Diff harness: F16 cos=1.000000; Q4_K cos=0.996491 (526 MB)
 - Registry entry added; docs/tts.md updated
 - GGUF artifacts: irodori-tts-600m-v3-voicedesign-{f16,q4_k}.gguf
+
+## §246 issue #81 endgame — close the remaining ~1.4× CUDA gap to onnx-asr (OPEN)
+
+Current: CrispASR parakeet-ctc q8_0 CUDA manual-attn = 153× RT warm
+(jfk×5 55 s, in-process) vs onnx-asr CUDA fp32 = 207× (134 s varied).
+Where the remaining ~0.36 s/55 s plausibly goes, ranked by expected value —
+**measure before building (LEARNING: the handover's bottleneck theory was
+wrong; the profiler wasn't):**
+
+1. **Per-stage split on CUDA first** (cheap, decides everything below):
+   extend `tools/kaggle/fc-unified-graph-ab` to run with
+   `CANARY_CTC_BENCH=1` + `CRISPASR_FC_PROFILE=1` on the P100 — mel vs
+   encoder+ctc vs readout. The mel is host-side single-threaded FFT
+   (`cc_fft_r2c`); at 55-134 s it may be a triple-digit-ms constant that
+   onnx doesn't pay. If so: parallelize `core_mel` (an unused
+   `mel_parallel` flag already sits in mel.cpp) or overlap mel with the
+   previous graph's compute.
+2. **F16 vs Q8_0 on GPU**: P100 has 2:1 fp16 rate and no tensor cores;
+   onnx runs fp32 cuBLAS. Our q8_0 mmq may be losing to plain f16/f32
+   GEMM at these shapes — one kernel arm with the F16 GGUF answers it.
+3. **CUDA-graph replay**: verify whether ggml-cuda's graph capture
+   actually engages across our rebuild-per-call graphs (same topology →
+   it should). If not, the `CRISPASR_FC_BUCKET` path provides the stable
+   topology; retry with small buckets (100 mel frames ≈ 1 s — the 500
+   bucket's pad overhead ≈ savings, smaller pads waste less).
+4. **Upstream flash fix (structural)**: teach `fattn.cu` to accept
+   per-head masks (`mask->ne[2] != 1` guard) so flash works for Shaw
+   rel-pos models on CUDA — reclaims fused-attention memory traffic that
+   manual attention re-materializes ((T,T,H) scores ×24). Upstream PR to
+   ggml-org/llama.cpp per repo convention (mechanical-AI disclosure only).
+5. **Honest re-run**: after any of the above, the canonical number is the
+   134 s-varied load-excluded methodology (issue81-onnx-bench), not jfk×5.
+
+Also OPEN: VPS 4-core x86 re-bench with the shipped defaults (pre-fix
+2.1× vs onnx-CPU 3.1×; handover synced to the VPS at
+handover-prompts/issue81-fc-perf.md).
+
+## §247 roll #81 techniques out to the other runtimes (OPEN)
+
+What shipped for the FastConformer family (fastconformer.h consumers:
+parakeet, canary, canary_ctc, canary_qwen, lfm2_audio, nemotron) and
+where else each technique applies:
+
+1. **F16-weights-in-quantized-GGUF audit** (the 35%-of-encoder trap):
+   any backend whose converter stores matmul-consumed weights 3D/1D gets
+   them silently skipped by the quantizer's 2D rule and runs them on the
+   ~6×-slower CPU F16 mul_mat path. Method: for each backend's shipped
+   q8_0/q4_k GGUF, list tensors with `GGUFReader` and flag F16 tensors
+   that feed `mul_mat` (reshape-consumed); or just run the per-node
+   profiler and look for `MUL_MAT f16` rows at high %. Prime suspects:
+   cohere-transcribe (Conformer convs), firered-asr (Conformer),
+   granite/conformer_ibm, sanm/paraformer conv layers, moonshine,
+   TTS vocoders (hifigan/seanet/dac k=1 convs — qwen3-tts FASTCONV
+   already fixed the cast side, not the storage side). Fix pattern:
+   quantizer carve-out (+ Q8_0 floor + idempotency rule) + load-time
+   repack via `core_conformer::repack_conv_pw_q8`-style helper +
+   fleet requant kernel (`tools/kaggle/fc-pw-requant` — FLEET list +
+   structural check + strict transcript equality are generic).
+2. **Generalize the per-node profiler**: `cc_prof_cb` (sched eval
+   callback, aggregates by op+src-type+shape, CRISPASR_FC_PROFILE=1)
+   should move to `src/core/sched_prof.h` so every sched-based runtime
+   gets it — it found in one run what three A/B rounds missed.
+3. **Fused QKV** (`core_conformer::fuse_qkv` is tensor-generic):
+   bit-identical, ~free win wherever Q/K/V matmuls share an input —
+   whisper-family encoders, cohere, firered, granite, sanm, decoder
+   self-attention in AED backends. Wire-up is load-time concat +
+   view-split at the build site.
+4. **Strided flash inputs**: grep `ggml_cont` feeding `flash_attn_ext`
+   across src/ — the kernel reads strided views (llama.cpp does this);
+   each cont is a full tensor copy per layer per pass.
+5. **Manual-attn-on-CUDA gate**: any backend whose flash mask has
+   ne[2] > 1 (per-head bias) silently falls back to CPU on CUDA —
+   `GGML_SCHED_DEBUG=2` on a CUDA box shows flash nodes on CPU splits.
+   Check cohere-transcribe (Shaw rel-pos) first. Reuse
+   `fc_gpu_manual_attn` + BlockParams.manual_attn pattern.
+6. **-inf pad masking + bucketed persistent graphs**
+   (CRISPASR_FC_BUCKET machinery): the reusable base for batched
+   inference and CUDA-graph capture; also the correct padding semantics
+   for any future streaming/batching work (finite mask constants get
+   overrun by pad garbage — LEARNINGS 2026-07-12).
+7. **Q8_0 floor for decode-critical tensors in sub-8-bit quants**
+   (quantizer): conv pw done; consider the same floor for other
+   high-sensitivity small tensors flagged by future A/Bs.
+
+Suggested order: (2) profiler generalization → (1) audit sweep with it
+(one Kaggle CPU kernel over the registry models, collect `MUL_MAT f16` %
+per backend) → fix the top offenders with the proven pattern → (4)/(3)
+mechanical wins alongside → (5) after the §246 CUDA per-stage data.

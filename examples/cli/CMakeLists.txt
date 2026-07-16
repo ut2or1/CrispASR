@@ -66,6 +66,8 @@ add_executable(${TARGET}
     crispasr_backend_mimo_asr.cpp
     crispasr_backend_ark_asr.cpp
     crispasr_backend_moss_audio.cpp
+    crispasr_backend_moss_tts.cpp
+    crispasr_backend_moss_tts_local.cpp
     crispasr_backend_moss_transcribe.cpp
     crispasr_backend_moss_transcribe_diarize.cpp
     crispasr_backend_funasr.cpp
@@ -209,6 +211,8 @@ target_link_libraries(crispasr-diff PRIVATE
     mimo_asr
     ark_asr
     moss_audio
+    moss_tts
+    moss_tts_local
     moss_transcribe
     moss_transcribe_diarize
     voxcpm2_tts
@@ -276,6 +280,15 @@ target_link_libraries(mimo-tokenizer-smoke PRIVATE
     ${CMAKE_THREAD_LIBS_INIT}
 )
 
+# 4B MossTTSLocal (#249) — P5-lite runtime smoke test (generate_codes end-to-end).
+if (TARGET moss_tts_local)
+    add_executable(moss-tts-local-smoke moss_tts_local_smoke.cpp)
+    target_link_libraries(moss-tts-local-smoke PRIVATE
+        moss_tts_local
+        ${CMAKE_THREAD_LIBS_INIT}
+    )
+endif()
+
 set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME crispasr)
 
 # httplib.h is in the server example directory
@@ -327,6 +340,8 @@ target_link_libraries(${TARGET} PRIVATE
     paraformer
     sensevoice
     moss_audio
+    moss_tts
+    moss_tts_local
     moss_transcribe
     moss_transcribe_diarize
     ${FFMPEG_LIBRARIES}
@@ -389,17 +404,8 @@ else()
     message(STATUS "Opus output disabled (libopus-dev not found)")
 endif()
 
-# Optional C2PA Content Credentials signing (c2pa-c library)
-find_library(C2PA_LIBRARY NAMES c2pa)
-find_path(C2PA_INCLUDE_DIR NAMES c2pa.h c2pa/c2pa.h)
-if (C2PA_LIBRARY AND C2PA_INCLUDE_DIR)
-    target_link_libraries(${TARGET} PRIVATE ${C2PA_LIBRARY})
-    target_include_directories(${TARGET} PRIVATE ${C2PA_INCLUDE_DIR})
-    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_C2PA=1)
-    message(STATUS "C2PA signing enabled (c2pa-c)")
-else()
-    message(STATUS "C2PA signing disabled (c2pa-c not found; install from github.com/contentauth/c2pa-c)")
-endif()
+# C2PA (Content Credentials) signing — shared logic in cmake/CrispasrC2pa.cmake.
+crispasr_enable_c2pa(${TARGET})
 
 install(TARGETS ${TARGET} RUNTIME BUNDLE DESTINATION bin)
 

@@ -46,6 +46,8 @@ std::unique_ptr<CrispasrBackend> crispasr_make_omniasr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_mimo_asr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_ark_asr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moss_audio_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_moss_tts_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_moss_tts_local_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moss_transcribe_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moss_transcribe_diarize_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_funasr_backend();
@@ -141,6 +143,12 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         name == "qwen3-tts-1.7b-customvoice" || name == "qwen3-tts-1.7b-cv" || name == "qwen3-tts-1.7b-voicedesign" ||
         name == "qwen3-tts-voicedesign" || name == "qwen3-tts-vd")
         return crispasr_make_qwen3_tts_backend();
+    if (name == "moss-tts-local" || name == "moss_tts_local" || name == "moss-tts-local-v1.5" ||
+        name == "mosstts-local" || name == "moss-tts-local-transformer")
+        return crispasr_make_moss_tts_local_backend();
+    if (name == "moss-tts" || name == "moss_tts" || name == "mosstts" || name == "moss-tts-v1.5" ||
+        name == "moss-tts-delay")
+        return crispasr_make_moss_tts_backend();
     if (name == "orpheus" || name == "orpheus-tts" || name == "orpheus3b" || name == "kartoffel-orpheus" ||
         name == "kartoffel_orpheus" || name == "kartoffel-orpheus-de-natural" ||
         name == "kartoffel-orpheus-de-synthetic" || name == "kartoffel-orpheus-natural" ||
@@ -267,6 +275,8 @@ std::vector<std::string> crispasr_list_backends() {
         "vibevoice",
         "kugelaudio",
         "qwen3-tts",
+        "moss-tts",
+        "moss-tts-local",
         "vibevoice-1.5b",
         "qwen3-tts-customvoice",
         "qwen3-tts-1.7b-base",
@@ -650,6 +660,10 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "moss-diarize";
     if (contains_ci("moss") && contains_ci("transcribe"))
         return "moss-transcribe";
+    if (contains_ci("moss") && contains_ci("tts") && contains_ci("local"))
+        return "moss-tts-local";
+    if (contains_ci("moss") && contains_ci("tts"))
+        return "moss-tts";
     if (contains_ci("moss") && contains_ci("audio"))
         return "moss-audio";
     if (contains_ci("ggml-") && contains_ci(".bin"))
@@ -703,6 +717,10 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "qwen3";
             else if (a == "qwen3-tts" || a == "qwen3_tts" || a == "qwen3tts")
                 result = "qwen3-tts";
+            else if (a == "moss-tts-local" || a == "moss_tts_local")
+                result = "moss-tts-local";
+            else if (a == "moss-tts" || a == "moss_tts" || a == "moss-tts-delay")
+                result = "moss-tts";
             else if (a == "orpheus")
                 result = "orpheus";
             else if (a == "kokoro" || a == "styletts2" || a == "styletts2-ljspeech")
@@ -814,4 +832,29 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
     }
     gguf_free(gctx);
     return result;
+}
+
+bool crispasr_gguf_is_pure_ctc(const std::string& model_path) {
+    // Mirror the parakeet backend's pure-CTC guard (src/parakeet.cpp): a NeMo
+    // EncDecCTCModelBPE (parakeet-ctc-*, stt_*_fastconformer_ctc) has an encoder +
+    // CTC head but NO RNN-T prediction network / joint — so it lacks both the
+    // single-embedding predictor (decoder.embed.weight) and the LSTM predictor
+    // (decoder.lstm.0.w_ih). Reads tensor infos only; no weights loaded.
+    struct gguf_init_params gip = {/*.no_alloc=*/true, /*.ctx=*/nullptr};
+    gguf_context* gctx = gguf_init_from_file(model_path.c_str(), gip);
+    if (!gctx)
+        return false;
+    bool has_embed = false, has_lstm = false;
+    const int64_t n_tensors = gguf_get_n_tensors(gctx);
+    for (int64_t i = 0; i < n_tensors; i++) {
+        const char* name = gguf_get_tensor_name(gctx, i);
+        if (!name)
+            continue;
+        if (std::strcmp(name, "decoder.embed.weight") == 0)
+            has_embed = true;
+        else if (std::strcmp(name, "decoder.lstm.0.w_ih") == 0)
+            has_lstm = true;
+    }
+    gguf_free(gctx);
+    return !has_embed && !has_lstm;
 }

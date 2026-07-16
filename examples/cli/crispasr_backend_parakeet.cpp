@@ -9,8 +9,8 @@
 #include "crispasr_backend_utils.h"
 #include "whisper_params.h"
 #include "core/asr_context_bias.h"
-
 #include "parakeet.h"
+#include "parakeet_orchestrate.h" // improvements Phase 1: shared transcribe orchestration
 
 #include <cstdio>
 #include <cstring>
@@ -72,7 +72,10 @@ public:
         }
         // Issue #89: JA-only models (vocab=3072) collapse past ~12 s on
         // real audio. Auto-chunk at 10 s instead of the global 30 s default.
-        is_ja_model_ = (parakeet_n_vocab(ctx_) <= 4096);
+        // Issue #257: detect JA by vocab content, not size — small-vocab ENGLISH
+        // models (parakeet-tdt-1.1b, vocab ~1024) were misclassified as Japanese
+        // and forced onto the JA short-chunk path, corrupting long/chunked output.
+        is_ja_model_ = parakeet_vocab_is_japanese(ctx_) != 0;
         // CTC decode mode (hybrid TDT+CTC models).
         if (p.parakeet_decoder == "ctc") {
             if (parakeet_has_ctc(ctx_)) {
@@ -111,6 +114,13 @@ public:
         parakeet_set_temperature(ctx_, params.temperature, params.seed);
         parakeet_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
 
+        // Issue #257: local-attention window (--att-context "L,R") — NeMo
+        // rel_pos_local_attn, bounds long-audio encoder VRAM. INT_MIN = unset
+        // (keep the model default loaded from the GGUF / env).
+        if (params.att_context_left != INT_MIN && params.att_context_right != INT_MIN) {
+            parakeet_set_att_context(ctx_, params.att_context_left, params.att_context_right);
+        }
+
         // MAES beam search (env: CRISPASR_PARAKEET_MAES=1, or --decode maes).
         // Requires beam_size > 1. Configurable via env vars.
         {
@@ -139,127 +149,40 @@ public:
             parakeet_set_hotwords(ctx_, ptrs.data(), (int)ptrs.size(), params.hotwords_boost);
         }
 
-        // Issue #89: encoding-path selection.
-        //
-        // parakeet_transcribe_ex (single-pass) routes the full audio through
-        // one bidirectional FastConformer encoder pass. The attention is
-        // numerically unstable past ~10-20 s in a way that depends on
-        // per-feature z-norm statistics: two codec-quantized copies of the
-        // same speech (≈0.3% RMS diff, 0.998 waveform corr) can flip the
-        // encoder output std by 10-15 % and drive the TDT decoder into
-        // emit-blank-forever past a few seconds. Repro: lenhone's clip in
-        // issue #89, comment 4529025103 (60 s file → 20 s of output).
-        //
-        // parakeet_transcribe_streamed encodes the (globally-z-normed) mel
-        // in overlapping 8 s windows and concatenates encoder outputs
-        // before a single TDT decode. The attention is local-bounded so
-        // codec-level perturbations don't amplify, and the decoder still
-        // sees one contiguous encoder sequence (no LSTM cold-start).
-        // On audio where single-pass works, streamed produces byte-
-        // identical or near-identical text. On audio where single-pass
-        // collapses, streamed still covers ~99 % of the clip.
-        //
-        // We therefore always go through the streamed path. Single-pass
-        // is preserved as an opt-in escape hatch for callers who really
-        // want the bidirectional-over-everything behaviour (e.g. for
-        // bit-exact reproduction of upstream NeMo on test data) — set
-        // `CRISPASR_PARAKEET_STREAM_THRESHOLD=999` to bypass streaming
-        // for audio shorter than that.
-        //
-        // Env knobs:
-        //   CRISPASR_PARAKEET_STREAM_THRESHOLD : single-pass for audio ≤
-        //       this duration (seconds). Default 0 = always streamed.
-        //   CRISPASR_PARAKEET_STREAM_CHUNK     : encoder chunk size (s).
-        //       Default 0 = let the C library pick per-model: 8 s for the
-        //       JA-only model (vocab=3072), 30 s for the multilingual / v3
-        //       family (vocab=8192). Manual override here for the rare
-        //       case where neither heuristic fits the audio at hand.
-        //   CRISPASR_PARAKEET_STREAM_OVERLAP   : encoder overlap (s).
-        //       Default 2. Covers FastConformer's receptive field at the
-        //       chunk boundary; overlap frames from later chunks are
-        //       discarded before decode.
-        // ---- Long-audio path selection (model-dependent; all overridable) ----
-        //
-        // Default per model family, then env gates. JA (vocab<=4096) and DE/EN
-        // (v3 / multilingual) behave very differently, so the defaults differ:
-        //
-        //   non-JA: single full-attention pass is byte-for-byte NeMo-exact
-        //     (verified 100% word match vs nvidia/parakeet-tdt-0.6b-v3, 30 s→
-        //     5 min). Use it up to a memory-safe cap (full attention is O(T^2):
-        //     ~5 min safe on 16 GB, 28 min OOMs); past the cap, silence-split
-        //     into <=cap single-pass pieces and concatenate (no boundary dups).
-        //   JA: collapses on single-pass (#89), so single-pass is disabled
-        //     (threshold 0 → streamed) and CAP_INTERNAL_CHUNKING is NOT set, so
-        //     the dispatcher keeps driving it via VAD / 30 s chunking. Behaviour
-        //     is unchanged from before this routing change.
-        //
-        // Env gates (seconds / 0|1), so JA vs DE and per-machine memory can be
-        // tuned without a rebuild:
-        //   CRISPASR_PARAKEET_STREAM_THRESHOLD : single-pass cap. 0 disables
-        //       single-pass entirely (always streamed). Default JA=0, else 300.
-        //   CRISPASR_PARAKEET_LONGFORM         : 1 = silence-split single-pass
-        //       above the cap; 0 = fall back to the streamed path. Default
-        //       follows the model (non-JA=1, JA=0).
-        //   CRISPASR_PARAKEET_STREAM_CHUNK / _OVERLAP : streamed encoder window.
-        // CLI escape hatches (no env needed): --chunk-seconds N forces the
-        // dispatcher's N-second chunk+merge; --vad forces the VAD path.
-        // JA: single-pass is NeMo-exact and safe up to ~12 s (issue #89 —
-        // past that the encoder collapses on real speech); with the VAD
-        // slice cap at 12 s every slice decodes single-pass. Longer inputs
-        // (explicit --chunk-seconds 0) still stream.
-        int stream_threshold_s = is_ja_model_ ? 12 : 300;
-        bool longform_enabled = !is_ja_model_;
-        int stream_chunk_s = 0; // 0 = let the C library pick per-model
-        int stream_overlap_s = 2;
-        if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_THRESHOLD"))
-            stream_threshold_s = std::max(0, atoi(e));
-        if (const char* e = getenv("CRISPASR_PARAKEET_LONGFORM"))
-            longform_enabled = atoi(e) != 0;
-        if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_CHUNK"))
-            stream_chunk_s = std::max(2, atoi(e));
-        if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_OVERLAP"))
-            stream_overlap_s = std::max(0, atoi(e));
-
-        const int SR = 16000;
-        if (longform_enabled && stream_threshold_s > 0 && n_samples > stream_threshold_s * SR) {
-            return transcribe_longform(samples, n_samples, t_offset_cs, stream_threshold_s * SR);
-        }
-
-        parakeet_result* r;
-        const bool use_single_pass = stream_threshold_s > 0 && n_samples <= stream_threshold_s * SR;
-        if (use_single_pass) {
-            r = parakeet_transcribe_ex(ctx_, samples, n_samples, t_offset_cs);
-        } else {
-            r = parakeet_transcribe_streamed(ctx_, samples, n_samples, t_offset_cs, stream_chunk_s, stream_overlap_s);
-        }
-        if (!r)
-            return out;
-
-        out.push_back(result_to_segment(r, t_offset_cs));
-        parakeet_result_free(r);
+        // Issue #89 / #257: long-audio path selection, the single-pass OOM
+        // fallback, and --chunk-seconds output segmentation are hoisted into the
+        // library (parakeet_transcribe_segments) so the session C-ABI runs the
+        // SAME orchestration instead of a divergent inline copy (improvements
+        // Phase 1). Sticky per-call state (temperature/beam/att-context/hotwords/
+        // ctc) was set on ctx_ above; the orchestration reads the
+        // CRISPASR_PARAKEET_* env knobs and takes JA-ness from is_ja_model_.
+        parakeet_orchestrate_opts oo;
+        oo.chunk_seconds_explicit = params.chunk_seconds_explicit;
+        oo.chunk_seconds = params.chunk_seconds;
+        oo.chunk_overlap_seconds = params.chunk_overlap_seconds;
+        oo.no_prints = params.no_prints;
+        for (const auto& ps : parakeet_transcribe_segments(ctx_, samples, n_samples, t_offset_cs, is_ja_model_, oo))
+            out.push_back(seg_from_parakeet_seg(ps));
         return out;
     }
 
-    // Convert a parakeet_result into one crispasr_segment. Does NOT free r.
-    static crispasr_segment result_to_segment(const parakeet_result* r, int64_t fallback_t0_cs) {
+    // Convert a neutral parakeet_seg (from the shared orchestration) into the
+    // CLI crispasr_segment type.
+    static crispasr_segment seg_from_parakeet_seg(const parakeet_seg& ps) {
         crispasr_segment seg;
-        seg.t0 = fallback_t0_cs;
-        seg.t1 = fallback_t0_cs;
-        seg.text = r->text ? r->text : "";
-
-        seg.words.reserve(r->n_words);
-        for (int i = 0; i < r->n_words; i++) {
-            const auto& w = r->words[i];
+        seg.text = ps.text;
+        seg.t0 = ps.t0;
+        seg.t1 = ps.t1;
+        seg.words.reserve(ps.words.size());
+        for (const auto& w : ps.words) {
             crispasr_word cw;
             cw.text = w.text;
             cw.t0 = w.t0;
             cw.t1 = w.t1;
             seg.words.push_back(std::move(cw));
         }
-
-        seg.tokens.reserve(r->n_tokens);
-        for (int i = 0; i < r->n_tokens; i++) {
-            const auto& t = r->tokens[i];
+        seg.tokens.reserve(ps.tokens.size());
+        for (const auto& t : ps.tokens) {
             crispasr_token ct;
             ct.text = t.text;
             ct.id = t.id;
@@ -268,111 +191,7 @@ public:
             ct.confidence = t.p;
             seg.tokens.push_back(std::move(ct));
         }
-
-        if (!seg.words.empty()) {
-            seg.t0 = seg.words.front().t0;
-            seg.t1 = seg.words.back().t1;
-        } else if (!seg.tokens.empty()) {
-            seg.t0 = seg.tokens.front().t0;
-            seg.t1 = seg.tokens.back().t1;
-        }
         return seg;
-    }
-
-    // Find a silence cut near `target` within [target - window, target] by
-    // locating the lowest-RMS 100 ms frame. Returns the cut sample index.
-    // Keeps chunk boundaries off mid-word so single-pass pieces concatenate
-    // cleanly with no overlap/merge needed (PLAN #80b energy-minimum trick).
-    static int find_silence_cut(const float* s, int n, int target, int window, int sr) {
-        const int lo = std::max(1, target - window);
-        const int hi = std::min(n - 1, target);
-        if (hi <= lo)
-            return std::min(std::max(target, 1), n);
-        const int win = std::max(1, sr / 10); // 100 ms
-        double best = 1e30;
-        int best_pos = target;
-        for (int c = lo; c <= hi; c += win / 2) {
-            const int a = std::max(0, c - win / 2);
-            const int b = std::min(n, c + win / 2);
-            double e = 0.0;
-            for (int i = a; i < b; i++)
-                e += (double)s[i] * (double)s[i];
-            e /= std::max(1, b - a);
-            if (e < best) {
-                best = e;
-                best_pos = c;
-            }
-        }
-        return best_pos;
-    }
-
-    // Long-audio path for non-JA models: split the clip at silence into
-    // pieces no longer than `cap_samples`, transcribe each with the
-    // NeMo-exact single full-attention pass, and concatenate. Each piece is
-    // independent (cuts in silence), so there is no overlap-merge step and
-    // hence no boundary duplicates — and memory stays bounded by the cap.
-    std::vector<crispasr_segment> transcribe_longform(const float* samples, int n_samples, int64_t t_offset_cs,
-                                                      int cap_samples) {
-        std::vector<crispasr_segment> out;
-        const int SR = 16000;
-        const int search = 5 * SR; // search last 5 s of each window for silence
-        const int ctx = 2 * SR;    // ±2 s acoustic context around each piece
-        int pos = 0;
-        while (pos < n_samples) {
-            int end;
-            if (n_samples - pos <= cap_samples) {
-                end = n_samples;
-            } else {
-                end = find_silence_cut(samples, n_samples, pos + cap_samples, search, SR);
-                if (end <= pos)
-                    end = std::min(n_samples, pos + cap_samples); // safety: never stall
-            }
-            // Transcribe with context on both sides so boundary words aren't
-            // dropped for lack of encoder context, then commit only the
-            // [pos,end) core by word timestamp. Adjacent pieces share the
-            // single cut `end` (A keeps t0<end, B keeps t0>=end) → no gap,
-            // no overlap, no duplicates.
-            const int ext_s = std::max(0, pos - ctx);
-            const int ext_e = std::min(n_samples, end + ctx);
-            const int64_t ext_t0 = t_offset_cs + (int64_t)((double)ext_s / SR * 100.0);
-            const int64_t left_cs = (pos == 0) ? INT64_MIN : t_offset_cs + (int64_t)((double)pos / SR * 100.0);
-            const int64_t right_cs = (end == n_samples) ? INT64_MAX : t_offset_cs + (int64_t)((double)end / SR * 100.0);
-
-            parakeet_result* r = parakeet_transcribe_ex(ctx_, samples + ext_s, ext_e - ext_s, ext_t0);
-            if (r) {
-                crispasr_segment full = result_to_segment(r, ext_t0);
-                parakeet_result_free(r);
-
-                crispasr_segment seg;
-                seg.t0 = left_cs == INT64_MIN ? full.t0 : left_cs;
-                seg.t1 = seg.t0;
-                // parakeet word.text has the leading space dropped and
-                // punctuation attached, so re-join committed words with a
-                // single space (non-JA = space-delimited languages only).
-                std::string text;
-                for (auto& w : full.words) {
-                    if (w.t0 >= left_cs && w.t0 < right_cs) {
-                        if (!text.empty())
-                            text += ' ';
-                        text += w.text;
-                        seg.words.push_back(std::move(w));
-                    }
-                }
-                for (auto& tk : full.tokens) {
-                    if (tk.t0 >= left_cs && tk.t0 < right_cs)
-                        seg.tokens.push_back(std::move(tk));
-                }
-                seg.text = std::move(text);
-                if (!seg.words.empty()) {
-                    seg.t0 = seg.words.front().t0;
-                    seg.t1 = seg.words.back().t1;
-                }
-                if (!seg.text.empty() || !seg.words.empty())
-                    out.push_back(std::move(seg));
-            }
-            pos = end;
-        }
-        return out;
     }
 
     bool prefers_vad() const override {

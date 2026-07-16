@@ -85,4 +85,18 @@ inline bool should_use_chunk_context(int effective_chunk_seconds, std::size_t n_
            chunk_overlap_seconds > 0.0f;
 }
 
+// Issue #257: a backend that chunks internally (CAP_INTERNAL_CHUNKING — parakeet
+// / canary FastConformer) produces coherent output only when it sees the whole
+// clip and slices at the encoder-frame level. When the user forces
+// --chunk-seconds on such a backend, the dispatcher's per-slice transcribe +
+// overlap-save trim + LCS merge corrupts it (degraded short-chunk decodes,
+// dropped boundary words). Returns true iff the dispatcher should BYPASS its own
+// slicing and hand the whole clip to the backend, which honours the requested
+// chunk size via its internal chunker. cohere/granite lack CAP_INTERNAL_CHUNKING,
+// so their dispatcher chunking is unchanged.
+inline bool backend_self_chunks_on_explicit(bool has_internal_chunking, bool chunk_seconds_explicit,
+                                            int chunk_seconds) {
+    return has_internal_chunking && chunk_seconds_explicit && chunk_seconds > 0;
+}
+
 } // namespace crispasr_chunk_context

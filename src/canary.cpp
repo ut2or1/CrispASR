@@ -175,6 +175,11 @@ struct canary_model {
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
 
+    // Q8_0 repack of the F16 conv pw1/pw2 weights (issue #81, CRISPASR_FC_PW_Q8)
+    core_conformer::PwRepackBuf pw_q8;
+    // Fused Q/K/V weight concat (issue #81, CRISPASR_FC_FUSED_QKV)
+    core_conformer::PwRepackBuf qkv_fused;
+
     std::map<std::string, ggml_tensor*> tensors;
 };
 
@@ -1171,13 +1176,19 @@ static void canary_fold_batchnorm(canary_model& model) {
             s[c] = bn_w[c] / sqrtf(bn_var[c] + eps);
 
         std::vector<float> w_f32 = core_cpu::to_f32(e.conv_dw_w); // F32/F16/quantized-safe read
-        std::vector<ggml_fp16_t> w_f16(w_f32.size());             // reused for the F16 write-back below
         for (int c = 0; c < d; c++)
             for (int ki = 0; ki < K; ki++)
                 w_f32[ki + c * K] *= s[c];
-        for (size_t i = 0; i < w_f16.size(); i++)
-            w_f16[i] = ggml_fp32_to_fp16(w_f32[i]);
-        ggml_backend_tensor_set(e.conv_dw_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
+        // Write back in the tensor's native dtype — an F32 conv_dw_w (--f32-encoder
+        // GGUFs / diff-harness validation) must NOT be clobbered with F16 (c9a4de65).
+        if (e.conv_dw_w->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_set(e.conv_dw_w, w_f32.data(), 0, w_f32.size() * sizeof(float));
+        } else {
+            std::vector<ggml_fp16_t> w_f16(w_f32.size());
+            for (size_t i = 0; i < w_f16.size(); i++)
+                w_f16[i] = ggml_fp32_to_fp16(w_f32[i]);
+            ggml_backend_tensor_set(e.conv_dw_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
+        }
 
         // Fold into existing dw_b: b'[c] = (dw_b[c] - mean[c]) * s[c] + bn_b[c]
         for (int c = 0; c < d; c++)
@@ -1361,6 +1372,18 @@ extern "C" struct canary_context* canary_init_from_file(const char* path_model, 
         return nullptr;
     }
     canary_fold_batchnorm(ctx->model);
+
+    // Repack F16 conv pw1/pw2 to Q8_0 (issue #81 — the 3D conv layout dodges
+    // crispasr-quantize, and the CPU F16 mul_mat path is ~6x slower than Q8_0).
+    {
+        auto& m = ctx->model;
+        std::vector<core_conformer::BlockWeights*> layers;
+        for (auto& e : m.enc)
+            layers.push_back(&e);
+        const bool quantized = !m.enc.empty() && m.enc[0].attn_q_w && ggml_is_quantized(m.enc[0].attn_q_w->type);
+        core_conformer::repack_conv_pw_q8(layers, ctx->backend, quantized, m.pw_q8, "canary");
+        core_conformer::fuse_qkv(layers, ctx->backend, m.qkv_fused, "canary");
+    }
     return ctx;
 }
 
@@ -1379,6 +1402,8 @@ extern "C" void canary_free(struct canary_context* ctx) {
         ggml_free(ctx->kv_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    ctx->model.pw_q8.free();
+    ctx->model.qkv_fused.free();
     if (ctx->model.buf)
         ggml_backend_buffer_free(ctx->model.buf);
     if (ctx->model.ctx)

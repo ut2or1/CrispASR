@@ -106,6 +106,7 @@ public final class CrispasrSession implements AutoCloseable {
         long         crispasr_session_result_word_t0(Pointer result, int iSeg, int iWord);
         long         crispasr_session_result_word_t1(Pointer result, int iSeg, int iWord);
         float        crispasr_session_result_word_p(Pointer result, int iSeg, int iWord);
+        float        crispasr_session_result_segment_no_speech_prob(Pointer result, int iSeg);
         // Per-frame CTC logits (opted in via crispasr_session_set_return_logits)
         // for backends with a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,
         // canary-ctc). _logits returns a const float* (frame-major;
@@ -289,6 +290,7 @@ public final class CrispasrSession implements AutoCloseable {
 
         // Session extras
         int     crispasr_session_available_backends(byte[] outCsv, int outCap);
+        int     crispasr_session_detected_language(Pointer session, byte[] outBuf, int outCap);
         // CTC vocabulary access (Omni CTC backend): n_vocab piece count,
         // token_text maps an id to its raw piece (JNA copies the model-owned
         // const char*; do not free) or "" when out of range / unsupported.
@@ -812,8 +814,11 @@ public final class CrispasrSession implements AutoCloseable {
         public final String text;
         public final long t0, t1; // centiseconds
         public final Word[] words;
-        Segment(String text, long t0, long t1, Word[] words) {
-            this.text = text; this.t0 = t0; this.t1 = t1; this.words = words;
+        /** Whisper's per-segment no-speech probability (the {@code <|nospeech|>}
+         *  posterior) in [0, 1]. Whisper-only; other backends leave -1.0 ("no data"). */
+        public final float noSpeechProb;
+        Segment(String text, long t0, long t1, Word[] words, float noSpeechProb) {
+            this.text = text; this.t0 = t0; this.t1 = t1; this.words = words; this.noSpeechProb = noSpeechProb;
         }
     }
 
@@ -934,9 +939,22 @@ public final class CrispasrSession implements AutoCloseable {
                     Lib.INSTANCE.crispasr_session_result_word_t1(r, i, j),
                     Lib.INSTANCE.crispasr_session_result_word_p(r, i, j));
             }
-            segs[i] = new Segment(text, t0, t1, words);
+            float noSpeechProb = Lib.INSTANCE.crispasr_session_result_segment_no_speech_prob(r, i);
+            segs[i] = new Segment(text, t0, t1, words, noSpeechProb);
         }
         return segs;
+    }
+
+    /**
+     * The acoustic language Whisper detected on the last transcribe, as an
+     * ISO-639-1 code ("en"). Whisper-only; other backends return the session's
+     * source-language hint, or "unknown".
+     */
+    public String detectedLanguage() {
+        if (handle == null) throw new IllegalStateException("session is closed");
+        byte[] buf = new byte[32];
+        Lib.INSTANCE.crispasr_session_detected_language(handle, buf, buf.length);
+        return nullTerminated(buf);
     }
 
     // Copy the result-owned float* logit grid into a Java float[] before the

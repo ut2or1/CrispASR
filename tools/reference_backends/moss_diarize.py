@@ -83,6 +83,12 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         if patched and tc_bak.exists():
             shutil.move(str(tc_bak), str(tc_path))
 
+    try:
+        from . import _reload_guard
+    except ImportError:
+        import _reload_guard
+    _reload_guard.reload_if_random_init(model, model_dir)
+
     audio = np.asarray(audio, dtype=np.float32)
 
     # ---- Build inputs manually (bypass chat template which may not exist) ----

@@ -187,6 +187,16 @@ extern "C" {
     pub fn crispasr_session_n_vocab(s: *mut CrispasrSession) -> c_int;
     pub fn crispasr_session_token_text(s: *mut CrispasrSession, id: c_int) -> *const c_char;
 
+    // Acoustic language detected by the last transcribe, written into `out_buf`
+    // as an ISO-639-1 code (whisper only; other backends fall back to the
+    // source-language hint, then "unknown"). Returns the code length in bytes
+    // (not counting NUL) or -1 on bad args. Distinct from the text-LID pass.
+    pub fn crispasr_session_detected_language(
+        s: *mut CrispasrSession,
+        out_buf: *mut c_char,
+        out_cap: c_int,
+    ) -> c_int;
+
     /// Write a comma-separated list of backend names the loaded dylib
     /// was built with. Returns the number of bytes written (not counting
     /// NUL) or a negative error.
@@ -444,6 +454,13 @@ extern "C" {
         r: *mut CrispasrSessionResult,
         i_seg: c_int,
         i_word: c_int,
+    ) -> f32;
+    // Whisper's per-segment no-speech probability (the <|nospeech|> token
+    // posterior) in [0, 1]. Only the whisper backend populates it; other
+    // backends and out-of-range indices return the -1.0 sentinel ("no data").
+    pub fn crispasr_session_result_segment_no_speech_prob(
+        r: *mut CrispasrSessionResult,
+        i_seg: c_int,
     ) -> f32;
 
     // Raw per-frame CTC logits (Omni CTC backend, opted in via

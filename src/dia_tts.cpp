@@ -1596,6 +1596,12 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
 
     {
         dia_bench_stage _b("decoder_ar");
+        // §176c measurement: isolate the host<->device self-attn KV round-trip
+        // (upload of the reordered past KV + readback/append of new K/V) vs the
+        // total decode, to decide whether a device-resident KV rewrite is worth
+        // its correctness risk. Gated by DIA_BENCH.
+        const bool kv_bench = getenv("DIA_BENCH") != nullptr;
+        double kv_up_us = 0.0, kv_rb_us = 0.0;
         for (uint32_t step = 0; step < max_gen; step++) {
             ctx->current_position = step;
             if (step == 0 && p.verbosity >= 1)
@@ -1886,6 +1892,7 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
             // self-attention silently corrupts from the 3rd decode step on. Reorder here.
             for (int l = 0; l < (int)m.n_decoder_layers; l++) {
                 if (T_past > 0) {
+                    const int64_t _kt0 = kv_bench ? ggml_time_us() : 0;
                     std::string kn = "past_k_" + std::to_string(l);
                     std::string vn = "past_v_" + std::to_string(l);
                     std::vector<float> pk((size_t)kv_dim * T_past * B), pv((size_t)kv_dim * T_past * B);
@@ -1901,6 +1908,8 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
                                             pk.size() * sizeof(float));
                     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, vn.c_str()), pv.data(), 0,
                                             pv.size() * sizeof(float));
+                    if (kv_bench)
+                        kv_up_us += (double)(ggml_time_us() - _kt0);
                 }
                 // Cross-attention K/V
                 std::string ckn = "cross_k_in_" + std::to_string(l);
@@ -1943,17 +1952,22 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
             }
 
             // Read new K/V and append to self-attention cache
-            for (int l = 0; l < (int)m.n_decoder_layers; l++) {
-                std::string kon = "new_k_" + std::to_string(l);
-                std::string von = "new_v_" + std::to_string(l);
-                std::vector<float> k_new(kv_dim * T_cur * B);
-                std::vector<float> v_new(kv_dim * T_cur * B);
-                ggml_backend_tensor_get(ggml_graph_get_tensor(gf, kon.c_str()), k_new.data(), 0,
-                                        k_new.size() * sizeof(float));
-                ggml_backend_tensor_get(ggml_graph_get_tensor(gf, von.c_str()), v_new.data(), 0,
-                                        v_new.size() * sizeof(float));
-                self_k[l].insert(self_k[l].end(), k_new.begin(), k_new.end());
-                self_v[l].insert(self_v[l].end(), v_new.begin(), v_new.end());
+            {
+                const int64_t _rt0 = kv_bench ? ggml_time_us() : 0;
+                for (int l = 0; l < (int)m.n_decoder_layers; l++) {
+                    std::string kon = "new_k_" + std::to_string(l);
+                    std::string von = "new_v_" + std::to_string(l);
+                    std::vector<float> k_new(kv_dim * T_cur * B);
+                    std::vector<float> v_new(kv_dim * T_cur * B);
+                    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, kon.c_str()), k_new.data(), 0,
+                                            k_new.size() * sizeof(float));
+                    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, von.c_str()), v_new.data(), 0,
+                                            v_new.size() * sizeof(float));
+                    self_k[l].insert(self_k[l].end(), k_new.begin(), k_new.end());
+                    self_v[l].insert(self_v[l].end(), v_new.begin(), v_new.end());
+                }
+                if (kv_bench)
+                    kv_rb_us += (double)(ggml_time_us() - _rt0);
             }
 
             // Read logits and apply CFG, then sample
@@ -2083,6 +2097,12 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
             if (p.verbosity >= 2 && (step + 1) % 100 == 0) {
                 fprintf(stderr, "dia_tts: decoder step %u/%u\n", step + 1, max_gen);
             }
+        }
+        if (kv_bench) {
+            fprintf(stderr,
+                    "dia_bench: self_kv_roundtrip   upload=%.1f ms  readback=%.1f ms  total=%.1f ms "
+                    "(host<->device self-attn KV; §176c target)\n",
+                    kv_up_us / 1e3, kv_rb_us / 1e3, (kv_up_us + kv_rb_us) / 1e3);
         }
     } // decoder_ar bench scope
 

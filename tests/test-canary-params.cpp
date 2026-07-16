@@ -11,6 +11,14 @@ TEST_CASE("canary_params: default values are sensible", "[unit][canary]") {
     REQUIRE(p.verbosity >= 0);
 }
 
+// Defaults-audit / config-parity guard (motivated by #192/#197 + PLAN #89). Pin
+// the shipped use_flash/use_gpu defaults so a silent flip fails CI.
+TEST_CASE("canary_params: gpu/flash defaults are pinned", "[unit][canary]") {
+    struct canary_context_params p = canary_context_default_params();
+    REQUIRE(p.use_gpu == true);
+    REQUIRE(p.use_flash == false);
+}
+
 TEST_CASE("canary_init_from_file: null path returns nullptr", "[unit][canary]") {
     struct canary_context_params p = canary_context_default_params();
     struct canary_context* ctx = canary_init_from_file(nullptr, p);

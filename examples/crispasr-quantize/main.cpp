@@ -336,6 +336,15 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     // code_pred.blk.*) are safe to quantize.
     const bool is_qwen3_tts = (arch.find("qwen3tts") != std::string::npos);
 
+    // MOSS-TTS-v1.5 (arch "moss-tts"): quantize the Qwen3-8B backbone bulk
+    // (llm.blk.*.attn_*, llm.blk.*.ffn_*) but keep the precision-sensitive
+    // lookups/heads at F16 — the token embedding (llm.embed), the text lm_head
+    // (llm.lm_head), and the 32 audio embedding tables + 32 audio LM heads
+    // (moss.audio_embed.*, moss.audio_head.*) that map codebook indices to/from
+    // hidden space and drive per-codebook sampling. (The transformer codec ships
+    // as a separate F16 GGUF and is never quantized here.)
+    const bool is_moss_tts = (arch.find("moss-tts") != std::string::npos || arch.find("moss_tts") != std::string::npos);
+
     // OmniVoice: Qwen3 backbone + audio_embeddings + audio_heads.
     // Keep audio_embd (8200×1024) and audio_output (8200×1024) at original
     // precision — they map codebook indices to/from hidden space, and
@@ -567,6 +576,9 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     // sizes.
     const int n_tensors = gguf_get_n_tensors(ctx_in);
     std::vector<ggml_type> target_types(n_tensors);
+    // Effective quantization row length per tensor — t->ne[0] except for the
+    // FastConformer 3D conv pointwise carve-out below, which quantizes as 2D.
+    std::vector<int64_t> row_lens(n_tensors, 0);
     // Per-rule --tensor-type match counters (summarised after the first pass).
     std::vector<int> override_hits(g_type_overrides.size(), 0);
     std::vector<int> override_skips(g_type_overrides.size(), 0);
@@ -600,8 +612,21 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                           sname[sname.size() - 1] >= '1' && sname[sname.size() - 1] <= '9') ||
                          (sname.find(".wq") != std::string::npos) || (sname.find(".wk") != std::string::npos) ||
                          (sname.find(".wv") != std::string::npos);
-        const bool ok_dims = (ggml_n_dims(t) == 2) || ((is_firered || is_ecapa) && ggml_n_dims(t) >= 2);
-        const int64_t ncols = t->ne[0];
+        // FastConformer conv pointwise weights ship as 3D conv tensors
+        // (1, d, N), which the 2D-only rule skips — so they stayed F16 even
+        // in Q8_0/Q4_K models and ran on the slow CPU F16 mul_mat path
+        // (issue #81). Every consumer does reshape_2d + mul_mat, so quantize
+        // them as their 2D (d, N) equivalent. Runtimes repack pre-existing
+        // GGUFs at load (core_conformer::repack_conv_pw_q8).
+        auto ends_with = [&sname](const char* suf) {
+            const size_t n = strlen(suf);
+            return sname.size() >= n && sname.compare(sname.size() - n, n, suf) == 0;
+        };
+        const bool pw_conv3d =
+            ggml_n_dims(t) == 3 && t->ne[0] == 1 && (ends_with("conv.pw1.weight") || ends_with("conv.pw2.weight"));
+        const bool ok_dims = (ggml_n_dims(t) == 2) || pw_conv3d || ((is_firered || is_ecapa) && ggml_n_dims(t) >= 2);
+        const int64_t ncols = pw_conv3d ? t->ne[1] : t->ne[0];
+        row_lens[i] = ncols;
 
         // Source may be F32/F16 OR already quantized. Accepting a quantized
         // source lets us re-quantize a big model straight from its q8_0 GGUF
@@ -656,6 +681,13 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                                sname.find("code_pred.output") == 0 || sname.find("code_pred.small_to_mtp") == 0 ||
                                sname.find("talker.token_embd") == 0 || sname.find("talker.text_proj") == 0 ||
                                sname.find("talker.codec_bridge") == 0)) &&
+            // moss-tts-local (4B) additionally keeps the 1-layer local/depth
+            // transformer (local.*) and its binary stop head (moss.local_text_head)
+            // at F16 — precision-sensitive, run n_vq times per frame. (8B has no
+            // such tensors, so these terms are inert there.)
+            !(is_moss_tts && (sname.find("llm.embed") == 0 || sname.find("llm.lm_head") == 0 ||
+                              sname.find("moss.audio_embed") == 0 || sname.find("moss.audio_head") == 0 ||
+                              sname.find("local.") == 0 || sname.find("moss.local_text_head") == 0)) &&
             !(is_parler && sname.find("dac.") == 0) &&
             !(is_dia && (sname.find("embedding") != std::string::npos || sname.find("audio_encoder") == 0)) &&
             // VibeVoice: keep the trajectory/control stack — diffusion head
@@ -783,6 +815,23 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             target_types[i] = (ncols % ggml_blck_size(GGML_TYPE_Q8_0) == 0) ? GGML_TYPE_Q8_0 : t->type;
         }
 
+        // FastConformer conv pointwise Q8_0 floor: sub-8-bit quants are both
+        // lossier and slower than Q8_0 on CPU for these matmul shapes, and
+        // Q8_0 here makes newly-quantized GGUFs byte-match what
+        // core_conformer::repack_conv_pw_q8 produces at load from old files.
+        if (pw_conv3d && should_quantize && ggml_is_quantized(target_types[i]) && target_types[i] != GGML_TYPE_Q8_0 &&
+            ncols % ggml_blck_size(GGML_TYPE_Q8_0) == 0) {
+            target_types[i] = GGML_TYPE_Q8_0;
+        }
+        // Idempotency for already-fixed GGUFs: their conv pw is 2D Q8_0, so
+        // pw_conv3d no longer matches and a sub-8-bit re-run would silently
+        // down-quantize the floor above to a k-quant. Keep Q8_0.
+        if (!pw_conv3d && ggml_n_dims(t) == 2 && t->type == GGML_TYPE_Q8_0 && should_quantize &&
+            ggml_is_quantized(target_types[i]) && target_types[i] != GGML_TYPE_Q8_0 &&
+            (ends_with("conv.pw1.weight") || ends_with("conv.pw2.weight"))) {
+            target_types[i] = GGML_TYPE_Q8_0;
+        }
+
         // User per-tensor override (--tensor-type <regex>=<type>). First match
         // wins; overrides the arch guards above. A quant override on a <2-D or
         // ill-tiled row is skipped (with a note) rather than corrupting output.
@@ -809,7 +858,13 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
 
         // Create a tensor descriptor with the target type for ctx_out
         if (target_types[i] != t->type) {
-            struct ggml_tensor* t_out = ggml_new_tensor(ctx_scratch, target_types[i], ggml_n_dims(t), t->ne);
+            struct ggml_tensor* t_out;
+            if (pw_conv3d && ggml_is_quantized(target_types[i])) {
+                // Quantized as the 2D (d, N) matmul view (see carve-out above).
+                t_out = ggml_new_tensor_2d(ctx_scratch, target_types[i], t->ne[1], t->ne[2]);
+            } else {
+                t_out = ggml_new_tensor(ctx_scratch, target_types[i], ggml_n_dims(t), t->ne);
+            }
             ggml_set_name(t_out, name);
             gguf_add_tensor(ctx_out, t_out);
         } else {
@@ -909,7 +964,8 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                 tr->to_float(qbuf.data(), f32_data.data(), nelements);
             }
 
-            const size_t max_q_size = ggml_row_size(qtype_used, t->ne[0]) * (nelements / t->ne[0]);
+            const int64_t n_per_row = row_lens[i] > 0 ? row_lens[i] : t->ne[0];
+            const size_t max_q_size = ggml_row_size(qtype_used, n_per_row) * (nelements / n_per_row);
             q_data.resize(max_q_size);
 
             // Importance matrix (if loaded and shape-matched): steers k-quant/IQ
@@ -918,17 +974,17 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             if (!g_imatrix.empty()) {
                 auto it = g_imatrix.find(name);
                 if (it != g_imatrix.end()) {
-                    if ((int64_t)it->second.size() == t->ne[0]) {
+                    if ((int64_t)it->second.size() == n_per_row) {
                         imatrix = it->second.data();
                         printf("(imatrix) ");
                     } else {
-                        printf("(imatrix shape %zu!=%lld, skipped) ", it->second.size(), (long long)t->ne[0]);
+                        printf("(imatrix shape %zu!=%lld, skipped) ", it->second.size(), (long long)n_per_row);
                     }
                 }
             }
 
-            size_t q_size = ggml_quantize_chunk(qtype_used, f32_data.data(), q_data.data(), 0, nelements / t->ne[0],
-                                                t->ne[0], imatrix);
+            size_t q_size = ggml_quantize_chunk(qtype_used, f32_data.data(), q_data.data(), 0, nelements / n_per_row,
+                                                n_per_row, imatrix);
 
             fwrite(q_data.data(), 1, q_size, fout);
 

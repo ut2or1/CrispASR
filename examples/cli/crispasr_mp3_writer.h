@@ -23,7 +23,7 @@
 
 #include <glint/glint.h>
 
-#include "crispasr_wav_writer.h"
+#include "core/crispasr_wav_writer.h"
 
 #ifdef CRISPASR_HAVE_LAME
 #include <lame/lame.h>

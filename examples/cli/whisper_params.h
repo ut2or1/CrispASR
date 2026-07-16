@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <climits> // INT_MIN (att_context_* sentinels) — issue #257
 #include <string>
 #include <thread>
 #include <vector>
@@ -149,8 +150,14 @@ struct whisper_params {
     bool warmup = false;    // run a short dummy transcribe after init to amortize first-call overhead (PLAN #80e)
     bool no_warmup = false; // --no-warmup: skip the always-on server warmup (e.g. crashes on some Vulkan drivers, #165)
     std::string parakeet_decoder; // "tdt" (default), "ctc" — selects parakeet decode head
-    std::string hotwords;         // comma-separated hotword list (PLAN #98)
-    float hotwords_boost = 2.0f;  // per-token log-prob boost for hotword prefix matches
+    // Issue #257: parakeet/canary local-attention window (encoder frames, 1 = ~80 ms)
+    // — NeMo change_attention_model("rel_pos_local_attn", [L,R]); bounds long-audio
+    // encoder memory to O(T·window). INT_MIN = unset (use the model default);
+    // negative = full attention. Set via --att-context "L,R".
+    int att_context_left = INT_MIN;
+    int att_context_right = INT_MIN;
+    std::string hotwords;        // comma-separated hotword list (PLAN #98)
+    float hotwords_boost = 2.0f; // per-token log-prob boost for hotword prefix matches
     // Free-form hotword/context text injected into the vibevoice-asr prompt
     // (only backend that reads this so far). Matches the `context_info` param
     // in microsoft/VibeVoice's vibevoice_asr_processor.py.
@@ -339,6 +346,13 @@ struct whisper_params {
     // Machine-readable provenance (watermark + C2PA) is always retained.
     // CLI: --no-spoken-disclaimer   Server: "spoken_disclaimer": false
     bool tts_no_spoken_disclaimer = false;
+
+    // Turn off the imperceptible AI-content watermark on TTS output.
+    // Equivalent to the CRISPASR_NO_WATERMARK env var; both emit a one-time
+    // warning that AI-usage marking responsibility then rests with the operator.
+    // On by default — see docs/issue-260/PLAN.md for the regulatory background.
+    // CLI: --no-watermark
+    bool tts_no_watermark = false;
 
     // Server mode: directory containing voice profiles for /v1/audio/speech.
     // Each profile is a sibling pair: <name>.wav + <name>.txt (the WAV is

@@ -10,6 +10,15 @@ TEST_CASE("firered_asr_context_params: default values are sensible", "[unit][fir
     REQUIRE(p.verbosity >= 0);
 }
 
+// Defaults-audit / config-parity guard (motivated by #192/#197). FireRedASR
+// decodes with beam search; beam_size is the load-bearing decode-policy knob, so
+// pin the shipped default (3) to catch a silent drift.
+TEST_CASE("firered_asr_context_params: decode knobs match the shipped defaults", "[unit][firered-asr]") {
+    struct firered_asr_context_params p = firered_asr_context_default_params();
+    REQUIRE(p.beam_size == 3);
+    REQUIRE(p.use_gpu == true);
+}
+
 TEST_CASE("firered_asr_init_from_file: null path returns nullptr", "[unit][firered-asr]") {
     struct firered_asr_context_params p = firered_asr_context_default_params();
     struct firered_asr_context* ctx = firered_asr_init_from_file(nullptr, p);

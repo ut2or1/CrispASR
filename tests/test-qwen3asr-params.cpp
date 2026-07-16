@@ -11,6 +11,15 @@ TEST_CASE("qwen3_asr_params: default values are sensible", "[unit][qwen3_asr]") 
     REQUIRE(p.verbosity >= 0);
 }
 
+// Defaults-audit / config-parity guard (motivated by #192/#197 + PLAN #89).
+// flash_attn must stay on by default; a silent removal (the #89 regression class,
+// which chatterbox guards the same way) fails CI here.
+TEST_CASE("qwen3_asr_params: gpu/flash defaults are pinned", "[unit][qwen3_asr]") {
+    struct qwen3_asr_context_params p = qwen3_asr_context_default_params();
+    REQUIRE(p.use_gpu == true);
+    REQUIRE(p.flash_attn == true);
+}
+
 TEST_CASE("qwen3_asr_init_from_file: null path returns nullptr", "[unit][qwen3_asr]") {
     struct qwen3_asr_context_params p = qwen3_asr_context_default_params();
     struct qwen3_asr_context* ctx = qwen3_asr_init_from_file(nullptr, p);

@@ -42,6 +42,11 @@ jobs:
 
       - name: Setup emsdk
         uses: mymindstorm/setup-emsdk@v14
+        with:
+          # Pin: emscripten 6.0.3 (2026-07-14) regressed the WASM backend — clang
+          # crashes in isKnownNeverNaN during WebAssembly ISel of
+          # voxtral_tts_synthesize (unchanged source). 6.0.2 is the last good one.
+          version: 6.0.2
 
       - name: Build WASM (${{ matrix.name }})
         run: ./build-wasm.sh --clean ${{ matrix.flag }}

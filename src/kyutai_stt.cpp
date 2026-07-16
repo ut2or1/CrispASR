@@ -19,6 +19,7 @@
 #include "core/beam_decode.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/rvq.h"              // §176l: shared Euclidean RVQ encode
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -265,7 +266,9 @@ struct kyutai_stt_context {
 // ===========================================================================
 
 extern "C" struct kyutai_stt_context_params kyutai_stt_context_default_params(void) {
-    return {/*n_threads=*/4, /*verbosity=*/1, /*use_gpu=*/true, /*temperature=*/0.0f, /*beam_size=*/1};
+    return {/*n_threads=*/4,        /*verbosity=*/1, /*use_gpu=*/true,
+            /*temperature=*/0.0f,   /*beam_size=*/1,
+            /*input_sample_rate=*/0};
 }
 
 // --- Helpers ---
@@ -792,6 +795,40 @@ static void rvq_encode_group(kyutai_stt_context* sctx, ggml_tensor* x_projected,
         }
     }
 
+    // §176l: route the RVQ argmin through the shared core_rvq helper (the
+    // 2·x·E−‖E‖² shootout, proven code-identical to the scalar loop below in
+    // test-core-rvq). Gated CRISPASR_KYUTAI_RVQ_FAST (default OFF until the
+    // emitted codes are confirmed byte-identical on a real Kyutai model). Needs
+    // all codebooks to share cdim; any mismatch falls through to the scalar path.
+    static const bool kyutai_rvq_fast = [] {
+        const char* e = std::getenv("CRISPASR_KYUTAI_RVQ_FAST");
+        return e && e[0] == '1';
+    }();
+    if (kyutai_rvq_fast) {
+        std::vector<std::vector<float>> cbdata((size_t)n_codebooks);
+        std::vector<const float*> embeds((size_t)n_codebooks);
+        std::vector<int> sizes((size_t)n_codebooks);
+        bool uniform = true;
+        for (int q = 0; q < n_codebooks && uniform; q++) {
+            const int cb_dim = (int)rvq.codebooks[q].embedding->ne[0];
+            const int num_codes = (int)rvq.codebooks[q].embedding->ne[1];
+            if (cb_dim != cdim) {
+                uniform = false;
+                break;
+            }
+            cbdata[q].resize((size_t)num_codes * cb_dim);
+            ggml_backend_tensor_get(rvq.codebooks[q].embedding, cbdata[q].data(), 0,
+                                    (size_t)num_codes * cb_dim * sizeof(float));
+            embeds[q] = cbdata[q].data();
+            sizes[q] = num_codes;
+        }
+        if (uniform && core_rvq::encode_euclidean_per_stage(residual.data(), T, cdim, embeds.data(), sizes.data(),
+                                                            n_codebooks, out_codes)) {
+            return;
+        }
+        out_codes.clear(); // partial fill on fallthrough — scalar path repopulates
+    }
+
     for (int q = 0; q < n_codebooks; q++) {
         // Codebook embedding: ggml shape [codebook_dim, num_codes]
         // ne[0]=codebook_dim, ne[1]=num_codes
@@ -1157,15 +1194,23 @@ static char* kyutai_stt_transcribe_impl(struct kyutai_stt_context* ctx, const fl
     auto& hp = ctx->model.hp;
     auto& m = ctx->model;
 
-    // Step 1: Resample 16 kHz → 24 kHz
+    // Step 1: Resample to 24 kHz if the input is not already at that rate.
+    // When the caller loads audio via crispasr_audio_load_at_rate(path, 24000, …)
+    // the PCM is already at 24 kHz and the resample is a no-op, avoiding the
+    // quality-degrading 16k→24k round-trip (issue #263).
+    const int input_rate = ctx->params.input_sample_rate > 0 ? ctx->params.input_sample_rate : 16000;
     std::vector<float> pcm_24k;
-    {
+    if (input_rate == (int)ctx->model.hp.sample_rate) {
+        // Already at model rate — just copy.
+        pcm_24k.assign(samples, samples + n_samples);
+        if (ctx->params.verbosity >= 1)
+            fprintf(stderr, "kyutai_stt: input already at %d Hz, no resample\n", input_rate);
+    } else {
         kyutai_stt_bench_stage _b("resample");
         resample_16k_to_24k(samples, n_samples, pcm_24k);
-    }
-
-    if (ctx->params.verbosity >= 1) {
-        fprintf(stderr, "kyutai_stt: resampled %d → %d samples (16k → 24k)\n", n_samples, (int)pcm_24k.size());
+        if (ctx->params.verbosity >= 1)
+            fprintf(stderr, "kyutai_stt: resampled %d → %d samples (%dk → 24k)\n", n_samples, (int)pcm_24k.size(),
+                    input_rate / 1000);
     }
 
     // Step 1b: Prepend silence prefix (required by some models, e.g. stt-2.6b-en uses 1.0s)
@@ -1371,6 +1416,11 @@ extern "C" void kyutai_stt_set_seed(struct kyutai_stt_context* ctx, unsigned int
 extern "C" void kyutai_stt_set_beam_size(struct kyutai_stt_context* ctx, int beam_size) {
     if (ctx)
         ctx->params.beam_size = (beam_size > 0) ? beam_size : 1;
+}
+
+extern "C" void kyutai_stt_set_input_sample_rate(struct kyutai_stt_context* ctx, int rate) {
+    if (ctx)
+        ctx->params.input_sample_rate = (rate > 0) ? rate : 0;
 }
 
 extern "C" void kyutai_stt_result_free(struct kyutai_stt_result* r) {

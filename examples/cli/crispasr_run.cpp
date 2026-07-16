@@ -45,12 +45,12 @@
 #include "titanet.h"
 #include "speaker_db.h"
 
-#include "crispasr_c2pa.h"
+#include "core/crispasr_c2pa.h"
 #include "crispasr_tts_chunking.h"
 #include "crispasr_tts_disclaimer.h"
 #include "crispasr_watermark.h"
 #include "crispasr_watermark_dispatch.h"
-#include "crispasr_wav_writer.h"
+#include "core/crispasr_wav_writer.h"
 #include "crispasr_mp3_writer.h"  // MP3 output via in-tree glint encoder
 #include "crispasr_aac_writer.h"  // AAC-LC (ADTS) output via in-tree glint encoder
 #include "crispasr_opus_writer.h" // Ogg Opus output via in-tree glint encoder
@@ -76,6 +76,21 @@
 
 namespace {
 
+// Resolve the --watermark-model argument to a GGUF path (#260). "auto"/"default"
+// pulls the AudioSeal neural watermark (MIT, opt-in SOTA) from the registry,
+// auto-downloading when enabled; any other value is passed through as a literal
+// path/name; empty stays empty (→ the always-on built-in spread-spectrum
+// watermark). A failed AudioSeal resolve falls back to spread-spectrum via the
+// dispatcher, which treats an unloadable model as "no neural watermark".
+static std::string crispasr_resolve_watermark_model(const whisper_params& params) {
+    if (params.watermark_model.empty())
+        return "";
+    if (params.watermark_model == "auto" || params.watermark_model == "default")
+        return crispasr_resolve_model_cli("auto", "audioseal", params.no_prints, params.cache_dir, params.auto_download,
+                                          "");
+    return params.watermark_model;
+}
+
 // Serialize synthesized (TTS/S2S) float32 PCM to `out_path` — WAV by
 // default, MP3 or AAC-LC/ADTS (in-tree glint encoder) when the path
 // ends in .mp3 / .aac. All carry AI-provenance metadata (WAV LIST/INFO
@@ -84,7 +99,8 @@ namespace {
 // silently dropping the manifest. Returns 0 on success, 16 on failure
 // (caller's exit code).
 static int crispasr_write_synth_audio(const std::string& out_path, const float* pcm, int n_samples, int sample_rate,
-                                      const std::string& c2pa_cert, const std::string& c2pa_key) {
+                                      const std::string& c2pa_cert, const std::string& c2pa_key,
+                                      const std::string& cache_dir = "") {
     auto has_ext = [&](const char* lo, const char* up) {
         return out_path.size() >= 4 &&
                (out_path.compare(out_path.size() - 4, 4, lo) == 0 || out_path.compare(out_path.size() - 4, 4, up) == 0);
@@ -104,6 +120,9 @@ static int crispasr_write_synth_audio(const std::string& out_path, const float* 
     const bool is_aac = has_ext(".aac", ".AAC");
     const bool is_opus = ends_with_ci(".opus") || ends_with_ci(".ogg");
     std::string blob;
+    // C2PA MIME/format for this container ("" = c2pa can't embed here, e.g. AAC
+    // (ADTS) / Opus (Ogg) — those get watermark + tag provenance only).
+    const char* c2pa_fmt = is_mp3 ? "audio/mpeg" : (is_aac || is_opus) ? "" : "audio/wav";
     if (is_mp3 || is_aac || is_opus) {
         const char* codec = is_mp3 ? "MP3" : (is_aac ? "AAC" : "Opus");
         blob = is_mp3   ? crispasr_make_mp3(pcm, n_samples, sample_rate)
@@ -113,13 +132,22 @@ static int crispasr_write_synth_audio(const std::string& out_path, const float* 
             fprintf(stderr, "crispasr: error: %s encoding failed for '%s'\n", codec, out_path.c_str());
             return 16;
         }
-        if (!c2pa_cert.empty() || !c2pa_key.empty())
-            fprintf(stderr, "crispasr: warning: C2PA signing is WAV-only; '%s' is written unsigned\n",
-                    out_path.c_str());
     } else {
         blob = crispasr_make_wav_int16(pcm, n_samples, sample_rate);
-        // C2PA Content Credentials signing (when available + configured)
-        crispasr_c2pa_sign_wav(blob, c2pa_cert, c2pa_key);
+    }
+
+    // C2PA Content Credentials signing. Effective signer creds are the
+    // user-provided --c2pa-cert/--c2pa-key, or (on by default when C2PA is
+    // compiled in) an auto-provisioned per-install self-signed cert. Signing is
+    // best-effort provenance: any failure or an unembeddable container leaves
+    // the watermark + metadata tag as the provenance signal.
+    if (c2pa_fmt && *c2pa_fmt) {
+        crispasr_c2pa_sign_auto(blob, c2pa_fmt, c2pa_cert, c2pa_key, cache_dir);
+    } else if (!c2pa_cert.empty() || !c2pa_key.empty()) {
+        fprintf(stderr,
+                "crispasr: note: C2PA cannot embed a manifest in this container; "
+                "'%s' written unsigned (watermark + metadata provenance still applied)\n",
+                out_path.c_str());
     }
     FILE* fout = fopen(out_path.c_str(), "wb");
     if (!fout) {
@@ -513,6 +541,15 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     // architecture.
     int effective_chunk_seconds = params.chunk_seconds;
     if (!params.chunk_seconds_explicit && (backend.capabilities() & CAP_UNBOUNDED_INPUT)) {
+        effective_chunk_seconds = 0;
+    }
+    // Issue #257: a backend that chunks internally (parakeet / canary — full-
+    // attention FastConformer) is corrupted by the dispatcher's per-slice
+    // transcribe + overlap-save trim + LCS merge. When the user forces
+    // --chunk-seconds on such a backend, hand it the whole clip and let its
+    // internal chunker honour the requested size (see the header for the gate).
+    if (crispasr_chunk_context::backend_self_chunks_on_explicit((backend.capabilities() & CAP_INTERNAL_CHUNKING) != 0,
+                                                                params.chunk_seconds_explicit, params.chunk_seconds)) {
         effective_chunk_seconds = 0;
     }
 
@@ -1450,8 +1487,9 @@ int crispasr_run_backend(const whisper_params& params_in) {
             pcm[i] = (float)pcm_i16[i] / 32768.0f;
         }
 
-        // Initialize watermark dispatcher (AudioSeal if --watermark-model given)
-        crispasr_wm_dispatch::init(params.watermark_model);
+        // Initialize watermark dispatcher (AudioSeal if --watermark-model given;
+        // "auto" pulls the AudioSeal GGUF from the registry — #260)
+        crispasr_wm_dispatch::init(crispasr_resolve_watermark_model(params));
 
         float confidence = crispasr_wm_dispatch::detect(pcm.data(), n_samples, (int)wav_sr);
 
@@ -1824,6 +1862,23 @@ int crispasr_run_backend(const whisper_params& params_in) {
     }
     params.model = resolved;
 
+    // A pure-CTC FastConformer model (parakeet-ctc-*, stt_*_fastconformer_ctc:
+    // encoder + CTC head, no RNN-T decoder/joint) cannot run on the parakeet
+    // (transducer) backend. Autodetection already routes such GGUFs to
+    // fastconformer-ctc by arch ("canary-ctc") and filename, but an explicit
+    // `--backend parakeet` bypasses that and dead-ends at the parakeet guard.
+    // Reroute here so the transducer-only backend never gets a CTC model.
+    if (backend_name == "parakeet" && crispasr_gguf_is_pure_ctc(params.model)) {
+        if (!params.no_prints) {
+            fprintf(stderr,
+                    "crispasr: '%s' is a pure-CTC model (no RNN-T decoder) — the parakeet\n"
+                    "crispasr: backend is transducer-only; auto-routing to --backend fastconformer-ctc\n",
+                    params.model.c_str());
+        }
+        backend_name = "fastconformer-ctc";
+        params.backend = "fastconformer-ctc";
+    }
+
     // Issue #125 follow-up: when the LM has a companion file in the
     // registry (e.g. mimo-tokenizer-q4_k.gguf for mimo-asr), fetch it now
     // so `--auto-download` produces a fully-functional setup. Previously
@@ -2193,8 +2248,10 @@ int crispasr_run_backend(const whisper_params& params_in) {
 
         // Initialize AudioSeal neural watermark if --watermark-model is set
         if (!params.watermark_model.empty()) {
-            crispasr_wm_dispatch::init(params.watermark_model);
+            crispasr_wm_dispatch::init(crispasr_resolve_watermark_model(params));
         }
+        // Honor the --no-watermark opt-out (equivalent to CRISPASR_NO_WATERMARK).
+        crispasr_wm_dispatch::set_disabled(params.tts_no_watermark);
 
         // Voice-cloning consent gate: if the voice is a .wav reference
         // (i.e. voice cloning), require --i-have-rights attestation.
@@ -2351,7 +2408,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // default, MP3/AAC when --tts-output ends in .mp3/.aac.
         std::string out_path = params.tts_output.empty() ? "tts_output.wav" : params.tts_output;
         if (int rc = crispasr_write_synth_audio(out_path, audio.data(), (int)audio.size(), sr_in, params.c2pa_cert,
-                                                params.c2pa_key))
+                                                params.c2pa_key, params.cache_dir))
             return rc;
 
         // Post-embed watermark verification: re-detect on the in-memory
@@ -2410,8 +2467,10 @@ int crispasr_run_backend(const whisper_params& params_in) {
         }
 
         if (!params.watermark_model.empty()) {
-            crispasr_wm_dispatch::init(params.watermark_model);
+            crispasr_wm_dispatch::init(crispasr_resolve_watermark_model(params));
         }
+        // Honor the --no-watermark opt-out (equivalent to CRISPASR_NO_WATERMARK).
+        crispasr_wm_dispatch::set_disabled(params.tts_no_watermark);
 
         std::string transcript;
         auto audio = backend->speech_to_speech(s2s_samples.data(), (int)s2s_samples.size(), &transcript, params);
@@ -2436,7 +2495,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // ends in .mp3/.aac.
         std::string out_path = params.s2s_output.empty() ? "s2s_output.wav" : params.s2s_output;
         if (int rc = crispasr_write_synth_audio(out_path, audio.data(), (int)audio.size(), sr_out, params.c2pa_cert,
-                                                params.c2pa_key))
+                                                params.c2pa_key, params.cache_dir))
             return rc;
 
         if (!params.no_prints)

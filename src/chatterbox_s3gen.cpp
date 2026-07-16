@@ -20,6 +20,7 @@
 #include "chatterbox_s3gen.h"
 #include "chatterbox_s3tok.h"
 #include "core/conv.h"
+#include "core/dac_decoder.h" // core_dac::fastconv_cache (shared FASTCONV)
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
@@ -355,6 +356,18 @@ struct chatterbox_s3gen_context {
     bool dequant_cfm_f16 = false;
     ggml_context* ctx_f16 = nullptr;
     ggml_backend_buffer_t buf_f16 = nullptr;
+
+    // FASTCONV (docs/perf-sweep/PLAN.md): baked F32 copies of the F16 conv
+    // kernels, so the fork's per-graph F16→F32 cast (in ggml_conv_1d) becomes a
+    // no-op. Two caches because s3gen weights are split across backends (split
+    // load routes s3.fd.*→CPU, rest→GPU; the Metal CFM fix moves quantized
+    // s3.fd.* back to GPU) — each F16 conv kernel is baked on ITS OWN backend so
+    // the pointer-swap in c->tensors preserves placement exactly. Cast-kill only
+    // (no k=1→matmul), which is bitwise-identical to the legacy cast. Gated
+    // CRISPASR_S3GEN_FASTCONV (default OFF pending a full seeded A/B on a quiet box).
+    core_dac::fastconv_cache fc_gpu;
+    core_dac::fastconv_cache fc_cpu;
+
     mt19937_state noise_rng{};
     uint32_t noise_seed = 0;
 
@@ -395,6 +408,8 @@ struct chatterbox_s3gen_context {
             ggml_backend_buffer_free(buf_f16);
         if (ctx_f16)
             ggml_free(ctx_f16);
+        fc_gpu.free();
+        fc_cpu.free();
         if (ctx_w)
             ggml_free(ctx_w);
         if (buf_w)
@@ -782,6 +797,61 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
                         "(%.0f→%.0f MiB; correct mul_mm_f16_f32_hp path, full GPU speed; "
                         "CRISPASR_S3GEN_UNET_CPU=1 for the CPU route)\n",
                         n_conv, bytes_q / 1048576.0, bytes_f16 / 1048576.0);
+            }
+        }
+    }
+
+    // FASTCONV: bake F32 copies of the F16 conv kernels and redirect graph
+    // lookups to them (same pointer-swap idiom as the ctx_f16 fix above), so
+    // ggml_conv_1d skips its per-graph F16→F32 kernel cast. Bitwise-identical to
+    // the legacy cast (the bake IS that conversion, done once at load). Each
+    // kernel is baked on its OWN backend to preserve split-load placement.
+    // Gated CRISPASR_S3GEN_FASTCONV; default OFF until a full seeded A/B lands.
+    {
+        // Default ON: the A/B proved cast-kill is audio byte-identical to the
+        // legacy in-graph cast (ON vs OFF @seed42 = 0/32768 across all samples,
+        // which for this flow-matching+AR pipeline also subsumes the determinism
+        // gate — a non-deterministic run would have diverged). Set =0 to revert.
+        const char* e = std::getenv("CRISPASR_S3GEN_FASTCONV");
+        const bool on = !e || (e[0] != '0');
+        if (on) {
+            const bool have_gpu = (c->backend_cpu && c->backend_cpu != c->backend);
+            ggml_backend_buffer_type_t cpu_buft =
+                have_gpu ? ggml_backend_get_default_buffer_type(c->backend_cpu) : nullptr;
+            std::vector<ggml_tensor*> gpu_k, cpu_k;
+            for (auto& kv : c->tensors) {
+                ggml_tensor* w = kv.second;
+                if (!w || w->type != GGML_TYPE_F16 || ggml_n_dims(w) != 3)
+                    continue; // conv kernels are the only 3D weights (matmuls are 2D)
+                // Exclude ConvTranspose1d upsample weights (.ups.): they go through
+                // core_convt's decomposed permute path, not ggml_conv_1d, and the
+                // permute below reads the F16 original from c->tensors — swapping
+                // them to F32 would feed garbage to permute_convt1d_weight.
+                if (kv.first.find(".ups.") != std::string::npos)
+                    continue;
+                // Route each kernel to a cache on ITS OWN backend so the swap
+                // preserves split-load placement. CPU-only mode → all on c->backend.
+                const bool on_cpu =
+                    have_gpu && w->buffer && cpu_buft && ggml_backend_buffer_get_type(w->buffer) == cpu_buft;
+                (on_cpu ? cpu_k : gpu_k).push_back(w);
+            }
+            c->fc_gpu.bake(c->backend, gpu_k, true);
+            if (have_gpu)
+                c->fc_cpu.bake(c->backend_cpu, cpu_k, true);
+            size_t swapped = 0;
+            for (auto& kv : c->tensors) {
+                ggml_tensor* w = kv.second;
+                ggml_tensor* f = c->fc_gpu.get(w);
+                if (f == w)
+                    f = c->fc_cpu.get(w);
+                if (f != w) {
+                    kv.second = f;
+                    swapped++;
+                }
+            }
+            if (verbosity >= 1 || std::getenv("CRISPASR_S3GEN_FASTCONV_DEBUG")) {
+                fprintf(stderr, "s3gen: FASTCONV ON — baked %zu GPU + %zu CPU F16 conv kernels → F32 (%zu swapped)\n",
+                        c->fc_gpu.f32.size(), c->fc_cpu.f32.size(), swapped);
             }
         }
     }

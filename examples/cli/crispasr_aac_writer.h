@@ -17,7 +17,7 @@
 
 #include <glint/glint.h>
 
-#include "crispasr_wav_writer.h"
+#include "core/crispasr_wav_writer.h"
 
 // AAC supports the 12 standard sample rates. Return `sr` when directly
 // encodable, otherwise the nearest supported rate at or above it

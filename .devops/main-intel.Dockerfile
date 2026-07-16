@@ -14,7 +14,9 @@ RUN if [ "${GGML_SYCL_F16}" = "ON" ]; then \
         echo "GGML_SYCL_F16 is set" \
         && export OPT_SYCL_F16="-DGGML_SYCL_F16=ON"; \
     fi && \
-    cmake -B build -DCRISPASR_BUILD_TESTS=OFF -DGGML_SYCL=1 -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx ${OPT_SYCL_F16} && \
+    cmake -B build -DCRISPASR_BUILD_TESTS=OFF -DGGML_SYCL=1 \
+      -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+      -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx ${OPT_SYCL_F16} && \
     cmake --build build -j"$(nproc)" --target crispasr-cli
 
 FROM intel/oneapi-basekit:$ONEAPI_VERSION AS runtime

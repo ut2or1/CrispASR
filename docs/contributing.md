@@ -467,8 +467,14 @@ not just M1.
 
 ## Watermarking tests
 
-All TTS output is automatically watermarked. When changing TTS output
-paths, ensure these test suites still pass:
+All TTS output is automatically watermarked (on by default). The mark can be
+turned off with the `--no-watermark` CLI flag or the `CRISPASR_NO_WATERMARK`
+env var — equivalent opt-outs, both emit a one-time stderr warning
+(`watermarking disabled. AI usage marking responsibility rests with the
+operator.`). The warning text is deliberately jurisdiction-neutral and does not
+name a specific statute; see `docs/issue-260/PLAN.md` for the regulatory
+background (incl. EU AI Act Art. 50). When changing TTS output paths, ensure
+these test suites still pass:
 
 ```bash
 # Unit tests (no model needed)

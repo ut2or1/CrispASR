@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -104,6 +105,38 @@ inline CheckResult check_tts_duration(int n_samples, int sample_rate, int n_word
     if (sec_per_word > max_sec_per_word) {
         return {false, "TTS audio too long (" + std::to_string(sec_per_word) + " sec/word, max " +
                            std::to_string(max_sec_per_word) + ")"};
+    }
+    return {true, ""};
+}
+
+// Check that a TTS waveform doesn't end with an excessive run of silence.
+// Trailing dead air is a common TTS pathology — a mis-handled EOS, a vocoder that
+// runs past the last phoneme, or a padded generation buffer that never got
+// trimmed. Scans backward in 10 ms windows and stops at the first window whose RMS
+// exceeds `silence_rms_threshold`; the untrimmed tail beyond that is the trailing
+// silence. (A per-sample abs test would be fooled by a stray DC-offset sample, so
+// use windowed RMS.) A fully-silent clip trips this too — its whole length is
+// "trailing silence" — which is the desired signal for "the model emitted nothing".
+inline CheckResult check_trailing_silence(const float* pcm, int n_samples, int sample_rate,
+                                          float max_trailing_silence_s = 2.0f, float silence_rms_threshold = 1e-3f) {
+    if (!pcm || n_samples <= 0 || sample_rate <= 0)
+        return {true, "skipped (no audio or zero sample rate)"};
+    const int win = std::max(1, sample_rate / 100); // 10 ms
+    int trailing_silent = 0;
+    for (int end = n_samples; end > 0; end -= win) {
+        int start = std::max(0, end - win);
+        double sumsq = 0.0;
+        for (int i = start; i < end; ++i)
+            sumsq += (double)pcm[i] * (double)pcm[i];
+        double rms = std::sqrt(sumsq / (double)(end - start));
+        if (rms > silence_rms_threshold)
+            break;
+        trailing_silent += (end - start);
+    }
+    float silence_s = (float)trailing_silent / (float)sample_rate;
+    if (silence_s > max_trailing_silence_s) {
+        return {false, "excessive trailing silence (" + std::to_string(silence_s) + " s, max " +
+                           std::to_string(max_trailing_silence_s) + ")"};
     }
     return {true, ""};
 }

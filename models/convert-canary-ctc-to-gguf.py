@@ -174,7 +174,7 @@ def is_f32_tensor(gguf_name: str, shape: tuple[int, ...]) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def convert(nemo_path: Path, out_path: Path) -> None:
+def convert(nemo_path: Path, out_path: Path, f32_encoder: bool = False) -> None:
     print(f"Loading: {nemo_path}")
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
@@ -253,7 +253,7 @@ def convert(nemo_path: Path, out_path: Path) -> None:
         if gguf_name == "ctc.weight" and t.ndim == 3 and t.shape[-1] == 1:
             t = t.squeeze(-1)
 
-        if is_f32_tensor(gguf_name, t.shape):
+        if is_f32_tensor(gguf_name, t.shape) or (f32_encoder and gguf_name.startswith("encoder.")):
             t = t.astype(np.float32)
             n_f32 += 1
         else:
@@ -296,9 +296,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--nemo", required=True, type=Path, help="path to canary-1b-v2.nemo")
     p.add_argument("--output", required=True, type=Path, help="output GGUF path")
+    p.add_argument("--f32-encoder", action="store_true",
+                   help="emit encoder weights (incl. conv.dw) as F32 — for diff-harness "
+                        "parity and to exercise the F32 BN-fold path")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    convert(args.nemo, args.output)
+    convert(args.nemo, args.output, args.f32_encoder)

@@ -32,8 +32,17 @@ ENV LIBRARY_PATH=/usr/local/cuda-13.0/lib64/stubs:/usr/local/cuda-13.0/compat:$L
 
 COPY . .
 ARG CRISPASR_BUILD_JOBS
+# GGML_NATIVE=OFF is REQUIRED for a distributed image (#261). Without it ggml
+# defaults GGML_NATIVE=ON → `-march=native`, baking the BUILD runner's CPU
+# instruction set (e.g. AVX-512) into the CPU ggml kernels. GPU ASR runs fine
+# on any host, but the CPU-only paths — Silero VAD and pyannote diarization —
+# then hit an illegal instruction (SIGILL) on hosts without those extensions
+# (common on consumer / WSL2 CPUs) and the server dies silently. OFF pins a
+# portable AVX2/FMA/F16C baseline (AVX-512 stays off); the GPU kernels are
+# unaffected.
 RUN jobs="${CRISPASR_BUILD_JOBS:-$(nproc)}" && \
     cmake -S . -B build -G Ninja -DCRISPASR_BUILD_TESTS=OFF -DGGML_CUDA=1 \
+        -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
         -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;120-real;120-virtual" \
         -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-shlib-undefined" && \
     cmake --build build -j"${jobs}" --target crispasr-cli

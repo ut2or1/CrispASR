@@ -232,6 +232,12 @@ pub struct SessionSegment {
     pub start: f64,
     pub end: f64,
     pub words: Vec<SessionWord>,
+    /// Whisper's per-segment probability that the segment is non-speech (the
+    /// `<|nospeech|>` token posterior), in `[0, 1]`. Only the whisper backend
+    /// produces it; every other backend leaves the `-1.0` sentinel ("no
+    /// data"), so a consumer can tell "unavailable" apart from a genuine low
+    /// no-speech probability.
+    pub no_speech_prob: f32,
 }
 
 /// Per-frame CTC logits captured from a CTC backend.
@@ -376,6 +382,28 @@ impl Session {
             out.push(piece);
         }
         Some(out)
+    }
+
+    /// The acoustic language whisper detected on the last transcribe, as an
+    /// ISO-639-1 code (e.g. `"en"`). Whisper-only: other backends return the
+    /// session's source-language hint, or `"unknown"` when none was set — as
+    /// does whisper before its first transcribe. This is the in-decode
+    /// acoustic signal, distinct from a text-LID pass over the transcript.
+    pub fn detected_language(&self) -> String {
+        let mut buf = [0 as c_char; 32];
+        let n = unsafe {
+            crispasr_sys::crispasr_session_detected_language(
+                self.handle,
+                buf.as_mut_ptr(),
+                buf.len() as c_int,
+            )
+        };
+        if n <= 0 {
+            return "unknown".to_string();
+        }
+        unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
     }
 
     /// Transcribe 16 kHz mono `f32` PCM. The internal dispatcher routes
@@ -635,11 +663,13 @@ impl Session {
                         confidence: if raw_p < 0.0 { 1.0 } else { raw_p },
                     });
                 }
+                let nsp = crispasr_sys::crispasr_session_result_segment_no_speech_prob(res, i);
                 out.push(SessionSegment {
                     text: text.trim().to_string(),
                     start: t0,
                     end: t1,
                     words,
+                    no_speech_prob: nsp,
                 });
             }
             // Lift out the raw CTC logits (if any) before the handle is freed.
@@ -769,11 +799,13 @@ impl Session {
                         confidence: if raw_p < 0.0 { 1.0 } else { raw_p },
                     });
                 }
+                let nsp = crispasr_sys::crispasr_session_result_segment_no_speech_prob(res, i);
                 out.push(SessionSegment {
                     text: text.trim().to_string(),
                     start: t0,
                     end: t1,
                     words,
+                    no_speech_prob: nsp,
                 });
             }
             crispasr_sys::crispasr_session_result_free(res);

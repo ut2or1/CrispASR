@@ -102,6 +102,8 @@ void canary_ctc_decode_result_free(struct canary_ctc_decode_result* r);
 
 // Hyperparameters
 int canary_ctc_n_vocab(struct canary_ctc_context* ctx);
+// SentencePiece piece string for a token id in [0, n_vocab); "" if out of range / no tokens loaded.
+const char* canary_ctc_token_text(struct canary_ctc_context* ctx, int id);
 int canary_ctc_blank_id(struct canary_ctc_context* ctx);
 int canary_ctc_frame_dur_cs(struct canary_ctc_context* ctx);
 int canary_ctc_n_mels(struct canary_ctc_context* ctx);

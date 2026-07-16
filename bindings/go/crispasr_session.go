@@ -2,7 +2,7 @@ package whisper
 
 // Minimal TTS + S2S surface for the Go binding. Exposes the unified
 // CrispASR Session API for TTS-capable backends (kokoro, vibevoice,
-// qwen3-tts, orpheus, chatterbox, csm, dia, zonos-tts, speecht5, fastpitch,
+// qwen3-tts, moss-tts, orpheus, chatterbox, csm, dia, zonos-tts, speecht5, fastpitch,
 // bananamind-tts, melotts, piper, parler-tts, outetts, indextts, voxcpm2-tts,
 // cosyvoice3-tts, pocket-tts, f5-tts, bark, kugelaudio, tada, lfm2-audio,
 // dots-tts, ...)
@@ -106,6 +106,7 @@ const char*  crispasr_session_result_word_text(crispasr_session_result* r, int i
 long long    crispasr_session_result_word_t0(crispasr_session_result* r, int i_seg, int i_word);
 long long    crispasr_session_result_word_t1(crispasr_session_result* r, int i_seg, int i_word);
 float        crispasr_session_result_word_p(crispasr_session_result* r, int i_seg, int i_word);
+float        crispasr_session_result_segment_no_speech_prob(crispasr_session_result* r, int i_seg);
 // Per-frame CTC logits (opted in via crispasr_session_set_return_logits) for
 // backends that produce a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,
 // canary-ctc). Frame-major: logits[t * n_logit_vocab + v]. Raw pre-softmax for
@@ -306,6 +307,7 @@ int crispasr_registry_list_backends_abi(char* out_csv, int out_cap);
 
 // --- Session extras ---
 int crispasr_session_available_backends(char* out_csv, int out_cap);
+int crispasr_session_detected_language(crispasr_session* s, char* out_buf, int out_cap);
 // CTC vocabulary access (Omni CTC backend): n_vocab piece count, token_text
 // maps an id to its raw piece (word-boundary marker intact) or "" when out of
 // range / unsupported. Pairs with the result logits accessor for detokenization.
@@ -331,7 +333,7 @@ import (
 	"unsafe"
 )
 
-// CrispasrSession is a TTS/S2S-capable session (kokoro, vibevoice, qwen3-tts, orpheus, parler-tts, pocket-tts, tada, lfm2-audio, mini-omni2).
+// CrispasrSession is a TTS/S2S-capable session (kokoro, vibevoice, qwen3-tts, moss-tts, orpheus, parler-tts, pocket-tts, tada, lfm2-audio, mini-omni2).
 type CrispasrSession struct {
 	handle *C.CrispasrSession
 }
@@ -497,8 +499,9 @@ func (s *CrispasrSession) SetFrequencyPenalty(penalty float32) error {
 	return nil
 }
 
-// SetTTSSteps sets the diffusion / CFM step count for diffusion-based TTS
-// backends (chatterbox today). Other backends silently no-op.
+// SetTTSSteps sets the diffusion / CFM / masked-iterative step count for
+// step-based TTS backends (chatterbox, vibevoice, kugelaudio, tada, irodori,
+// omnivoice). Higher = better fidelity, slower. Other backends silently no-op.
 func (s *CrispasrSession) SetTTSSteps(steps int) error {
 	rc := C.crispasr_session_set_tts_steps(s.handle, C.int(steps))
 	if rc != 0 && rc != -2 {
@@ -1054,6 +1057,10 @@ type TranscribeSegment struct {
 	T0    int64 // centiseconds
 	T1    int64
 	Words []TranscribeWord
+	// NoSpeechProb is Whisper's per-segment no-speech probability (the
+	// <|nospeech|> posterior) in [0, 1]. Whisper-only; other backends leave
+	// the -1.0 "no data" sentinel.
+	NoSpeechProb float32
 }
 
 // TranscribeWord is one word with timing and confidence.
@@ -1192,6 +1199,7 @@ func extractResult(r *C.crispasr_session_result) *TranscribeResult {
 		seg.Text = C.GoString(C.crispasr_session_result_segment_text(r, C.int(i)))
 		seg.T0 = int64(C.crispasr_session_result_segment_t0(r, C.int(i)))
 		seg.T1 = int64(C.crispasr_session_result_segment_t1(r, C.int(i)))
+		seg.NoSpeechProb = float32(C.crispasr_session_result_segment_no_speech_prob(r, C.int(i)))
 		nWords := int(C.crispasr_session_result_n_words(r, C.int(i)))
 		seg.Words = make([]TranscribeWord, nWords)
 		for j := 0; j < nWords; j++ {
@@ -1759,6 +1767,15 @@ func AvailableBackends() []string {
 	return out
 }
 
+// DetectedLanguage returns the acoustic language Whisper detected on the last
+// transcribe as an ISO-639-1 code (e.g. "en"). Whisper-only; other backends
+// return the session's source-language hint, or "unknown".
+func (s *Session) DetectedLanguage() string {
+	var buf [32]C.char
+	C.crispasr_session_detected_language(s.handle, &buf[0], 32)
+	return C.GoString(&buf[0])
+}
+
 func splitCSV(s string) []string {
 	var out []string
 	start := 0
@@ -1818,7 +1835,10 @@ func DetectBackendFromGGUF(path string) (string, error) {
 	defer C.free(unsafe.Pointer(cpath))
 	var out [128]C.char
 	rc := C.crispasr_detect_backend_from_gguf(cpath, &out[0], 128)
-	if rc != 0 {
+	// rc > 0 = detected (strlen of name); rc == 0 = valid GGUF but no backend
+	// mapping (empty name); rc < 0 = error. The prior `rc != 0` reported every
+	// successful detection as a failure.
+	if rc < 0 {
 		return "", fmt.Errorf("detect_backend_from_gguf failed for %s", path)
 	}
 	return C.GoString(&out[0]), nil

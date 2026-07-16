@@ -278,6 +278,17 @@ struct irodori_tts_context {
     ggml_backend_buffer_t buf_weights = nullptr;
     ggml_context* w_ctx = nullptr; // weight tensor context (kept alive)
 
+    // §243: persistent cached DiT step graph (CRISPASR_IRODORI_PERSIST_GRAPH).
+    // The DiT graph shape is constant across every ODE/CFG run_dit_forward call of
+    // one generation, so build + gallocr-alloc ONCE and reuse — stable tensor
+    // addresses let the CUDA graph warm up once (Ampere+) instead of re-capturing
+    // every step. Rebuilt only when the shape signature changes. Freed at teardown.
+    ggml_context* dit_ctx = nullptr;
+    ggml_cgraph* dit_gf = nullptr;
+    ggml_gallocr_t dit_galloc = nullptr;
+    int dit_T_latent = -1, dit_T_text = -1, dit_T_ref = -1, dit_T_cap = -1;
+    bool dit_has_spk = false, dit_has_cap = false;
+
     // Tokenizer (BPE with Metaspace pre-tokenization — matches HF LlamaTokenizer)
     std::vector<std::string> vocab;
     std::unordered_map<std::string, int32_t> token_to_id;
@@ -307,6 +318,9 @@ struct irodori_tts_context {
     ggml_tensor* codec_out_proj_b = nullptr;
     // DAC decoder weights (reusing core_dac structure with DACVAE config)
     core_dac::DacWeights dac;
+    // FASTCONV (docs/perf-sweep/PLAN.md): baked-F32 decode conv kernels so the
+    // per-graph F16→F32 cast becomes a no-op. Gated CRISPASR_IRODORI_FASTCONV.
+    core_dac::fastconv_cache dac_fc;
     // DAC-VAE encoder weights (voice cloning: reference audio → latent)
     irodori_dacvae_encoder enc;
 
@@ -1463,6 +1477,7 @@ struct irodori_tts_context* irodori_tts_init_from_file(const char* path_model, s
 void irodori_tts_free(struct irodori_tts_context* ctx) {
     if (!ctx)
         return;
+    ctx->dac_fc.free(); // FASTCONV baked-kernel buffer (on codec_backend)
     if (ctx->codec_buf)
         ggml_backend_buffer_free(ctx->codec_buf);
     if (ctx->codec_ctx)
@@ -1471,6 +1486,10 @@ void irodori_tts_free(struct irodori_tts_context* ctx) {
         ggml_backend_buffer_free(ctx->buf_weights);
     if (ctx->w_ctx)
         ggml_free(ctx->w_ctx);
+    if (ctx->dit_galloc) // §243 persistent DiT graph
+        ggml_gallocr_free(ctx->dit_galloc);
+    if (ctx->dit_ctx)
+        ggml_free(ctx->dit_ctx);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
         ggml_backend_free(ctx->backend);
     if (ctx->backend_cpu)
@@ -1646,6 +1665,25 @@ int irodori_tts_set_codec_path(struct irodori_tts_context* ctx, const char* code
     ctx->codec_ctx = wl.ctx;
     ctx->codec_buf = wl.buf;
     ctx->has_codec = true;
+
+    // FASTCONV (docs/perf-sweep/PLAN.md): bake F32 copies of the DECODE conv
+    // kernels via the shared core_dac cache so the per-graph F16→F32 cast becomes
+    // a no-op + k=1 convs become matmuls. Gated CRISPASR_IRODORI_FASTCONV (default
+    // on); =0 restores the legacy cast path (clean A/B). Encode/voice-clone convs
+    // stay legacy (rare path).
+    {
+        const char* e = std::getenv("CRISPASR_IRODORI_FASTCONV");
+        const bool on = !(e && e[0] == '0');
+        std::vector<ggml_tensor*> convs = {dac.in_conv_w, dac.out_conv_w, ctx->codec_out_proj_w};
+        for (auto& blk : dac.blocks) {
+            convs.push_back(blk.up_w);
+            for (int r = 0; r < 3; r++) {
+                convs.push_back(blk.res[r].conv0_w);
+                convs.push_back(blk.res[r].conv1_w);
+            }
+        }
+        ctx->dac_fc.bake(ctx->codec_backend, convs, on);
+    }
 
     if (ctx->verbosity >= 1) {
         std::fprintf(stderr, "[irodori] DAC-VAE codec loaded (%d decoder blocks)\n", dac.config.n_decoder_blocks);
@@ -2287,97 +2325,163 @@ static std::vector<float> run_dit_forward(irodori_tts_context* ctx, const float*
     const int D = hp.model_dim;
     const int latent_d = hp.patched_latent_dim();
 
-    const int n_tensors = 2048 + hp.num_layers * 200; // extra for half-RoPE views/concats
-    size_t ctx_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(n_tensors, false);
-    ggml_init_params ip = {ctx_size, nullptr, true};
-    ggml_context* g = ggml_init(ip);
+    // §243 STEP-0: split per-DiT-call time into graph construct+alloc (what a
+    // persistent cached graph eliminates), input-set, and compute. Gated
+    // CRISPASR_IRODORI_DIT_TIMING=1; cumulative, last line = the answer.
+    static const bool s_dit_timing = []() {
+        const char* e = std::getenv("CRISPASR_IRODORI_DIT_TIMING");
+        return e && e[0] && e[0] != '0';
+    }();
+    static int64_t s_construct_us = 0, s_setinput_us = 0, s_compute_us = 0;
+    static int s_dit_calls = 0;
+    const int64_t t_dit0 = s_dit_timing ? ggml_time_us() : 0;
 
-    // Input tensors
-    ggml_tensor* x_in = ggml_new_tensor_2d(g, GGML_TYPE_F32, latent_d, T_latent);
-    ggml_set_name(x_in, "x_t");
-    ggml_set_input(x_in);
+    // §243: reuse a persistent cached DiT graph when the shape signature matches
+    // (it is constant across every ODE/CFG call of one generation). Env-gated
+    // CRISPASR_IRODORI_PERSIST_GRAPH, default OFF. On a cache hit we skip build +
+    // gallocr entirely and only re-set inputs below; stable tensor addresses let
+    // the CUDA graph warm up once and replay (Ampere+), instead of re-capturing
+    // every step. Correctness is identical — only the graph's identity is reused.
+    static const bool s_persist = []() {
+        const char* e = std::getenv("CRISPASR_IRODORI_PERSIST_GRAPH");
+        return e && e[0] && e[0] != '0';
+    }();
+    const bool has_spk = spk_state_data && T_ref > 0;
+    const bool has_cap = cap_state_data && T_cap > 0;
+    // KV length (self | text | speaker | caption) — needed both to size the mask
+    // tensor at build and to refill it every call, so keep it in the outer scope.
+    const int T_kv = T_latent + T_text + (has_spk ? T_ref : 0) + (has_cap ? T_cap : 0);
 
-    ggml_tensor* cond_in = ggml_new_tensor_1d(g, GGML_TYPE_F32, D * 3);
-    ggml_set_name(cond_in, "cond_embed");
-    ggml_set_input(cond_in);
+    ggml_context* g = nullptr;
+    ggml_cgraph* gf = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+    ggml_tensor *x_in = nullptr, *cond_in = nullptr, *text_in = nullptr, *pos_latent = nullptr;
+    ggml_tensor *spk_in = nullptr, *cap_in = nullptr, *attn_mask_in = nullptr, *x = nullptr;
 
-    ggml_tensor* text_in = ggml_new_tensor_2d(g, GGML_TYPE_F32, hp.text_dim, T_text);
-    ggml_set_name(text_in, "text_state");
-    ggml_set_input(text_in);
+    const bool cache_hit = s_persist && ctx->dit_gf && ctx->dit_T_latent == T_latent && ctx->dit_T_text == T_text &&
+                           ctx->dit_T_ref == T_ref && ctx->dit_T_cap == T_cap && ctx->dit_has_spk == has_spk &&
+                           ctx->dit_has_cap == has_cap;
 
-    ggml_tensor* pos_latent = ggml_new_tensor_1d(g, GGML_TYPE_I32, T_latent);
-    ggml_set_name(pos_latent, "pos_latent");
-    ggml_set_input(pos_latent);
+    if (cache_hit) {
+        g = ctx->dit_ctx;
+        gf = ctx->dit_gf;
+        galloc = ctx->dit_galloc;
+        x_in = ggml_graph_get_tensor(gf, "x_t");
+        cond_in = ggml_graph_get_tensor(gf, "cond_embed");
+        text_in = ggml_graph_get_tensor(gf, "text_state");
+        pos_latent = ggml_graph_get_tensor(gf, "pos_latent");
+        spk_in = ggml_graph_get_tensor(gf, "spk_state"); // null if not in this graph
+        cap_in = ggml_graph_get_tensor(gf, "cap_state");
+        attn_mask_in = ggml_graph_get_tensor(gf, "attn_mask");
+        x = ggml_graph_get_tensor(gf, "v_pred");
+    } else {
+        // Persist on but shape changed (or first call): free any stale cached graph.
+        if (s_persist && ctx->dit_ctx) {
+            if (ctx->dit_galloc)
+                ggml_gallocr_free(ctx->dit_galloc);
+            ggml_free(ctx->dit_ctx);
+            ctx->dit_ctx = nullptr;
+            ctx->dit_gf = nullptr;
+            ctx->dit_galloc = nullptr;
+        }
 
-    ggml_tensor* spk_in = nullptr;
-    ggml_tensor* cap_in = nullptr;
-    ggml_tensor* attn_mask_in = nullptr;
+        const int n_tensors = 2048 + hp.num_layers * 200; // extra for half-RoPE views/concats
+        size_t ctx_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(n_tensors, false);
+        ggml_init_params ip = {ctx_size, nullptr, true};
+        g = ggml_init(ip);
 
-    if (spk_state_data && T_ref > 0) {
-        spk_in = ggml_new_tensor_2d(g, GGML_TYPE_F32, hp.speaker_dim, T_ref);
-        ggml_set_name(spk_in, "spk_state");
-        ggml_set_input(spk_in);
+        // Input tensors
+        x_in = ggml_new_tensor_2d(g, GGML_TYPE_F32, latent_d, T_latent);
+        ggml_set_name(x_in, "x_t");
+        ggml_set_input(x_in);
+
+        cond_in = ggml_new_tensor_1d(g, GGML_TYPE_F32, D * 3);
+        ggml_set_name(cond_in, "cond_embed");
+        ggml_set_input(cond_in);
+
+        text_in = ggml_new_tensor_2d(g, GGML_TYPE_F32, hp.text_dim, T_text);
+        ggml_set_name(text_in, "text_state");
+        ggml_set_input(text_in);
+
+        pos_latent = ggml_new_tensor_1d(g, GGML_TYPE_I32, T_latent);
+        ggml_set_name(pos_latent, "pos_latent");
+        ggml_set_input(pos_latent);
+
+        if (has_spk) {
+            spk_in = ggml_new_tensor_2d(g, GGML_TYPE_F32, hp.speaker_dim, T_ref);
+            ggml_set_name(spk_in, "spk_state");
+            ggml_set_input(spk_in);
+        }
+        if (has_cap) {
+            cap_in = ggml_new_tensor_2d(g, GGML_TYPE_F32, hp.caption_dim, T_cap);
+            ggml_set_name(cap_in, "cap_state");
+            ggml_set_input(cap_in);
+        }
+
+        // Attention mask when speaker or caption needs masking (T_kv from outer scope)
+        if (spk_in || cap_in) {
+            attn_mask_in = ggml_new_tensor_2d(g, GGML_TYPE_F16, T_kv, T_latent);
+            ggml_set_name(attn_mask_in, "attn_mask");
+            ggml_set_input(attn_mask_in);
+        }
+
+        // Build graph: in_proj → DiT blocks → out_norm → out_proj
+        IRODORI_DBG("[irodori]     in_proj: (%d,%d) x (%d,%d)\n", (int)w.in_proj_w->ne[0], (int)w.in_proj_w->ne[1],
+                    latent_d, T_latent);
+        x = mul_mat_f32(g, w.in_proj_w, x_in);
+        x = ggml_add(g, x, w.in_proj_b);
+        IRODORI_DBG("[irodori]     after in_proj: (%d,%d)\n", (int)x->ne[0], (int)x->ne[1]);
+
+        // Build just the first layer for debugging, then add more once stable
+        int n_build_layers = hp.num_layers;
+        const char* env_layers = std::getenv("CRISPASR_IRODORI_LAYERS");
+        if (env_layers)
+            n_build_layers = std::min(std::atoi(env_layers), hp.num_layers);
+        for (int i = 0; i < n_build_layers; i++) {
+            IRODORI_DBG("[irodori]     building DiT block %d...\n", i);
+            x = build_dit_block_graph(g, ctx, w.dit_blocks[i], x, cond_in, text_in, T_text, spk_in, T_ref, cap_in,
+                                      T_cap, T_latent, pos_latent, attn_mask_in);
+            IRODORI_DBG("[irodori]     DiT block %d built OK\n", i);
+        }
+
+        x = rms_norm(g, x, w.out_norm, hp.norm_eps);
+        x = mul_mat_f32(g, w.out_proj_w, x);
+        x = ggml_add(g, x, w.out_proj_b);
+        ggml_set_name(x, "v_pred");
+        ggml_set_output(x);
+
+        IRODORI_DBG("[irodori]     DiT graph built, creating cgraph (%d tensors)...\n", n_tensors);
+        gf = ggml_new_graph_custom(g, n_tensors, false);
+        ggml_build_forward_expand(gf, x);
+        IRODORI_DBG("[irodori]     cgraph has %d nodes, allocating...\n", ggml_graph_n_nodes(gf));
+
+        // Allocate
+        galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+        bool res_ok = ggml_gallocr_reserve(galloc, gf);
+        IRODORI_DBG("[irodori]     gallocr reserve: %s\n", res_ok ? "OK" : "FAILED");
+        bool alloc_ok = ggml_gallocr_alloc_graph(galloc, gf);
+        IRODORI_DBG("[irodori]     gallocr alloc: %s\n", alloc_ok ? "OK" : "FAILED");
+        if (!res_ok || !alloc_ok) {
+            std::fprintf(stderr, "[irodori] ERROR: failed to allocate DiT graph\n");
+            ggml_gallocr_free(galloc);
+            ggml_free(g);
+            return {};
+        }
+
+        if (s_persist) {
+            ctx->dit_ctx = g;
+            ctx->dit_gf = gf;
+            ctx->dit_galloc = galloc;
+            ctx->dit_T_latent = T_latent;
+            ctx->dit_T_text = T_text;
+            ctx->dit_T_ref = T_ref;
+            ctx->dit_T_cap = T_cap;
+            ctx->dit_has_spk = has_spk;
+            ctx->dit_has_cap = has_cap;
+        }
     }
-    if (cap_state_data && T_cap > 0) {
-        cap_in = ggml_new_tensor_2d(g, GGML_TYPE_F32, hp.caption_dim, T_cap);
-        ggml_set_name(cap_in, "cap_state");
-        ggml_set_input(cap_in);
-    }
 
-    // Attention mask when speaker or caption needs masking
-    int T_kv = T_latent + T_text;
-    if (spk_in)
-        T_kv += T_ref;
-    if (cap_in)
-        T_kv += T_cap;
-    if (spk_in || cap_in) {
-        attn_mask_in = ggml_new_tensor_2d(g, GGML_TYPE_F16, T_kv, T_latent);
-        ggml_set_name(attn_mask_in, "attn_mask");
-        ggml_set_input(attn_mask_in);
-    }
-
-    // Build graph: in_proj → DiT blocks → out_norm → out_proj
-    IRODORI_DBG("[irodori]     in_proj: (%d,%d) x (%d,%d)\n", (int)w.in_proj_w->ne[0], (int)w.in_proj_w->ne[1],
-                latent_d, T_latent);
-    ggml_tensor* x = mul_mat_f32(g, w.in_proj_w, x_in);
-    x = ggml_add(g, x, w.in_proj_b);
-    IRODORI_DBG("[irodori]     after in_proj: (%d,%d)\n", (int)x->ne[0], (int)x->ne[1]);
-
-    // Build just the first layer for debugging, then add more once stable
-    int n_build_layers = hp.num_layers;
-    const char* env_layers = std::getenv("CRISPASR_IRODORI_LAYERS");
-    if (env_layers)
-        n_build_layers = std::min(std::atoi(env_layers), hp.num_layers);
-    for (int i = 0; i < n_build_layers; i++) {
-        IRODORI_DBG("[irodori]     building DiT block %d...\n", i);
-        x = build_dit_block_graph(g, ctx, w.dit_blocks[i], x, cond_in, text_in, T_text, spk_in, T_ref, cap_in, T_cap,
-                                  T_latent, pos_latent, attn_mask_in);
-        IRODORI_DBG("[irodori]     DiT block %d built OK\n", i);
-    }
-
-    x = rms_norm(g, x, w.out_norm, hp.norm_eps);
-    x = mul_mat_f32(g, w.out_proj_w, x);
-    x = ggml_add(g, x, w.out_proj_b);
-    ggml_set_name(x, "v_pred");
-    ggml_set_output(x);
-
-    IRODORI_DBG("[irodori]     DiT graph built, creating cgraph (%d tensors)...\n", n_tensors);
-    ggml_cgraph* gf = ggml_new_graph_custom(g, n_tensors, false);
-    ggml_build_forward_expand(gf, x);
-    IRODORI_DBG("[irodori]     cgraph has %d nodes, allocating...\n", ggml_graph_n_nodes(gf));
-
-    // Allocate and set inputs
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-    bool res_ok = ggml_gallocr_reserve(galloc, gf);
-    IRODORI_DBG("[irodori]     gallocr reserve: %s\n", res_ok ? "OK" : "FAILED");
-    bool alloc_ok = ggml_gallocr_alloc_graph(galloc, gf);
-    IRODORI_DBG("[irodori]     gallocr alloc: %s\n", alloc_ok ? "OK" : "FAILED");
-    if (!res_ok || !alloc_ok) {
-        std::fprintf(stderr, "[irodori] ERROR: failed to allocate DiT graph\n");
-        ggml_gallocr_free(galloc);
-        ggml_free(g);
-        return {};
-    }
+    const int64_t t_dit1 = s_dit_timing ? ggml_time_us() : 0; // construct+alloc done
 
     // Set inputs (only if allocated — unused inputs have null buffers)
     if (x_in->buffer)
@@ -2417,14 +2521,33 @@ static std::vector<float> run_dit_forward(irodori_tts_context* ctx, const float*
         ggml_backend_tensor_set(attn_mask_in, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
     }
 
+    const int64_t t_dit2 = s_dit_timing ? ggml_time_us() : 0; // input-set done
     ggml_backend_graph_compute(ctx->backend, gf);
+    if (s_dit_timing) {
+        const int64_t t_dit3 = ggml_time_us();
+        s_construct_us += t_dit1 - t_dit0;
+        s_setinput_us += t_dit2 - t_dit1;
+        s_compute_us += t_dit3 - t_dit2;
+        s_dit_calls++;
+        const double c = s_construct_us / 1e3, si = s_setinput_us / 1e3, cp = s_compute_us / 1e3;
+        const double tot = c + si + cp;
+        fprintf(stderr,
+                "[irodori dit_timing] calls=%d cum: construct+alloc=%.1fms (%.1f%%) setinput=%.1fms (%.1f%%) "
+                "compute=%.1fms (%.1f%%) | persistence removes the construct+alloc share\n",
+                s_dit_calls, c, tot > 0 ? 100 * c / tot : 0, si, tot > 0 ? 100 * si / tot : 0, cp,
+                tot > 0 ? 100 * cp / tot : 0);
+    }
 
     // Read velocity prediction
     std::vector<float> v_pred(T_latent * latent_d);
     ggml_backend_tensor_get(x, v_pred.data(), 0, v_pred.size() * sizeof(float));
 
-    ggml_gallocr_free(galloc);
-    ggml_free(g);
+    // §243: keep the graph alive when persisting (freed at teardown); otherwise
+    // free per-call as before.
+    if (!s_persist) {
+        ggml_gallocr_free(galloc);
+        ggml_free(g);
+    }
     return v_pred;
 }
 
@@ -2496,24 +2619,25 @@ static std::vector<float> decode_dac_window(irodori_tts_context* ctx, const floa
     ggml_set_name(lat_in, "latent_in");
     ggml_set_input(lat_in);
 
+    const core_dac::fastconv_cache* fc = &ctx->dac_fc;
     ggml_tensor* h = lat_in;
     if (ctx->codec_out_proj_w) {
-        h = core_dac::conv1d(g, h, ctx->codec_out_proj_w, ctx->codec_out_proj_b, 1);
+        h = core_dac::conv1d(g, h, ctx->codec_out_proj_w, ctx->codec_out_proj_b, 1, 1, fc);
         h = ggml_cast(g, h, GGML_TYPE_F32);
     }
     if (dac.in_conv_w) {
-        h = core_dac::conv1d(g, h, dac.in_conv_w, dac.in_conv_b, 7);
+        h = core_dac::conv1d(g, h, dac.in_conv_w, dac.in_conv_b, 7, 1, fc);
         h = ggml_cast(g, h, GGML_TYPE_F32);
     }
     for (int b = 0; b < cfg.n_decoder_blocks; b++) {
-        h = core_dac::dec_block(g, h, dac.blocks[b], cfg.upsampling_ratios[b]);
+        h = core_dac::dec_block(g, h, dac.blocks[b], cfg.upsampling_ratios[b], fc);
         h = ggml_cont(g, h);
         h = ggml_cast(g, h, GGML_TYPE_F32);
     }
     if (dac.out_snake_alpha)
         h = core_dac::snake(g, h, dac.out_snake_alpha);
     if (dac.out_conv_w) {
-        h = core_dac::conv1d(g, h, dac.out_conv_w, dac.out_conv_b, 7);
+        h = core_dac::conv1d(g, h, dac.out_conv_w, dac.out_conv_b, 7, 1, fc);
         h = ggml_cast(g, h, GGML_TYPE_F32);
     }
     h = ggml_tanh(g, h);

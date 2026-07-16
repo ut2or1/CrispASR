@@ -117,6 +117,12 @@ static inline std::vector<int32_t> tokenize(const std::string& text,
         }
     }
 
+    // A ≥2 GiB input would overflow the int32 length below (n + 1 → INT_MIN,
+    // OOB reads in the DP tables / piece_at). No real ASR/TTS text approaches
+    // this. Reject at INT_MAX so `n + 1` (and `(size_t)n + 1`) never overflows.
+    if (s.size() >= 0x7fffffffu) {
+        return {};
+    }
     const int n = (int)s.size();
     if (n == 0) {
         return {};
@@ -127,9 +133,9 @@ static inline std::vector<int32_t> tokenize(const std::string& text,
     // dp[i] = best total log-prob to reach byte position i.
     // piece_at[i] = token ID of the last piece ending at position i.
     // prev_pos[i] = byte position before the last piece.
-    std::vector<float> dp(n + 1, NEG_INF);
-    std::vector<int32_t> piece_at(n + 1, -1);
-    std::vector<int> prev_pos(n + 1, -1);
+    std::vector<float> dp((size_t)n + 1, NEG_INF);
+    std::vector<int32_t> piece_at((size_t)n + 1, -1);
+    std::vector<int> prev_pos((size_t)n + 1, -1);
     dp[0] = 0.0f;
 
     for (int i = 0; i < n; i++) {
@@ -291,6 +297,11 @@ static inline std::vector<int32_t> tokenize_bpe(const std::string& text,
                                                 const std::unordered_map<std::string, int32_t>& token_to_id,
                                                 const std::vector<float>& scores, const Config& cfg = {},
                                                 bool prepend_space = true) {
+    // A >2 GiB input would overflow the int32 arithmetic below (max_iter =
+    // (int)symbols.size() * 2). No real ASR/TTS text approaches this.
+    if (text.size() > 0x7fffffffu) {
+        return {};
+    }
     std::string s;
     s.reserve(text.size() + 4);
     if (prepend_space) {

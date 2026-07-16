@@ -3,8 +3,8 @@
 // Tests for: consent gate logic, C2PA no-op, ID3v2 tag structure,
 // WAV LIST/INFO metadata, disclaimer helpers.
 
-#include "crispasr_wav_writer.h"
-#include "crispasr_c2pa.h"
+#include "core/crispasr_wav_writer.h"
+#include "core/crispasr_c2pa.h"
 
 #include <catch2/catch_test_macros.hpp>
 

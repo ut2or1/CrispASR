@@ -280,6 +280,12 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
 // an empty string if detection fails.
 std::string crispasr_detect_backend_from_gguf(const std::string& model_path);
 
+// True if the GGUF at model_path is a pure-CTC FastConformer model (no RNN-T
+// decoder/joint tensors) — i.e. a parakeet-ctc / stt_*_fastconformer_ctc that must
+// run on the fastconformer-ctc backend, not the parakeet (transducer) backend.
+// Cheap: reads tensor infos only (no weights). Returns false on any read failure.
+bool crispasr_gguf_is_pure_ctc(const std::string& model_path);
+
 // List the backend names that were compiled into this binary.
 std::vector<std::string> crispasr_list_backends();
 

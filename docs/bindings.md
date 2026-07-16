@@ -78,9 +78,25 @@ backend doesn't expose that knob, but the call is safe to make.
 > (`bindings/javascript/emscripten.cpp`) via the `asr*` functions
 > (`asrOpen`/`asrTranscribe`/`asrSet…`).
 >
+> **⚠ `transcribe` does not auto-chunk long audio.** The session `transcribe`
+> is a low-level "transcribe this buffer" primitive: it runs one pass over the
+> whole PCM. For short-segment models (e.g. moonshine) that degrades and slows
+> badly past ~30 s. The CLI/server add dispatcher chunking on top; session
+> callers must chunk long audio themselves or use `transcribe_chunked`
+> (parakeet has bespoke internal long-audio handling, so it is the exception).
+>
 > **Chunked long-form + progress (issue #208).** `transcribe_chunked` forces
-> the Parakeet backend through its bounded overlapping-window long-form path
-> (inert on other backends) and is exposed in **every** binding:
+> the Parakeet backend through its bounded long-form path (inert on other
+> backends) and is exposed in **every** binding:
+>
+> _Issue #257:_ when `chunk_seconds > 0` is passed explicitly, the non-JA
+> Parakeet path now runs one coherent internal-streamed decode at the model's
+> quality encoder window (complete text, bounded VRAM — small encoder windows
+> degrade this full-attention FastConformer) and returns **~`chunk_seconds`-second
+> segments** (per-segment `start`/`end`/`words`), instead of one giant segment.
+> `chunk_seconds <= 0` keeps the single-merged-segment #208 contract.
+>
+> Binding names:
 > `Session.transcribe_chunked` (Python), `CrispasrSession.TranscribeChunked`
 > (Go), `.transcribeChunked` (Java/Dart), `Session.transcribe_chunked` (Ruby),
 > `asrTranscribeChunked` (WASM), `transcribeSession({chunk_seconds,…})` (Node
@@ -303,6 +319,15 @@ concatenation) before watermarking, use `synthesize_raw()` +
 `watermark_embed()` instead. The spoken disclaimer is not applied at
 the C API level (see
 [`tts.md`](tts.md#spoken-disclaimer-voice-clones-only)).
+
+> **The CLI `--no-watermark` flag and the `CRISPASR_NO_WATERMARK` env var do
+> NOT affect the bindings.** They are wired into the `crispasr` CLI and server
+> only; `synthesize()` and `crispasr_watermark_embed()` watermark
+> unconditionally. A binding consumer that legitimately needs unwatermarked
+> output uses `synthesize_raw()` and simply does not call `watermark_embed()` —
+> and thereby assumes the AI-content marking responsibility itself (see
+> [`tts.md`](tts.md#disabling-the-watermark-operator-opt-out) for what that
+> means).
 
 ```python
 # Python (identical shape in every binding)

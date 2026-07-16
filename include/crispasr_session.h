@@ -220,6 +220,12 @@ CRISPASR_SESSION_API crispasr_session* crispasr_session_open_with_params(const c
                                                                          const crispasr_open_params_v1* params);
 CRISPASR_SESSION_API const char* crispasr_session_backend(crispasr_session* s);
 CRISPASR_SESSION_API int crispasr_session_available_backends(char* out_csv, int out_cap);
+// Acoustic language detected by the last transcribe, as an ISO-639-1 code
+// (whisper only; other backends fall back to the source-language hint, then
+// "unknown"). Writes into out_buf (NUL-terminated, truncated to out_cap) and
+// returns the code length in bytes, or -1 on bad args. Distinct from the
+// text-LID pass crispasr_text_detect_language.
+CRISPASR_SESSION_API int crispasr_session_detected_language(crispasr_session* s, char* out_buf, int out_cap);
 // CTC vocabulary access (Omni CTC backend). crispasr_session_n_vocab returns
 // the number of SentencePiece pieces in the loaded model (0 for backends that
 // don't expose a CTC vocab); crispasr_session_token_text maps a token id in
@@ -290,6 +296,10 @@ CRISPASR_SESSION_API const char* crispasr_session_result_word_text(crispasr_sess
 CRISPASR_SESSION_API int64_t crispasr_session_result_word_t0(crispasr_session_result* r, int i_seg, int i_word);
 CRISPASR_SESSION_API int64_t crispasr_session_result_word_t1(crispasr_session_result* r, int i_seg, int i_word);
 CRISPASR_SESSION_API float crispasr_session_result_word_p(crispasr_session_result* r, int i_seg, int i_word);
+// Whisper's per-segment no-speech probability (the <|nospeech|> token
+// posterior) in [0, 1]. Only the whisper backend populates it; other backends
+// and out-of-range indices return the -1.0 sentinel ("no data").
+CRISPASR_SESSION_API float crispasr_session_result_segment_no_speech_prob(crispasr_session_result* r, int i_seg);
 // Per-frame CTC logits (opted in via crispasr_session_set_return_logits) for
 // backends that produce a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,
 // canary-ctc). Frame-major: logits[t * n_logit_vocab + v]. Raw pre-softmax for
@@ -304,6 +314,12 @@ CRISPASR_SESSION_API const char* crispasr_session_result_word_alt_text(crispasr_
 CRISPASR_SESSION_API float crispasr_session_result_word_alt_p(crispasr_session_result* r, int i_seg, int i_word,
                                                               int i_alt);
 CRISPASR_SESSION_API void crispasr_session_result_free(crispasr_session_result* r);
+// Issue #257: parakeet/canary local-attention window in encoder frames (~80 ms
+// each) — NeMo change_attention_model("rel_pos_local_attn", [left, right]).
+// Bounds long-audio encoder memory to O(T·window) instead of O(T²). Negative
+// values = full attention; INT_MIN,INT_MIN = clear (use the model default).
+// No-op for non-parakeet backends. Returns 0 on success.
+CRISPASR_SESSION_API int crispasr_session_set_parakeet_att_context(crispasr_session* s, int left, int right);
 CRISPASR_SESSION_API int crispasr_session_set_codec_path(crispasr_session* s, const char* path);
 CRISPASR_SESSION_API int crispasr_session_set_voice(crispasr_session* s, const char* path,
                                                     const char* ref_text_or_null);

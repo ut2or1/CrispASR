@@ -11,6 +11,14 @@ TEST_CASE("parakeet_params: default values are sensible", "[unit][parakeet]") {
     REQUIRE(p.verbosity >= 0);
 }
 
+// Defaults-audit / config-parity guard (motivated by #192/#197 + PLAN #89). Pin
+// the shipped use_flash/use_gpu defaults so a silent flip fails CI.
+TEST_CASE("parakeet_params: gpu/flash defaults are pinned", "[unit][parakeet]") {
+    struct parakeet_context_params p = parakeet_context_default_params();
+    REQUIRE(p.use_gpu == true);
+    REQUIRE(p.use_flash == false);
+}
+
 TEST_CASE("parakeet_init_from_file: null path returns nullptr", "[unit][parakeet]") {
     struct parakeet_context_params p = parakeet_context_default_params();
     struct parakeet_context* ctx = parakeet_init_from_file(nullptr, p);
