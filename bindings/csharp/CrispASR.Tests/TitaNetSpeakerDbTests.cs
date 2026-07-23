@@ -83,11 +83,27 @@ namespace CrispASR.Tests
         }
 
         [Fact]
-        public void SpeakerDb_Load_ThrowsOnBadPath()
+        public void SpeakerDb_Open_ThrowsWithoutConsent()
         {
+            // Consent gate is enforced managed-side; no native library needed.
+            Assert.Throws<InvalidOperationException>(() =>
+                SpeakerDb.Open("/nonexistent/speakers", "Alice", consentAttested: false));
+        }
+
+        [Fact]
+        public void SpeakerDb_Open_ThrowsOnEmptyRoster()
+        {
+            // No open 1:N mode: an empty claimed roster is refused natively.
             if (!CanLoadLibrary()) return;
             Assert.Throws<InvalidOperationException>(() =>
-                SpeakerDb.Load("/nonexistent/speakers"));
+                SpeakerDb.Open("/nonexistent/speakers", "", consentAttested: true));
+        }
+
+        [Fact]
+        public void SpeakerDb_Enroll_ThrowsWithoutConsent()
+        {
+            Assert.Throws<InvalidOperationException>(() =>
+                SpeakerDb.Enroll("/nonexistent/speakers", "alice", new float[] { 1, 0 }, consentAttested: false));
         }
     }
 }

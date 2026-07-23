@@ -44,6 +44,13 @@ std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_streaming_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_gemma4_e2b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_omniasr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_mimo_asr_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_htdemucs_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_mel_band_roformer_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_crepe_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_btc_chords_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_tabcnn_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_rvc_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_beat_this_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_ark_asr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moss_audio_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moss_tts_backend();
@@ -53,7 +60,11 @@ std::unique_ptr<CrispasrBackend> crispasr_make_moss_transcribe_diarize_backend()
 std::unique_ptr<CrispasrBackend> crispasr_make_funasr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_paraformer_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_sensevoice_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_sidon_backend();
+std::unique_ptr<CrispasrBackend> crispasr_create_miotts_backend();
+std::unique_ptr<CrispasrBackend> crispasr_create_piano_transcription_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_voxcpm2_tts_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_voxcpm2_vae_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_cosyvoice3_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_piper_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_melotts_backend();
@@ -91,7 +102,11 @@ std::unique_ptr<CrispasrBackend> crispasr_make_omnivoice_backend();
 // ---------------------------------------------------------------------------
 
 std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name) {
-    if (name == "whisper")
+    // "tiron" (#295) is a Whisper large-v3 checkpoint with inline <|speakerN|>
+    // markers — it runs on the whisper backend, which auto-detects the speaker
+    // vocab and enables the tiron constrained-decoding grammar. The alias only
+    // affects the model-registry lookup + CLI dispatch.
+    if (name == "whisper" || name == "tiron")
         return crispasr_make_whisper_backend();
     if (name == "nemotron" || name == "nemotron-streaming" || name == "nemotron-3.5" || name == "nemotron-asr" ||
         name == "nemotron-speech-streaming")
@@ -143,6 +158,10 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         name == "qwen3-tts-1.7b-customvoice" || name == "qwen3-tts-1.7b-cv" || name == "qwen3-tts-1.7b-voicedesign" ||
         name == "qwen3-tts-voicedesign" || name == "qwen3-tts-vd")
         return crispasr_make_qwen3_tts_backend();
+    if (name == "miotts" || name == "mio-tts" || name == "mio_tts" || name == "miotts-0.6b")
+        return crispasr_create_miotts_backend();
+    if (name == "piano-transcription" || name == "piano_transcription" || name == "piano-trans")
+        return crispasr_create_piano_transcription_backend();
     if (name == "moss-tts-local" || name == "moss_tts_local" || name == "moss-tts-local-v1.5" ||
         name == "mosstts-local" || name == "moss-tts-local-transformer")
         return crispasr_make_moss_tts_local_backend();
@@ -184,6 +203,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_fastpitch_backend();
     if (name == "voxcpm2-tts" || name == "voxcpm2" || name == "voxcpm" || name == "voxcpm2_tts")
         return crispasr_make_voxcpm2_tts_backend();
+    if (name == "voxcpm2-vae" || name == "voxcpm2_vae" || name == "voxcpm2-upscaler")
+        return crispasr_make_voxcpm2_vae_backend();
     if (name == "cosyvoice3" || name == "cosyvoice3-tts" || name == "cosyvoice3_tts" || name == "cv3" ||
         name == "cv3-tts")
         return crispasr_make_cosyvoice3_tts_backend();
@@ -194,6 +215,21 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_t5_backend();
     if (name == "glm-asr" || name == "glmasr" || name == "glm" || name == "glm_asr")
         return crispasr_make_glm_asr_backend();
+    if (name == "htdemucs" || name == "demucs" || name == "htdemucs-ft")
+        return crispasr_make_htdemucs_backend();
+    if (name == "mel-band-roformer" || name == "mel_band_roformer" || name == "melbandroformer" || name == "mbr")
+        return crispasr_make_mel_band_roformer_backend();
+    if (name == "crepe" || name == "crepe-tiny" || name == "crepe-full" || name == "pitch")
+        return crispasr_make_crepe_backend();
+    if (name == "btc-chords" || name == "btc" || name == "chords" || name == "btc-chords-large" ||
+        name == "btc-chords-majmin")
+        return crispasr_make_btc_chords_backend();
+    if (name == "tabcnn" || name == "tab" || name == "tablature")
+        return crispasr_make_tabcnn_backend();
+    if (name == "rvc-svc" || name == "rvc" || name == "svc")
+        return crispasr_make_rvc_backend();
+    if (name == "beat-this" || name == "beatthis" || name == "beat_this" || name == "beats")
+        return crispasr_make_beat_this_backend();
     if (name == "kyutai-stt" || name == "kyutai" || name == "moshi-stt" || name == "kyutai-stt-2.6b")
         return crispasr_make_kyutai_stt_backend();
     if (name == "firered-asr" || name == "firered")
@@ -223,6 +259,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_paraformer_backend();
     if (name == "sensevoice" || name == "sensevoice-small" || name == "sense-voice")
         return crispasr_make_sensevoice_backend();
+    if (name == "sidon" || name == "sidon-v0.1" || name == "speech-restoration")
+        return crispasr_make_sidon_backend();
     if (name == "bark" || name == "bark-tts" || name == "bark-small" || name == "bark-large")
         return crispasr_make_bark_backend();
     if (name == "speecht5" || name == "speecht5-tts" || name == "speecht5_tts")
@@ -275,6 +313,8 @@ std::vector<std::string> crispasr_list_backends() {
         "vibevoice",
         "kugelaudio",
         "qwen3-tts",
+        "miotts",
+        "piano-transcription",
         "moss-tts",
         "moss-tts-local",
         "vibevoice-1.5b",
@@ -303,6 +343,7 @@ std::vector<std::string> crispasr_list_backends() {
         "piper",
         "outetts",
         "voxcpm2-tts",
+        "voxcpm2-vae",
         "cosyvoice3-tts",
         "m2m100",
         "m2m100-wmt21",
@@ -326,6 +367,7 @@ std::vector<std::string> crispasr_list_backends() {
         "fun-asr-mlt-nano",
         "paraformer",
         "sensevoice",
+        "sidon",
         "bark",
         "bark-tts",
         "speecht5",
@@ -341,6 +383,13 @@ std::vector<std::string> crispasr_list_backends() {
         "bananamind-tts",
         "omnivoice",
         "omnivoice-singing",
+        "htdemucs",
+        "mel-band-roformer",
+        "crepe",
+        "btc-chords",
+        "tabcnn",
+        "rvc-svc",
+        "beat-this",
     };
 }
 
@@ -373,6 +422,12 @@ static constexpr feature_col kFeatures[] = {
     {"s2s", CAP_S2S},
     {"voice-clone", CAP_VOICE_CLONING},
     {"streaming", CAP_STREAMING},
+    {"separate", CAP_SEPARATE},
+    {"pitch", CAP_PITCH},
+    {"chords", CAP_CHORDS},
+    {"beats", CAP_BEATS},
+    {"tab", CAP_TAB},
+    {"piano", CAP_PIANO},
 };
 
 void crispasr_print_backend_matrix() {
@@ -449,6 +504,12 @@ static constexpr cap_slug kCapSlugs[] = {
     {"s2s", CAP_S2S},
     {"voice-cloning", CAP_VOICE_CLONING},
     {"streaming", CAP_STREAMING},
+    {"separate", CAP_SEPARATE},
+    {"pitch", CAP_PITCH},
+    {"chords", CAP_CHORDS},
+    {"beats", CAP_BEATS},
+    {"tab", CAP_TAB},
+    {"piano", CAP_PIANO},
 };
 
 void crispasr_print_backend_matrix_json() {
@@ -521,6 +582,18 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return lo.find(needle) != std::string::npos;
     };
 
+    if (contains_ci("htdemucs") || contains_ci("demucs"))
+        return "htdemucs";
+    if (contains_ci("mel-band-roformer") || contains_ci("mel_band_roformer") || contains_ci("roformer"))
+        return "mel-band-roformer";
+    if (contains_ci("crepe"))
+        return "crepe";
+    if (contains_ci("btc"))
+        return "btc-chords";
+    if (contains_ci("tabcnn"))
+        return "tabcnn";
+    if (contains_ci("beat-this") || contains_ci("beat_this") || contains_ci("beatthis"))
+        return "beat-this";
     if (contains_ci("voxtral") && contains_ci("tts"))
         return "voxtral-tts";
     if (contains_ci("voxtral") && contains_ci("4b"))
@@ -614,6 +687,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "kokoro";
     if (contains_ci("styletts") && contains_ci("ljspeech"))
         return "kokoro";
+    if (contains_ci("voxcpm2-vae") || contains_ci("voxcpm2_vae"))
+        return "voxcpm2-vae";
     if (contains_ci("voxcpm2") || contains_ci("voxcpm"))
         return "voxcpm2-tts";
     if (contains_ci("cosyvoice3") || contains_ci("cosyvoice-3") || contains_ci("cv3"))
@@ -640,6 +715,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "funasr";
     if (contains_ci("sensevoice") || contains_ci("sense-voice") || contains_ci("sense_voice"))
         return "sensevoice";
+    if (contains_ci("sidon"))
+        return "sidon";
     if (contains_ci("speecht5"))
         return "speecht5";
     if (contains_ci("bark"))
@@ -666,6 +743,10 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "moss-tts";
     if (contains_ci("moss") && contains_ci("audio"))
         return "moss-audio";
+    if (contains_ci("miotts"))
+        return "miotts";
+    if (contains_ci("piano") && contains_ci("transcription"))
+        return "piano-transcription";
     if (contains_ci("ggml-") && contains_ci(".bin"))
         return "whisper";
 
@@ -686,6 +767,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
             const std::string a = arch;
             if (a == "whisper")
                 result = "whisper";
+            else if (a == "sidon")
+                result = "sidon";
             else if (a == "nemotron" || a == "nemotron-asr" || a == "nemotron-streaming")
                 result = "nemotron";
             else if (a == "parakeet")
@@ -717,6 +800,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "qwen3";
             else if (a == "qwen3-tts" || a == "qwen3_tts" || a == "qwen3tts")
                 result = "qwen3-tts";
+            else if (a == "miotts" || a == "mio-tts")
+                result = "miotts";
             else if (a == "moss-tts-local" || a == "moss_tts_local")
                 result = "moss-tts-local";
             else if (a == "moss-tts" || a == "moss_tts" || a == "moss-tts-delay")
@@ -725,6 +810,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "orpheus";
             else if (a == "kokoro" || a == "styletts2" || a == "styletts2-ljspeech")
                 result = "kokoro";
+            else if (a == "voxcpm2-vae" || a == "voxcpm2_vae")
+                result = "voxcpm2-vae";
             else if (a == "voxcpm2" || a == "voxcpm2_tts" || a == "voxcpm2-tts")
                 result = "voxcpm2-tts";
             else if (a == "cosyvoice3" || a == "cosyvoice3-tts" || a == "cosyvoice3_tts" || a == "cosyvoice3-llm")
@@ -771,6 +858,20 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "fastconformer-ctc";
             else if (a == "glmasr" || a == "glm-asr" || a == "glm_asr")
                 result = "glm-asr";
+            else if (a == "htdemucs" || a == "demucs")
+                result = "htdemucs";
+            else if (a == "mel-band-roformer" || a == "mel_band_roformer")
+                result = "mel-band-roformer";
+            else if (a == "crepe")
+                result = "crepe";
+            else if (a == "btc")
+                result = "btc-chords";
+            else if (a == "tabcnn")
+                result = "tabcnn";
+            else if (a == "rvc")
+                result = "rvc-svc";
+            else if (a == "beat-this")
+                result = "beat-this";
             else if (a == "kyutai-stt" || a == "kyutai_stt" || a == "kyutaistt")
                 result = "kyutai-stt";
             else if (a == "firered-asr" || a == "firered_asr" || a == "firereadasr" || a == "firered-lid" ||
@@ -828,6 +929,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "parler-tts";
             else if (a == "zonos" || a == "zonos-tts" || a == "zonos_tts")
                 result = "zonos";
+            else if (a == "piano-transcription" || a == "piano_transcription")
+                result = "piano-transcription";
         }
     }
     gguf_free(gctx);

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/crispasr_env.h"
 
 class OmniasrBackend : public CrispasrBackend {
 public:
@@ -39,7 +40,7 @@ public:
         cp.temperature = params.temperature;
         cp.beam_size = params.beam_size > 0 ? params.beam_size : 1;
         cp.use_gpu = crispasr_backend_should_use_gpu(params);
-        if (getenv("OMNIASR_DEBUG"))
+        if (crispasr_env::get("CRISPASR_OMNIASR_DEBUG"))
             cp.verbosity = 2;
         // Pass language for LLM variant (e.g. "eng_Latn" from -l en)
         // The LLM model uses this for language conditioning

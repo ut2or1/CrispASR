@@ -110,6 +110,8 @@ public:
         if (!ctx_)
             return out;
         mimo_asr_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
+        // #292: forward --max-new-tokens only when explicit; 0 keeps the backend default.
+        mimo_asr_set_max_new_tokens(ctx_, params.max_new_tokens_explicit ? params.max_new_tokens : 0);
         if (!params.ask.empty()) {
             mimo_asr_set_ask(ctx_, params.ask.c_str());
         } else if (!params.language.empty() && params.language != "auto") {

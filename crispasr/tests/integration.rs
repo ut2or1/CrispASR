@@ -597,6 +597,25 @@ fn registry_lookup_parakeet() {
 }
 
 #[test]
+fn registry_default_bundle_omnivoice() {
+    let bundle = crispasr::registry_default_bundle("omnivoice")
+        .expect("bundle call")
+        .expect("omnivoice bundle");
+    assert_eq!(bundle.backend, "omnivoice");
+    assert_eq!(bundle.artifacts.len(), 2);
+    assert_eq!(
+        bundle.artifacts[0].kind,
+        crispasr::RegistryArtifactKind::Primary
+    );
+    assert_eq!(bundle.artifacts[0].filename, "omnivoice-f16.gguf");
+    assert_eq!(
+        bundle.artifacts[1].kind,
+        crispasr::RegistryArtifactKind::Companion
+    );
+    assert_eq!(bundle.artifacts[1].filename, "omnivoice-tokenizer-f16.gguf");
+}
+
+#[test]
 fn cache_dir_exists() {
     let dir = crispasr::cache_dir(None).expect("cache_dir");
     if let Some(d) = dir {

@@ -56,8 +56,14 @@ struct crispasr_segment {
     std::string text;
     int64_t t0 = 0; // centiseconds, absolute
     int64_t t1 = 0;
-    std::string speaker;                // empty if no diarization
-    bool speaker_turn_next = false;     // whisper tinydiarize
+    std::string speaker;            // empty if no diarization
+    bool speaker_turn_next = false; // whisper tinydiarize
+    // #292: which chunk/slice this segment came from, or -1 for a single-pass
+    // (unchunked) run. Speaker labels like "(speaker 1)" are CHUNK-LOCAL — they
+    // restart per chunk — so a consumer needs chunk_id to tell "same speaker,
+    // same chunk" (continuity) from "speaker 1 in chunk 0" vs "speaker 1 in
+    // chunk 2" (which may be different people). Only set when there is >1 chunk.
+    int chunk_id = -1;
     std::vector<crispasr_word> words;   // may be empty
     std::vector<crispasr_token> tokens; // may be empty
     // Multi-task ASR metadata (SenseVoice and similar). Empty when the
@@ -104,10 +110,30 @@ enum crispasr_capability : uint32_t {
     CAP_UNBOUNDED_INPUT = 1u << 19,     // encoder handles arbitrary-length audio without chunking
                                         // (FastConformer, CTC-only encoders). LLM-based backends
                                         // and whisper's fixed-window encoder do NOT set this.
+    CAP_SEPARATE = 1u << 22,            // audio source separation (stems)
     CAP_INTERNAL_CHUNKING = 1u << 20,   // backend handles its own long-audio chunking internally
                                         // (PLAN #104: parakeet uses chunked-encode + single-decode).
                                         // Skip the crispasr_run.cpp auto-chunk fallback for these.
-    CAP_STREAMING = 1u << 22,           // backend supports true token-level streaming output
+    CAP_STREAMING = 1u << 23,           // backend supports true token-level streaming output
+    CAP_PITCH = 1u << 24,               // monophonic F0 / pitch-track estimation (audio in ->
+                                        // pitch frames out). Like CAP_SEPARATE this is a task
+                                        // marker for --list-backends, NOT a transcribe() path:
+                                        // routing happens in the --pitch dispatcher.
+    CAP_CHORDS = 1u << 25,              // chord recognition (audio in -> chord timeline out).
+                                        // Same task-marker role as CAP_PITCH/CAP_SEPARATE;
+                                        // routing happens in the --chords dispatcher.
+    CAP_PIANO = 1u << 27,               // polyphonic piano transcription (audio in -> note
+                                        // events out). Task marker like CAP_CHORDS/CAP_PITCH;
+                                        // routing happens in the --piano dispatcher.
+    CAP_BEATS = 1u << 26,               // beat / downbeat tracking (audio in -> beat grid out).
+                                        // Same task-marker role as CAP_CHORDS; routing happens
+                                        // in the --beats dispatcher.
+    CAP_TAB = 1u << 28,                 // guitar tablature emission scoring (audio in ->
+                                        // per-frame per-string fret SCORES out). Task marker
+                                        // like CAP_CHORDS; routing happens in the --tab
+                                        // dispatcher. Note this backend emits scores, not a
+                                        // decided tablature: the constrained Viterbi/DP that
+                                        // picks a playable fingering belongs to the caller.
 };
 
 // ---------------------------------------------------------------------------
@@ -129,7 +155,13 @@ public:
     // they care about.
     virtual bool init(const whisper_params& params) = 0;
 
-    // Transcribe a single audio slice of 16 kHz mono PCM samples.
+    // Sample rate the backend expects for input PCM (default 16000).
+    // The CLI loads audio at this rate via crispasr_audio_load_at_rate,
+    // avoiding the lossy down-then-up resample for non-16 kHz backends.
+    virtual int input_sample_rate() const { return 16000; }
+
+    // Transcribe a single audio slice of mono PCM samples at the rate
+    // returned by input_sample_rate() (16 kHz unless overridden).
     // t_offset_cs is the absolute start of this slice in centiseconds; all
     // returned segment/word/token timestamps must be absolute (include the
     // offset).

@@ -10,6 +10,7 @@
 //   PARAFORMER_AUDIO_EN  — English test audio WAV (default: samples/jfk.wav)
 
 #include <catch2/catch_test_macros.hpp>
+#include "core/crispasr_env.h"
 #include "paraformer.h"
 
 #include <cstdio>
@@ -19,7 +20,7 @@
 #include <vector>
 
 static std::string get_env(const char* name, const char* fallback = "") {
-    const char* v = std::getenv(name);
+    const char* v = crispasr_env::get(name);
     return v ? v : fallback;
 }
 
@@ -92,7 +93,7 @@ static std::vector<float> load_wav_16k_mono(const std::string& path) {
 }
 
 TEST_CASE("paraformer: init and free", "[paraformer][.live]") {
-    std::string model = get_env("PARAFORMER_MODEL");
+    std::string model = get_env("CRISPASR_PARAFORMER_MODEL");
     if (model.empty()) {
         SKIP("PARAFORMER_MODEL not set; skipping paraformer live tests");
     }
@@ -106,11 +107,11 @@ TEST_CASE("paraformer: init and free", "[paraformer][.live]") {
 }
 
 TEST_CASE("paraformer: Chinese transcription matches reference", "[paraformer][.live]") {
-    std::string model = get_env("PARAFORMER_MODEL");
+    std::string model = get_env("CRISPASR_PARAFORMER_MODEL");
     if (model.empty()) {
         SKIP("PARAFORMER_MODEL not set");
     }
-    std::string audio = get_env("PARAFORMER_AUDIO_ZH");
+    std::string audio = get_env("CRISPASR_PARAFORMER_AUDIO_ZH");
     if (audio.empty()) {
         SKIP("PARAFORMER_AUDIO_ZH not set");
     }
@@ -149,11 +150,11 @@ TEST_CASE("paraformer: Chinese transcription matches reference", "[paraformer][.
 }
 
 TEST_CASE("paraformer: English JFK matches reference", "[paraformer][.live]") {
-    std::string model = get_env("PARAFORMER_MODEL");
+    std::string model = get_env("CRISPASR_PARAFORMER_MODEL");
     if (model.empty()) {
         SKIP("PARAFORMER_MODEL not set");
     }
-    std::string audio = get_env("PARAFORMER_AUDIO_EN", "samples/jfk.wav");
+    std::string audio = get_env("CRISPASR_PARAFORMER_AUDIO_EN", "samples/jfk.wav");
 
     auto pcm = load_wav_16k_mono(audio);
     if (pcm.empty()) {
@@ -179,11 +180,11 @@ TEST_CASE("paraformer: English JFK matches reference", "[paraformer][.live]") {
 }
 
 TEST_CASE("paraformer: Q4_K transcript matches F16", "[paraformer][.live]") {
-    std::string model = get_env("PARAFORMER_MODEL_Q4K");
+    std::string model = get_env("CRISPASR_PARAFORMER_MODEL_Q4K");
     if (model.empty()) {
         SKIP("PARAFORMER_MODEL_Q4K not set");
     }
-    std::string audio = get_env("PARAFORMER_AUDIO_ZH");
+    std::string audio = get_env("CRISPASR_PARAFORMER_AUDIO_ZH");
     if (audio.empty()) {
         SKIP("PARAFORMER_AUDIO_ZH not set");
     }

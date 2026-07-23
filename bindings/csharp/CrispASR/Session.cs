@@ -19,7 +19,7 @@ namespace CrispASR
     /// </code>
     /// </para>
     /// </summary>
-    public sealed class Session : IDisposable
+    public sealed partial class Session : IDisposable
     {
         private IntPtr _handle;
 
@@ -38,6 +38,22 @@ namespace CrispASR
         /// <summary>
         /// Open a session with automatic backend detection from GGUF metadata.
         /// </summary>
+        /// <remarks>
+        /// The model is loaded once and stays resident for the life of the
+        /// <see cref="Session"/>. To transcribe many clips WITHOUT reloading the
+        /// model (issue #291), open one session and call
+        /// <see cref="Transcribe(float[])"/> repeatedly:
+        /// <code>
+        /// using var asr = Session.Open("parakeet.gguf");
+        /// foreach (var clip in clips)
+        ///     Process(asr.Transcribe(clip));   // model loaded once, reused
+        /// </code>
+        /// A <see cref="Session"/> is not thread-safe; use one per thread, or
+        /// serialize calls. Standalone <see cref="VadSegments"/> is the exception —
+        /// it loads and frees its VAD model on every call, so a hot VAD-only loop
+        /// still reloads. Prefer session-integrated VAD (the vad transcribe path)
+        /// when you also transcribe, so the one session covers both.
+        /// </remarks>
         public static Session Open(string modelPath, int nThreads = 4)
         {
             var p = NativeMethods.crispasr_session_open(modelPath, nThreads);
@@ -310,6 +326,40 @@ namespace CrispASR
             }
         }
 
+        /// <summary>
+        /// Attest acceptance of AI-content marking/disclosure responsibility (EU
+        /// AI Act Art. 50). REQUIRED before <see cref="SynthesizeRaw"/> will return
+        /// unmarked audio; the default <see cref="Synthesize"/> is watermarked and
+        /// needs no attestation. <paramref name="attestation"/> is recorded for audit.
+        /// </summary>
+        public void AcceptMarkingResponsibility(string attestation = "")
+            => Check(NativeMethods.crispasr_session_accept_marking_responsibility(Handle, attestation ?? ""),
+                     "accept_marking_responsibility");
+
+        /// <summary>
+        /// UNMARKED synthesis (no watermark), for callers that post-process before
+        /// embedding the mark themselves. Hard-refused (throws) unless
+        /// <see cref="AcceptMarkingResponsibility"/> was called first. Prefer
+        /// <see cref="Synthesize"/> for the default watermarked output.
+        /// </summary>
+        public float[] SynthesizeRaw(string text)
+        {
+            var ptr = NativeMethods.crispasr_session_synthesize_raw(Handle, text, out int nSamples);
+            if (ptr == IntPtr.Zero || nSamples <= 0)
+                throw new InvalidOperationException(
+                    "SynthesizeRaw returned no audio (attestation required? call AcceptMarkingResponsibility first)");
+            try
+            {
+                var pcm = new float[nSamples];
+                Marshal.Copy(ptr, pcm, 0, nSamples);
+                return pcm;
+            }
+            finally
+            {
+                NativeMethods.crispasr_pcm_free(ptr);
+            }
+        }
+
         // ----------------------------------------------------------------
         // ASR Transcription
         // ----------------------------------------------------------------
@@ -541,8 +591,14 @@ namespace CrispASR
                 var raw = new float[n * 2];
                 Marshal.Copy(outSpans[0], raw, 0, n * 2);
                 var spans = new VadSpan[n];
+                // The native crispasr_vad_segments ABI returns CENTISECONDS
+                // (start_cs, end_cs — see crispasr.h), the raw whisper.cpp VAD
+                // unit. Every other time value in this binding (Segment/Word T0/T1)
+                // is seconds, and this method's own doc-comment promises seconds,
+                // so convert here. Reported as issue #291: without this the spans
+                // came back as ms/10 and silently disagreed with Session times.
                 for (int i = 0; i < n; i++)
-                    spans[i] = new VadSpan(raw[i * 2], raw[i * 2 + 1]);
+                    spans[i] = new VadSpan(raw[i * 2] / 100.0, raw[i * 2 + 1] / 100.0);
                 return spans;
             }
             finally
@@ -866,17 +922,30 @@ namespace CrispASR
     // Speaker database
     // ====================================================================
 
-    /// <summary>On-disk speaker embedding database.</summary>
+    /// <summary>
+    /// On-disk speaker embedding database (closed-roster, consent-gated —
+    /// issue #266). Matching is a claimed-participant confirmation, never
+    /// an open 1:N search.
+    /// </summary>
     public sealed class SpeakerDb : IDisposable
     {
         private IntPtr _handle;
 
         private SpeakerDb(IntPtr handle) => _handle = handle;
 
-        public static SpeakerDb Load(string dirPath)
+        /// <summary>
+        /// Open a db narrowed to the claimed roster. <paramref name="expectedNames"/>
+        /// is the comma-separated list of enrolled participants asserted present
+        /// (e.g. "Alice,Bob"). <paramref name="consentAttested"/> affirms a lawful
+        /// basis + explicit consent from every enrolled person (GDPR Art. 9);
+        /// the call refuses without both.
+        /// </summary>
+        public static SpeakerDb Open(string dirPath, string expectedNames, bool consentAttested)
         {
-            var p = NativeMethods.crispasr_speaker_db_load(dirPath);
-            if (p == IntPtr.Zero) throw new InvalidOperationException($"Failed to load speaker db from {dirPath}");
+            if (!consentAttested)
+                throw new InvalidOperationException("SpeakerDb requires an explicit consent attestation (GDPR Art. 9)");
+            var p = NativeMethods.crispasr_speaker_db_open(dirPath, expectedNames, 1);
+            if (p == IntPtr.Zero) throw new InvalidOperationException($"Failed to open speaker db from {dirPath}");
             return new SpeakerDb(p);
         }
 
@@ -892,10 +961,16 @@ namespace CrispASR
             return (NativeMethods.NullTerminated(outName), score);
         }
 
-        /// <summary>Enroll a new speaker embedding.</summary>
-        public static void Enroll(string dirPath, string name, float[] embedding)
+        /// <summary>
+        /// Enroll a new speaker embedding. <paramref name="consentAttested"/> records
+        /// the enrolled person's explicit consent (GDPR Art. 9) in the profile;
+        /// enrollment refuses without it.
+        /// </summary>
+        public static void Enroll(string dirPath, string name, float[] embedding, bool consentAttested)
         {
-            int rc = NativeMethods.crispasr_speaker_db_enroll(dirPath, name, embedding, embedding.Length);
+            if (!consentAttested)
+                throw new InvalidOperationException("Enrollment requires an explicit consent attestation (GDPR Art. 9)");
+            int rc = NativeMethods.crispasr_speaker_db_enroll2(dirPath, name, embedding, embedding.Length, 1);
             if (rc != 0) throw new InvalidOperationException($"speaker_db_enroll failed (rc={rc})");
         }
 

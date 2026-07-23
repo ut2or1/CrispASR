@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 #include <sys/stat.h>
+#include "core/crispasr_env.h"
 
 namespace {
 
@@ -95,7 +96,7 @@ public:
 
         // Diff-harness: OMNIVOICE_ENCODE_DIFF=<ref.gguf> runs the encode-path
         // stage diff and exits (#254 voice-clone port validation).
-        if (const char* rp = getenv("OMNIVOICE_ENCODE_DIFF")) {
+        if (const char* rp = crispasr_env::get("CRISPASR_OMNIVOICE_ENCODE_DIFF")) {
             int rc = omnivoice_encode_diff(ctx_, rp);
             exit(rc == 0 ? 0 : 1);
         }

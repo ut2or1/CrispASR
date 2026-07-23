@@ -355,6 +355,8 @@ CRISPASR_API int whisper_n_vocab(struct whisper_context* ctx);
 CRISPASR_API int whisper_n_text_ctx(struct whisper_context* ctx);
 CRISPASR_API int whisper_n_audio_ctx(struct whisper_context* ctx);
 CRISPASR_API int whisper_is_multilingual(struct whisper_context* ctx);
+// Tiron (#295): 1 if the loaded model has <|speakerN|> tokens.
+CRISPASR_API int whisper_has_speaker_tokens(struct whisper_context* ctx);
 
 CRISPASR_API int whisper_model_n_vocab(struct whisper_context* ctx);
 CRISPASR_API int whisper_model_n_audio_ctx(struct whisper_context* ctx);
@@ -618,11 +620,19 @@ CRISPASR_API int crispasr_session_set_ask(struct crispasr_session* s, const char
 // TTS synthesis — returns malloc'd float32 PCM at 24 kHz mono.
 // Caller frees with crispasr_pcm_free(). Returns nullptr on failure.
 CRISPASR_API float* crispasr_session_synthesize(struct crispasr_session* s, const char* text, int* out_n_samples);
+// UNMARKED synthesis (no watermark) — hard-refused (returns nullptr) unless the
+// integrator first calls crispasr_session_accept_marking_responsibility(). Use
+// crispasr_session_synthesize() for the default watermarked output.
 CRISPASR_API float* crispasr_session_synthesize_raw(struct crispasr_session* s, const char* text, int* out_n_samples);
+// Attest that the integrator accepts AI-content marking/disclosure responsibility
+// (EU AI Act Art. 50). REQUIRED to use crispasr_session_synthesize_raw(); the
+// default marked paths do not need it. `attestation` is recorded for audit.
+CRISPASR_API int crispasr_session_accept_marking_responsibility(struct crispasr_session* s, const char* attestation);
 CRISPASR_API void crispasr_pcm_free(float* pcm);
 
 // Speech-to-Speech — audio in → audio out via a single model pass.
-// Supported on backends with S2S capability (lfm2-audio, mini-omni2).
+// Supported on backends with S2S capability (lfm2-audio, mini-omni2, sidon,
+// voxcpm2-vae).
 // Returns malloc'd float32 PCM; caller frees with crispasr_pcm_free().
 // out_text (optional): if non-null, receives the intermediate transcript
 // (malloc'd, caller frees with free()). Returns nullptr on failure or
@@ -647,7 +657,7 @@ CRISPASR_API const char* crispasr_session_last_synth_error(struct crispasr_sessi
 // backends and 0 on error.
 CRISPASR_API int crispasr_session_input_sample_rate(struct crispasr_session* s);
 
-// Tell the session what sample rate the next transcribe call's PCM is at.
+// Tell the session what sample rate the next PCM input call's audio is at.
 // Backends that normally resample (e.g. 16 kHz → 24 kHz) will skip the
 // step when the rate already matches. Defaults to 16000 for back-compat.
 CRISPASR_API int crispasr_session_set_pcm_sample_rate(struct crispasr_session* s, int rate);

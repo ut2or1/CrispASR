@@ -11,6 +11,7 @@
 // vocab=131072). No biases anywhere.
 
 #include "voxtral.h"
+#include "core/crispasr_env.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -49,7 +50,7 @@
 static bool voxtral_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("VOXTRAL_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_VOXTRAL_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;

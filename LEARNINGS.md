@@ -10,6 +10,453 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## A hardcoded decode cap silently ignores --max-new-tokens — and forwarding it naively SHRINKS a backend (#292, 10 ASR backends, 2026-07-22)
+
+An autoregressive/LLM ASR backend caps its decode loop at some `const int max_new
+= N`. If N is hardcoded, `--max-new-tokens` does nothing and a long SINGLE-PASS
+run (`--chunk-seconds 0`) truncates — the reporter's 300 s file stopped at 164 s
+against moss-diarize's baked-in 1024. The audit found the identical pattern in
+**10 backends** (moss-diarize, canary, canary-qwen, glm-asr, funasr, mimo-asr,
+moss-transcribe, mini-omni2, higgs-stt, higgs); it hides because with default
+chunking each ~30 s chunk fits the cap, so it only bites single-pass or unusually
+dense audio.
+
+Three transferable points:
+
+1. **The fix is a context field + setter + adapter forward + session forward, per
+   backend** — mirror an existing `set_beam_size`. The field defaults to the
+   backend's OWN old constant, so nothing regresses; the decode loop AND any
+   coupled KV-cache sizing must both read it (funasr/higgs/moss-transcribe sized
+   the KV as `prompt + 1024` separately — miss it and a raised cap overflows
+   `kv_max_ctx` → GGML_ASSERT).
+
+2. **Naive forwarding is a SECOND bug.** `whisper_params.max_new_tokens` defaults
+   to 512, but several backends default HIGHER (diarize 1024). Forwarding 512
+   unconditionally SHRINKS them. The gate is a `max_new_tokens_explicit` flag
+   (set only when the user passed `-n`), so the CLI default never overrides a
+   backend's own — mirrors `chunk_seconds_explicit`. The session path needs no
+   flag: its default is 0 = unset.
+
+3. **Not every cap is a bug.** moonshine's `ceil(n_samples/16000*6.5)` clamped to
+   194 is LENGTH-DERIVED and 194 is its architectural short-form limit — forcing
+   more exceeds its trained window. Grep each backend's source before "fixing" a
+   constant; a length-derived or architectural bound is correct.
+
+CUDA-validated the flag is honored by measuring word count at
+`--max-new-tokens 64` vs `4096` (both single-pass): a deterministic causal
+increase (216→366) — equal counts would be the bug, independent of clip length.
+A first gate demanding `>2x` wrongly FAILed the real 1.7x; validate the ORACLE
+(the threshold) before believing a red result — see [[parity-harness-negative-control]].
+
+---
+
+## A green release job is not a shipped artifact — verify what you DELIVER, not what the workflow says (v0.8.18–v0.8.20 release train, 2026-07-21)
+
+Four releases in one session, and every real failure REPORTED SUCCESS. The
+pattern is the lesson: a workflow conclusion describes the workflow, not the
+artifact. Each was caught by a gate that tested the delivered thing directly.
+
+- **Presence is not resolvability.** The lib-bundle gate checked that every
+  `@rpath`/`DT_NEEDED` dependency was PRESENT in the tarball. It was — and 6 of 7
+  bundles still could not be `dlopen`ed. macOS baked the CI runner's build path
+  into `LC_RPATH` (`/Users/runner/work/...`); all 5 Linux bundles used
+  `$ORIGIN/../../ggml/src`, one level too high. The file was in the box; the map
+  didn't lead to it. Fix: `tools/verify-lib-bundle.sh` RELOCATES the bundle to an
+  unrelated dir and dlopens it — loading in place succeeds by accident on the
+  machine that built it, which is exactly how it shipped.
+- **A green job can attach nothing.** The `build-xcframework` job went green
+  having uploaded ZERO assets: the file is `crispasr-<tag>-xcframework.zip`
+  (dash) but the attach glob was `*.xcframework.zip` (dot), and
+  `fail_on_unmatched_files: false` let it pass empty. For an asset that is the
+  whole point of a job, set `fail_on_unmatched_files: true` — a glob matching
+  nothing must FAIL, not ship the feature nowhere.
+- **The irreversible step deserves an independent gate.** pub.dev publishing is
+  irreversible, so the check that matters runs BEFORE it: download the shipped
+  bundles, dlopen them, confirm the xcframework's slices exist. The pub.dev
+  publish itself failed at its DRY RUN (stale `flutter/crispasr/CHANGELOG.md`
+  missing the version — `bump-version.sh` doesn't touch it), which is the safe
+  failure: nothing published. Cross-platform caveat: on macOS you can only
+  closure-check a Linux ELF bundle, not dlopen it — the native dlopen ran in the
+  release job on Linux; don't misread "slice is not valid mach-o" as a defect.
+
+Transferable: after any release, verify the downloaded artifact does the thing a
+consumer does (loads / links / exists). "Release: success" is the beginning of
+verification, not the end. Same family as [[cmake-link-not-shipped]] and the
+cancelled-CI-reads-as-green trap. See `PLAN.md` 2026-07-21 completions and memory
+[[release-packaging-gotchas]].
+
+---
+
+## A capability flag is a PROMISE the backend must keep — an unimplemented cap disables the safety nets keyed off it (canary-qwen #290, 2026-07-21)
+
+`canary-qwen` declared `CAP_INTERNAL_CHUNKING` but `src/canary_qwen.cpp` has NO
+chunking code — 0 hits for `chunk_seconds`, vs 62 in `src/parakeet.cpp` and a
+real chunker in `src/canary.cpp`. The flag asserts "I slice long audio myself,"
+so the dispatcher trusted it and disabled BOTH of its own safeguards: the #257
+gate handed over the whole clip when `--chunk-seconds` was given, and
+`should_auto_chunk_long()` bailed at the `CAP_INTERNAL_CHUNKING` branch when it
+wasn't. canary-qwen also doesn't `prefers_vad()`, so the auto-VAD net was out
+too. Result: one full-length FastConformer pass — O(T²) attention, RSS growing
+384 MiB → 6.3 → 10.2 GiB with clip length, and text degraded past the encoder's
+trained window. Reproduced either way BECAUSE one false flag killed every net.
+
+Two transferable points. (1) A capability is not documentation — code dispatches
+on it, so declaring one you don't implement is worse than declaring nothing.
+Grep the backend's own source for the feature before trusting its cap
+(`chunk_seconds` count was decisive here). (2) The fix that WROTE the gate
+(`1a2b3dcea`, for parakeet) was correct; it keyed on the capability, so the bug
+was always the false declaration, not the gate. When a shared gate misbehaves
+for one backend, suspect that backend's inputs to the gate, not the gate.
+
+Verified by the capability BITMASK with parakeet/canary/fastconformer-ctc as
+controls (they keep bit 20; canary-qwen no longer does) — a first-run unit-test
+pass proves nothing without a control. Memory [[check-blueprint-before-backend-feature]].
+
+---
+
+## Moving a release tag is CLEAN when the fix touches only release TOOLING — the test is provenance, not "never move a tag" (v0.8.20, 2026-07-21)
+
+At v0.8.18 I refused to move a tag: assets were built from source the moved tag
+wouldn't match. At v0.8.20 I moved it THREE times, correctly — because each fix
+touched only `release.yml` / `verify-lib-bundle.sh` / `build-xcframework.sh`,
+never binary-producing source. Every already-built asset was byte-identical to
+what the new commit produces, so there was no provenance mismatch and no reason
+to burn a new version number. The user pushed back on my reflexive "cut v0.8.21"
+and was right.
+
+The rule is provenance, stated as a check:
+`git diff --name-only <oldtag>..<newcommit> | grep -E '\.(cpp|h|c|cu)$|CMakeLists'`
+returning nothing ⇒ safe to force-move the `v*` tag and re-run the release (all
+assets rebuild identically; the fixed jobs now succeed/attach). If it returns
+source files, DON'T move — the shipped binaries would then disagree with the
+tagged source. A corollary for pub.dev: the CHANGELOG fix moved ONLY the
+`crispasr-v<x>` tag, not the `v<x>` GH tag — a Dart-package doc change shouldn't
+trigger a 40-min binary rebuild, and the two tags legitimately differing by one
+doc commit is fine. Memory [[release-packaging-gotchas]].
+
+---
+
+## A positional arg landing on the WRONG parameter is invisible in review and baked into the weights (piano-transcription BN eps, 2026-07-20)
+
+The first per-stage validation of a backend we had already shipped found it
+wrong. `crispasr-diff piano` reported mel PASS at cos 1.000000 and then
+`conv_block_output` FAIL at **cos 0.810** — first divergence = the bug, exactly
+as the harness is supposed to work.
+
+Upstream builds every 2-D BN as `nn.BatchNorm2d(out_channels, momentum)`
+(models.py:74). `BatchNorm2d`'s second POSITIONAL parameter is **`eps`**, not
+`momentum`. So the intended momentum 0.01 silently became **eps = 0.01** and
+momentum kept its 0.1 default. One line later, `nn.BatchNorm1d(768,
+momentum=momentum)` passes it as a KEYWORD, so that layer keeps eps = 1e-5.
+The loaded checkpoint confirms it: **33 BatchNorm2d at eps=0.01, 4 BatchNorm1d
+at eps=1e-5.**
+
+Our runtime hardcoded the PyTorch default 1e-5 everywhere. It mattered enormously
+because the running variances are tiny (~0.003), so eps DOMINATES the
+denominator: `sqrt(0.00295 + 1e-5) = 0.0544` vs `sqrt(0.00295 + 0.01) = 0.1138`
+— a 2.09x error per layer, compounding to 2.44x by conv block 1 and dragging
+the onset head to cos 0.72.
+
+Three transferable points:
+
+1. **An upstream slip that the weights were TRAINED with is not a bug to fix —
+   it is a spec to reproduce.** Same as BTC's trailing ReLU. Read what the code
+   DOES, not what it evidently meant.
+2. **Never assume a framework default for a hyperparameter you can read off the
+   loaded module.** `[m.eps for m in model.modules() if isinstance(m, _BatchNorm)]`
+   is one line and would have caught this at port time. Defaults are the least
+   reliable thing in a port.
+3. **"It produces plausible output" is not validation.** A downstream consumer
+   had reported this very backend "recognised the Für Elise motif" on a real
+   build — while every 2-D BN was wrong. Plausible-but-wrong is the failure mode
+   per-stage diffing exists for.
+
+Bisecting it is worth copying: mel PASSed, so the input was right; a numpy spec
+built from the GGUF weights matched our C++ at cos 1.000000 (so the C++ was a
+faithful implementation of the WRONG algorithm); then stepping conv1 -> bn1
+inside block 1 showed conv1 exact and bn1 diverged — three comparisons to go
+from "somewhere in an 8-layer stack" to one constant.
+
+---
+
+## "Linked in CMake" is NOT evidence the code SHIPS — the linker drops an object nothing references (mel-band-roformer, 2026-07-20)
+
+`crispasr-lib` linked the `mel-band-roformer` target, exactly as the CMakeLists
+reads. But nothing in `src/crispasr_c_api.cpp` ever referenced its symbols, so
+the linker dropped the whole object from the shared library. Verified against
+the **released v0.8.17 artifact**: `mel_band_roformer_separate` is simply not
+in `libcrispasr.dylib`.
+
+So the backend was not merely "unreachable from the session API" — the code was
+**not present in the shipped library at all**, for every consumer of it. The CLI
+worked the whole time because `crispasr-cli` links the static lib directly, and
+`--separate` reads the GGUF arch in its own dispatcher. A working CLI proved
+nothing about the artifact every binding loads.
+
+Three things follow:
+
+1. **Verify a release artifact by SYMBOL, not by version number or changelog.**
+   `nm -gU libcrispasr.dylib | c++filt | grep <fn>` answers "is this actually in
+   the build" in one line. We asked the question this way and learned that
+   v0.8.17 ships chords but not MBR separation — which no amount of reading the
+   tag or the notes would have revealed.
+2. **Demangle before concluding.** Some runtimes are C++-linkage, not
+   `extern "C"`: `sidon_init_from_file` appears only as
+   `__Z20sidon_init_from_file...`. A raw `nm | grep _name` reports a shipped
+   backend as missing. My first pass did exactly that and produced a false
+   alarm on sidon.
+3. **Source-text audits are structurally blind to this.** Every other check in
+   `tools/check-backend-wiring.py` greps source, and the source looked correct.
+   The new shipped-library check compares declared backends against symbols in
+   the built dylib — ground truth, so it has NO alias false positives (the
+   name-matching alternative produced 21/76 noise; this one produces 0/63).
+   Proven both directions: PASS clean, FAIL when the c_api arm is removed.
+
+The residual blind spot is unchanged and recorded in PLAN.md: a backend in
+NEITHER the CLI roster NOR the c_api list is invisible to all three checks.
+
+---
+
+## Cosine, correlation and peak-match are ALL scale-invariant — a uniform gain error passes every one of them (CQT `scale=True`, 2026-07-20)
+
+`core/cqt.h` normalised each constant-Q kernel by its L1 norm but never applied
+librosa's `scale=True` factor (`V /= np.sqrt(lengths)`, the default). Every bin
+came out low by `sqrt(N_k)` — **152x at the bottom octave**. BTC read its
+features as near-silence and emitted "no chord" for every frame of every file.
+
+The bug is trivial. What it cost was the second half-day, and that came from
+the guards being structurally unable to see it:
+
+- **`tools/cqt_librosa_parity.py`** checked per-frame shape correlation and
+  peak-bin match. Both are scale-invariant *by construction*. It reported
+  correlation 0.9999 and 97.6% peak match against a build that was wrong by
+  two orders of magnitude.
+- **`tests/test-core-cqt.cpp`** passed **726 assertions** against the same
+  build. Six test cases, none of which pinned an absolute magnitude.
+
+This is the THIRD time this exact class has bitten us. The htdemucs iSTFT scale
+was inverted (`1/sqrt(nfft)` for `sqrt(nfft)`) and `spec_input` passed at
+cos 1.000000 the whole time; it was caught only by printing `|mine|` vs `|ref|`
+alongside the cosine. Different backend, different year, same blind spot.
+
+**The rule: any metric that normalises its inputs cannot validate the scale of
+those inputs.** Cosine similarity, Pearson correlation, argmax agreement, SNR
+against a normalised reference, "does the peak land in the right bin" — every
+one divides the magnitude out. If a stage can be wrong by a constant factor,
+something must compare an ABSOLUTE quantity: `|mine|` vs `|ref|` next to the
+cosine (our diff harness prints exactly this — use it), or a per-bin magnitude
+ratio, or an analytic value.
+
+Two sharper corollaries, both learned the hard way in this same fix:
+
+**1. Assert the invariant, not a bound on a signal.** The strongest test here
+turned out to need no signal at all: after normalisation each kernel's L1 norm
+must equal `sqrt(N_k)` exactly, because the code multiplies by `sqrt(N)/l1`.
+That is arithmetic on the coefficients — no window leakage, no tolerance to
+argue about, and it fails by a factor of up to 152 the moment the scale factor
+is dropped. Reach for the algebraic identity before reaching for a threshold.
+
+**2. A tolerance wider than the defect is not a test — and a test NAME can
+encode the wrong law.** One existing case, "L1 normalisation makes bins
+comparable across kernel lengths", compared peak magnitude two octaves apart
+and required `ratio < 3`. It measured exactly the right quantity. It passed
+anyway, because the correct and broken builds sit on *opposite sides of it*:
+
+|                        | response         | two-octave ratio |
+|------------------------|------------------|------------------|
+| L1 only (the bug)      | flat across bins | 1.0              |
+| L1 x sqrt(N) (librosa) | ~ `sqrt(N_k)`    | 2.0              |
+
+Both under 3. Worse, the property the test was NAMED for — equal-amplitude
+tones giving equal magnitude — is the one the **buggy** build satisfies;
+`scale=True` deliberately does not have it. I nearly re-broke the code
+"fixing" that test to `< 1.5` before measuring. The replacement asserts the
+exact law (`peak == (A/2) * sqrt(N_k)`, which holds to four decimals across
+the whole range) instead of a bound.
+
+**Write the guard before the fix.** The magnitude check went into the parity
+tool first, so it failed on the broken build, and reverting the fix afterwards
+still drives its asserted median from 1.0043 to 0.0131 — a 76x margin. A guard
+authored after the fix has never been observed to fail, which means it has
+never been observed to work.
+
+See `docs/music-transcription/PLAN.md` and the header comments in
+`src/core/cqt.h` + `tests/test-core-cqt.cpp`.
+
+---
+
+## A logits-level diff harness at cos 1.000000 says nothing about the TABLE that turns logits into labels (BTC chord vocabulary, 2026-07-20)
+
+`crispasr-diff btc` passes 13/13 stages at cos 1.000000. That validates the
+transformer completely and the user-visible output not at all: the last step is
+`argmax -> index -> name`, and the name tables live outside the graph. A wrong
+entry in the 170-class quality table, or one flipped bool in the maj/min
+collapse, produces byte-identical logits and mislabels a chord forever. It
+would read as "the model is weak on diminished chords", not as a typo.
+
+Same shape as the OmniVoice zeroed-`token_embd` lesson (a data defect wearing a
+model defect's clothes), but from the other end of the pipeline.
+
+**And the blind spot is not only at the END of the harness — it is at the
+START.** The BTC reference dump deliberately includes `input_feat` so the
+runtime replays the exact features the spec scored, which stops a front-end
+difference masquerading as a model parity failure. That is the right design,
+and it means the harness NEVER TESTED OUR FRONT END. Two real bugs lived there
+through 13/13 at cos 1.000000:
+
+- The reference CQTs each 10 s chunk INDEPENDENTLY and concatenates
+  (`audio_file_to_features`). Because librosa centres every call, each chunk
+  carries its own edge padding, so this is NOT a continuous transform: 2778
+  frames vs 2770 on a 257 s clip. We had implemented `librosa.cqt` correctly
+  and `audio_file_to_features` not at all — our features scored **cos 0.9993
+  against a continuous librosa CQT and 0.8815 against the actual reference
+  pipeline**.
+- Frame duration is `inst_len / timestep` (10/108 = 0.0925926 s), NOT
+  `hop / sample_rate` (2048/22050 = 0.0928798 s). A 0.31 % difference — 0.79 s
+  of accumulated drift over a four-minute song, every chord boundary
+  progressively late.
+
+Neither is visible in a per-stage logit diff. Both were found only by running
+the reference pipeline end-to-end on real audio and comparing chord timelines
+with `mir_eval`: **86.63 % → 98.56 % (tetrads)** once fixed.
+
+So the rule has two halves. Port the reference's PIPELINE, not just its
+mathematical operation — the wrapper around `librosa.cqt` was as load-bearing
+as the transform. And when a harness pins an input to isolate a stage, write
+down what that pinning excludes, because that is now untested surface. Ours is
+covered by `tests/test-btc-vocab.cpp` (geometry, hermetic) plus the real-music
+`mir_eval` comparison.
+
+So: **for every port, list what the diff harness structurally cannot see, and
+cover that separately.** Here that meant extracting the pure vocabulary +
+positional-encoding helpers into `src/btc_chord_vocab.h` purely so they could be
+unit-tested without weights (`tests/test-btc-vocab.cpp`), and asserting
+properties a table typo breaks: all 170 names distinct, the root surviving the
+maj/min collapse, every one of the 25 collapsed labels reachable (an
+unreachable one = a chord that can never be emitted), and the positional
+encoding's halves being concatenated rather than interleaved.
+
+Cheap, hermetic, no model, no GPU — and it covers the only part of the chain
+the expensive harness is blind to.
+
+---
+
+## PLAN "OPEN" items are frequently already shipped — audit against the CODE, never the prose (2026-07-17)
+
+A single session found **~11 PLAN items marked OPEN / NOT STARTED / SURVEY-ONLY
+that were fully implemented in the tree**: §169 (qwen3-asr ChatML prompt, landed
+under the #218 work), #128 (Piper TTS — whole backend + converter + registry +
+tests present), #60o (MTLBinaryArchive pipeline cache — the
+`crispasr_metal_pipeline_cache_open/_flush` lines print on every run), §155
+(CONV_TRANSPOSE_1D — all phases + Metal/Vulkan/CUDA `col2im_1d` kernels), #58
+(MOSS-Audio-4B), #101 (OmniVoice), §229 (`GGML_LLAMAFILE ON`), python `_find_lib`,
+§66 (pub.dev `crispasr` published), plus §57/§106/§224/§247 sub-items. The PLAN is
+compacted periodically but individual stale entries survive, so trusting one
+wastes hours re-deriving shipped code. **Before implementing any roadmap item,
+`grep`/read the code it names and check `git log -- <file>`; if it exists, verify
+empirically and just correct the PLAN.** Corollary for *external*-state claims
+(registry presence, HF uploads): a one-line API `curl` settles them — the PLAN
+said pub.dev was "absent" when the package was live (crates.io 404-checks need a
+`User-Agent` header or they 403 and masquerade as a real 404). A subagent is an
+efficient way to run this audit across many headers at once.
+
+## When you can't run the acceptance roundtrip, ship the path gated default-OFF + a provable-equivalence argument — don't block on the model (#201 TADA cloning, 2026-07-17)
+
+HARD RULE #3 says the decoded-output roundtrip is the only acceptance test, but a
+memory-pressured box couldn't load tada-1b + the 1.3 GB aligner to run it. Rather
+than block, the mergeable move was: (1) build the new path so its numerics are
+**equivalent by construction** to a shipped, already-validated path — here
+`tada_make_ref_from_pcm` = the validated `tada_encoder_encode` + a `load_prompt`
+body extracted into `tada_set_prompt_values`, and `write_ref_gguf` demonstrably
+writes the exact tensors `load_prompt` reads, so the in-memory path is the
+file path minus the I/O (no new graph math); and (2) gate the new behaviour behind
+`CRISPASR_TADA_WAV_CLONE=1`, default OFF, so the default path is byte-identical and
+no regression is possible. That combination is safe to merge to `main` *before*
+the roundtrip — the roundtrip then only gates flipping the default ON, not the
+merge. Matches the `keep-gated-not-revert` discipline: a plausible,
+review-verified path ships opt-in with the acceptance gate documented, not
+withheld. (Also: the feature needed the SAME logic in TWO surfaces — session
+C-ABI and server *adapter* — the recurring multi-surface trap; a shared
+`clone_from_wav`/`tada_make_ref_from_pcm` keeps them from drifting.)
+
+---
+
+## Two writers on one output field at different pipeline stages = an ordering bug — fix the ORDER, don't bolt on provenance (#266 speaker labels, 2026-07-17)
+
+`--speaker-db` wrote matched names into `seg.speaker` per slice (pre-merge);
+global clustering rewrote the same field per segment post-merge. Result: mixed
+slices got one identity, then clustering destroyed the names anyway. The
+tempting fix is a structured label (`{cluster_id, name?, source, score}`) with
+precedence rules — a real refactor across every output writer. The actual fix
+was smaller and stronger: **make the two writers one ordered chain** (cluster
+first, identify per CLUSTER after, nothing label-touching downstream). Once
+identification consumes clustering's output instead of racing it, "later
+stages must not overwrite matched names" holds by construction and the string
+field is fine. Generalization: when two features fight over one field, first
+ask whether they're actually *stages* of one pipeline in the wrong order;
+provenance/priority metadata is the fallback, not the default. Bonus from the
+same change: the identification stage reuses the embeddings clustering already
+computed (centroid per cluster) — correct architecture was also the cheaper
+one (no second embedding pass).
+
+## Path-filtered CI workflows ROT — the first re-triggering change inherits ALL the debt accumulated since the last run (Go bindings, 2026-07-17)
+
+`Bindings Tests (Go)` only runs when `bindings/go/**` changes. Nobody had
+touched it since 2026-07-14, so three independent breaks sat invisible until
+the #266 ABI sweep re-triggered it, and they surfaced ONE AT A TIME (each fix
+revealed the next): (1) a cgo-preamble decl used `crispasr_session*` where the
+preamble's opaque typedef is `CrispasrSession` — gcc rejects the whole
+preamble; (2) the same old commit declared `func (s *Session)` for a type
+named `CrispasrSession` — plain Go compile error; (3) `whisper.go` cgo LDFLAGS
+had drifted when the c2pa-audio lib was added (the drift-check job had never
+run either). Lessons: (a) when your change re-awakens a dormant path-filtered
+workflow, budget for paying down its debt — the red X on YOUR commit is
+usually not (only) your bug; check `git log` since the workflow's last
+successful run before debugging your own diff; (b) a cgo preamble is compiled
+C — `gcc -fsyntax-only` on the extracted comment block reproduces CI's
+preamble errors locally in seconds, no cgo build needed; (c) for LDFLAGS
+regeneration on macOS, the documented recipe (`-DGGML_METAL=OFF
+-DGGML_BLAS=OFF -DGGML_CUDA=OFF` + `--dot`) really does keep Metal/BLAS out
+of the linux line — verify the diff adds only the intended `-l<newlib>`.
+
+## Scoped `ctest -R` on a PARTIALLY BUILT tree has two name-collision traps: configure-time add_test and catch_discover NOT_BUILT placeholders (first Windows unit-test leg, 2026-07-17)
+
+To run just the speaker-db tests on the (never-unit-tested) Windows CI job we
+built 3 of ~200 test targets and filtered `ctest -R "speaker|..."`. Two
+non-obvious classes of test still match such a filter without being built:
+(1) **plain `add_test(NAME ... COMMAND script)` entries register at CONFIGURE
+time** regardless of what was built — `test-speaker-id-live` (a bash script)
+matched "speaker" and would have been exec'd on Windows; (2)
+**`catch_discover_tests` writes a failing `<target>_NOT_BUILT-<hash>`
+placeholder** for targets that were configured but never built — the unbuilt
+`test-crispasr-speaker-resample` placeholder matched "speaker" and failed the
+first real run 38/39. The robust pattern for a scoped leg:
+`ctest -R "<positive>" -E "live|NOT_BUILT"` + register POSIX-script tests
+`if(NOT WIN32)`. Also: enumerate what a regex matches BEFORE shipping it —
+resolving every TEST_CASE name + add_test registration against the filter
+(a 15-line python pass over tests/CMakeLists.txt) caught trap (1) pre-push;
+trap (2) only a real run could catch. Positive result worth keeping: the
+speaker-db suite (incl. the `.spkr` v2 `CreateDirectoryA` path) passes on
+windows-latest — the `_WIN32` code paths were correct all along, just never
+executed.
+
+## A binding wrapper that has never been EXECUTED is untested code — and parallel agents produce cross-cutting conflicts only the verifier can see (#266 hardening, 2026-07-17)
+
+The hand-updated Python `SpeakerDB` wrapper passed symbol-parity checks and
+eyeball review, yet its first-ever runtime execution found two real bugs in
+minutes: the class was never re-exported from `crispasr/__init__.py`
+(ImportError on the documented usage), and `__init__` raised (consent gate)
+before setting `self._db`, so every refused instance crashed `__del__` at GC.
+Symbol lists and signatures verify LINKAGE, not behavior — when touching an
+ABI, write one runtime smoke per wrapper you changed (ctypes + a shared-lib
+build is enough; `build-shared` with warm ccache is mostly link time). Second
+lesson from the same session: two agents in isolated worktrees each did
+correct work that CONFLICTED — agent A added a POSIX gate-test script whose
+ctest name matched agent B's new Windows `ctest -R "speaker|..."` filter.
+Neither could see the other's diff. The verifier's job is not just re-running
+each agent's tests but explicitly checking the INTERACTION of concurrently
+produced diffs (grep each diff's new identifiers against the other's).
+
 ## Deterministic DROPOUT of whole words/tokens (not garble) = a zeroed weight BLOCK in the shipped GGUF — scan converted tensors for zero-norm rows BEFORE debugging the port (OmniVoice #254 `token_embd`, 2026-07-15)
 
 OmniVoice TTS silently dropped specific words ("quick", "started", "One", "See";
@@ -13128,3 +13575,120 @@ interleaves device/model-load noise (and an appended "generated by artificial
 intelligence" disclosure) on the transcript lines — feed the FULL ANSI-stripped
 stdout to a word-OVERLAP check (present-in, not exact-match); a `[-400:]` tail
 truncation dropped the real transcript and faked a FAIL.
+
+## A GPU-vs-reference RTF gap that survives kernel parity is per-step HOST detours — fuse them into the step graph; unified-memory Metal hides exactly this class of cost (omnivoice #254, 2026-07-16)
+
+After single-shot synthesis landed, omnivoice on the reporter's RTX 5070 Ti was
+still RTF 0.17 vs omnivoice.cpp's 0.144 — with the forward kernels already at
+parity (~34 ms/step both). The residual was entirely between the forwards, on
+the host, per MaskGIT step: (a) audio-embedding lookup via a separate get_rows
+graph with an ~18 MB F32 readback, a single-threaded codebook sum, and a ~5 MB
+re-upload of the summed embeds; (b) a full-sequence logits readback (~39 MB,
+out_dim×T_c) when only the target slice is consumed; (c) single-threaded
+triple-log-softmax CFG scoring (~13M `exp` per step); (d) multi-MB per-step
+vector allocs incl. a full 18 MB `u_logits` copy in the interval-CFG path.
+~44 ms/step of pure host work next to a 27 ms forward.
+
+**The fix — fused step graph** (`OMNIVOICE_FUSED_STEP`): the shifted audio-token
+ids (140 KB of int32) are the ONLY per-step upload. In-graph: get_rows +
+codebook sum + concat with a device-resident text-embedding tensor (uploaded
+once into its OWN backend buffer — gallocr-managed tensors get aliased, a
+dedicated buffer is exempt); after the transformer, `ggml_cont` views emit ONLY
+the target logit slices. CFG scoring threads over target positions. Verdict on
+the reporter's box: gen 3.55 s → 1.53 s (2.3×), RTF 0.07 — ~2× faster than
+omnivoice.cpp — and ONE CUDA-graph warmup for all 32 steps.
+
+Durable techniques from the byte-identity requirement (codes cmp-identical to
+the legacy path on M1 Metal across 2-forward / unified / interval-CFG K=2 /
+guidance=0, AND on the reporter's CUDA box):
+
+1. **In-graph embedding sums can be bitwise-equal to a host sum** if the add
+   ORDER matches: chained `ggml_add` over per-codebook views in cb-ascending
+   order reproduces the host `dst[j] += src[j]` loop exactly (elementwise F32
+   IEEE add, no reassociation). Order-matched graph math is what turns a perf
+   rewrite into a cmp-verifiable no-op.
+2. **Threading a sampling loop without changing output:** draw the Gumbel noise
+   SERIALLY first (same rng object, same t-outer/cb-inner order as the serial
+   loop), then consume the precomputed array from worker threads. The rng
+   stream — and thus the output — is bit-identical. Data-dependent draw counts
+   (class_temp>0 top-k sampling) can't be precomputed → that path stays serial.
+3. **Platform asymmetry: judge host-detour optimizations on a DISCRETE-GPU
+   box.** On M1 the same change is NEUTRAL (matched-load per-stage A/B: 96.3 s
+   fused vs 93.7 s legacy for the same paragraph; legacy's embed prep cost 0.9 s
+   of ~94 s) because unified memory makes the readback/re-upload nearly free
+   and Accelerate eats the sums. The 2.3× only exists where host↔device
+   round-trips and single-thread scoring are real costs. Inverse of the usual
+   lesson: this time the M1 could not SHOW the win, not fake one.
+4. **ggml fork CUDA-graph facts** (checked in `ggml-cuda.cu`): capture state is
+   keyed PER cgraph (`ggml_cuda_graph_get_key` = nodes[0]), so several
+   alternating persistent graphs each keep their own capture — alternation is
+   NOT the enemy, per-step REBUILD is. And `TAG_GET_ROWS_CUDA_GRAPHS` disables
+   capture for any graph containing GET_ROWS on a *quantized* table (host sync
+   in the kquant path) — omnivoice survives because the quantizer keeps
+   audio_embd/audio_output/llm.token_embd at F16. Audit the embd dtype BEFORE
+   fusing embedding lookups into a forward graph on another backend.
+5. **Reference-voice disk cache** (reporter parity ask, shipped as
+   `CRISPASR_OMNIVOICE_VOICE_CACHE`): the RVQ ref encode is deterministic →
+   cache content-addressed (FNV-1a over the PREPROCESSED pcm + an
+   encoder-weight fingerprint), OVC1 header + int32 codes, atomic tmp+rename,
+   same dir resolution as the pocket_tts latents cache. Second run loads in
+   ~0 ms; audio data chunk bit-identical (only the timestamped C2PA chunk
+   differs — compare WAV `data` chunks, not whole files).
+
+Bench-hygiene reminders this session re-taught: a loaded shared M1 (loadavg
+100–290) inverted the Metal A/B verdict TWICE before matched-load per-stage
+medians settled it (the tell: the arms' identical decode code differing 3.8×);
+and `curl -C -` resume on top of a 29-byte HTML error stub produces a
+GGUF-with-garbage-prefix that parses as `invalid magic 'Inva'` — delete before
+retrying, never resume a file you haven't validated.
+
+## `git apply --3way` STAGES its result — a later `git add X && git commit` sweeps it up
+
+Applying a patch with `git apply --3way` leaves the result **staged**, not just
+in the working tree. So a subsequent `git add <unrelated files> && git commit`
+commits the patch too, under a message that says nothing about it. That is how
+the `group_words_into_speaker_runs` diarize DRY refactor landed inside
+`29e3e7af6`, a commit labelled "mel-band-roformer reference dumper" — and it
+was pushed to shared `main` before its unit tests had been run (they pass:
+21/21, including the pre-existing `apply_pyannote` / `score_speaker_for_range`
+cases, which is what makes the refactor provably behaviour-preserving — but the
+verification happened in the wrong order).
+
+Habits: after `git apply --3way`, run `git status` and either commit the patch
+deliberately on its own or `git restore --staged` the parts you are not ready
+to ship; and prefer `git commit <explicit paths>` over `git add X && git commit`
+when the tree holds more than one logical change. On a repo with concurrent
+sessions pushing to `main`, the mistake is not fixable by amending — history is
+already shared — so the correction has to be additive, like this note.
+
+The refactor itself is real and worth knowing about: the word→speaker-run
+grouping + short-run stability fold used by the pyannote/sherpa segment
+splitters now lives in one pure, unit-testable helper,
+`crispasr_diarize_internal::group_words_into_speaker_runs()`
+(`src/crispasr_diarize.cpp` / `_internal.h`), instead of being duplicated per
+splitter. `min_run_cs <= 0` disables the fold (split on every speaker change);
+50 cs is the pyannote default that suppresses one-word track-index flips.
+
+## A normalization stage amplifies upstream float error — input-align it before trusting its cos (§248 MBR)
+
+Mel-Band RoFormer's `band_split` starts with RMSNorm
+(`F.normalize(x,-1)*sqrt(dim)*gamma`). Diffing `band_split_out` off OUR STFT
+scored cos=0.976 and looked like a port bug — but the band_split MATH was
+already proven exact (an identical numpy recompute from the fixture's own
+`band_gathered` matched to cos=1.0). Cause: RMSNorm divides by each band's L2
+norm, so on near-silent bands it amplifies the ~5e-4 float-level difference
+between our radix-2 FFT and torch's STFT into a large relative error. Measured:
+a *uniform* ±5e-4 perturbation on `band_gathered` alone tanks band_split to
+cos 0.73 (our real, correlated error did better at 0.976).
+
+Lesson (a sharper form of "gate input alignment before trusting per-layer cos"):
+when a stage BEGINS with a normalization (RMS/Layer/L2), a cos taken off your
+own upstream output conflates two things — your stage's correctness and the
+upstream's float rounding, magnified. Diff that stage fed the REFERENCE's input
+tensor, so it tests only its own math; validate the upstream separately by its
+own pre-norm stage (here stft_packed, cos=1.0). After input-aligning,
+band_split_out was cos=1.000000 (max_abs 1.5e-3 = f16 weight rounding). The
+same input-alignment applies to every later MBR stage (each RoFormer block also
+opens with RMSNorm). General rule for the harness: prefer feeding each stage the
+reference input over chaining your own outputs, whenever the stage's first op is
+scale-sensitive.

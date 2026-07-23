@@ -1,4 +1,4 @@
-// glint - whole-file decode C ABI (auto-detects MP3 / AAC-LC / Opus).
+// glint - whole-file decode C ABI (auto-detects MP3 / AAC-LC / Opus / FLAC).
 // Mirrors the CLI decode pipeline (cli/audio_io.hpp) so every language
 // wrapper gets decode_file / transcode_file for free. glint_decode_audio_ex
 // adds an output rate, an int16 option, and Opus surround (family 1).
@@ -10,19 +10,40 @@
 #include <vector>
 
 #include "aac_decoder.hpp"
+#include "flac_decoder.hpp"
 #include "glint/glint.h"
 #include "mp3_decoder.hpp"
 #include "opus_decoder.hpp"
 #include "opus_ms_decoder.hpp"
 #include "opus_ogg.hpp"
 #include "resample.hpp"
+#include "vorbis_decoder.hpp"
+#include "vorbis_ogg.hpp"
 
 namespace {
 
-enum class Fmt { Unknown, Mp3, Aac, Opus };
+enum class Fmt { Unknown, Mp3, Aac, Opus, Vorbis, Flac };
+
+// Ogg containers carry both Opus and Vorbis. Peek at the first logical
+// stream's first packet: "OpusHead" -> Opus, 0x01 "vorbis" -> Vorbis.
+Fmt detect_ogg_codec(const uint8_t* d, size_t n) {
+    std::vector<std::vector<uint8_t>> packets;
+    int64_t granule = -1;
+    if (glint::vorbis::ogg_demux_first_stream(d, n, packets, &granule) != 0 ||
+        packets.empty())
+        return Fmt::Unknown;
+    const auto& p0 = packets[0];
+    if (p0.size() >= 8 && !std::memcmp(p0.data(), "OpusHead", 8))
+        return Fmt::Opus;
+    if (p0.size() >= 7 && p0[0] == 0x01 &&
+        !std::memcmp(p0.data() + 1, "vorbis", 6))
+        return Fmt::Vorbis;
+    return Fmt::Unknown;
+}
 
 Fmt detect(const uint8_t* d, size_t n) {
-    if (n >= 4 && !std::memcmp(d, "OggS", 4)) return Fmt::Opus;
+    if (n >= 4 && !std::memcmp(d, "OggS", 4)) return detect_ogg_codec(d, n);
+    if (n >= 4 && !std::memcmp(d, "fLaC", 4)) return Fmt::Flac;
     size_t off = 0;
     if (n > 10 && !std::memcmp(d, "ID3", 3))
         off = 10 + ((d[6] & 0x7F) << 21 | (d[7] & 0x7F) << 14 |
@@ -134,35 +155,20 @@ bool decode_opus(const uint8_t* d, size_t n, std::vector<float>& out,
     return true;
 }
 
-// Decode any supported stream to interleaved float at the native rate.
-bool decode_native(const uint8_t* data, size_t len, std::vector<float>& out,
+// Decode Ogg-Vorbis I (whole buffer) at its native sample rate.
+bool decode_vorbis(const uint8_t* d, size_t n, std::vector<float>& out,
                    int& sr, int& ch) {
-    switch (detect(data, len)) {
-    case Fmt::Mp3: return decode_mp3(data, len, out, sr, ch);
-    case Fmt::Aac: return decode_aac(data, len, out, sr, ch);
-    case Fmt::Opus: return decode_opus(data, len, out, sr, ch);
-    default: return false;
-    }
+    return glint::vorbis::decode_ogg(d, n, out, sr, ch) == 0 && ch > 0;
 }
 
-}  // namespace
+bool decode_flac(const uint8_t* d, size_t n, std::vector<float>& out,
+                 int& sr, int& ch) {
+    return glint::flac::decode(d, n, out, sr, ch) == 0 && ch > 0;
+}
 
-extern "C" {
-
-void* glint_decode_audio_ex(const uint8_t* data, int len, int out_rate,
-                            int want_int16, int* out_sr, int* out_ch,
-                            int* out_frames) {
-    if (out_sr) *out_sr = 0;
-    if (out_ch) *out_ch = 0;
-    if (out_frames) *out_frames = 0;
-    if (!data || len <= 0) return nullptr;
-
-    std::vector<float> pcm;
-    int sr = 0, ch = 0;
-    if (!decode_native(data, (size_t)len, pcm, sr, ch) || ch <= 0)
-        return nullptr;
-
-    // Optional resample to a requested output rate.
+void* finish_decode(std::vector<float>& pcm, int sr, int ch, int out_rate,
+                    int want_int16, int* out_sr, int* out_ch,
+                    int* out_frames) {
     if (out_rate > 0 && out_rate != sr && !pcm.empty()) {
         int in_frames = (int)(pcm.size() / (size_t)ch);
         int nf = 0;
@@ -202,10 +208,65 @@ void* glint_decode_audio_ex(const uint8_t* data, int len, int out_rate,
     return buf;
 }
 
+// Decode any supported stream to interleaved float at the native rate.
+bool decode_native(const uint8_t* data, size_t len, std::vector<float>& out,
+                   int& sr, int& ch) {
+    switch (detect(data, len)) {
+    case Fmt::Mp3: return decode_mp3(data, len, out, sr, ch);
+    case Fmt::Aac: return decode_aac(data, len, out, sr, ch);
+    case Fmt::Opus: return decode_opus(data, len, out, sr, ch);
+    case Fmt::Vorbis: return decode_vorbis(data, len, out, sr, ch);
+    case Fmt::Flac: return decode_flac(data, len, out, sr, ch);
+    default: return false;
+    }
+}
+
+}  // namespace
+
+extern "C" {
+
+void* glint_decode_audio_ex(const uint8_t* data, int len, int out_rate,
+                            int want_int16, int* out_sr, int* out_ch,
+                            int* out_frames) {
+    if (out_sr) *out_sr = 0;
+    if (out_ch) *out_ch = 0;
+    if (out_frames) *out_frames = 0;
+    if (!data || len <= 0) return nullptr;
+
+    std::vector<float> pcm;
+    int sr = 0, ch = 0;
+    if (!decode_native(data, (size_t)len, pcm, sr, ch) || ch <= 0)
+        return nullptr;
+
+    return finish_decode(pcm, sr, ch, out_rate, want_int16, out_sr, out_ch,
+                         out_frames);
+}
+
 float* glint_decode_audio(const uint8_t* data, int len, int* out_sr,
                           int* out_ch, int* out_frames) {
     // Simple default: float, native rate, whatever channel count decodes.
     return static_cast<float*>(glint_decode_audio_ex(
+        data, len, 0, 0, out_sr, out_ch, out_frames));
+}
+
+void* glint_flac_decode_ex(const uint8_t* data, int len, int out_rate,
+                           int want_int16, int* out_sr, int* out_ch,
+                           int* out_frames) {
+    if (out_sr) *out_sr = 0;
+    if (out_ch) *out_ch = 0;
+    if (out_frames) *out_frames = 0;
+    if (!data || len <= 0) return nullptr;
+    std::vector<float> pcm;
+    int sr = 0, ch = 0;
+    if (!decode_flac(data, (size_t)len, pcm, sr, ch) || ch <= 0)
+        return nullptr;
+    return finish_decode(pcm, sr, ch, out_rate, want_int16, out_sr, out_ch,
+                         out_frames);
+}
+
+float* glint_flac_decode(const uint8_t* data, int len, int* out_sr,
+                         int* out_ch, int* out_frames) {
+    return static_cast<float*>(glint_flac_decode_ex(
         data, len, 0, 0, out_sr, out_ch, out_frames));
 }
 

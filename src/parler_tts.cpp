@@ -33,6 +33,7 @@
 #include "core/gguf_loader.h"
 #include "core/sentencepiece.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -61,7 +62,7 @@
 static bool parler_tts_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("PARLER_TTS_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_PARLER_TTS_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -946,7 +947,7 @@ int parler_tts_set_description(struct parler_tts_context* ctx, const char* descr
     // tokenizer can't handle correctly. Override via PARLER_DESC_IDS env var
     // (comma-separated ints) for diff-testing.
     std::vector<int> desc_ids;
-    const char* override_ids = getenv("PARLER_DESC_IDS");
+    const char* override_ids = crispasr_env::get("CRISPASR_PARLER_DESC_IDS");
     if (override_ids && override_ids[0]) {
         // Parse comma-separated IDs for diff-testing
         std::string s(override_ids);
@@ -1044,7 +1045,7 @@ int parler_tts_set_description(struct parler_tts_context* ctx, const char* descr
     }
 
     // Optionally dump encoder output for diff-testing
-    const char* dump_path = getenv("PARLER_DUMP_ENC");
+    const char* dump_path = crispasr_env::get("CRISPASR_PARLER_DUMP_ENC");
     if (dump_path && dump_path[0]) {
         FILE* f = fopen(dump_path, "wb");
         if (f) {
@@ -1534,7 +1535,7 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
 
     // Tokenize the text prompt (override via PARLER_PROMPT_IDS for diff-testing)
     std::vector<int> prompt_ids;
-    const char* prompt_override = getenv("PARLER_PROMPT_IDS");
+    const char* prompt_override = crispasr_env::get("CRISPASR_PARLER_PROMPT_IDS");
     if (prompt_override && prompt_override[0]) {
         std::string s(prompt_override);
         size_t pos = 0;
@@ -1824,7 +1825,8 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
     std::vector<float> prefill_embed(prefill_len * D, 0.0f);
 
     // Prompt tokens
-    const bool parler_debug = (getenv("PARLER_DEBUG") && getenv("PARLER_DEBUG")[0] == '1');
+    const bool parler_debug =
+        (crispasr_env::get("CRISPASR_PARLER_DEBUG") && crispasr_env::get("CRISPASR_PARLER_DEBUG")[0] == '1');
     for (int i = 0; i < n_prompt; i++) {
         read_embed_row(m.dec_embed_prompts, prompt_ids[i], &prefill_embed[i * D], D);
     }

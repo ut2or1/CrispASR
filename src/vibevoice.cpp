@@ -20,6 +20,7 @@
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 #include "vibevoice_wav_ref.h"
 
 #include "ggml-backend.h"
@@ -48,7 +49,7 @@
 static bool vibevoice_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("VIBEVOICE_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_VIBEVOICE_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -163,6 +164,23 @@ struct vibevoice_context {
     // ASan heap-use-after-free). A private sched only ever sees this one
     // fixed-topology graph, so its gallocr never reallocates under it.
     ggml_backend_sched_t pred_sched = nullptr;
+
+    // Persistent 1-token embedding micro-graph (perf-sweep TODO-5): the AR
+    // loops call run_token_embedding_lookup once PER TOKEN; a fresh graph +
+    // sched_reset + sched_alloc per call is pure lifecycle overhead for a
+    // single get_rows. Own gallocr pinned to the backend where tok_emb
+    // actually lives (same placement the sched would pick), fully independent
+    // of the shared sched — same isolation rationale as pred_sched above.
+    struct {
+        std::vector<uint8_t> meta;
+        ggml_context* ctx0 = nullptr;
+        ggml_cgraph* gf = nullptr;
+        ggml_tensor* ids = nullptr;
+        ggml_tensor* out = nullptr;
+        ggml_gallocr_t ga = nullptr;
+        ggml_backend_t be = nullptr;
+        bool disabled = false; // init failed once — stay on the legacy path
+    } embed1;
     // §201 Lk-bucketed TTS LM step graphs (positive + negative KV paths)
     struct LmBucket {
         int lk = 0;
@@ -411,6 +429,10 @@ extern "C" void vibevoice_set_cfg_scale(struct vibevoice_context* ctx, float sca
 extern "C" void vibevoice_free(struct vibevoice_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->embed1.ga)
+        ggml_gallocr_free(ctx->embed1.ga);
+    if (ctx->embed1.ctx0)
+        ggml_free(ctx->embed1.ctx0);
     if (ctx->pred_graph_ctx)
         ggml_free(ctx->pred_graph_ctx);
     for (auto& bk : ctx->lm_buckets_pos)
@@ -906,6 +928,59 @@ static std::vector<float> run_token_embedding_lookup(vibevoice_context* ctx, con
     if (it == m.tensors.end() || !it->second)
         return {};
 
+    // Persistent 1-token fast path (perf-sweep TODO-5). Byte-identical: the
+    // same ggml_get_rows on the same weight, computed on the backend the
+    // weight lives on (which is where the sched placed it in the legacy
+    // path). VIBEVOICE_PERSIST_EMBED=0 restores the per-call graph.
+    const bool persist_gate = [] {
+        const char* e = std::getenv("VIBEVOICE_PERSIST_EMBED");
+        return !(e && *e && *e == '0');
+    }();
+    if (n_ids == 1 && persist_gate && !ctx->embed1.disabled) {
+        auto& e1 = ctx->embed1;
+        if (!e1.ctx0) {
+            // Pin to the weight's backend: host-resident weight + GPU main
+            // backend would otherwise hit the no-auto-copy sched rule.
+            e1.be = (it->second->buffer && ggml_backend_buffer_is_host(it->second->buffer) &&
+                     !ggml_backend_is_cpu(ctx->backend))
+                        ? ctx->backend_cpu
+                        : ctx->backend;
+            size_t mem1 = 16 * ggml_tensor_overhead() + ggml_graph_overhead();
+            e1.meta.resize(mem1);
+            ggml_init_params ip1 = {mem1, e1.meta.data(), true};
+            e1.ctx0 = ggml_init(ip1);
+            e1.ids = ggml_new_tensor_1d(e1.ctx0, GGML_TYPE_I32, 1);
+            ggml_set_name(e1.ids, "tok_ids1");
+            ggml_set_input(e1.ids);
+            e1.out = ggml_get_rows(e1.ctx0, it->second, e1.ids);
+            ggml_set_name(e1.out, "tok_emb1_out");
+            ggml_set_output(e1.out);
+            e1.gf = ggml_new_graph(e1.ctx0);
+            ggml_build_forward_expand(e1.gf, e1.out);
+            e1.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(e1.be));
+            if (!e1.ga || !ggml_gallocr_alloc_graph(e1.ga, e1.gf)) {
+                if (e1.ga)
+                    ggml_gallocr_free(e1.ga);
+                ggml_free(e1.ctx0);
+                e1.ctx0 = nullptr;
+                e1.ga = nullptr;
+                e1.disabled = true;
+            } else if (ctx->params.verbosity >= 1) {
+                fprintf(stderr, "vibevoice: persistent embed micro-graph active (%s)\n", ggml_backend_name(e1.be));
+            }
+        }
+        if (e1.ctx0) {
+            // Re-set the input EVERY compute (gallocr aliasing gotcha).
+            ggml_backend_tensor_set(e1.ids, ids, 0, sizeof(int32_t));
+            if (ggml_backend_graph_compute(e1.be, e1.gf) == GGML_STATUS_SUCCESS) {
+                std::vector<float> embeds((size_t)ctx->model.hp.d_lm);
+                ggml_backend_tensor_get(e1.out, embeds.data(), 0, embeds.size() * sizeof(float));
+                return embeds;
+            }
+            e1.disabled = true; // compute failed — legacy path from here on
+        }
+    }
+
     size_t mem = ctx->compute_meta.size();
     ggml_init_params ip = {mem, ctx->compute_meta.data(), true};
     ggml_context* ctx0 = ggml_init(ip);
@@ -1092,7 +1167,7 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
 
     auto& m = ctx->model;
     auto& hp = m.hp;
-    const char* dump_dir = getenv("VIBEVOICE_DUMP_DIR");
+    const char* dump_dir = crispasr_env::get("CRISPASR_VIBEVOICE_DUMP_DIR");
 
     auto G = [&](const std::string& name) -> ggml_tensor* {
         auto it = m.tensors.find(name);
@@ -1155,7 +1230,7 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
     // Debug: optionally inject Python reference features (whole-buffer
     // override of the features computed above; only used for short
     // single-chunk reference clips in stage-diff testing).
-    const char* ref_features_path = getenv("VIBEVOICE_REF_FEATURES");
+    const char* ref_features_path = crispasr_env::get("CRISPASR_VIBEVOICE_REF_FEATURES");
     if (ref_features_path && ref_features_path[0]) {
         FILE* f = fopen(ref_features_path, "rb");
         if (f) {
@@ -1650,7 +1725,7 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
     }
 
     // Debug: dump first 20 generated tokens
-    if (getenv("VIBEVOICE_DEBUG")) {
+    if (crispasr_env::get("CRISPASR_VIBEVOICE_DEBUG")) {
         fprintf(stderr, "vibevoice: first 20 tokens: [");
         for (int i = 0; i < std::min((int)output_tokens.size(), 20); i++) {
             int tid = output_tokens[i];
@@ -1677,7 +1752,7 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
     }
 
     if (result.empty()) {
-        if (getenv("VIBEVOICE_DEBUG")) {
+        if (crispasr_env::get("CRISPASR_VIBEVOICE_DEBUG")) {
             fprintf(stderr, "vibevoice: result is EMPTY after detokenization (all tokens were special)\n");
         }
         return nullptr;
@@ -2158,7 +2233,7 @@ static bool backend_is_vulkan_intel_igpu(ggml_backend_t b) {
 static bool vibevoice_vae_should_use_cpu(ggml_backend_t backend, ggml_backend_t backend_cpu) {
     if (!backend_cpu)
         return false; // no CPU backend wired — can't fallback
-    const char* env = std::getenv("VIBEVOICE_VAE_BACKEND");
+    const char* env = crispasr_env::get("CRISPASR_VIBEVOICE_VAE_BACKEND");
     if (env && std::strcmp(env, "cpu") == 0)
         return true;
     if (env && std::strcmp(env, "gpu") == 0)
@@ -2185,7 +2260,7 @@ static bool vibevoice_vae_should_use_cpu(ggml_backend_t backend, ggml_backend_t 
 // half of the graph — together the two knobs bisect the TTS compute on a GPU.
 static bool vibevoice_tts_use_flash_attn() {
     static const bool v = []() {
-        const char* e = std::getenv("VIBEVOICE_TTS_FLASH_ATTN");
+        const char* e = crispasr_env::get("CRISPASR_VIBEVOICE_TTS_FLASH_ATTN");
         return !(e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N' || e[0] == 'f' || e[0] == 'F'));
     }();
     return v;
@@ -2576,7 +2651,7 @@ static ggml_tensor* build_transposed_conv1d(ggml_context* ctx, ggml_tensor* x, g
 static ggml_cgraph* build_vae_decoder_graph(vibevoice_context* ctx, int n_frames) {
     auto& hp = ctx->model.hp;
     auto& ts = ctx->model.tensors;
-    const bool dump_decoder = getenv("VIBEVOICE_TTS_DUMP_DECODER") != nullptr;
+    const bool dump_decoder = crispasr_env::get("CRISPASR_VIBEVOICE_TTS_DUMP_DECODER") != nullptr;
     auto G = [&](const std::string& name) -> ggml_tensor* {
         auto it = ts.find(name);
         return it != ts.end() ? it->second : nullptr;
@@ -2976,7 +3051,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     int verbosity = ctx->params.verbosity;
     int vae_dim = hp.vae_dim_acoustic;
     int d_lm = hp.d_lm;
-    const char* dump_dir = getenv("VIBEVOICE_TTS_DUMP");
+    const char* dump_dir = crispasr_env::get("CRISPASR_VIBEVOICE_TTS_DUMP");
     const auto tts_t0 = std::chrono::high_resolution_clock::now();
 
     // VibeVoice TTS hits Apple's GPU watchdog
@@ -3055,7 +3130,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         // Try loading voice audio from the voice GGUF path (reused as audio path for 1.5B)
         // For the Base models, --voice points to a reference .wav
         if (ctx->voice.tts_seq_len == 0) {
-            const char* voice_wav = getenv("VIBEVOICE_VOICE_AUDIO");
+            const char* voice_wav = crispasr_env::get("CRISPASR_VIBEVOICE_VOICE_AUDIO");
             if (voice_wav && voice_wav[0]) {
                 FILE* fv = fopen(voice_wav, "rb");
                 std::vector<float> ref_pcm;
@@ -3427,7 +3502,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         mt19937_state rng;
         {
             uint32_t seed = 42;
-            if (const char* sv = getenv("VIBEVOICE_TTS_SEED")) {
+            if (const char* sv = crispasr_env::get("CRISPASR_VIBEVOICE_TTS_SEED")) {
                 seed = (uint32_t)strtoul(sv, nullptr, 0);
             }
             if (ctx->params.seed != 0)
@@ -3607,7 +3682,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         memcpy(out_buf, raw_audio.data() + trim_start, (size_t)trimmed_len * sizeof(float));
         if (out_n_samples)
             *out_n_samples = trimmed_len;
-        if (getenv("VIBEVOICE_BENCH")) {
+        if (crispasr_env::get("CRISPASR_VIBEVOICE_BENCH")) {
             const auto t_pure_infer_end = std::chrono::high_resolution_clock::now();
             double infer_sec = std::chrono::duration<double>(t_pure_infer_end - t_pure_infer_start).count();
             double audio_sec = trimmed_len / 24000.0;
@@ -4575,7 +4650,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
             fprintf(stderr, "vibevoice TTS: neg TTS LM prefill failed\n");
             return nullptr;
         }
-        if (verbosity >= 2 || getenv("VIBEVOICE_TTS_TRACE")) {
+        if (verbosity >= 2 || crispasr_env::get("CRISPASR_VIBEVOICE_TTS_TRACE")) {
             float rms = sqrtf(
                 std::inner_product(neg_condition.begin(), neg_condition.end(), neg_condition.begin(), 0.0f) / d_lm);
             fprintf(stderr, "  neg_condition prefill (IMAGE_PAD): rms=%.4f\n", rms);
@@ -4640,7 +4715,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
             ggml_backend_tensor_get(sf, &scaling_factor, 0, sizeof(float));
         if (bf)
             ggml_backend_tensor_get(bf, &bias_factor, 0, sizeof(float));
-        if (verbosity >= 2 || getenv("VIBEVOICE_TTS_TRACE"))
+        if (verbosity >= 2 || crispasr_env::get("CRISPASR_VIBEVOICE_TTS_TRACE"))
             fprintf(stderr, "  speech_scaling=%g speech_bias=%g  (sf=%p bf=%p)\n", scaling_factor, bias_factor,
                     (void*)sf, (void*)bf);
     }
@@ -4680,7 +4755,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     float cfg_scale = is_base_model ? 1.3f : 3.0f;
     if (ctx->params.cfg_scale > 0.0f) {
         cfg_scale = ctx->params.cfg_scale;
-    } else if (const char* ce = getenv("VIBEVOICE_TTS_CFG_SCALE")) {
+    } else if (const char* ce = crispasr_env::get("CRISPASR_VIBEVOICE_TTS_CFG_SCALE")) {
         float v = (float)atof(ce);
         if (v > 0.0f)
             cfg_scale = v;
@@ -4690,7 +4765,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     mt19937_state rng;
     {
         uint32_t seed = 42;
-        if (const char* sv = getenv("VIBEVOICE_TTS_SEED")) {
+        if (const char* sv = crispasr_env::get("CRISPASR_VIBEVOICE_TTS_SEED")) {
             seed = (uint32_t)strtoul(sv, nullptr, 0);
         }
         if (ctx->params.seed != 0)
@@ -4699,7 +4774,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     }
 
     std::vector<float> preloaded_noise;
-    const char* noise_file = getenv("VIBEVOICE_TTS_NOISE");
+    const char* noise_file = crispasr_env::get("CRISPASR_VIBEVOICE_TTS_NOISE");
     if (noise_file && noise_file[0]) {
         FILE* nf = fopen(noise_file, "rb");
         if (nf) {
@@ -4716,7 +4791,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     int total_frames = 0;
     bool finished = false;
     int trace_frame = -1;
-    if (const char* tf = getenv("VIBEVOICE_TTS_TRACE_FRAME"))
+    if (const char* tf = crispasr_env::get("CRISPASR_VIBEVOICE_TTS_TRACE_FRAME"))
         trace_frame = atoi(tf);
     double bench_sum_diff = 0, bench_sum_lm = 0;
     int bench_frames = 0;
@@ -4763,7 +4838,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
             if (fi == 0)
                 vibevoice_dump_f32(dump_dir, "tts_noise_frame0", z.data(), z.size());
             // Per-frame conditions/noise dump (VIBEVOICE_TTS_DUMP_PERFRAME=1).
-            if (getenv("VIBEVOICE_TTS_DUMP_PERFRAME")) {
+            if (crispasr_env::get("CRISPASR_VIBEVOICE_TTS_DUMP_PERFRAME")) {
                 char nm[64];
                 snprintf(nm, sizeof(nm), "perframe_pos_cond_f%03d", fi);
                 vibevoice_dump_f32(dump_dir, nm, hidden.data(), hidden.size());
@@ -4820,7 +4895,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                 if (fi == 0 && step == 0)
                     vibevoice_dump_f32(dump_dir, "tts_v_cfg_step0", v_cfg.data(), v_cfg.size());
                 // Per-frame step-0 v_cfg dump (VIBEVOICE_TTS_DUMP_PERFRAME=1).
-                if (step == 0 && getenv("VIBEVOICE_TTS_DUMP_PERFRAME")) {
+                if (step == 0 && crispasr_env::get("CRISPASR_VIBEVOICE_TTS_DUMP_PERFRAME")) {
                     char nm[64];
                     snprintf(nm, sizeof(nm), "perframe_v_cfg_step0_f%03d", fi);
                     vibevoice_dump_f32(dump_dir, nm, v_cfg.data(), v_cfg.size());
@@ -4864,7 +4939,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
             if (fi == 0) {
                 vibevoice_dump_f32(dump_dir, "tts_latent_frame0", z.data(), z.size());
             }
-            if (getenv("VIBEVOICE_TTS_DUMP_PERFRAME")) {
+            if (crispasr_env::get("CRISPASR_VIBEVOICE_TTS_DUMP_PERFRAME")) {
                 char nm[64];
                 snprintf(nm, sizeof(nm), "perframe_latent_f%03d", fi);
                 vibevoice_dump_f32(dump_dir, nm, z.data(), z.size());
@@ -4881,7 +4956,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
             if (fi == 0) {
                 vibevoice_dump_f32(dump_dir, "tts_acoustic_embed_frame0", speech_embed.data(), speech_embed.size());
             }
-            if (getenv("VIBEVOICE_TTS_DUMP_PERFRAME")) {
+            if (crispasr_env::get("CRISPASR_VIBEVOICE_TTS_DUMP_PERFRAME")) {
                 char nm[64];
                 snprintf(nm, sizeof(nm), "perframe_acoustic_embed_f%03d", fi);
                 vibevoice_dump_f32(dump_dir, nm, speech_embed.data(), speech_embed.size());
@@ -4956,7 +5031,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                             ggml_backend_tensor_get(ggml_graph_get_tensor(gf_e, "eos_out"), &eos_logit, 0,
                                                     sizeof(float));
                             float eos_prob = 1.0f / (1.0f + expf(-eos_logit)); // sigmoid
-                            if (getenv("VIBEVOICE_TTS_DUMP_PERFRAME")) {
+                            if (crispasr_env::get("CRISPASR_VIBEVOICE_TTS_DUMP_PERFRAME")) {
                                 char nm[64];
                                 snprintf(nm, sizeof(nm), "perframe_eos_logit_f%03d", fi);
                                 vibevoice_dump_f32(dump_dir, nm, &eos_logit, 1);
@@ -4973,7 +5048,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                 }
             }
             // Per-frame timing accumulation
-            if (getenv("VIBEVOICE_BENCH")) {
+            if (crispasr_env::get("CRISPASR_VIBEVOICE_BENCH")) {
                 auto t_frame_end = std::chrono::high_resolution_clock::now();
                 double diff_ms = std::chrono::duration<double, std::milli>(t_diff_end - t_frame_start).count();
                 double rest_ms = std::chrono::duration<double, std::milli>(t_frame_end - t_diff_end).count();
@@ -4994,7 +5069,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
 
     } // end text/speech interleave loop
 
-    if (const char* latent_file = getenv("VIBEVOICE_TTS_LATENTS")) {
+    if (const char* latent_file = crispasr_env::get("CRISPASR_VIBEVOICE_TTS_LATENTS")) {
         std::vector<float> override_latents;
         if (!vibevoice_load_f32_file(latent_file, override_latents) || override_latents.empty() ||
             (override_latents.size() % (size_t)vae_dim) != 0) {
@@ -5024,7 +5099,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
 
     // 6. Scale and decode
     const auto t_ar_done = std::chrono::high_resolution_clock::now();
-    if (getenv("VIBEVOICE_BENCH") && lm_step_count > 0) {
+    if (crispasr_env::get("CRISPASR_VIBEVOICE_BENCH") && lm_step_count > 0) {
         fprintf(stderr,
                 "  BENCH LM step (%d calls): build=%.0fms (%.1f/call), alloc=%.0fms (%.1f/call), compute=%.0fms "
                 "(%.1f/call)\n",
@@ -5078,7 +5153,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         return nullptr;
     }
     auto t_vae_compute1 = std::chrono::high_resolution_clock::now();
-    if (getenv("VIBEVOICE_BENCH")) {
+    if (crispasr_env::get("CRISPASR_VIBEVOICE_BENCH")) {
         fprintf(stderr, "  BENCH VAE (%d frames→%dx): build=%.0fms, alloc=%.0fms, compute=%.0fms, ops=%d\n",
                 actual_frames, actual_frames * 3200,
                 std::chrono::duration<double, std::milli>(t_vae_alloc0 - t_vae_build0).count(),
@@ -5099,7 +5174,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         fprintf(stderr, "vibevoice TTS: output %d samples (%.2f sec at 24kHz) in %.1f ms (%.2fx realtime)\n",
                 total_audio, audio_sec, tts_ms, audio_sec / (tts_ms / 1000.0));
     }
-    if (getenv("VIBEVOICE_BENCH")) {
+    if (crispasr_env::get("CRISPASR_VIBEVOICE_BENCH")) {
         double prefill_ms = std::chrono::duration<double, std::milli>(t_prefill_done - tts_t0).count();
         double ar_ms = std::chrono::duration<double, std::milli>(t_ar_done - t_prefill_done).count();
         double vae_ms = std::chrono::duration<double, std::milli>(tts_t1 - t_ar_done).count();
@@ -5113,7 +5188,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     ggml_backend_tensor_get(audio_out, raw_audio.data(), 0, (size_t)total_audio * sizeof(float));
     if (dump_dir) {
         vibevoice_dump_f32(dump_dir, "tts_raw_audio", raw_audio.data(), raw_audio.size());
-        if (getenv("VIBEVOICE_TTS_DUMP_DECODER")) {
+        if (crispasr_env::get("CRISPASR_VIBEVOICE_TTS_DUMP_DECODER")) {
             const char* names[] = {"dec_stem",   "dec_stage0", "dec_up1",    "dec_stage1", "dec_up2",
                                    "dec_stage2", "dec_up3",    "dec_stage3", "dec_up4",    "dec_stage4",
                                    "dec_up5",    "dec_stage5", "dec_up6",    "dec_stage6"};

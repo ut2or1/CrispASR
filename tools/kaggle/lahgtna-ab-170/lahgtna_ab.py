@@ -123,6 +123,11 @@ if not CRISPASR_DIR.exists():
 sys.path.insert(0, str(CRISPASR_DIR / "tools" / "kaggle"))
 try:
     import kaggle_harness as kh
+    # Full harness regime: authenticate HF pulls from the attached token
+    # dataset (anon pulls get rate-limited); hf_transfer wedges multi-GB
+    # Kaggle downloads, so keep the plain resumable downloader.
+    kh.resolve_hf_token()
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
     kh.init_progress()
     kh.install_build_toolchain()
 except Exception as e:
@@ -135,7 +140,7 @@ os.makedirs(build_dir, exist_ok=True)
 
 subprocess.check_call([
     "cmake", "-G", "Ninja", "-B", str(build_dir),
-    "-DCMAKE_BUILD_TYPE=Release",
+    "-DCMAKE_BUILD_TYPE=Release", "-DCRISPASR_NO_C2PA_NATIVE=ON",
     "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
     "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
 ], cwd=str(CRISPASR_DIR),

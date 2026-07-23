@@ -13,6 +13,7 @@
 //              8198 = 8192 vocab + 1 blank + 5 TDT durations {0,1,2,3,4}
 
 #include "parakeet.h"
+#include "core/crispasr_env.h"
 #include "parakeet_ja_detect.h"
 
 #ifndef M_PI
@@ -59,7 +60,7 @@
 static bool parakeet_use_scalar() {
     static int v = -1;
     if (v < 0)
-        v = (getenv("PARAKEET_FORCE_SCALAR") != nullptr) ? 1 : 0;
+        v = (crispasr_env::get("CRISPASR_PARAKEET_FORCE_SCALAR") != nullptr) ? 1 : 0;
     return v != 0;
 }
 #endif
@@ -75,7 +76,7 @@ static bool parakeet_use_scalar() {
 static bool parakeet_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("PARAKEET_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_PARAKEET_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -935,7 +936,7 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
     // corruption (reuse windows collapse enc std 0.020 → 0.008). See issue #208.
     ggml_cgraph* gf;
     const bool use_enc_cache = getenv("CRISPASR_PARAKEET_ENC_CACHE") != nullptr;
-    const bool probe_time = getenv("PARAKEET_ENC_PROBE") != nullptr;
+    const bool probe_time = crispasr_env::get("CRISPASR_PARAKEET_ENC_PROBE") != nullptr;
     bool enc_cache_hit = false;
     int64_t t_build0 = probe_time ? ggml_time_us() : 0;
     if (use_enc_cache && ctx->cached_enc_gf && ctx->cached_enc_T_mel == T_mel) {
@@ -1010,7 +1011,7 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
 
     std::vector<float> result((size_t)d * Te);
     ggml_backend_tensor_get(out, result.data(), 0, result.size() * sizeof(float));
-    if (getenv("PARAKEET_ENC_PROBE")) {
+    if (crispasr_env::get("CRISPASR_PARAKEET_ENC_PROBE")) {
         double s = 0, s2 = 0;
         const size_t n = result.size();
         for (float v : result) {
@@ -1287,7 +1288,7 @@ static void parakeet_init_pred_weights(parakeet_context* ctx) {
     // either the converter dropped padding_idx semantics or the
     // checkpoint was built with a different convention — the SOS step
     // (predictor at blank input) would produce wrong output.
-    if (getenv("PARAKEET_DEBUG") && blank_id < (int)embed_rows) {
+    if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG") && blank_id < (int)embed_rows) {
         const float* row = W.embed.data() + (size_t)blank_id * H;
         double s = 0;
         float maxv = 0;
@@ -1371,9 +1372,9 @@ static bool parakeet_init_ggml_decoder(parakeet_context* ctx, core_rnnt_ggml::De
     if (ggml_dec && ggml_backend_is_metal(ctx->backend))
         ggml_dec = false;
 #endif
-    if (const char* e = getenv("PARAKEET_GGML_DECODE"))
+    if (const char* e = crispasr_env::get("CRISPASR_PARAKEET_GGML_DECODE"))
         ggml_dec = (e[0] == '1');
-    if (ggml_dec && getenv("RNNT_GGML_PERSTEP") == nullptr) {
+    if (ggml_dec && crispasr_env::get("CRISPASR_RNNT_GGML_PERSTEP") == nullptr) {
         const auto& p = ctx->model.predictor;
         const auto& j = ctx->model.joint;
         core_rnnt_ggml::decoder_init(gdec, ctx->backend, p.embed_w, p.lstm0_w_ih, p.lstm0_b_ih, p.lstm0_w_hh,
@@ -1416,7 +1417,7 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
     // §232: ggml GPU decode default (see parakeet_init_ggml_decoder / LEARNINGS 33).
     core_rnnt_ggml::Decoder gdec;
     const bool ggml_dec = parakeet_init_ggml_decoder(ctx, gdec);
-    const bool time_dec = getenv("PARAKEET_DECODE_TIMING") != nullptr;
+    const bool time_dec = crispasr_env::get("CRISPASR_PARAKEET_DECODE_TIMING") != nullptr;
     auto _dt0 = std::chrono::steady_clock::now();
 
     const auto& hp = ctx->model.hparams;
@@ -1444,7 +1445,7 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
         parakeet_predictor_step_ggml(ctx, gdec, blank_id, state, pred_out);
     else
         predictor_step(W, blank_id, state, pred_out);
-    if (getenv("PARAKEET_DEBUG"))
+    if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG"))
         fprintf(
             stderr, "parakeet: pred_out[blank]: mean=%.4f std=%.4f [0..3]=%.4f %.4f %.4f %.4f\n",
             [&] {
@@ -1527,7 +1528,7 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
                 core_context_bias::apply_bias(ctx->hotword_trie, hw_state, logits.data(), n_vocab_blk,
                                               ctx->hotword_boost);
 
-            if (getenv("PARAKEET_DEBUG") && total_steps < 5) {
+            if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG") && total_steps < 5) {
                 // Show first few logits
                 int best = 0;
                 float best_v = logits[0];
@@ -1643,7 +1644,7 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
 
             // Diagnostic: dump predictor stats for the first few emissions
             // so we can compare with NeMo step-by-step (not just SOS).
-            if (getenv("PARAKEET_DEBUG") && (int)emitted.size() <= 5) {
+            if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG") && (int)emitted.size() <= 5) {
                 double s = 0, m = 0;
                 float minv = pred_out[0], maxv = pred_out[0];
                 for (auto v : pred_out) {
@@ -3232,7 +3233,7 @@ extern "C" int parakeet_test_encoder(struct parakeet_context* ctx, int T_mel) {
     auto out = parakeet_encode_mel(ctx, mel.data(), n_mels, T_mel, &T_enc);
     if (out.empty())
         return -1;
-    if (getenv("PARAKEET_DEBUG"))
+    if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG"))
         fprintf(stderr, "parakeet: encoder OK — T_mel=%d → T_enc=%d  d=%d  out[0..3]=%g %g %g %g\n", T_mel, T_enc,
                 (int)ctx->model.hparams.d_model, (double)out[0], (double)out[1], (double)out[2], (double)out[3]);
     return T_enc;
@@ -3244,7 +3245,7 @@ extern "C" int parakeet_test_audio(struct parakeet_context* ctx, const float* sa
     if (mel.empty())
         return -1;
 
-    if (getenv("PARAKEET_DEBUG"))
+    if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG"))
         fprintf(stderr, "parakeet: mel OK — n_samples=%d (%.2fs)  T_mel=%d  n_mels=%d  mel[0..3]=%g %g %g %g\n",
                 n_samples, (double)n_samples / ctx->model.hparams.sample_rate, T_mel, (int)ctx->model.hparams.n_mels,
                 (double)mel[0], (double)mel[1], (double)mel[2], (double)mel[3]);
@@ -3267,7 +3268,7 @@ extern "C" int parakeet_test_audio(struct parakeet_context* ctx, const float* sa
     }
     double mean = sum / enc_out.size();
     double var = sq / enc_out.size() - mean * mean;
-    if (getenv("PARAKEET_DEBUG"))
+    if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG"))
         fprintf(stderr, "parakeet: encoder OK — T_enc=%d  d=%d  mean=%.4f  std=%.4f  min=%.3f  max=%.3f\n", T_enc,
                 (int)ctx->model.hparams.d_model, mean, sqrt(var), (double)mn, (double)mx);
     return T_enc;
@@ -3700,7 +3701,7 @@ static std::vector<float> parakeet_encode_chunked(parakeet_context* ctx, const f
                        enc.begin() + (size_t)(skip_frames + keep_frames) * d_model);
         T_enc_total += keep_frames;
 
-        if (getenv("PARAKEET_DEBUG"))
+        if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG"))
             fprintf(stderr, "parakeet: chunk @%d: %d samples → %d mel → %d enc (skip %d, keep %d)\n", offset, chunk_len,
                     T_mel, T_enc, skip_frames, keep_frames);
     }
@@ -3739,7 +3740,7 @@ extern "C" struct parakeet_result* parakeet_transcribe_chunked(struct parakeet_c
     if (enc_all.empty() || T_enc_total <= 0)
         return nullptr;
 
-    if (getenv("PARAKEET_DEBUG"))
+    if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG"))
         fprintf(stderr, "parakeet: chunked encode done: %d total encoder frames from %d samples\n", T_enc_total,
                 n_samples);
 
@@ -3761,7 +3762,7 @@ extern "C" struct parakeet_result* parakeet_transcribe_chunked(struct parakeet_c
                : use_beam ? parakeet_tdt_beam_decode(ctx, enc_all.data(), T_enc_total, d_model, ctx->decode_beam_size)
                           : parakeet_tdt_decode_batched(ctx, enc_all.data(), T_enc_total, d_model));
 
-    if (getenv("PARAKEET_DEBUG"))
+    if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG"))
         fprintf(stderr, "parakeet: %s decode OK (%d tokens from %d enc frames)\n",
                 use_ctc    ? "CTC"
                 : use_rnnt ? "RNNT"
@@ -3868,7 +3869,7 @@ extern "C" struct parakeet_result* parakeet_transcribe_streamed(struct parakeet_
     if (mel_full.empty() || T_mel <= 0)
         return nullptr;
 
-    if (getenv("PARAKEET_DEBUG"))
+    if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG"))
         fprintf(stderr, "parakeet[streamed]: full mel: %d frames from %d samples\n", T_mel, n_samples);
 
     // ---- Pass 2: encode mel in overlapping chunks ----
@@ -3907,7 +3908,7 @@ extern "C" struct parakeet_result* parakeet_transcribe_streamed(struct parakeet_
                        enc.begin() + (size_t)(skip + keep) * d_model);
         T_enc_total += keep;
 
-        if (getenv("PARAKEET_DEBUG"))
+        if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG"))
             fprintf(stderr, "parakeet[streamed]: mel chunk @%d: %d mel → %d enc (skip %d, keep %d)\n", mel_offset,
                     chunk_T, T_enc, skip, keep);
     }
@@ -3915,7 +3916,7 @@ extern "C" struct parakeet_result* parakeet_transcribe_streamed(struct parakeet_
     if (enc_all.empty() || T_enc_total <= 0)
         return nullptr;
 
-    if (getenv("PARAKEET_DEBUG"))
+    if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG"))
         fprintf(stderr, "parakeet[streamed]: total %d enc frames → single TDT decode\n", T_enc_total);
 
     // ---- Single TDT decode over concatenated encoder output ----
@@ -3938,7 +3939,7 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
     }
     if (mel.empty())
         return nullptr;
-    if (getenv("PARAKEET_DEBUG"))
+    if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG"))
         fprintf(stderr, "parakeet: mel OK (%d frames)\n", T_mel);
 
     // 2. Encoder
@@ -3950,7 +3951,7 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
     }
     if (enc.empty())
         return nullptr;
-    if (getenv("PARAKEET_DEBUG")) {
+    if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG")) {
         fprintf(stderr, "parakeet: encoder OK (%d frames)\n", T_enc);
         int d = (int)ctx->model.hparams.d_model;
         double s = 0, sq = 0;
@@ -3982,7 +3983,7 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
                : use_beam ? parakeet_tdt_beam_decode(ctx, enc.data(), T_enc, d, ctx->decode_beam_size)
                           : (getenv("CRISPASR_TDT_BATCH") ? parakeet_tdt_decode_batched(ctx, enc.data(), T_enc, d)
                                                           : parakeet_tdt_decode(ctx, enc.data(), T_enc, d)));
-    if (getenv("PARAKEET_DEBUG"))
+    if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG"))
         fprintf(stderr, "parakeet: %s%s decode OK (%d tokens)\n",
                 use_ctc    ? "CTC"
                 : use_rnnt ? "RNNT"

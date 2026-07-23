@@ -8,6 +8,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/crispasr_env.h"
 
 class MoonshineStreamingBackend : public CrispasrBackend {
 public:
@@ -34,9 +35,9 @@ public:
         // text). Revisit once the offline batch-encoder fast-path lands
         // (PLAN §232 Fix 2). MOONSHINE_STREAMING_GPU=1 opts in for A/B (and to
         // exercise the §232 hybrid decoder-weight placement).
-        if (const char* g = getenv("MOONSHINE_STREAMING_GPU"))
+        if (const char* g = crispasr_env::get("CRISPASR_MOONSHINE_STREAMING_GPU"))
             cp.use_gpu = (g[0] == '1');
-        if (getenv("CRISPASR_VERBOSE") || getenv("MOONSHINE_STREAMING_BENCH"))
+        if (getenv("CRISPASR_VERBOSE") || crispasr_env::get("CRISPASR_MOONSHINE_STREAMING_BENCH"))
             cp.verbosity = 2;
         ctx_ = moonshine_streaming_init_from_file(params.model.c_str(), cp);
         return ctx_ != nullptr;

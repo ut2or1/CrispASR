@@ -65,6 +65,8 @@ void canary_qwen_set_temperature(struct canary_qwen_context* ctx, float temperat
 
 // Beam search width. n > 1 activates beam search; n <= 0 → 1 (greedy).
 void canary_qwen_set_beam_size(struct canary_qwen_context* ctx, int n);
+// #292: forward --max-new-tokens. <= 0 keeps the backend's 256 default.
+void canary_qwen_set_max_new_tokens(struct canary_qwen_context* ctx, int n);
 
 // Hyper-parameters
 int canary_qwen_frame_dur_cs(struct canary_qwen_context* ctx);

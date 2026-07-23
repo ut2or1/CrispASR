@@ -13,6 +13,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "core/crispasr_env.h"
 
 namespace {
 
@@ -78,7 +79,7 @@ public:
         auto hi = text.find_last_not_of(' ');
         text = (lo == std::string::npos) ? "" : text.substr(lo, hi - lo + 1);
 
-        if (getenv("WAV2VEC2_BENCH"))
+        if (crispasr_env::get("CRISPASR_WAV2VEC2_BENCH"))
             fprintf(stderr, "wav2vec2: decoded %d frames → %zu chars (%zu emissions)\n", T, text.size(),
                     token_probs.size());
 

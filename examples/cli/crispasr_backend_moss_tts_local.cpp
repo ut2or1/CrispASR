@@ -123,6 +123,18 @@ public:
             sp.text_temperature = params.temperature;
             sp.audio_temperature = params.temperature;
         }
+        // Explicit-only: whisper_params default 512 vs moss-tts-local default 4096
+        // — `> 0` would shrink every synthesis to 512 frames. Gate on the flag (#292).
+        if (params.max_new_tokens_explicit)
+            sp.max_new_frames = params.max_new_tokens;
+        if (params.tts_max_speech_tokens >= 0)
+            sp.max_audio_frames = params.tts_max_speech_tokens;
+        if (params.tts_top_p >= 0.0f)
+            sp.audio_top_p = params.tts_top_p;
+        if (params.tts_top_k >= 0)
+            sp.audio_top_k = params.tts_top_k;
+        if (params.tts_repetition_penalty >= 0.0f)
+            sp.audio_repetition_penalty = params.tts_repetition_penalty;
         std::string lang;
         if (!params.language.empty() && params.language != "auto") {
             lang = crispasr_iso_to_english_lang(params.language);

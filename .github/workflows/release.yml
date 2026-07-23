@@ -435,10 +435,14 @@ jobs:
             -exec cp -P {} "$OUT/src/" \;
           find build-libs/ggml/src -name 'libggml*.so*' \( -type f -o -type l \) \
             -exec cp -P {} "$OUT/ggml/src/" \;
-          for f in "$OUT"/src/*.so* "$OUT"/ggml/src/*.so*; do
-            [ -L "$f" ] && continue
-            patchelf --set-rpath '$ORIGIN:$ORIGIN/../../ggml/src' "$f" 2>/dev/null || true
-          done
+          # Flatten into lib/ (src/ and ggml/src/ stay as symlinks so existing
+          # CRISPASR_SYS_LIB_DIR consumers keep working), rewrite RUNPATH to be
+          # $ORIGIN-relative, then PROVE the bundle dlopens from a relocated
+          # copy. The old inline patchelf used $ORIGIN/../../ggml/src — one
+          # level too high, pointing outside the bundle — and shipped anyway,
+          # because the gate only checked dependencies were PRESENT, never that
+          # RUNPATH could find them. Fails the release rather than the consumer.
+          bash tools/package-lib-bundle.sh "$OUT"
           cp include/crispasr.h "$OUT/include/"
           cp ggml/include/*.h   "$OUT/ggml/include/" 2>/dev/null || true
           cp LICENSE "$OUT/"
@@ -740,6 +744,63 @@ jobs:
           files: release/crispasr-macos.tar.gz
           fail_on_unmatched_files: false
 
+  # ── Apple xcframework (iOS + simulator + macOS + tvOS/visionOS) ───────────────
+  #
+  # iOS shipped NOWHERE before this. build.yml has an ios-xcode-build job, but
+  # build.yml is deliberately NOT triggered on our v* tags (see its header: it is
+  # the upstream ggml matrix and its own release: job would race this workflow and
+  # attach ggml artifacts). Its "attach xcframework if ref_type == tag" step was
+  # therefore dead code — the workflow never ran on a tag, so no iOS asset ever
+  # reached a release. This puts the build where tags actually live.
+  #
+  # build-xcframework.sh builds STATIC (BUILD_SHARED_LIBS=OFF), so the xcframework
+  # has no dylib and none of the @rpath problems the desktop lib bundles had — the
+  # archive drops straight into an Xcode/Flutter project.
+  build-xcframework:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Build xcframework
+        run: |
+          chmod +x build-xcframework.sh
+          ./build-xcframework.sh
+
+      - name: Package
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          test -d build-apple/crispasr.xcframework  # fail loudly if the build produced nothing
+          mkdir -p release-ios
+          # --symlinks: the .framework Versions/Current symlinks must survive the
+          # zip or the consumer's framework is malformed. Zip from inside
+          # build-apple so the archive root is crispasr.xcframework, not a path.
+          ( cd build-apple && zip --symlinks -r "$GITHUB_WORKSPACE/release-ios/crispasr-${TAG}-xcframework.zip" crispasr.xcframework )
+          ls -lh release-ios/
+          # Guard: the zip name is crispasr-<TAG>-xcframework.zip (a DASH before
+          # xcframework). The attach glob below must match that; an earlier
+          # `*.xcframework.zip` (dot) matched nothing and, with
+          # fail_on_unmatched_files:false, the job went green having attached NO
+          # iOS asset. Assert the file exists here so a naming slip fails loudly.
+          test -n "$(ls release-ios/*xcframework.zip 2>/dev/null)" || { echo "no xcframework zip produced"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-xcframework
+          path: release-ios/*xcframework.zip
+
+      - name: Attach xcframework to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: release-ios/*xcframework.zip
+          # true, not false: this is the headline iOS asset — a glob that matches
+          # nothing must FAIL the release, not ship it silently (that is exactly
+          # how the first v0.8.20 run "succeeded" with no xcframework attached).
+          fail_on_unmatched_files: true
+
   # ── Shared-library bundle for macOS arm64 (Metal) ────────────────────────────
   #
   # Mirrors what llama.cpp's release artifacts do: ship a per-platform
@@ -797,12 +858,32 @@ jobs:
             -exec cp -P {} "$OUT/ggml/src/" \;
           # Headers so binding authors can extend the FFI without
           # vendoring the whole CrispASR repo.
+          # NOTE: there are deliberately no libogg/libopus copies here. They
+          # are STATIC archives linked into libcrispasr (src/CMakeLists.txt
+          # forces BUILD_SHARED_LIBS=OFF around the FetchContent block), so
+          # they must not appear as separate dylibs. If they ever do, the
+          # @rpath gate below fails the release rather than shipping a bundle
+          # that cannot dlopen — which is what happened in v0.8.17.
+          # Headers so binding authors can extend the FFI without
+          # vendoring the whole CrispASR repo.
           cp include/crispasr.h "$OUT/include/"
           cp ggml/include/*.h   "$OUT/ggml/include/" 2>/dev/null || true
           cp LICENSE "$OUT/"
           cp THIRD_PARTY_NOTICES.txt "$OUT/"
+
+          # Flatten into lib/ (src/ and ggml/src/ stay as symlinks so existing
+          # CRISPASR_SYS_LIB_DIR consumers keep working), rewrite LC_RPATH to be
+          # @loader_path-relative, then PROVE the bundle dlopens from a relocated
+          # copy. v0.8.18 baked the CI runner's build tree into LC_RPATH
+          # (/Users/runner/work/CrispASR/...), so @rpath/libggml.0.dylib resolved
+          # to a directory that exists on no other machine — and it shipped,
+          # because the gate only checked dependencies were PRESENT, never that
+          # LC_RPATH could find them. Same script the Linux lib jobs run.
+          bash tools/package-lib-bundle.sh "$OUT"
+
           cd release && tar czf libcrispasr-macos-arm64.tar.gz libcrispasr-macos-arm64/
           ls -lh libcrispasr-macos-arm64.tar.gz
+          echo "bundle contents:"; tar tzf libcrispasr-macos-arm64.tar.gz | sed 's/^/  /'
 
       - uses: actions/upload-artifact@v4
         with:
@@ -863,10 +944,14 @@ jobs:
             -exec cp -P {} "$OUT/ggml/src/" \;
           # Patch RPATH to $ORIGIN so libs resolve siblings without
           # LD_LIBRARY_PATH (matches build-python-linux convention).
-          for f in "$OUT"/src/*.so* "$OUT"/ggml/src/*.so*; do
-            [ -L "$f" ] && continue
-            patchelf --set-rpath '$ORIGIN:$ORIGIN/../../ggml/src' "$f" 2>/dev/null || true
-          done
+          # Flatten into lib/ (src/ and ggml/src/ stay as symlinks so existing
+          # CRISPASR_SYS_LIB_DIR consumers keep working), rewrite RUNPATH to be
+          # $ORIGIN-relative, then PROVE the bundle dlopens from a relocated
+          # copy. The old inline patchelf used $ORIGIN/../../ggml/src — one
+          # level too high, pointing outside the bundle — and shipped anyway,
+          # because the gate only checked dependencies were PRESENT, never that
+          # RUNPATH could find them. Fails the release rather than the consumer.
+          bash tools/package-lib-bundle.sh "$OUT"
           # Headers so binding authors can extend the FFI without
           # vendoring the whole CrispASR repo.
           cp include/crispasr.h "$OUT/include/"
@@ -929,10 +1014,14 @@ jobs:
             -exec cp -P {} "$OUT/src/" \;
           find build-libs/ggml/src -name 'libggml*.so*' \( -type f -o -type l \) \
             -exec cp -P {} "$OUT/ggml/src/" \;
-          for f in "$OUT"/src/*.so* "$OUT"/ggml/src/*.so*; do
-            [ -L "$f" ] && continue
-            patchelf --set-rpath '$ORIGIN:$ORIGIN/../../ggml/src' "$f" 2>/dev/null || true
-          done
+          # Flatten into lib/ (src/ and ggml/src/ stay as symlinks so existing
+          # CRISPASR_SYS_LIB_DIR consumers keep working), rewrite RUNPATH to be
+          # $ORIGIN-relative, then PROVE the bundle dlopens from a relocated
+          # copy. The old inline patchelf used $ORIGIN/../../ggml/src — one
+          # level too high, pointing outside the bundle — and shipped anyway,
+          # because the gate only checked dependencies were PRESENT, never that
+          # RUNPATH could find them. Fails the release rather than the consumer.
+          bash tools/package-lib-bundle.sh "$OUT"
           cp include/crispasr.h "$OUT/include/"
           cp ggml/include/*.h   "$OUT/ggml/include/" 2>/dev/null || true
           cp LICENSE "$OUT/"
@@ -997,10 +1086,14 @@ jobs:
             -exec cp -P {} "$OUT/ggml/src/" \;
           # Patch RPATH to $ORIGIN so libs resolve siblings without
           # LD_LIBRARY_PATH (matches build-libs-linux-x86_64 convention).
-          for f in "$OUT"/src/*.so* "$OUT"/ggml/src/*.so*; do
-            [ -L "$f" ] && continue
-            patchelf --set-rpath '$ORIGIN:$ORIGIN/../../ggml/src' "$f" 2>/dev/null || true
-          done
+          # Flatten into lib/ (src/ and ggml/src/ stay as symlinks so existing
+          # CRISPASR_SYS_LIB_DIR consumers keep working), rewrite RUNPATH to be
+          # $ORIGIN-relative, then PROVE the bundle dlopens from a relocated
+          # copy. The old inline patchelf used $ORIGIN/../../ggml/src — one
+          # level too high, pointing outside the bundle — and shipped anyway,
+          # because the gate only checked dependencies were PRESENT, never that
+          # RUNPATH could find them. Fails the release rather than the consumer.
+          bash tools/package-lib-bundle.sh "$OUT"
           # Headers so binding authors can extend the FFI without
           # vendoring the whole CrispASR repo.
           cp include/crispasr.h "$OUT/include/"
@@ -1246,10 +1339,14 @@ jobs:
           # ggml-cuda.so + ggml-base.so + ggml-cpu.so all live under ggml/src
           find build-libs/ggml/src -name 'libggml*.so*' \( -type f -o -type l \) \
             -exec cp -P {} "$OUT/ggml/src/" \;
-          for f in "$OUT"/src/*.so* "$OUT"/ggml/src/*.so*; do
-            [ -L "$f" ] && continue
-            patchelf --set-rpath '$ORIGIN:$ORIGIN/../../ggml/src' "$f" 2>/dev/null || true
-          done
+          # Flatten into lib/ (src/ and ggml/src/ stay as symlinks so existing
+          # CRISPASR_SYS_LIB_DIR consumers keep working), rewrite RUNPATH to be
+          # $ORIGIN-relative, then PROVE the bundle dlopens from a relocated
+          # copy. The old inline patchelf used $ORIGIN/../../ggml/src — one
+          # level too high, pointing outside the bundle — and shipped anyway,
+          # because the gate only checked dependencies were PRESENT, never that
+          # RUNPATH could find them. Fails the release rather than the consumer.
+          bash tools/package-lib-bundle.sh "$OUT"
           cp include/crispasr.h "$OUT/include/"
           cp ggml/include/*.h   "$OUT/ggml/include/" 2>/dev/null || true
           cp LICENSE "$OUT/"

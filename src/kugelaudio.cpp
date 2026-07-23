@@ -19,6 +19,7 @@
 #include "core/gguf_loader.h"
 #include "core/torch_rng.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -45,7 +46,7 @@
 static bool kugelaudio_debug_enabled() {
     static int cached = -1;
     if (cached < 0) {
-        const char* e = std::getenv("KUGELAUDIO_DEBUG");
+        const char* e = crispasr_env::get("CRISPASR_KUGELAUDIO_DEBUG");
         cached = (e && (e[0] == '1' || e[0] == 't' || e[0] == 'T')) ? 1 : 0;
     }
     return cached != 0;

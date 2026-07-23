@@ -5,6 +5,7 @@
 // See moss_audio.h for the full architecture description.
 
 #include "moss_audio.h"
+#include "core/crispasr_env.h"
 #include "core/win_compat.h"
 
 #include "core/beam_decode.h"
@@ -20,6 +21,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -47,7 +49,7 @@
 static bool moss_audio_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("MOSS_AUDIO_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_MOSS_AUDIO_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -1757,7 +1759,7 @@ static char* moss_audio_process_impl(struct moss_audio_context* ctx, const float
     // 1. Mel spectrogram (or load from file for debugging)
     int n_mels = 0, T_mel = 0;
     float* mel = nullptr;
-    const char* mel_override = std::getenv("MOSS_AUDIO_MEL_FILE");
+    const char* mel_override = crispasr_env::get("CRISPASR_MOSS_AUDIO_MEL_FILE");
     if (mel_override) {
         // Load pre-computed mel from raw F32 file (n_mels × T row-major)
         FILE* mf = fopen(mel_override, "rb");
@@ -2024,19 +2026,28 @@ static char* moss_audio_process_impl(struct moss_audio_context* ctx, const float
     } else {
         // Greedy decode
         for (int step = 0; step < max_new; step++) {
-            int best_id = 0;
-            float best_val = logits[0];
-            for (int i = 1; i < vocab; i++) {
-                if (logits[i] > best_val) {
+            // NaN-robust argmax (see canary_qwen note): seed -inf, skip non-finite,
+            // abort if the whole row is non-finite.
+            int best_id = -1;
+            float best_val = -std::numeric_limits<float>::infinity();
+            for (int i = 0; i < vocab; i++) {
+                if (std::isfinite(logits[i]) && logits[i] > best_val) {
                     best_val = logits[i];
                     best_id = i;
                 }
+            }
+            if (best_id < 0) {
+                free(logits);
+                logits = nullptr;
+                fprintf(stderr, "moss_audio: non-finite logits at step %d — aborting decode\n", step);
+                break;
             }
             float tok_prob = 0.0f;
             if (on_tok && best_id != (int)hp.eos_token_id) {
                 float s = 0.0f;
                 for (int i = 0; i < vocab; i++)
-                    s += expf(logits[i] - best_val);
+                    if (std::isfinite(logits[i]))
+                        s += expf(logits[i] - best_val);
                 tok_prob = (s > 0.0f) ? (1.0f / s) : 0.0f;
             }
             free(logits);

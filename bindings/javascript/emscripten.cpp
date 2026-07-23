@@ -66,6 +66,23 @@ int crispasr_session_detected_language(CrispasrSession* s, char* out_buf, int ou
 // range / unsupported.
 int crispasr_session_n_vocab(CrispasrSession* s);
 const char* crispasr_session_token_text(CrispasrSession* s, int id);
+// Pitch (F0) estimation — CREPE. `pitch` runs the track and returns the
+// frame count; `pitch_frames` hands back a session-owned flat array of
+// 3 floats per frame {time_ms, f0_hz, voiced_prob}, frame-major.
+// Referencing these here is also what keeps the `crepe` objects from
+// being dead-stripped out of the wasm module at link time.
+int crispasr_session_pitch(CrispasrSession* s, const float* pcm_16k, int n_samples, float hop_ms);
+const float* crispasr_session_pitch_frames(CrispasrSession* s, int* out_n_frames);
+int crispasr_session_pitch_sample_rate(CrispasrSession* s);
+
+// Chord recognition — BTC. `chords` runs the timeline and returns the span
+// count; `chords_spans` hands back a session-owned flat array of 4 floats per
+// span ({startMs, endMs, label, confidence}). The label is an index; resolve
+// it with chords_span_name, since the names are strings.
+int crispasr_session_chords(CrispasrSession* s, const float* pcm, int n_samples, int sample_rate);
+const float* crispasr_session_chords_spans(CrispasrSession* s, int* out_n_spans);
+const char* crispasr_session_chords_span_name(CrispasrSession* s, int idx);
+int crispasr_session_chords_vocab_size(CrispasrSession* s);
 CrispasrSession* crispasr_session_open_explicit(const char* model_path, const char* backend_name, int n_threads);
 CrispasrSession* crispasr_session_open_with_params(const char* model_path, const char* backend_name,
                                                    const void* params);
@@ -227,13 +244,14 @@ void crispasr_titanet_free(void* ctx);
 int crispasr_titanet_embed(void* ctx, const float* pcm_16k, int n_samples, float* out);
 float crispasr_titanet_cosine_sim(const float* a, const float* b, int dim);
 
-// Speaker database
-void* crispasr_speaker_db_load(const char* dir_path);
+// Speaker database (closed-roster, consent-gated — issue #266)
+void* crispasr_speaker_db_open(const char* dir_path, const char* expected_names_csv, int consent_attested);
 void crispasr_speaker_db_free(void* db);
 int crispasr_speaker_db_count(const void* db);
 float crispasr_speaker_db_match(const void* db, const float* embedding, int dim, float threshold, char* out_name,
                                 int out_cap);
-int crispasr_speaker_db_enroll(const char* dir_path, const char* name, const float* embedding, int dim);
+int crispasr_speaker_db_enroll2(const char* dir_path, const char* name, const float* embedding, int dim,
+                                int consent_attested);
 
 // Pluggable speaker embedder + clustering + pyannote cache
 void* crispasr_speaker_embedder_make_abi(const char* model_spec, int n_threads, const char* cache_dir);
@@ -258,6 +276,11 @@ int crispasr_registry_lookup_abi(const char* backend, char* out_filename, int fi
 int crispasr_registry_lookup_by_filename_abi(const char* filename, char* out_filename, int filename_cap, char* out_url,
                                              int url_cap, char* out_size, int size_cap);
 int crispasr_registry_list_backends_abi(char* out_csv, int out_cap);
+int crispasr_registry_default_bundle_info_abi(const char* backend, char* out_backend, int backend_cap,
+                                              char* out_license, int license_cap, int* out_requires_acceptance);
+int crispasr_registry_default_bundle_artifact_abi(const char* backend, int index, int* out_kind, char* out_filename,
+                                                  int filename_cap, char* out_url, int url_cap, char* out_size,
+                                                  int size_cap);
 int crispasr_cache_ensure_file_abi(const char* filename, const char* url, int quiet, const char* cache_dir_override,
                                    char* out_buf, int out_cap);
 int crispasr_cache_dir_abi(const char* cache_dir_override, char* out_buf, int out_cap);
@@ -959,6 +982,97 @@ EMSCRIPTEN_BINDINGS(whisper) {
             crispasr_session_translate_text_free(res);
             return out;
         }));
+
+    // --- Pitch (F0) estimation — CREPE ---
+    // Open the model with ttsOpenExplicit(path, "crepe", nThreads) -- always
+    // correct. Plain ttsOpen also works from 0.8.15 on, where the GGUF
+    // architecture auto-detect gained a `crepe` case; older builds return
+    // false for a CREPE model even though the backend is compiled in.
+    //
+    // `audio` is a mono Float32Array at 16 kHz (query sessionPitchSampleRate
+    // rather than hard-coding it); `hopMs` <= 0 uses the model default of
+    // 10 ms. Returns [{timeMs, f0Hz, voicedProb}, ...] — the same field names
+    // the Dart `PitchFrame` record uses, so the seam is identical across
+    // bindings — or [] on failure.
+    emscripten::function(
+        "sessionPitch", emscripten::optional_override([](const emscripten::val& audio, float hopMs) -> emscripten::val {
+            emscripten::val out = emscripten::val::array();
+            if (!g_tts_session)
+                return out;
+            const int n = audio["length"].as<int>();
+            if (n <= 0)
+                return out;
+            std::vector<float> pcmf32(n);
+            emscripten::val heap = emscripten::val::module_property("HEAPU8");
+            emscripten::val memory = heap["buffer"];
+            emscripten::val view = audio["constructor"].new_(memory, reinterpret_cast<uintptr_t>(pcmf32.data()), n);
+            view.call<void>("set", audio);
+
+            if (crispasr_session_pitch(g_tts_session, pcmf32.data(), n, hopMs) <= 0)
+                return out;
+            int n_frames = 0;
+            const float* frames = crispasr_session_pitch_frames(g_tts_session, &n_frames);
+            if (!frames || n_frames <= 0)
+                return out;
+            for (int i = 0; i < n_frames; i++) {
+                emscripten::val f = emscripten::val::object();
+                f.set("timeMs", (double)frames[i * 3 + 0]);
+                f.set("f0Hz", (double)frames[i * 3 + 1]);
+                f.set("voicedProb", (double)frames[i * 3 + 2]);
+                out.call<void>("push", f);
+            }
+            return out;
+        }));
+
+    // Native input rate the loaded pitch model expects (16000 for CREPE), or
+    // 0 when the session has no pitch arm — doubles as a capability probe.
+    emscripten::function("sessionPitchSampleRate", emscripten::optional_override([]() {
+                             return g_tts_session ? crispasr_session_pitch_sample_rate(g_tts_session) : 0;
+                         }));
+
+    // --- Chord recognition (BTC) ---
+    //
+    // NOTE: the shipped BTC weights are CC-BY-NC-SA, not MIT like this
+    // library. A commercial deployment must supply its own weights; the
+    // registry will not download these without an explicit licence
+    // acceptance. See docs/music-transcription/PLAN.md.
+    emscripten::function("sessionChords", emscripten::optional_override([](emscripten::val audio, int sampleRate) {
+                             emscripten::val out = emscripten::val::array();
+                             if (!g_tts_session)
+                                 return out;
+                             const int n = audio["length"].as<int>();
+                             if (n <= 0 || sampleRate <= 0)
+                                 return out;
+                             std::vector<float> pcmf32(n);
+                             emscripten::val heap = emscripten::val::module_property("HEAPU8");
+                             emscripten::val memory = heap["buffer"];
+                             emscripten::val view =
+                                 audio["constructor"].new_(memory, reinterpret_cast<uintptr_t>(pcmf32.data()), n);
+                             view.call<void>("set", audio);
+
+                             if (crispasr_session_chords(g_tts_session, pcmf32.data(), n, sampleRate) <= 0)
+                                 return out;
+                             int n_spans = 0;
+                             const float* spans = crispasr_session_chords_spans(g_tts_session, &n_spans);
+                             if (!spans || n_spans <= 0)
+                                 return out;
+                             for (int i = 0; i < n_spans; i++) {
+                                 emscripten::val c = emscripten::val::object();
+                                 c.set("startMs", (double)spans[i * 4 + 0]);
+                                 c.set("endMs", (double)spans[i * 4 + 1]);
+                                 const char* nm = crispasr_session_chords_span_name(g_tts_session, i);
+                                 c.set("chord", std::string(nm ? nm : "N"));
+                                 c.set("confidence", (double)spans[i * 4 + 3]);
+                                 out.call<void>("push", c);
+                             }
+                             return out;
+                         }));
+
+    // 25 or 170, or 0 when the session has no chord arm — capability probe,
+    // mirroring sessionPitchSampleRate.
+    emscripten::function("sessionChordsVocabSize", emscripten::optional_override([]() {
+                             return g_tts_session ? crispasr_session_chords_vocab_size(g_tts_session) : 0;
+                         }));
 
     // --- Available backends ---
     emscripten::function("availableBackends", emscripten::optional_override([]() -> std::string {

@@ -34,6 +34,7 @@
 // degenerate-window gate + instruction-echo safety net in the transcribe path.
 
 #include "canary_qwen.h"
+#include "core/crispasr_env.h"
 #include "canary_qwen_echo.h"
 
 #ifndef M_PI
@@ -58,6 +59,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -74,7 +76,7 @@
 static bool cq_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("CANARY_QWEN_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_CANARY_QWEN_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -235,6 +237,8 @@ struct canary_qwen_context {
     float decode_temperature = 0.0f;
     uint64_t decode_seed = 0;
     int beam_size = 1;
+    // #292: decode cap; forwarded from --max-new-tokens when set, else this default.
+    int max_new_tokens = 256;
 };
 
 // ===========================================================================
@@ -1127,7 +1131,7 @@ static canary_qwen_result* canary_qwen_transcribe_impl(canary_qwen_context* ctx,
     }
 
     // 4. Allocate KV cache
-    const int max_new_tokens = 256;
+    const int max_new_tokens = ctx->max_new_tokens > 0 ? ctx->max_new_tokens : 256; // #292
     const int max_ctx = total_prompt + max_new_tokens;
     if (!ctx->kv_k || ctx->kv_max_ctx < max_ctx) {
         if (ctx->kv_buf) {
@@ -1164,21 +1168,37 @@ static canary_qwen_result* canary_qwen_transcribe_impl(canary_qwen_context* ctx,
     {
         cq_bench_stage bs("decode");
         for (int step = 0; step < max_new_tokens; step++) {
-            // Argmax
-            int32_t best_id = 0;
-            float best_val = logits[0];
-            for (int v2 = 1; v2 < vocab; v2++) {
-                if (logits[v2] > best_val) {
+            // Argmax — NaN-robust. Seeding best_val from logits[0] pins best_id at
+            // 0 forever when logits[0] is non-finite: `x > NaN` is false for every
+            // x, so the scan never moves off 0 and the decode silently spews token
+            // 0 (== "!") for the whole budget. That is exactly what a corrupt q4_k
+            // LLM projection produced (q8_0 fine, q4_k → all "!"). Seed from -inf,
+            // skip non-finite logits, and if the entire row is non-finite treat it
+            // as a numerics failure and stop rather than emit garbage.
+            int32_t best_id = -1;
+            float best_val = -std::numeric_limits<float>::infinity();
+            for (int v2 = 0; v2 < vocab; v2++) {
+                if (std::isfinite(logits[v2]) && logits[v2] > best_val) {
                     best_val = logits[v2];
                     best_id = v2;
                 }
             }
+            if (best_id < 0) {
+                fprintf(stderr,
+                        "canary_qwen: non-finite logits at step %d — aborting decode "
+                        "(corrupt/over-quantized weights? this quant is unusable)\n",
+                        step);
+                break;
+            }
 
-            // Compute softmax probability for the chosen token
+            // Compute softmax probability for the chosen token. Skip non-finite
+            // logits so a stray Inf/NaN elsewhere in the row can't poison the
+            // reported confidence of an otherwise-valid argmax.
             float max_logit = best_val;
             float sum_exp = 0.0f;
             for (int v2 = 0; v2 < vocab; v2++)
-                sum_exp += expf(logits[v2] - max_logit);
+                if (std::isfinite(logits[v2]))
+                    sum_exp += expf(logits[v2] - max_logit);
             float prob = 1.0f / sum_exp;
 
             if (best_id == eos_id || best_id == endoftext_id)
@@ -1362,6 +1382,11 @@ extern "C" void canary_qwen_set_temperature(struct canary_qwen_context* ctx, flo
         ctx->decode_temperature = temperature;
         ctx->decode_seed = seed;
     }
+}
+
+extern "C" void canary_qwen_set_max_new_tokens(struct canary_qwen_context* ctx, int n) {
+    if (ctx && n > 0) // #292: <= 0 keeps the backend's 256 default
+        ctx->max_new_tokens = n;
 }
 
 extern "C" void canary_qwen_set_beam_size(struct canary_qwen_context* ctx, int n) {

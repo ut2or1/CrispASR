@@ -8,6 +8,7 @@
 
 #include "core/fft.h"
 #include "core/mel.h"
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -34,7 +35,7 @@ namespace chatterbox_ve {
 static bool cb_ve_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("CB_VE_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_CB_VE_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;

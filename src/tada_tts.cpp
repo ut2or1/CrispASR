@@ -5,11 +5,13 @@
 
 #include "tada_tts.h"
 #include "tada_codec.h"
+#include "tada_encoder.h" // in-memory make-ref (#201): encoder + aligner over PCM
 #include "core/gguf_loader.h"
 #include "core/attention.h"
 #include "core/ffn.h"
 #include "core/bpe.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -49,7 +51,7 @@ namespace {
 static bool tada_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("TADA_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_TADA_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -1677,6 +1679,24 @@ static void fm_euler_solve(tada_context* c, float* speech, const float* cond, in
     std::vector<float> zero_cond(c->hp.fm_hidden, 0.0f);
     const float* neg = neg_cond ? neg_cond : zero_cond.data();
 
+    // Interval-CFG (opt-in, APPROXIMATE — mirrors OMNIVOICE_CFG_INTERVAL): recompute
+    // the uncond (neg) FM velocity only every K CFG-active steps and reuse the stale
+    // value in between; the cond (pos) velocity stays fresh every step; the first
+    // CFG-active step always recomputes. vel_neg persists across iterations, so a skip
+    // step simply leaves its last-recomputed value in place — no separate cache. Only
+    // active when K>1, so at the default both velocities are recomputed every step and
+    // the result is byte-for-byte the legacy path. Gated CRISPASR_TADA_CFG_INTERVAL.
+    const int cfg_interval = [] {
+        const char* e = std::getenv("CRISPASR_TADA_CFG_INTERVAL");
+        const int k = e ? std::atoi(e) : 1;
+        return k < 1 ? 1 : k;
+    }();
+    const bool interval_on = cfg_interval > 1;
+    int cfg_active_idx = 0; // counts CFG-active (a_cfg != 1) steps for the every-K test
+    if (interval_on && std::getenv("CRISPASR_TADA_CFG_INTERVAL_DEBUG"))
+        fprintf(stderr, "[tada] interval-CFG K=%d (neg velocity recomputed every %d CFG-active steps; first always)\n",
+                cfg_interval, cfg_interval);
+
     for (int i = 0; i < num_steps; i++) {
         float dt = t_span[i + 1] - t_span[i];
         float t_val = t_span[i];
@@ -1687,13 +1707,22 @@ static void fm_euler_solve(tada_context* c, float* speech, const float* cond, in
         if (a_cfg != 1.0f) {
             // CFG: velocity = v_neg + cfg * (v_pos - v_neg)
             // Separate acoustic and duration CFG (duration_cfg = 1.0)
-            // B=2 path: run pos+neg in one batched forward when available.
-            bool used_b2 =
-                c->fm_b2_active && run_fm_step_b2(c, speech, t_val, cond, neg, vel_pos.data(), vel_neg.data());
-            if (!used_b2) {
+            // Interval-CFG: recompute neg only on the first + every K-th CFG-active
+            // step; otherwise keep vel_neg's stale value and refresh only vel_pos.
+            const bool recompute_neg = !interval_on || (cfg_active_idx % cfg_interval == 0);
+            if (recompute_neg) {
+                // B=2 path: run pos+neg in one batched forward when available.
+                bool used_b2 =
+                    c->fm_b2_active && run_fm_step_b2(c, speech, t_val, cond, neg, vel_pos.data(), vel_neg.data());
+                if (!used_b2) {
+                    run_fm_step(c, speech, t_val, cond, vel_pos.data());
+                    run_fm_step(c, speech, t_val, neg, vel_neg.data());
+                }
+            } else {
+                // pos fresh only; vel_neg retains its last-recomputed (stale) value
                 run_fm_step(c, speech, t_val, cond, vel_pos.data());
-                run_fm_step(c, speech, t_val, neg, vel_neg.data());
             }
+            cfg_active_idx++;
 
             for (int j = 0; j < ad; j++) {
                 // Acoustic dims: apply acoustic CFG
@@ -2267,7 +2296,7 @@ int tada_load_prompt(struct tada_context* ctx, const char* path) {
     gguf_context* meta = core_gguf::open_metadata(path);
     if (!meta)
         return -1;
-    ctx->prompt_text = core_gguf::kv_str(meta, "crispasr.ref.tada_tts_prompt_text", "");
+    const std::string prompt_text = core_gguf::kv_str(meta, "crispasr.ref.tada_tts_prompt_text", "");
     core_gguf::free_metadata(meta);
 
     core_gguf::WeightLoad wl;
@@ -2286,36 +2315,20 @@ int tada_load_prompt(struct tada_context* ctx, const char* path) {
 
     const int ad = (int)ctx->hp.acoustic_dim;
     const int np = (int)(ggml_nelements(tv) / ad);
-    ctx->n_prompt = np;
 
-    // Read token values
-    ctx->prompt_values.resize(np * ad);
-    ggml_backend_tensor_get(tv, ctx->prompt_values.data(), 0, (size_t)np * ad * sizeof(float));
-
-    // Read positions and compute time gaps
+    // Read token values + positions into host memory, then apply through the
+    // shared in-memory setter so the file path and the on-the-fly clone path
+    // (#201) compute the time-gap conditioning identically.
+    std::vector<float> values((size_t)np * ad);
+    ggml_backend_tensor_get(tv, values.data(), 0, (size_t)np * ad * sizeof(float));
+    std::vector<float> positions;
+    const float* pos_ptr = nullptr;
     if (tp) {
-        std::vector<float> pos(np);
-        ggml_backend_tensor_get(tp, pos.data(), 0, (size_t)np * sizeof(float));
-
-        // Time gaps: time_before[i] = positions[i] - positions[i-1], clamped to [0, num_time_classes-1]
-        int max_t = (int)ctx->hp.num_time_classes - 1;
-        ctx->prompt_time_before.resize(np + 1, 0);
-        ctx->prompt_time_after.resize(np + 1, 0);
-        for (int i = 0; i < np; i++) {
-            int p_cur = (int)pos[i];
-            int p_prev = (i > 0) ? (int)pos[i - 1] : 1;
-            int gap = std::min(std::max(p_cur - p_prev, 0), max_t);
-            ctx->prompt_time_before[i + 1] = gap; // shifted by 1 (index 0 is padding)
-        }
-        // time_after[i] = time_before[i+1]
-        for (int i = 0; i < np; i++) {
-            ctx->prompt_time_after[i] =
-                (i + 1 < (int)ctx->prompt_time_before.size()) ? ctx->prompt_time_before[i + 1] : 1;
-        }
+        positions.resize(np);
+        ggml_backend_tensor_get(tp, positions.data(), 0, (size_t)np * sizeof(float));
+        pos_ptr = positions.data();
     }
-
-    // Masks: all 1 for prompt tokens
-    ctx->prompt_masks.assign(np, 1);
+    int rc = tada_set_prompt_values(ctx, values.data(), np, ad, pos_ptr, prompt_text.c_str());
 
     // Clean up
     if (wl.buf)
@@ -2323,10 +2336,74 @@ int tada_load_prompt(struct tada_context* ctx, const char* path) {
     if (wl.ctx)
         ggml_free(wl.ctx);
 
-    if (ctx->params.verbosity >= 1) {
+    if (rc == 0 && ctx->params.verbosity >= 1) {
         fprintf(stderr, "tada: loaded prompt with %d tokens from %s\n", np, path);
     }
+    return rc;
+}
+
+int tada_set_prompt_values(struct tada_context* ctx, const float* token_values, int n_tokens, int embed_dim,
+                           const float* token_positions, const char* prompt_text) {
+    if (!ctx || !token_values || n_tokens <= 0 || embed_dim <= 0)
+        return -1;
+    const int ad = (int)ctx->hp.acoustic_dim;
+    if (embed_dim != ad) {
+        fprintf(stderr, "tada: prompt embed_dim %d != acoustic_dim %d\n", embed_dim, ad);
+        return -1;
+    }
+    ctx->prompt_text = prompt_text ? prompt_text : "";
+    ctx->n_prompt = n_tokens;
+    ctx->prompt_values.assign(token_values, token_values + (size_t)n_tokens * ad);
+
+    if (token_positions) {
+        // Time gaps: time_before[i] = positions[i] - positions[i-1], clamped to
+        // [0, num_time_classes-1]. Mirrors the former tada_load_prompt body.
+        const int max_t = (int)ctx->hp.num_time_classes - 1;
+        ctx->prompt_time_before.assign(n_tokens + 1, 0);
+        ctx->prompt_time_after.assign(n_tokens + 1, 0);
+        for (int i = 0; i < n_tokens; i++) {
+            int p_cur = (int)token_positions[i];
+            int p_prev = (i > 0) ? (int)token_positions[i - 1] : 1;
+            int gap = std::min(std::max(p_cur - p_prev, 0), max_t);
+            ctx->prompt_time_before[i + 1] = gap; // shifted by 1 (index 0 is padding)
+        }
+        for (int i = 0; i < n_tokens; i++) {
+            ctx->prompt_time_after[i] =
+                (i + 1 < (int)ctx->prompt_time_before.size()) ? ctx->prompt_time_before[i + 1] : 1;
+        }
+    } else {
+        ctx->prompt_time_before.clear();
+        ctx->prompt_time_after.clear();
+    }
+
+    // Masks: all 1 for prompt tokens
+    ctx->prompt_masks.assign(n_tokens, 1);
     return 0;
+}
+
+int tada_make_ref_from_pcm(struct tada_context* ctx, const char* encoder_gguf, const char* aligner_gguf,
+                           const float* audio_24k, int n_samples_24k, const char* transcript) {
+    if (!ctx || !encoder_gguf || !aligner_gguf || !audio_24k || n_samples_24k <= 0 || !transcript || !transcript[0])
+        return -1;
+
+    tada_encoder_params ep = tada_encoder_default_params();
+    ep.n_threads = ctx->params.n_threads > 0 ? ctx->params.n_threads : ep.n_threads;
+    ep.verbosity = ctx->params.verbosity;
+    tada_encoder_context* ectx = tada_encoder_init(encoder_gguf, ep);
+    if (!ectx) {
+        fprintf(stderr, "tada: make-ref: failed to load encoder '%s'\n", encoder_gguf);
+        return -2;
+    }
+    tada_encoder_result result;
+    int rc = tada_encoder_encode(ectx, aligner_gguf, audio_24k, n_samples_24k, transcript, result);
+    tada_encoder_free(ectx);
+    if (rc != 0) {
+        fprintf(stderr, "tada: make-ref: encode failed (rc=%d)\n", rc);
+        return rc;
+    }
+    // Apply exactly what write_ref_gguf(result)+load_prompt would have, in memory.
+    return tada_set_prompt_values(ctx, result.token_values.data(), result.n_tokens, result.embed_dim,
+                                  result.token_positions.data(), transcript);
 }
 
 void tada_set_seed(struct tada_context* ctx, uint64_t seed) {
@@ -2627,7 +2704,7 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
 
     // Prompt text tokens (transcript of reference audio for voice conditioning)
     std::vector<int32_t> prompt_text_ids;
-    const char* prompt_text_env = getenv("TADA_PROMPT_TEXT");
+    const char* prompt_text_env = crispasr_env::get("CRISPASR_TADA_PROMPT_TEXT");
     if (prompt_text_env && ctx->n_prompt > 0) {
         prompt_text_ids = tokenize(ctx, tada_normalize_text(std::string(prompt_text_env)));
     } else if (!ctx->prompt_text.empty() && ctx->n_prompt > 0) {
@@ -2692,7 +2769,7 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     std::vector<int> time_before_list;
     std::vector<tada_fm_dump_record> fm_dump_records;
     const bool dump_fm_steps = []() {
-        const char* path = std::getenv("TADA_DUMP_FM_STEPS");
+        const char* path = crispasr_env::get("CRISPASR_TADA_DUMP_FM_STEPS");
         return path && path[0];
     }();
 
@@ -3209,7 +3286,7 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     }
 
     if (dump_fm_steps) {
-        const char* dump_path = std::getenv("TADA_DUMP_FM_STEPS");
+        const char* dump_path = crispasr_env::get("CRISPASR_TADA_DUMP_FM_STEPS");
         if (FILE* f = fopen(dump_path, "wb")) {
             uint32_t hdr[4] = {(uint32_t)fm_dump_records.size(), (uint32_t)lat, (uint32_t)hp.fm_hidden,
                                (uint32_t)hp.time_dim};
@@ -3289,7 +3366,7 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     // Use only features from skip_frames onwards
     std::vector<std::vector<float>> decode_feats(acoustic_features.begin() + skip_frames, acoustic_features.end());
 
-    if (const char* dump_acoustic_path = getenv("TADA_DUMP_ACOUSTIC_FEATURES");
+    if (const char* dump_acoustic_path = crispasr_env::get("CRISPASR_TADA_DUMP_ACOUSTIC_FEATURES");
         dump_acoustic_path && dump_acoustic_path[0]) {
         if (FILE* f = fopen(dump_acoustic_path, "wb")) {
             uint32_t hdr[2] = {(uint32_t)acoustic_features.size(), (uint32_t)ad};
@@ -3307,7 +3384,8 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
         }
     }
 
-    if (const char* dump_time_path = getenv("TADA_DUMP_TIME_BEFORE"); dump_time_path && dump_time_path[0]) {
+    if (const char* dump_time_path = crispasr_env::get("CRISPASR_TADA_DUMP_TIME_BEFORE");
+        dump_time_path && dump_time_path[0]) {
         if (FILE* f = fopen(dump_time_path, "wb")) {
             std::vector<float> dump_times;
             dump_times.reserve(all_times.size() + (all_times.empty() ? 0 : 1));
@@ -3364,7 +3442,7 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     // of crashing the machine.
     {
         int max_expanded = 16384;
-        if (const char* e = getenv("TADA_MAX_EXPANDED_FRAMES"); e && e[0])
+        if (const char* e = crispasr_env::get("CRISPASR_TADA_MAX_EXPANDED_FRAMES"); e && e[0])
             max_expanded = atoi(e);
         if (max_expanded > 0 && n_expanded > max_expanded) {
             fprintf(stderr,
@@ -3405,7 +3483,7 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     // Optional feature dump for diff harness (TADA_DUMP_FEATURES=/path/to/file).
     // Python side: tools/reference_backends/tada_codec_diff.py --features <path>
     {
-        const char* dump_path = getenv("TADA_DUMP_FEATURES");
+        const char* dump_path = crispasr_env::get("CRISPASR_TADA_DUMP_FEATURES");
         if (dump_path && n_expanded > 0) {
             FILE* df = fopen(dump_path, "wb");
             if (df) {

@@ -26,6 +26,7 @@
 #include "core/gguf_loader.h"
 #include "core/hifigan.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -50,7 +51,7 @@
 static bool speecht5_tts_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("SPEECHT5_TTS_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_SPEECHT5_TTS_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -1051,7 +1052,7 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
 
     // ── SPEECHT5_DUMP_DIR: per-step intermediate dumps ──
     {
-        static const char* dump_dir = getenv("SPEECHT5_DUMP_DIR");
+        static const char* dump_dir = crispasr_env::get("CRISPASR_SPEECHT5_DUMP_DIR");
         if (dump_dir) {
             auto dump_f32 = [&](const char* tag, const float* data, size_t n) {
                 std::string path = std::string(dump_dir) + "/step" + std::to_string(dec_step) + "_" + tag + ".f32";

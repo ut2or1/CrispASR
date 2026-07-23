@@ -29,7 +29,13 @@ jobs:
           submodules: recursive
 
       - name: Setup Pages
+        # enablement:true auto-provisions the Pages site on first run instead of
+        # failing with "Get Pages site failed … Pages not enabled" (the stale-red
+        # cause). Keeps the workflow dispatch-only (Pages stays dormant until a
+        # maintainer manually runs it — see the on: note above).
         uses: actions/configure-pages@v5
+        with:
+          enablement: true
 
       - name: Setup emsdk
         uses: mymindstorm/setup-emsdk@v14

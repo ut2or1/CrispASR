@@ -199,4 +199,21 @@ inline void put_floats(const char* tag, const void* key, size_t key_len, const s
     save_floats(content_path(tag, key, key_len), tag, shape, data, count);
 }
 
+// ── content-addressed raw-byte blob get/put ──
+// Same as get_floats/put_floats but for opaque payloads (e.g. int32 RVQ codes)
+// that aren't float32. Returns true on a cache hit. Disabled by CRISPASR_TTS_REF_CACHE=0.
+inline bool get_bytes(const char* tag, const void* key, size_t key_len, std::vector<uint32_t>& shape,
+                      std::vector<uint8_t>& out) {
+    if (disabled())
+        return false;
+    return load(content_path(tag, key, key_len), /*voice_path=*/"", tag, shape, out);
+}
+
+inline void put_bytes(const char* tag, const void* key, size_t key_len, const std::vector<uint32_t>& shape,
+                      const void* data, size_t nbytes) {
+    if (disabled())
+        return;
+    save(content_path(tag, key, key_len), tag, shape, data, nbytes);
+}
+
 } // namespace crispasr_ref_cache

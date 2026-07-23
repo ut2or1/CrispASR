@@ -76,6 +76,12 @@ Usage:
     python models/convert-voxcpm2-to-gguf.py \\
         --input /path/to/VoxCPM2 \\
         --output voxcpm2-f16.gguf
+
+    # AudioVAE-only 16 kHz -> 48 kHz speech upscaler:
+    python models/convert-voxcpm2-to-gguf.py \\
+        --input openbmb/VoxCPM2 \\
+        --output voxcpm2-vae-f32.gguf \\
+        --vae-only
 """
 
 from __future__ import annotations
@@ -415,6 +421,142 @@ def serialize_rope_factors(config: dict) -> tuple[np.ndarray, np.ndarray]:
     return short_factors, long_factors
 
 
+def add_vae_metadata(writer: gguf.GGUFWriter, cfg: dict) -> None:
+    """Write the metadata required by the standalone AudioVAE runtime."""
+    vae_cfg = cfg.get("audio_vae_config", {})
+    writer.add_uint32("voxcpm2.patch_size", cfg.get("patch_size", 4))
+    writer.add_uint32("voxcpm2.feat_dim", cfg.get("feat_dim", 64))
+    writer.add_uint32("voxcpm2.vae.latent_dim", vae_cfg.get("latent_dim", 64))
+    writer.add_uint32("voxcpm2.vae.encoder_dim", vae_cfg.get("encoder_dim", 128))
+    writer.add_uint32("voxcpm2.vae.decoder_dim", vae_cfg.get("decoder_dim", 2048))
+    writer.add_uint32("voxcpm2.vae.sample_rate", vae_cfg.get("sample_rate", 16000))
+    writer.add_uint32("voxcpm2.vae.out_sample_rate", vae_cfg.get("out_sample_rate", 48000))
+    writer.add_array("voxcpm2.vae.encoder_rates", vae_cfg.get("encoder_rates", [2, 5, 8, 8]))
+    writer.add_array("voxcpm2.vae.decoder_rates", vae_cfg.get("decoder_rates", [8, 6, 5, 2, 2, 2]))
+    sr_boundaries = vae_cfg.get("sr_bin_boundaries", [20000, 30000, 40000])
+    if sr_boundaries:
+        writer.add_array("voxcpm2.vae.sr_bin_boundaries", sr_boundaries)
+
+
+def required_vae_tensor_names() -> set[str]:
+    """Names dereferenced by the fixed AudioVAE V2 native kernels."""
+    names: set[str] = set()
+
+    def conv(prefix: str) -> None:
+        names.update({f"{prefix}.weight_g", f"{prefix}.weight_v", f"{prefix}.bias"})
+
+    conv("vae.enc.conv0")
+    for block in range(4):
+        bp = f"vae.enc.blk.{block}"
+        for residual in range(3):
+            rp = f"{bp}.res.{residual}"
+            names.update({f"{rp}.0.alpha", f"{rp}.2.alpha"})
+            conv(f"{rp}.1")
+            conv(f"{rp}.3")
+        names.add(f"{bp}.sub.3.alpha")
+        conv(f"{bp}.sub.4")
+    conv("vae.enc.fc_mu")
+
+    conv("vae.dec.layer.0")
+    conv("vae.dec.layer.1")
+    for layer in range(2, 8):
+        lp = f"vae.dec.layer.{layer}"
+        names.update({
+            f"vae.dec.sr_cond.{layer}.scale_embed",
+            f"vae.dec.sr_cond.{layer}.bias_embed",
+            f"{lp}.block.0.alpha",
+        })
+        conv(f"{lp}.block.1")
+        for residual in range(2, 5):
+            rp = f"{lp}.block.{residual}"
+            names.update({f"{rp}.0.alpha", f"{rp}.2.alpha"})
+            conv(f"{rp}.1")
+            conv(f"{rp}.3")
+    names.add("vae.dec.layer.8.alpha")
+    conv("vae.dec.layer.9")
+    return names
+
+
+def add_vae_tensors(writer: gguf.GGUFWriter, input_dir: Path) -> int:
+    """Add F32 AudioVAE tensors from either supported upstream checkpoint."""
+    vae_safetensors = input_dir / "audiovae.safetensors"
+    vae_pth = input_dir / "audiovae.pth"
+    if not vae_safetensors.exists() and not vae_pth.exists():
+        sys.exit(f"missing audiovae.safetensors or audiovae.pth in {input_dir}")
+
+    print("\nConverting AudioVAE tensors...")
+    n_vae = 0
+    converted_names: set[str] = set()
+
+    def add_tensor(name: str, tensor: np.ndarray) -> None:
+        nonlocal n_vae
+        if name in converted_names:
+            sys.exit(f"duplicate AudioVAE tensor after name remapping: {name}")
+        writer.add_tensor(name, tensor)
+        converted_names.add(name)
+        n_vae += 1
+
+    if vae_safetensors.exists():
+        with safe_open(str(vae_safetensors), framework="numpy") as f:
+            vae_keys = list(f.keys())
+            print(f"  {len(vae_keys)} tensors in audiovae.safetensors")
+            for key in vae_keys:
+                gguf_name = remap_vae_name(key)
+                if gguf_name is None:
+                    print(f"  SKIP VAE: {key}")
+                    continue
+                tensor = f.get_tensor(key).astype(np.float32)
+                add_tensor(gguf_name, tensor)
+    else:
+        if not _HAS_TORCH:
+            sys.exit("pip install torch (needed to load audiovae.pth)")
+
+        print(f"  Loading {vae_pth.name} (this may use significant RAM)...")
+        checkpoint = torch.load(str(vae_pth), map_location="cpu", weights_only=True)
+        vae_state = checkpoint.get("state_dict", checkpoint)
+        print(f"  {len(vae_state)} tensors in audiovae.pth")
+        for key, tensor_pt in vae_state.items():
+            gguf_name = remap_vae_name(key)
+            if gguf_name is None:
+                print(f"  SKIP VAE: {key}")
+                continue
+            add_tensor(gguf_name, tensor_pt.numpy().astype(np.float32))
+        del vae_state, checkpoint
+
+    missing = sorted(required_vae_tensor_names() - converted_names)
+    if missing:
+        preview = ", ".join(missing[:8])
+        suffix = " ..." if len(missing) > 8 else ""
+        sys.exit(f"AudioVAE checkpoint is incomplete: missing {len(missing)} required tensors ({preview}{suffix})")
+
+    print(f"  VAE: {n_vae} tensors converted")
+    return n_vae
+
+
+def finalize_writer(writer: gguf.GGUFWriter, out_path: Path, n_tensors: int) -> None:
+    print("\nFinalizing GGUF...")
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    print(f"\nDone! {n_tensors} tensors total -> {out_path}")
+    print(f"  File size: {out_path.stat().st_size / 1024**3:.2f} GB")
+
+
+def convert_vae_only(input_dir: Path, out_path: Path) -> None:
+    """Convert only AudioVAE V2 for the standalone S2S upscaler backend."""
+    print(f"Loading config: {input_dir}")
+    with open(input_dir / "config.json", "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    print(f"Writing AudioVAE-only GGUF: {out_path}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = gguf.GGUFWriter(str(out_path), arch="voxcpm2-vae")
+    add_vae_metadata(writer, cfg)
+    n_vae = add_vae_tensors(writer, input_dir)
+    finalize_writer(writer, out_path, n_vae)
+
+
 # ---------------------------------------------------------------------------
 # Main conversion
 # ---------------------------------------------------------------------------
@@ -427,7 +569,6 @@ def convert(input_dir: Path, out_path: Path) -> None:
     lm_cfg = cfg.get("lm_config", {})
     enc_cfg = cfg.get("encoder_config", {})
     dit_cfg = cfg.get("dit_config", {})
-    vae_cfg = cfg.get("audio_vae_config", {})
     cfm_cfg = dit_cfg.get("cfm_config", {})
 
     # Find model files
@@ -499,26 +640,13 @@ def convert(input_dir: Path, out_path: Path) -> None:
     writer.add_float32("voxcpm2.cfm.inference_cfg_rate", float(cfm_cfg.get("inference_cfg_rate", 2.0)))
     writer.add_string("voxcpm2.cfm.solver", cfm_cfg.get("solver", "euler"))
 
-    # Shared params
-    writer.add_uint32("voxcpm2.patch_size", cfg.get("patch_size", 4))
-    writer.add_uint32("voxcpm2.feat_dim", cfg.get("feat_dim", 64))
+    # Full-model-only params
     writer.add_uint32("voxcpm2.fsq.latent_dim", cfg.get("scalar_quantization_latent_dim", 512))
     writer.add_uint32("voxcpm2.fsq.scale", cfg.get("scalar_quantization_scale", 9))
     writer.add_uint32("voxcpm2.max_length", cfg.get("max_length", 8192))
 
     # AudioVAE params
-    writer.add_uint32("voxcpm2.vae.latent_dim", vae_cfg.get("latent_dim", 64))
-    writer.add_uint32("voxcpm2.vae.encoder_dim", vae_cfg.get("encoder_dim", 128))
-    writer.add_uint32("voxcpm2.vae.decoder_dim", vae_cfg.get("decoder_dim", 2048))
-    writer.add_uint32("voxcpm2.vae.sample_rate", vae_cfg.get("sample_rate", 16000))
-    writer.add_uint32("voxcpm2.vae.out_sample_rate", vae_cfg.get("out_sample_rate", 48000))
-    enc_rates = vae_cfg.get("encoder_rates", [2, 5, 8, 8])
-    dec_rates = vae_cfg.get("decoder_rates", [8, 6, 5, 2, 2, 2])
-    writer.add_array("voxcpm2.vae.encoder_rates", enc_rates)
-    writer.add_array("voxcpm2.vae.decoder_rates", dec_rates)
-    sr_boundaries = vae_cfg.get("sr_bin_boundaries", [20000, 30000, 40000])
-    if sr_boundaries:
-        writer.add_array("voxcpm2.vae.sr_bin_boundaries", sr_boundaries)
+    add_vae_metadata(writer, cfg)
 
     # Special token IDs
     writer.add_uint32("voxcpm2.audio_start_token", 101)
@@ -594,57 +722,8 @@ def convert(input_dir: Path, out_path: Path) -> None:
 
     print(f"  Model: {n_converted} converted, {n_skipped} skipped")
 
-    # ----- Convert AudioVAE tensors -----
-    print(f"\nConverting AudioVAE tensors...")
-    n_vae = 0
-
-    if vae_safetensors.exists():
-        with safe_open(str(vae_safetensors), framework="numpy") as f:
-            vae_keys = list(f.keys())
-            print(f"  {len(vae_keys)} tensors in audiovae.safetensors")
-            for key in vae_keys:
-                gguf_name = remap_vae_name(key)
-                if gguf_name is None:
-                    print(f"  SKIP VAE: {key}")
-                    continue
-                tensor = f.get_tensor(key)
-                # VAE stays F32 for audio quality (following TrevorJS finding)
-                tensor = tensor.astype(np.float32)
-                writer.add_tensor(gguf_name, tensor)
-                n_vae += 1
-    else:
-        # Load from .pth — need torch
-        if not _HAS_TORCH:
-            sys.exit("pip install torch (needed to load audiovae.pth)")
-
-        print(f"  Loading {vae_pth.name} (this may use significant RAM)...")
-        checkpoint = torch.load(str(vae_pth), map_location="cpu", weights_only=True)
-        vae_state = checkpoint.get("state_dict", checkpoint)
-        print(f"  {len(vae_state)} tensors in audiovae.pth")
-
-        for key, tensor_pt in vae_state.items():
-            gguf_name = remap_vae_name(key)
-            if gguf_name is None:
-                print(f"  SKIP VAE: {key}")
-                continue
-            tensor = tensor_pt.numpy().astype(np.float32)
-            writer.add_tensor(gguf_name, tensor)
-            n_vae += 1
-
-        del vae_state, checkpoint
-
-    print(f"  VAE: {n_vae} tensors converted")
-
-    # ----- Finalize -----
-    print(f"\nFinalizing GGUF...")
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file()
-    writer.close()
-
-    total = n_converted + n_vae
-    print(f"\nDone! {total} tensors total → {out_path}")
-    print(f"  File size: {out_path.stat().st_size / 1024**3:.2f} GB")
+    n_vae = add_vae_tensors(writer, input_dir)
+    finalize_writer(writer, out_path, n_converted + n_vae)
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +742,10 @@ def main():
         "--output", "-o", type=str, required=True,
         help="Output GGUF file path"
     )
+    parser.add_argument(
+        "--vae-only", action="store_true",
+        help="Convert only AudioVAE V2 for the voxcpm2-vae S2S upscaler"
+    )
     args = parser.parse_args()
 
     input_dir = Path(args.input)
@@ -672,7 +755,13 @@ def main():
         try:
             from huggingface_hub import snapshot_download
             print(f"Downloading from HuggingFace: {args.input}")
-            input_dir = Path(snapshot_download(args.input))
+            if args.vae_only:
+                input_dir = Path(snapshot_download(
+                    args.input,
+                    allow_patterns=["config.json", "audiovae.safetensors", "audiovae.pth"],
+                ))
+            else:
+                input_dir = Path(snapshot_download(args.input))
         except ImportError:
             sys.exit("pip install huggingface_hub  (needed to download from HF)")
         except Exception as e:
@@ -681,7 +770,10 @@ def main():
     if not input_dir.exists():
         sys.exit(f"Input directory not found: {input_dir}")
 
-    convert(input_dir, Path(args.output))
+    if args.vae_only:
+        convert_vae_only(input_dir, Path(args.output))
+    else:
+        convert(input_dir, Path(args.output))
 
 
 if __name__ == "__main__":

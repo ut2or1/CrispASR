@@ -102,6 +102,7 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # under a delay pattern + 1.6B transformer codec. The greedy code grid
     # ("codes") is the Phase-3 byte-parity target; "waveform" (needs the codec)
     # is the Phase-4 decoded reference. Text from $MOSS_TTS_TEXT; --audio ignored.
+    "miotts":     "reference_backends.miotts",
     "moss-tts":   "reference_backends.moss_tts",
     "qwen3":      "reference_backends.qwen3",
     "higgs-stt":  "reference_backends.higgs_stt",
@@ -118,6 +119,11 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # autoregresses with a KV cache that doesn't have a clean "per-step
     # logits" entry point the way the speech-LLMs do.
     "cohere":     "reference_backends.cohere",
+    # Tiron (#295): Whisper large-v3 + inline <|speakerN|> markers. Dumps mel +
+    # encoder_output (structural parity) and the CONSTRAINED-GRAMMAR decoded
+    # transcript (the acceptance target — see reference_backends/tiron.py). The
+    # audio arg is a real multi-speaker clip.
+    "tiron":      "reference_backends.tiron",
     "parakeet":   "reference_backends.parakeet",
     # Parakeet-TDT MAES beam decoding. Same model as "parakeet" but captures
     # transducer component intermediates (prediction net, joint net) plus
@@ -244,6 +250,9 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # model_dir = openbmb/VoxCPM2 HF snapshot. Audio arg = reference WAV
     # for voice cloning (optional). Synth text from VOXCPM2_SYN_TEXT env.
     "voxcpm2-tts": "reference_backends.voxcpm2_tts",
+    # AudioVAE-only 16 kHz -> 48 kHz S2S upscaler. Mirrors the official
+    # VoxCPM2 encode padding/layout and audio_vae decode round trip.
+    "voxcpm2-vae": "reference_backends.voxcpm2_vae",
     # CosyVoice3 TTS — Phase 3b: single-DiT-block stages only (flow
     # model is the only thing wired through extract_stage so far).
     # model_dir = FunAudioLLM/Fun-CosyVoice3-0.5B-2512 HF snapshot.
@@ -317,6 +326,38 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # MOSS-Transcribe-Diarize: Whisper-Medium encoder + VQAdaptor + Qwen3-0.6B.
     # Joint ASR + diarization + timestamps. model_dir = OpenMOSS-Team/MOSS-Transcribe-Diarize.
     "moss-diarize": "reference_backends.moss_diarize",
+    # HTDemucs (Meta Demucs v4): hybrid transformer source separation.
+    # 4-stem (drums, bass, other, vocals). model_dir = pretrained name
+    # ("htdemucs", "htdemucs_ft") or local checkpoint. Audio arg = mixed
+    # music WAV (any sample rate; resampled to 44100 Hz stereo internally).
+    "htdemucs":    "reference_backends.htdemucs",
+    # Mel-Band RoFormer (§248): frequency-band source separation, vocal/
+    # instrumental. model_dir = a directory (or .ckpt path) holding the
+    # checkpoint AND its YAML config — the band layout (num_bands / n_fft /
+    # hop) is not recoverable from the weights alone. Audio arg = mixed music
+    # WAV (any rate; resampled to the config's rate, stereo, internally).
+    "mel-band-roformer": "reference_backends.mel_band_roformer",
+    # MioCodec v2 (§249): neural audio codec. model_dir = HF repo ID
+    # ("Aratako/MioCodec-25Hz-44.1kHz-v2") or local snapshot dir.
+    # Audio arg = mono WAV at 44100 Hz. Captures decode path intermediates
+    # (FSQ→prenet→decoder→upsampler→ISTFT) for per-stage parity testing.
+    "miocodec": "reference_backends.miocodec",
+    # CREPE (Kim et al. 2018, MIT) monophonic F0 / pitch. NOT ASR and NOT TTS —
+    # it emits a 360-bin pitch activation per 10 ms frame. `model_dir` is the
+    # CAPACITY, not a directory: pass "tiny" or "full" (weights ship inside the
+    # torchcrepe package). Audio arg = any 16 kHz mono WAV.
+    # ⚠️ Only the raw activation is dumped: torchcrepe.convert.bins_to_cents
+    # dithers, so any decoded Hz would be non-deterministic.
+    "crepe": "reference_backends.crepe",
+    # TabCNN (Wiggins & Kim 2019) guitar tablature: six per-string softmaxes
+    # over 21 fret classes per frame. `model_dir` is the CHECKPOINT FILE from
+    # the EGSet12 Zenodo record (CC BY 4.0); the reference implementation is
+    # amt-tools (MIT), `pip install amt-tools`.
+    # ⚠️ The model's own `frontend` is an EMPTY Sequential — the CQT lives
+    # outside it — so this dumper emits `audio` and `cqt_db` too. Diff from the
+    # waveform, not from replayed features, or the front end is never tested
+    # (the BTC/piano blind spot).
+    "tabcnn": "reference_backends.tabcnn",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import

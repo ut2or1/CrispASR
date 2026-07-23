@@ -374,6 +374,30 @@ extern "C" {
     /// Shared known-model registry lookup by filename (exact then fuzzy).
     pub fn crispasr_registry_list_backends_abi(out_csv: *mut c_char, out_cap: c_int) -> c_int;
 
+    /// Describe the exact canonical artifact bundle downloaded by `-m auto`.
+    /// Returns its artifact count, 0 on miss, or a negative argument/buffer error.
+    pub fn crispasr_registry_default_bundle_info_abi(
+        backend: *const c_char,
+        out_backend: *mut c_char,
+        backend_cap: c_int,
+        out_license: *mut c_char,
+        license_cap: c_int,
+        out_requires_acceptance: *mut c_int,
+    ) -> c_int;
+
+    /// Read one default-bundle artifact by index. 0 = success.
+    pub fn crispasr_registry_default_bundle_artifact_abi(
+        backend: *const c_char,
+        index: c_int,
+        out_kind: *mut c_int,
+        out_filename: *mut c_char,
+        filename_cap: c_int,
+        out_url: *mut c_char,
+        url_cap: c_int,
+        out_size: *mut c_char,
+        size_cap: c_int,
+    ) -> c_int;
+
     // --- Streaming (PLAN #62) — rolling-window decoder for whisper today ---
     pub fn crispasr_session_stream_open(
         s: *mut CrispasrSession,

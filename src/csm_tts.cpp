@@ -28,6 +28,7 @@
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -60,7 +61,7 @@ namespace {
 static bool csm_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("CSM_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_CSM_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;

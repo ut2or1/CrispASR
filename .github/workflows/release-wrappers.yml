@@ -153,6 +153,9 @@ jobs:
     name: Publish Dart wrapper to pub.dev
     runs-on: ubuntu-latest
     continue-on-error: true
+    environment:
+      name: pub.dev
+      url: https://pub.dev/packages/crispasr
     permissions:
       id-token: write  # for pub.dev OIDC publishing
     steps:

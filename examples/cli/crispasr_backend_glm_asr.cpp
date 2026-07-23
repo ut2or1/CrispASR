@@ -4,6 +4,7 @@
 #include "crispasr_backend_utils.h"
 #include "glm_asr.h"
 #include "whisper_params.h"
+#include "core/bpe.h"
 #include "core/ngram_loop_fix.h"
 
 #include <algorithm>
@@ -85,6 +86,8 @@ public:
         } else {
             glm_asr_set_ask(ctx_, nullptr);
         }
+        // #292: forward --max-new-tokens only when explicit; 0 keeps the backend default.
+        glm_asr_set_max_new_tokens(ctx_, params.max_new_tokens_explicit ? params.max_new_tokens : 0);
 
         // Best-of-N: when temperature > 0 and best_of > 1, run N seeded
         // decodes (process-global libc rand reseeded per run) and keep the
@@ -132,32 +135,7 @@ public:
 
         // Apply fix_loops to text; token dedup done after token construction below (#218)
 
-        // GPT-2 byte-level BPE decoder: Ġ (U+0120, UTF-8 0xC4 0xA0) → space,
-        // Ċ (U+010A, UTF-8 0xC4 0x8A) → newline. All other bytes pass through.
-        auto decode_bpe_piece = [](const char* raw) -> std::string {
-            std::string out;
-            if (!raw)
-                return out;
-            for (size_t ci = 0; raw[ci] != '\0';) {
-                unsigned char c = (unsigned char)raw[ci];
-                if (c == 0xC4 && raw[ci + 1] != '\0') {
-                    unsigned char c2 = (unsigned char)raw[ci + 1];
-                    if (c2 == 0xA0) {
-                        out += ' ';
-                        ci += 2;
-                        continue;
-                    }
-                    if (c2 == 0x8A) {
-                        out += '\n';
-                        ci += 2;
-                        continue;
-                    }
-                }
-                out += (char)c;
-                ci++;
-            }
-            return out;
-        };
+        // GPT-2 byte-level BPE decoder — full table (handles CJK, etc.).
 
         // Per-token confidence; no per-token timestamps (GLM-ASR's LLM
         // decoder isn't time-aligned).
@@ -167,7 +145,8 @@ public:
             crispasr_token tok;
             tok.id = r->token_ids[i];
             tok.confidence = r->token_probs[i];
-            tok.text = decode_bpe_piece(glm_asr_token_text(ctx_, r->token_ids[i]));
+            const char* raw = glm_asr_token_text(ctx_, r->token_ids[i]);
+            tok.text = raw ? core_bpe::token_bytes_to_utf8(raw) : "";
             all_tokens.push_back(std::move(tok));
         }
         glm_asr_result_free(r);

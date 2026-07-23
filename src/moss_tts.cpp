@@ -23,6 +23,7 @@
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h"
 #include "core/wav_reader.h"
+#include "core/crispasr_env.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -52,7 +53,7 @@
 static bool moss_tts_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("MOSS_TTS_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_MOSS_TTS_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;

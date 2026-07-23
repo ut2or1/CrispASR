@@ -36,6 +36,8 @@ void mini_omni2_free(struct mini_omni2_context* ctx);
 // Override the default instruction. Pass NULL or "" to reset.
 // For ASR the model uses _asr token; set_ask overrides the task prompt.
 void mini_omni2_set_ask(struct mini_omni2_context* ctx, const char* prompt);
+// #292: forward --max-new-tokens; <= 0 keeps the backend's 512 default.
+void mini_omni2_set_max_new_tokens(struct mini_omni2_context* ctx, int n);
 
 // ---- ASR: audio → text ----
 

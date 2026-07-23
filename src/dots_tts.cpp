@@ -48,6 +48,7 @@
 #include "core/lstm.h"
 #include "core/wav_reader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include <algorithm>
 #include <cassert>
@@ -71,7 +72,7 @@
 static bool dots_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("DOTS_TTS_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_DOTS_TTS_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -900,39 +901,16 @@ static void dots_llm_step(dots_tts_context* ctx, const float* input_embeds, int 
 // attn_mask_add: optional (fm_len*fm_len) additive mask, row-major [query][key]
 //   (0 = attend, -INFINITY = block); nullptr = full bidirectional.
 // pos_ids_in:   optional (fm_len) RoPE position ids; nullptr = arange(0..T-1).
-static void dots_dit_forward(dots_tts_context* ctx, const float* fm_seq, int fm_len, float timestep,
-                             const float* g_cond, const float* attn_mask_add, const int32_t* pos_ids_in,
-                             float* out_velocity) {
+// Shared DiT graph body: timestep MLP → AdaLN condition → in_proj → blocks →
+// final AdaLN + projection. ONE copy of the math, used by BOTH the legacy
+// per-call forward and the persistent fused step graph (#254 pattern) — so the
+// two paths cannot drift and byte-identity is structural. Inputs are caller-
+// created tensors (input-flagged or device-resident constants); returns the
+// final (latent_dim, T) velocity tensor, un-named.
+static ggml_tensor* dots_build_dit_body(dots_tts_context* ctx, ggml_context* ctx0, ggml_tensor* x,
+                                        ggml_tensor* t_emb_in, ggml_tensor* g_cond_in, ggml_tensor* positions,
+                                        ggml_tensor* attn_mask_t, int T) {
     auto& dit = ctx->dit;
-    const int D = (int)dit.hidden_size;
-    const int T = fm_len;
-
-    // Null-check critical tensors
-    if (!dit.time_mlp_0_w || !dit.in_proj_w || !dit.final_proj_w) {
-        std::fprintf(stderr, "dots_tts: DiT has null critical tensors (time_mlp_0=%p in_proj=%p final_proj=%p)\n",
-                     (void*)dit.time_mlp_0_w, (void*)dit.in_proj_w, (void*)dit.final_proj_w);
-        // Zero output and return
-        std::memset(out_velocity, 0, fm_len * (int)dit.hidden_size * sizeof(float));
-        return;
-    }
-
-    size_t n_tensors = dit.n_layers * 80 + 256; // AdaLN + attn + FFN needs ~50 nodes/block
-    size_t ctx_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead();
-    ggml_init_params ip = {ctx_size, nullptr, true};
-    ggml_context* ctx0 = ggml_init(ip);
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, n_tensors, false);
-
-    // Input sequence
-    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, T);
-    ggml_set_name(x, "dit_input");
-    ggml_set_input(x);
-
-    // Timestep embedding: sinusoidal(t_dim) → Linear(t_dim→D) → SiLU → Linear(D→D)
-    // t_dim = time_mlp_0_w.ne[0] (the input dimension of the first linear)
-    const int t_dim = (int)dit.time_mlp_0_w->ne[0];
-    ggml_tensor* t_emb_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, t_dim);
-    ggml_set_name(t_emb_in, "t_emb");
-    ggml_set_input(t_emb_in);
 
     ggml_tensor* t_emb = ggml_mul_mat(ctx0, dit.time_mlp_0_w, t_emb_in);
     if (dit.time_mlp_0_b)
@@ -944,13 +922,8 @@ static void dots_dit_forward(dots_tts_context* ctx, const float* fm_seq, int fm_
 
     // AdaLN condition c = t_emb (+ g_cond). All block/final modulation uses c.
     ggml_tensor* c = t_emb;
-    ggml_tensor* g_cond_in = nullptr;
-    if (g_cond) {
-        g_cond_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, D);
-        ggml_set_name(g_cond_in, "dit_gcond");
-        ggml_set_input(g_cond_in);
+    if (g_cond_in)
         c = ggml_add(ctx0, t_emb, g_cond_in);
-    }
 
     const bool dit_dbg = std::getenv("CRISPASR_DOTS_DIT_DEBUG") != nullptr;
 
@@ -960,19 +933,6 @@ static void dots_dit_forward(dots_tts_context* ctx, const float* fm_seq, int fm_
         cur = ggml_add(ctx0, cur, dit.in_proj_b);
     ggml_tensor* dbg_x0 = cur;
     ggml_tensor* dbg_b0 = nullptr;
-
-    // Positions for RoPE (pos_ids_in, or 0..T-1 when null)
-    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
-    ggml_set_name(positions, "dit_pos");
-    ggml_set_input(positions);
-
-    // Optional additive attention mask (production FM block-causal mask).
-    ggml_tensor* attn_mask_t = nullptr;
-    if (attn_mask_add) {
-        attn_mask_t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T, T); // (Tk, Tq)
-        ggml_set_name(attn_mask_t, "dit_mask");
-        ggml_set_input(attn_mask_t);
-    }
 
     // DiT blocks with AdaLN-Zero
     for (uint32_t il = 0; il < dit.n_layers; il++) {
@@ -1063,8 +1023,6 @@ static void dots_dit_forward(dots_tts_context* ctx, const float* fm_seq, int fm_
     if (dit.final_proj_b)
         cur = ggml_add(ctx0, cur, dit.final_proj_b);
 
-    ggml_set_name(cur, "dit_output");
-    ggml_set_output(cur);
     if (dit_dbg) {
         ggml_set_output(t_emb);
         ggml_set_name(t_emb, "dbg_temb");
@@ -1077,6 +1035,66 @@ static void dots_dit_forward(dots_tts_context* ctx, const float* fm_seq, int fm_
             ggml_set_name(dbg_b0, "dbg_b0");
         }
     }
+    return cur;
+}
+
+static void dots_dit_forward(dots_tts_context* ctx, const float* fm_seq, int fm_len, float timestep,
+                             const float* g_cond, const float* attn_mask_add, const int32_t* pos_ids_in,
+                             float* out_velocity) {
+    auto& dit = ctx->dit;
+    const int D = (int)dit.hidden_size;
+    const int T = fm_len;
+
+    // Null-check critical tensors
+    if (!dit.time_mlp_0_w || !dit.in_proj_w || !dit.final_proj_w) {
+        std::fprintf(stderr, "dots_tts: DiT has null critical tensors (time_mlp_0=%p in_proj=%p final_proj=%p)\n",
+                     (void*)dit.time_mlp_0_w, (void*)dit.in_proj_w, (void*)dit.final_proj_w);
+        // Zero output and return
+        std::memset(out_velocity, 0, fm_len * (int)dit.hidden_size * sizeof(float));
+        return;
+    }
+
+    size_t n_tensors = dit.n_layers * 80 + 256; // AdaLN + attn + FFN needs ~50 nodes/block
+    size_t ctx_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(n_tensors, false);
+    ggml_init_params ip = {ctx_size, nullptr, true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, n_tensors, false);
+
+    // Input sequence
+    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, T);
+    ggml_set_name(x, "dit_input");
+    ggml_set_input(x);
+
+    // Timestep embedding: sinusoidal(t_dim) → Linear(t_dim→D) → SiLU → Linear(D→D)
+    // t_dim = time_mlp_0_w.ne[0] (the input dimension of the first linear)
+    const int t_dim = (int)dit.time_mlp_0_w->ne[0];
+    ggml_tensor* t_emb_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, t_dim);
+    ggml_set_name(t_emb_in, "t_emb");
+    ggml_set_input(t_emb_in);
+
+    ggml_tensor* g_cond_in = nullptr;
+    if (g_cond) {
+        g_cond_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, D);
+        ggml_set_name(g_cond_in, "dit_gcond");
+        ggml_set_input(g_cond_in);
+    }
+
+    // Positions for RoPE (pos_ids_in, or 0..T-1 when null)
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_name(positions, "dit_pos");
+    ggml_set_input(positions);
+
+    // Optional additive attention mask (production FM block-causal mask).
+    ggml_tensor* attn_mask_t = nullptr;
+    if (attn_mask_add) {
+        attn_mask_t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T, T); // (Tk, Tq)
+        ggml_set_name(attn_mask_t, "dit_mask");
+        ggml_set_input(attn_mask_t);
+    }
+
+    ggml_tensor* cur = dots_build_dit_body(ctx, ctx0, x, t_emb_in, g_cond_in, positions, attn_mask_t, T);
+    ggml_set_name(cur, "dit_output");
+    ggml_set_output(cur);
     ggml_build_forward_expand(gf, cur);
 
     // Allocate and compute
@@ -1108,6 +1126,7 @@ static void dots_dit_forward(dots_tts_context* ctx, const float* fm_seq, int fm_
     int out_dim = (int)out->ne[0];
     ggml_backend_tensor_get(out, out_velocity, 0, out_dim * T * sizeof(float));
 
+    const bool dit_dbg = std::getenv("CRISPASR_DOTS_DIT_DEBUG") != nullptr;
     if (dit_dbg) {
         for (const char* nm : {"dbg_temb", "dbg_c", "dbg_x0", "dbg_b0"}) {
             ggml_tensor* dt = ggml_graph_get_tensor(gf, nm);
@@ -1482,6 +1501,136 @@ static std::vector<float> dots_linear(dots_tts_context* ctx, ggml_tensor* w, ggm
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Fused persistent DiT step graph (#254 pattern; perf-sweep TODO-5)
+// ---------------------------------------------------------------------------
+//
+// The legacy ODE loop rebuilds a fresh ggml_context + graph + gallocr for
+// EVERY DiT forward (2 CFG arms × ode_steps per patch) and re-uploads the full
+// (dit_dim, T) sequence, the (T, T) attention mask, and the positions each
+// call, then reads back the full (latent_dim, T) velocity when only the
+// trailing noise-slot patch is consumed. Everything except the noise patch and
+// the timestep is constant across a patch's ODE steps, so: build ONE graph per
+// CFG arm per patch — constants (sequence prefix, mask, positions, g_cond)
+// live in a dedicated backend buffer uploaded once; the per-step inputs are
+// the raw z patch (coordinate_proj runs IN-GRAPH — same mul_mat+add ops as
+// dots_linear, bitwise-identical) and the tiny sinusoidal t embedding; the
+// output is a ggml_cont view of ONLY the noise-slot velocity slice. Math is
+// dots_build_dit_body — the same body the legacy path runs.
+struct dots_fused_dit_graph {
+    std::vector<uint8_t> mem_buf;
+    ggml_context* ctx0 = nullptr;
+    ggml_cgraph* gf = nullptr;
+    ggml_tensor* z_in = nullptr; // (latent_dim, patch_size)
+    ggml_tensor* t_in = nullptr; // (t_dim)
+    ggml_tensor* out_patch = nullptr;
+    ggml_gallocr_t ga = nullptr;
+    // Device-resident per-patch constants (own buffer — NOT gallocr-managed,
+    // so they are exempt from the input-aliasing gotcha and set once).
+    ggml_context* ctx_const = nullptr;
+    ggml_backend_buffer_t buf_const = nullptr;
+    ggml_tensor* prefix = nullptr;
+    ggml_tensor* pos_t = nullptr;
+    ggml_tensor* mask_t = nullptr;
+    ggml_tensor* gcond_t = nullptr;
+    ~dots_fused_dit_graph() { release(); }
+    void release() {
+        if (ga)
+            ggml_gallocr_free(ga);
+        if (ctx0)
+            ggml_free(ctx0);
+        if (buf_const)
+            ggml_backend_buffer_free(buf_const);
+        if (ctx_const)
+            ggml_free(ctx_const);
+        ga = nullptr;
+        ctx0 = nullptr;
+        buf_const = nullptr;
+        ctx_const = nullptr;
+    }
+};
+
+static void dots_build_fused_dit(dots_tts_context* ctx, dots_fused_dit_graph& g, const float* seq_full,
+                                 int latent_start, int patch_size, const float* attn_mask_add, const int32_t* pos_ids,
+                                 const float* g_cond, int fm_total_len) {
+    auto& dit = ctx->dit;
+    const int D = (int)dit.hidden_size;
+    const int latent_dim = ctx->latent_dim;
+    const int T = fm_total_len;
+    const int t_dim = (int)dit.time_mlp_0_w->ne[0];
+
+    // Per-patch constants in a dedicated backend buffer, uploaded once.
+    {
+        ggml_init_params ipc = {8 * ggml_tensor_overhead(), nullptr, true};
+        g.ctx_const = ggml_init(ipc);
+        if (latent_start > 0)
+            g.prefix = ggml_new_tensor_2d(g.ctx_const, GGML_TYPE_F32, D, latent_start);
+        g.pos_t = ggml_new_tensor_1d(g.ctx_const, GGML_TYPE_I32, T);
+        if (attn_mask_add)
+            g.mask_t = ggml_new_tensor_2d(g.ctx_const, GGML_TYPE_F32, T, T);
+        if (g_cond)
+            g.gcond_t = ggml_new_tensor_1d(g.ctx_const, GGML_TYPE_F32, D);
+        g.buf_const = ggml_backend_alloc_ctx_tensors(g.ctx_const, ctx->backend);
+        if (g.prefix)
+            ggml_backend_tensor_set(g.prefix, seq_full, 0, (size_t)D * latent_start * sizeof(float));
+        std::vector<int32_t> pos(T);
+        for (int i = 0; i < T; i++)
+            pos[i] = pos_ids ? pos_ids[i] : i;
+        ggml_backend_tensor_set(g.pos_t, pos.data(), 0, (size_t)T * sizeof(int32_t));
+        if (g.mask_t)
+            ggml_backend_tensor_set(g.mask_t, attn_mask_add, 0, (size_t)T * T * sizeof(float));
+        if (g.gcond_t)
+            ggml_backend_tensor_set(g.gcond_t, g_cond, 0, (size_t)D * sizeof(float));
+    }
+
+    size_t n_tensors = dit.n_layers * 80 + 320;
+    size_t mem_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(n_tensors, false);
+    g.mem_buf.resize(mem_size);
+    ggml_init_params ip = {mem_size, g.mem_buf.data(), true};
+    g.ctx0 = ggml_init(ip);
+    g.gf = ggml_new_graph_custom(g.ctx0, n_tensors, false);
+
+    g.z_in = ggml_new_tensor_2d(g.ctx0, GGML_TYPE_F32, latent_dim, patch_size);
+    ggml_set_name(g.z_in, "fused_z");
+    ggml_set_input(g.z_in);
+    g.t_in = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_F32, t_dim);
+    ggml_set_name(g.t_in, "fused_t_emb");
+    ggml_set_input(g.t_in);
+
+    // coordinate_proj IN-GRAPH — the exact dots_linear ops (mul_mat + add).
+    ggml_tensor* zp = ggml_mul_mat(g.ctx0, ctx->proj.coord_proj_w, g.z_in);
+    if (ctx->proj.coord_proj_b)
+        zp = ggml_add(g.ctx0, zp, ctx->proj.coord_proj_b);
+
+    ggml_tensor* x = g.prefix ? ggml_concat(g.ctx0, g.prefix, zp, 1) : zp;
+
+    ggml_tensor* cur = dots_build_dit_body(ctx, g.ctx0, x, g.t_in, g.gcond_t, g.pos_t, g.mask_t, T);
+
+    // Only the trailing noise-slot velocity slice leaves the device.
+    g.out_patch = ggml_cont(
+        g.ctx0, ggml_view_2d(g.ctx0, cur, cur->ne[0], patch_size, cur->nb[1], (size_t)latent_start * cur->nb[1]));
+    ggml_set_name(g.out_patch, "fused_vel_patch");
+    ggml_set_output(g.out_patch);
+    ggml_build_forward_expand(g.gf, g.out_patch);
+
+    g.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    ggml_gallocr_alloc_graph(g.ga, g.gf);
+}
+
+static void dots_run_fused_dit(dots_tts_context* ctx, dots_fused_dit_graph& g, const float* z_data, float timestep,
+                               float* out_vel_patch) {
+    // Re-set EVERY gallocr-managed input each compute (aliasing gotcha —
+    // gallocr may hand an input's slot to an intermediate of the previous
+    // compute). The ctx_const tensors live in their own buffer and are exempt.
+    ggml_backend_tensor_set(g.z_in, z_data, 0, ggml_nbytes(g.z_in));
+    const int t_dim = (int)g.t_in->ne[0];
+    std::vector<float> t_emb_data;
+    dots_timestep_embed(timestep, t_dim, t_emb_data);
+    ggml_backend_tensor_set(g.t_in, t_emb_data.data(), 0, (size_t)t_dim * sizeof(float));
+    ggml_backend_graph_compute(ctx->backend, g.gf);
+    ggml_backend_tensor_get(g.out_patch, out_vel_patch, 0, ggml_nbytes(g.out_patch));
+}
+
 // Flow-matching ODE driver (core.fm_solver_step + _flow_matching_step_fm).
 //   input_seq / cfg_seq: (fm_total_len, dit_dim) row-major. The two CFG branches
 //     differ only in the history hidden slots (real hidden_proj vs hidden_proj(0)).
@@ -1490,6 +1639,11 @@ static std::vector<float> dots_linear(dots_tts_context* ctx, ggml_tensor* w, ggm
 //   pos_ids:       (fm_total_len) RoPE ids or nullptr (arange).
 //   noise:         (patch_size, latent_dim) ODE initial coordinate (caller-seeded).
 // Writes the raw (un-denormalized) latent (patch_size, latent_dim) to out_latent.
+
+// Fused-step gate override for the in-process A/B hook (-1 = use the env /
+// backend default). A plain global instead of setenv — MSVC has no setenv.
+static int g_dots_fused_override = -1;
+
 static void dots_flow_match_core(dots_tts_context* ctx, const float* input_seq, const float* cfg_seq, int fm_total_len,
                                  int latent_start, const float* attn_mask_add, const int32_t* pos_ids,
                                  const float* noise, int num_steps, float cfg_scale, float* out_latent,
@@ -1509,8 +1663,88 @@ static void dots_flow_match_core(dots_tts_context* ctx, const float* input_seq, 
     std::vector<float> vel_c((size_t)fm_total_len * latent_dim);
     std::vector<float> vel_u((size_t)fm_total_len * latent_dim);
 
+    // Interval-CFG (opt-in, APPROXIMATE — mirrors OMNIVOICE_CFG_INTERVAL): recompute
+    // the uncond DiT forward only every K ODE steps and reuse the cached uncond
+    // velocity in between; the cond forward stays fresh every step; the FIRST and
+    // LAST step always recompute. This uses a slightly stale uncond, so it CHANGES
+    // the output and stays gated OFF by default (K=1 = exact). The cond/uncond
+    // forwards are already two separate B=1 dots_dit_forward()s, so K>1 simply skips
+    // the uncond forward. Only active when K>1, so at the default both forwards run
+    // every step and the result is byte-for-byte the legacy path. Gated
+    // CRISPASR_DOTS_CFG_INTERVAL.
+    const int cfg_interval = [] {
+        const char* e = std::getenv("CRISPASR_DOTS_CFG_INTERVAL");
+        const int k = e ? atoi(e) : 1;
+        return k < 1 ? 1 : k;
+    }();
+    const bool interval_on = cfg_interval > 1;
+    std::vector<float> vel_u_cache; // last computed uncond velocity; reused between recomputes
+    static bool dbg_printed = false;
+    if (interval_on && !dbg_printed && std::getenv("CRISPASR_DOTS_CFG_INTERVAL_DEBUG")) {
+        fprintf(stderr, "dots_tts: interval-CFG K=%d (uncond recomputed every %d ODE steps; first+last always)\n",
+                cfg_interval, cfg_interval);
+        dbg_printed = true;
+    }
+
+    // Fused persistent step graphs (#254 pattern, perf-sweep TODO-5): one graph
+    // per CFG arm per patch, reused across all ODE steps — kills the per-step
+    // ggml_context + gallocr rebuild ×2 arms, the full-sequence + (T,T)-mask
+    // re-uploads, and the full-T velocity readback. coordinate_proj runs
+    // in-graph with the same ops as dots_linear, so the result is
+    // byte-identical to the legacy path (A/B: fixed seed + WAV data-chunk cmp).
+    // CRISPASR_DOTS_FUSED_STEP=0 restores the legacy loop; default ON for
+    // CPU/Metal, OFF on CUDA pending the TODO-7 capture audit (never flip a
+    // GPU default blind — dev-guide LEARNING 35).
+    const bool fused_step = [&] {
+        if (!ctx->dit.time_mlp_0_w || !ctx->dit.in_proj_w || !ctx->dit.final_proj_w)
+            return false; // legacy path carries the null-tensor diagnostics
+        if (g_dots_fused_override >= 0)
+            return g_dots_fused_override != 0; // in-process A/B hook (portable, no setenv)
+        const char* e = std::getenv("CRISPASR_DOTS_FUSED_STEP");
+        if (e && *e)
+            return *e != '0';
+        if (ctx->backend && std::strstr(ggml_backend_name(ctx->backend), "CUDA") != nullptr)
+            return false; // pending CUDA A/B (perf-sweep TODO-7)
+        return true;
+    }();
+    dots_fused_dit_graph fg_c, fg_u;
+    std::vector<float> vel_cp, vel_up, vel_up_cache; // noise-slot-only velocities (fused path)
+    if (fused_step) {
+        dots_build_fused_dit(ctx, fg_c, input_seq, latent_start, patch_size, attn_mask_add, pos_ids, g_cond,
+                             fm_total_len);
+        dots_build_fused_dit(ctx, fg_u, cfg_seq, latent_start, patch_size, attn_mask_add, pos_ids,
+                             /*g_cond=*/nullptr, fm_total_len);
+        vel_cp.resize(n_latent);
+        vel_up.resize(n_latent);
+    }
+
     for (int step = 0; step < num_steps; step++) {
         float t = (float)step * dt;
+
+        if (fused_step) {
+            dots_run_fused_dit(ctx, fg_c, z.data(), t, vel_cp.data());
+            const bool recompute_unc = !interval_on || vel_up_cache.empty() || (step == 0) || (step == num_steps - 1) ||
+                                       ((step % cfg_interval) == 0);
+            if (recompute_unc) {
+                dots_run_fused_dit(ctx, fg_u, z.data(), t, vel_up.data());
+                if (interval_on)
+                    vel_up_cache = vel_up;
+            } else {
+                vel_up = vel_up_cache; // reuse stale uncond velocity
+            }
+            // Euler step (identical arithmetic to the legacy loop — the fused
+            // buffers hold exactly the noise-slot slice of vel_c/vel_u).
+            for (int i = 0; i < patch_size; i++) {
+                for (int d = 0; d < latent_dim; d++) {
+                    int src = i * latent_dim + d;
+                    float vc = vel_cp[src];
+                    float vu = vel_up[src];
+                    float v = vc + cfg_scale * (vc - vu);
+                    z[i * latent_dim + d] += dt * v;
+                }
+            }
+            continue;
+        }
 
         // coordinate_proj(z): (patch_size, latent_dim) → (patch_size, dit_dim)
         std::vector<float> z_proj =
@@ -1524,7 +1758,18 @@ static void dots_flow_match_core(dots_tts_context* ctx, const float* input_seq, 
         // branch carries the speaker g_cond and the UNCOND branch carries zero
         // (reference fm_solver_step: DiT g_cond=[g, 0]). Text-only → both null.
         dots_dit_forward(ctx, seq_c.data(), fm_total_len, t, g_cond, attn_mask_add, pos_ids, vel_c.data());
-        dots_dit_forward(ctx, seq_u.data(), fm_total_len, t, /*g_cond=*/nullptr, attn_mask_add, pos_ids, vel_u.data());
+        // Interval-CFG: recompute uncond on the first + last step and every K-th step;
+        // otherwise reuse the cached uncond velocity (the approximation).
+        const bool recompute_unc = !interval_on || vel_u_cache.empty() || (step == 0) || (step == num_steps - 1) ||
+                                   ((step % cfg_interval) == 0);
+        if (recompute_unc) {
+            dots_dit_forward(ctx, seq_u.data(), fm_total_len, t, /*g_cond=*/nullptr, attn_mask_add, pos_ids,
+                             vel_u.data());
+            if (interval_on)
+                vel_u_cache = vel_u;
+        } else {
+            vel_u = vel_u_cache; // reuse stale uncond velocity
+        }
 
         // Euler step on the noise-slot velocities with classifier-free guidance.
         for (int i = 0; i < patch_size; i++) {
@@ -2881,6 +3126,39 @@ extern "C" int dots_tts_flowmatch_diff(const char* model_gguf, const char* ref_g
     std::vector<float> got((size_t)out_n, 0.0f);
     dots_flow_match_core(ctx, in_seq.data(), cfg_seq.data(), total_len, latent_start, mask.data(), pos.data(),
                          noise.data(), num_steps, cfg_scale, got.data());
+
+    // Byte-exact A/B hook (fused-step verification): dump the raw latent so two
+    // runs (CRISPASR_DOTS_FUSED_STEP=0 vs 1) can be diffed with cmp.
+    if (const char* dump = std::getenv("CRISPASR_DOTS_FM_DUMP")) {
+        if (FILE* f = fopen(dump, "wb")) {
+            fwrite(got.data(), sizeof(float), got.size(), f);
+            fclose(f);
+            std::fprintf(stderr, "dots-tts flow-match: dumped %d floats to %s\n", out_n, dump);
+        }
+    }
+    // In-process fused-vs-legacy A/B (CRISPASR_DOTS_FM_AB=1): rerun the solver
+    // with the fused gate forced the OTHER way and require byte-equality —
+    // one model load instead of two full runs.
+    const char* ab_env = std::getenv("CRISPASR_DOTS_FM_AB");
+    if (ab_env && *ab_env && *ab_env != '0') {
+        // Resolve the gate the primary run ACTUALLY used (env override, else
+        // the backend default) — deriving it from the raw env alone would
+        // compare fused-vs-fused when the env is unset on CPU/Metal.
+        const bool cur_fused = [&] {
+            const char* cur_gate = std::getenv("CRISPASR_DOTS_FUSED_STEP");
+            if (cur_gate && *cur_gate)
+                return *cur_gate != '0';
+            return !(ctx->backend && std::strstr(ggml_backend_name(ctx->backend), "CUDA") != nullptr);
+        }();
+        g_dots_fused_override = cur_fused ? 0 : 1; // force the OTHER path (portable, no setenv)
+        std::vector<float> other((size_t)out_n, 0.0f);
+        dots_flow_match_core(ctx, in_seq.data(), cfg_seq.data(), total_len, latent_start, mask.data(), pos.data(),
+                             noise.data(), num_steps, cfg_scale, other.data());
+        g_dots_fused_override = -1;
+        const bool same = std::memcmp(got.data(), other.data(), (size_t)out_n * sizeof(float)) == 0;
+        std::fprintf(stderr, "dots-tts flow-match A/B (%s vs %s): %s\n", cur_fused ? "fused" : "legacy",
+                     cur_fused ? "legacy" : "fused", same ? "BYTE-IDENTICAL" : "DIFFERS");
+    }
 
     double dot = 0, na = 0, nb = 0, maxabs = 0;
     for (int i = 0; i < out_n; i++) {

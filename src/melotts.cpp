@@ -26,6 +26,7 @@
 #include "core/conv.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include <algorithm>
 #include <cassert>
@@ -45,7 +46,7 @@
 static bool melotts_use_scalar() {
     static int v = -1;
     if (v < 0)
-        v = (getenv("MELOTTS_FORCE_SCALAR") != nullptr) ? 1 : 0;
+        v = (crispasr_env::get("CRISPASR_MELOTTS_FORCE_SCALAR") != nullptr) ? 1 : 0;
     return v != 0;
 }
 #endif
@@ -57,7 +58,7 @@ static bool melotts_use_scalar() {
 static bool melotts_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("MELOTTS_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_MELOTTS_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;

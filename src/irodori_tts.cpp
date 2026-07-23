@@ -2844,6 +2844,27 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
         }
     }
 
+    // Interval-CFG (opt-in, APPROXIMATE — mirrors OMNIVOICE_CFG_INTERVAL): irodori
+    // runs up to THREE uncond DiT forwards per in-window step (text / speaker /
+    // caption independent guidance). Recompute those uncond forwards only every K
+    // CFG-active steps and reuse the cached uncond velocities in between; the cond
+    // forward stays fresh every step; the first CFG-active step always recomputes.
+    // This uses slightly stale uncond, so it CHANGES the output and stays gated OFF
+    // by default (K=1 = exact). Only active when K>1, so the default recomputes every
+    // step and is byte-for-byte the legacy path. Gated CRISPASR_IRODORI_CFG_INTERVAL.
+    const int cfg_interval = [] {
+        const char* e = std::getenv("CRISPASR_IRODORI_CFG_INTERVAL");
+        const int k = e ? std::atoi(e) : 1;
+        return k < 1 ? 1 : k;
+    }();
+    const bool cfg_interval_on = cfg_interval > 1;
+    std::vector<float> v_text_cache, v_spk_cache, v_cap_cache; // cached uncond velocities
+    int cfg_active_idx = 0;                                    // counts CFG-active steps (for the every-K test)
+    if (cfg_interval_on && std::getenv("CRISPASR_IRODORI_CFG_INTERVAL_DEBUG"))
+        std::fprintf(stderr,
+                     "[irodori] interval-CFG K=%d (uncond recomputed every %d CFG-active steps; first always)\n",
+                     cfg_interval, cfg_interval);
+
     // ODE integration loop
     for (int step = 0; step < n_ode; step++) {
         float t_val = t_schedule[step];
@@ -2907,27 +2928,52 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
 
         if (do_text_cfg || do_spk_cfg || do_cap_cfg) {
             const float* spk_ptr = spk_state.empty() ? nullptr : spk_state.data();
+            // Interval-CFG: recompute the uncond passes on the first CFG-active step
+            // and every K-th CFG-active step; otherwise reuse the cached velocities.
+            const bool recompute_unc = !cfg_interval_on || (cfg_active_idx % cfg_interval == 0) ||
+                                       (do_text_cfg && v_text_cache.empty()) || (do_spk_cfg && v_spk_cache.empty()) ||
+                                       (do_cap_cfg && v_cap_cache.empty());
             // Text-unconditional pass: zero text state, keep speaker+caption attended.
             std::vector<float> v_text_uncond;
             if (do_text_cfg) {
-                std::vector<float> text_uncond(T_text * hp.text_dim, 0.0f);
-                v_text_uncond = run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_uncond.data(),
-                                                T_text, spk_ptr, T_ref, attend_speaker, cap_ptr, T_cap, attend_caption);
+                if (recompute_unc) {
+                    std::vector<float> text_uncond(T_text * hp.text_dim, 0.0f);
+                    v_text_uncond =
+                        run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_uncond.data(), T_text,
+                                        spk_ptr, T_ref, attend_speaker, cap_ptr, T_cap, attend_caption);
+                    if (cfg_interval_on)
+                        v_text_cache = v_text_uncond;
+                } else {
+                    v_text_uncond = v_text_cache;
+                }
             }
             // Speaker-unconditional pass: conditioned text+caption, speaker masked out.
             std::vector<float> v_spk_uncond;
             if (do_spk_cfg) {
-                v_spk_uncond =
-                    run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_state.data(), T_text,
-                                    spk_ptr, T_ref, /*attend_speaker=*/false, cap_ptr, T_cap, attend_caption);
+                if (recompute_unc) {
+                    v_spk_uncond =
+                        run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_state.data(), T_text,
+                                        spk_ptr, T_ref, /*attend_speaker=*/false, cap_ptr, T_cap, attend_caption);
+                    if (cfg_interval_on)
+                        v_spk_cache = v_spk_uncond;
+                } else {
+                    v_spk_uncond = v_spk_cache;
+                }
             }
             // Caption-unconditional pass: conditioned text+speaker, caption masked out.
             std::vector<float> v_cap_uncond;
             if (do_cap_cfg) {
-                v_cap_uncond =
-                    run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_state.data(), T_text,
-                                    spk_ptr, T_ref, attend_speaker, cap_ptr, T_cap, /*attend_caption=*/false);
+                if (recompute_unc) {
+                    v_cap_uncond =
+                        run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_state.data(), T_text,
+                                        spk_ptr, T_ref, attend_speaker, cap_ptr, T_cap, /*attend_caption=*/false);
+                    if (cfg_interval_on)
+                        v_cap_cache = v_cap_uncond;
+                } else {
+                    v_cap_uncond = v_cap_cache;
+                }
             }
+            cfg_active_idx++;
             for (size_t i = 0; i < x_t.size(); i++) {
                 float v = v_cond[i];
                 if (!v_text_uncond.empty())

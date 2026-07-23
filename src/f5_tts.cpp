@@ -31,6 +31,7 @@
 
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #if defined(HAVE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
@@ -59,7 +60,7 @@
 static bool f5_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("F5_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_F5_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -69,7 +70,46 @@ static bool f5_bench_enabled() {
 static bool f5_batch_cfg_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("F5_BATCH_CFG");
+        const char* e = crispasr_env::get("CRISPASR_F5_BATCH_CFG");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+// Opt-in (#294): feed the DiT matmuls F16 activations instead of F32, by casting
+// only the mat-mul RHS (norm/attn/FFN activations); norms/adaln/rope/flash and the
+// output stay F32. Intent: the F16 weights make the F32 activation the only wide
+// operand, so an F16 RHS halves its bandwidth on the 64×/synth forwards.
+//   MEASURED (M1 Metal, F16, jfk ref): output is BYTE-IDENTICAL to the F32-activation
+//   path (md5 unchanged) AND ~17% slower (dit_graph 53.3 s vs 45.3 s). The
+//   byte-identity proves ggml's F16-weight mul_mat already converts the F32 RHS to
+//   F16 internally on Metal — so the explicit cast is redundant work, not a new win.
+//   Kept gated (default OFF) ONLY so a CUDA user can A/B it, since a cuBLAS/CUDA
+//   kernel may keep F32 activations where this would help. Do NOT default this on
+//   without a trustworthy CUDA measurement. (The old "F32->F16 activations is the
+//   real lever" note below is wrong for the Metal backend.)
+static bool f5_f16_act_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_F5_F16_ACT");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+// Opt-in (#294): compute the InputEmbedding (input_proj + 2× grouped conv-pos +
+// Mish + residual) on the GPU backend instead of host BLAS/scalar. On the default
+// (32 steps) that host stage is ~26% of the ODE loop on M1 and a larger share on a
+// fast-GPU/slow-CPU box (the #294 reporter's RTX 5060 Ti + Ryzen 2600). Moving it
+// to ctx->backend frees the CPU stall between GPU DiT dispatches. Reuses the proven
+// grouped-conv-pos graph pattern from cosyvoice3_tts (identical
+// Conv1d(dim,dim,k=31,groups=16)+Mish module), adapted to F5's SYMMETRIC pad=15.
+// Default OFF pending a CUDA A/B (on M1 the GPU is already the bottleneck, so this
+// is expected to regress locally while winning on the reporter's hardware).
+static bool f5_embed_gpu_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_F5_EMBED_GPU");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -266,6 +306,34 @@ struct f5_dit_graph_cache {
     ~f5_dit_graph_cache() { reset(); }
 };
 
+// #294: GPU InputEmbedding graph (opt-in CRISPASR_F5_EMBED_GPU). Built once per
+// (T,B), reused across forwards. Input = the concatenated [x|cond'|text] (cat_dim,
+// T, B); output = hidden (dim, T, B). input_proj + conv-pos weights already live on
+// ctx->backend, so this keeps the whole embed on-device.
+struct f5_embed_graph_cache {
+    int T_cached = -1;
+    int B_cached = -1;
+    ggml_context* gctx = nullptr;
+    ggml_cgraph* gf = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+    ggml_tensor* cat_in = nullptr;     // (cat_dim, T, B) — concatenated input
+    ggml_tensor* hidden_out = nullptr; // (dim, T, B) — embedded hidden
+    void reset() {
+        if (galloc) {
+            ggml_gallocr_free(galloc);
+            galloc = nullptr;
+        }
+        if (gctx) {
+            ggml_free(gctx);
+            gctx = nullptr;
+        }
+        gf = nullptr;
+        cat_in = hidden_out = nullptr;
+        T_cached = B_cached = -1;
+    }
+    ~f5_embed_graph_cache() { reset(); }
+};
+
 // ── Context ──────────────────────────────────────────────────────
 
 struct f5_tts_context {
@@ -299,6 +367,7 @@ struct f5_tts_context {
 
     // Cached fused DiT graph (rebuilt only when T changes)
     f5_dit_graph_cache dit_cache;
+    f5_embed_graph_cache embed_cache; // #294 GPU InputEmbedding (opt-in)
 
     // Pre-dequantized F32 input-embedding weights.
     // Avoids 64× read_tensor_f32 per synthesis (conv_pos tensors are 7.7 MB each).
@@ -880,7 +949,7 @@ static std::vector<float> compute_mel_spectrogram(const float* pcm_24k, int n_sa
 // F5_FORCE_SCALAR=1.
 static bool f5_use_scalar() {
 #if defined(HAVE_ACCELERATE)
-    static const bool force_scalar = std::getenv("F5_FORCE_SCALAR") != nullptr;
+    static const bool force_scalar = crispasr_env::get("CRISPASR_F5_FORCE_SCALAR") != nullptr;
     return force_scalar;
 #else
     return true;
@@ -1011,6 +1080,11 @@ static bool f5_dit_cache_build(f5_tts_context* ctx, int T, int B) {
     ggml_set_input(cache.pos_in);
 
     // Chain all 22 DiT blocks
+    // #294: optionally feed the big mat-muls F16 activations (weights are F16
+    // already, so the RHS is the only F32 operand). Cast only the mat-mul inputs;
+    // everything else (norm/adaln/rope/flash) stays F32, output stays F32.
+    const bool f16act = f5_f16_act_enabled();
+    auto A = [&](ggml_tensor* t) { return f16act ? ggml_cast(cache.gctx, t, GGML_TYPE_F16) : t; };
     ggml_tensor* x = cache.hidden_in;
     for (int i = 0; i < hp.depth; i++) {
         const auto& blk = w.dit_blocks[i];
@@ -1033,12 +1107,13 @@ static bool f5_dit_cache_build(f5_tts_context* ctx, int T, int B) {
         norm_x = ggml_add(cache.gctx, norm_x, scaled);
         norm_x = ggml_add(cache.gctx, norm_x, shift_msa);
 
-        // QKV projections
-        ggml_tensor* q = ggml_mul_mat(cache.gctx, blk.attn_q_weight, norm_x);
+        // QKV projections (share one F16 cast of the norm output across q/k/v)
+        ggml_tensor* norm_x_m = A(norm_x);
+        ggml_tensor* q = ggml_mul_mat(cache.gctx, blk.attn_q_weight, norm_x_m);
         q = ggml_add(cache.gctx, q, blk.attn_q_bias);
-        ggml_tensor* k = ggml_mul_mat(cache.gctx, blk.attn_k_weight, norm_x);
+        ggml_tensor* k = ggml_mul_mat(cache.gctx, blk.attn_k_weight, norm_x_m);
         k = ggml_add(cache.gctx, k, blk.attn_k_bias);
-        ggml_tensor* v = ggml_mul_mat(cache.gctx, blk.attn_v_weight, norm_x);
+        ggml_tensor* v = ggml_mul_mat(cache.gctx, blk.attn_v_weight, norm_x_m);
         v = ggml_add(cache.gctx, v, blk.attn_v_bias);
 
         // Reshape for RoPE: (dim, T) → (head_dim, n_heads, T)
@@ -1061,7 +1136,7 @@ static bool f5_dit_cache_build(f5_tts_context* ctx, int T, int B) {
         attn_out = ggml_reshape_3d(cache.gctx, attn_out, dim, T, B);
 
         // O-proj + gated residual
-        ggml_tensor* attn_proj = ggml_mul_mat(cache.gctx, blk.attn_o_weight, attn_out);
+        ggml_tensor* attn_proj = ggml_mul_mat(cache.gctx, blk.attn_o_weight, A(attn_out));
         attn_proj = ggml_add(cache.gctx, attn_proj, blk.attn_o_bias);
         ggml_tensor* gated_attn = ggml_mul(cache.gctx, attn_proj, gate_msa);
         ggml_tensor* x_res = ggml_add(cache.gctx, x, gated_attn);
@@ -1073,10 +1148,10 @@ static bool f5_dit_cache_build(f5_tts_context* ctx, int T, int B) {
         ff_norm = ggml_add(cache.gctx, ff_norm, shift_mlp);
 
         // FFN: up → GELU → down
-        ggml_tensor* ff = ggml_mul_mat(cache.gctx, blk.ffn_up_weight, ff_norm);
+        ggml_tensor* ff = ggml_mul_mat(cache.gctx, blk.ffn_up_weight, A(ff_norm));
         ff = ggml_add(cache.gctx, ff, blk.ffn_up_bias);
         ff = ggml_gelu(cache.gctx, ff);
-        ff = ggml_mul_mat(cache.gctx, blk.ffn_down_weight, ff);
+        ff = ggml_mul_mat(cache.gctx, blk.ffn_down_weight, A(ff));
         ff = ggml_add(cache.gctx, ff, blk.ffn_down_bias);
 
         // Gated residual
@@ -1097,7 +1172,7 @@ static bool f5_dit_cache_build(f5_tts_context* ctx, int T, int B) {
         norm_x = ggml_add(cache.gctx, norm_x, fn_sc);
         norm_x = ggml_add(cache.gctx, norm_x, fshift);
 
-        ggml_tensor* vel = ggml_mul_mat(cache.gctx, w.final_proj_weight, norm_x);
+        ggml_tensor* vel = ggml_mul_mat(cache.gctx, w.final_proj_weight, A(norm_x));
         vel = ggml_add(cache.gctx, vel, w.final_proj_bias);
         ggml_set_name(vel, "velocity");
         ggml_set_output(vel);
@@ -1185,6 +1260,114 @@ static std::vector<float> f5_dit_run(f5_tts_context* ctx, const float* hidden, i
 static int64_t g_f5_hostembed_us = 0;
 static int64_t g_f5_ditgraph_us = 0;
 
+// ── GPU InputEmbedding (#294, opt-in) ────────────────────────────
+// Mish = x * tanh(softplus(x)).
+static ggml_tensor* f5_mish_graph(ggml_context* g, ggml_tensor* x) {
+    return ggml_mul(g, x, ggml_tanh(g, ggml_softplus(g, x)));
+}
+
+// Symmetric ("same") grouped Conv1d for F5's ConvPositionEmbedding.
+// h: (C, T) F32 — channel-first. w: (K, C_per_group, C). b: (C,). pad = (K-1)/2 so
+// output length == T. Mirrors cosyvoice3_tts::cv3_causal_grouped_conv1d but with
+// symmetric padding instead of causal left-pad.
+static ggml_tensor* f5_sym_grouped_conv1d_graph(ggml_context* g, ggml_tensor* h, ggml_tensor* w, ggml_tensor* b) {
+    const int K = (int)w->ne[0];
+    const int C_per_g = (int)w->ne[1];
+    const int C = (int)w->ne[2];
+    const int T = (int)h->ne[1];
+    const int G = C / C_per_g;
+    const int pad = (K - 1) / 2;
+    ggml_tensor* out = nullptr;
+    for (int grp = 0; grp < G; grp++) {
+        const size_t c0 = (size_t)grp * C_per_g;
+        ggml_tensor* h_g = ggml_view_2d(g, h, C_per_g, T, h->nb[1], c0 * h->nb[0]);
+        h_g = ggml_cont(g, ggml_transpose(g, h_g)); // (T, C_per_g)
+        ggml_tensor* w_g = ggml_view_3d(g, w, K, C_per_g, C_per_g, w->nb[1], w->nb[2], c0 * w->nb[2]);
+        w_g = ggml_cont(g, w_g);
+        ggml_tensor* y = ggml_conv_1d(g, w_g, h_g, /*s*/ 1, /*p*/ pad, /*d*/ 1); // (T, C_per_g)
+        y = ggml_cont(g, ggml_transpose(g, y));                                  // (C_per_g, T)
+        ggml_tensor* b_g = ggml_view_1d(g, b, C_per_g, c0 * b->nb[0]);
+        y = ggml_add(g, y, b_g);
+        out = out ? ggml_concat(g, out, y, 0) : y;
+    }
+    return out;
+}
+
+// Build the cached GPU embed graph (once per T). B is always 1 here — the CFG arms
+// call this separately. cat_in (cat_dim,T,1) → input_proj → 2×(grouped conv + Mish)
+// + residual → hidden_out (dim,T,1).
+static bool f5_embed_cache_build(f5_tts_context* ctx, int T) {
+    auto& ec = ctx->embed_cache;
+    if (ec.T_cached == T && ec.B_cached == 1 && ec.galloc)
+        return true;
+    ec.reset();
+    const auto& hp = ctx->hp;
+    const auto& w = ctx->w;
+    const int cat_dim = hp.mel_dim + hp.mel_dim + hp.text_dim;
+
+    struct ggml_init_params p = {4 * 1024 * 1024, nullptr, true};
+    ec.gctx = ggml_init(p);
+    if (!ec.gctx)
+        return false;
+
+    ec.cat_in = ggml_new_tensor_2d(ec.gctx, GGML_TYPE_F32, cat_dim, T);
+    ggml_set_name(ec.cat_in, "cat_in");
+    ggml_set_input(ec.cat_in);
+
+    // input_proj: (cat_dim,T) → (dim,T)
+    ggml_tensor* h = ggml_mul_mat(ec.gctx, w.input_proj_weight, ec.cat_in);
+    h = ggml_add(ec.gctx, h, w.input_proj_bias);
+    ggml_tensor* proj_out = h;
+    // 2 × (grouped conv-pos + Mish)
+    h = f5_mish_graph(ec.gctx, f5_sym_grouped_conv1d_graph(ec.gctx, h, w.conv_pos_0_weight, w.conv_pos_0_bias));
+    h = f5_mish_graph(ec.gctx, f5_sym_grouped_conv1d_graph(ec.gctx, h, w.conv_pos_1_weight, w.conv_pos_1_bias));
+    h = ggml_add(ec.gctx, h, proj_out); // residual
+    ggml_set_name(h, "hidden_out");
+    ggml_set_output(h);
+    ec.hidden_out = h;
+
+    ec.gf = ggml_new_graph_custom(ec.gctx, 2048, false);
+    ggml_build_forward_expand(ec.gf, ec.hidden_out);
+    ec.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!ggml_gallocr_reserve(ec.galloc, ec.gf) || !ggml_gallocr_alloc_graph(ec.galloc, ec.gf)) {
+        ec.reset();
+        return false;
+    }
+    ec.T_cached = T;
+    ec.B_cached = 1;
+    return true;
+}
+
+// GPU equivalent of f5_compute_hidden (one arm). Builds the cat on host (trivial,
+// no FLOP), uploads, runs input_proj + conv-pos on the backend, returns hidden
+// [T*dim] in the same layout as the host path.
+static std::vector<float> f5_compute_hidden_gpu(f5_tts_context* ctx, const float* x_data, int T, int mel_dim,
+                                                const float* cond_data, const float* text_data, int text_dim,
+                                                bool drop_audio_cond) {
+    const int dim = ctx->hp.dim;
+    const int cat_dim = mel_dim + mel_dim + text_dim;
+    if (!f5_embed_cache_build(ctx, T))
+        return {};
+    auto& ec = ctx->embed_cache;
+    if (!ggml_gallocr_alloc_graph(ec.galloc, ec.gf))
+        return {};
+    std::vector<float> cat_input((size_t)T * cat_dim);
+    for (int t = 0; t < T; t++) {
+        for (int d = 0; d < mel_dim; d++)
+            cat_input[t * cat_dim + d] = x_data[t * mel_dim + d];
+        for (int d = 0; d < mel_dim; d++)
+            cat_input[t * cat_dim + mel_dim + d] = drop_audio_cond ? 0.0f : cond_data[t * mel_dim + d];
+        for (int d = 0; d < text_dim; d++)
+            cat_input[t * cat_dim + mel_dim + mel_dim + d] = text_data[t * text_dim + d];
+    }
+    ggml_backend_tensor_set(ec.cat_in, cat_input.data(), 0, cat_input.size() * sizeof(float));
+    if (ggml_backend_graph_compute(ctx->backend, ec.gf) != GGML_STATUS_SUCCESS)
+        return {};
+    std::vector<float> hidden((size_t)T * dim);
+    ggml_backend_tensor_get(ec.hidden_out, hidden.data(), 0, hidden.size() * sizeof(float));
+    return hidden;
+}
+
 // Host-side InputEmbedding: cat(x, cond, text) → input_proj → +conv_pos_embed.
 // Returns `hidden` [dim,T] (== ggml [dim,T] memory layout). Shared by the plain
 // per-pass path and the batched-CFG path (which computes it once per arm).
@@ -1192,6 +1375,9 @@ static std::vector<float> f5_compute_hidden(f5_tts_context* ctx, const float* x_
                                             const float* cond_data, const float* text_data, int text_dim,
                                             bool drop_audio_cond, bool drop_text, int step_idx) {
     (void)drop_text;
+    // #294 opt-in: run the whole InputEmbedding on the GPU backend.
+    if (f5_embed_gpu_enabled())
+        return f5_compute_hidden_gpu(ctx, x_data, T, mel_dim, cond_data, text_data, text_dim, drop_audio_cond);
     const int dim = ctx->hp.dim;
 
     // Concatenate along feature dim: (T, mel_dim + mel_dim + text_dim) = (T, 712)
@@ -1576,6 +1762,60 @@ static std::vector<float> euler_solve(f5_tts_context* ctx,
 
     int n_steps = (int)t_schedule.size() - 1;
 
+    // Interval-CFG (opt-in, APPROXIMATE — mirrors OMNIVOICE_CFG_INTERVAL): recompute
+    // the uncond DiT forward only every K ODE steps and reuse the cached uncond
+    // velocity in between; the cond forward stays fresh every step; the FIRST and
+    // LAST step always recompute. This uses a slightly stale uncond, so it CHANGES
+    // the output and stays gated OFF by default (K=1 = exact). It uses the separate
+    // 2-forward path (which is already the default; the batched F5_BATCH_CFG path
+    // fuses cond+uncond in one B=2 graph, nothing to skip — so interval overrides it).
+    // Only active when K>1 && CFG is on, so at the default the legacy paths below are
+    // byte-for-byte unchanged. Gated CRISPASR_F5_CFG_INTERVAL.
+    const int cfg_interval = [] {
+        const char* e = std::getenv("CRISPASR_F5_CFG_INTERVAL");
+        const int k = e ? atoi(e) : 1;
+        return k < 1 ? 1 : k;
+    }();
+    const bool interval_on = cfg_interval > 1 && ctx->cfg_strength >= 1e-5f;
+    std::vector<float> v_uncond_cache; // last computed uncond velocity [T*mel_dim]; reused between recomputes
+    if (interval_on && ctx->verbosity >= 1)
+        fprintf(stderr, "f5_tts: interval-CFG K=%d (uncond recomputed every %d ODE steps; first+last always)\n",
+                cfg_interval, cfg_interval);
+    // Footgun guard (#294): interval-CFG reuses a stale uncond velocity between
+    // recomputes. That is fine at the default 32 / 16 steps, but stacking it on an
+    // aggressive EPSS low-step schedule leaves too few recomputes over a highly
+    // non-uniform schedule and the output degrades to noise (MEASURED: 7 steps +
+    // K=2 → unintelligible, while 16 + K=2 is clean). Warn — don't block; the
+    // caller may have a reason. Threshold picked from the 7-vs-16 A/B.
+    if (interval_on && n_steps < 16)
+        fprintf(stderr,
+                "f5_tts: WARNING interval-CFG (CRISPASR_F5_CFG_INTERVAL=%d) with only %d ODE steps degrades "
+                "quality — use one lever or the other (low --tts-steps OR interval CFG), not both.\n",
+                cfg_interval, n_steps);
+
+    // DiTReducio-style temporal skipping (opt-in, APPROXIMATE — #294). Consecutive
+    // ODE steps produce near-identical DiT velocities, so recompute the full step
+    // velocity (BOTH CFG arms) only every K steps + first/last, and reuse the cached
+    // velocity in between — skipping the entire DiT forward on reuse steps (unlike
+    // interval-CFG, which only skips the uncond arm). ~K× fewer forwards at stride K.
+    // Same stale-reuse risk as interval-CFG: fine near the default step count, breaks
+    // at aggressive low NFE. Default OFF (K=1 = exact, legacy path byte-identical).
+    const int dit_skip = [] {
+        const char* e = std::getenv("CRISPASR_F5_DIT_SKIP");
+        const int k = e ? atoi(e) : 1;
+        return k < 1 ? 1 : k;
+    }();
+    const bool dit_skip_on = dit_skip > 1;
+    std::vector<float> v_step_cache; // last full step velocity [T*mel_dim], reused on skip steps
+    if (dit_skip_on && ctx->verbosity >= 1)
+        fprintf(stderr, "f5_tts: DiT temporal-skip K=%d (full velocity recomputed every %d steps; first+last always)\n",
+                dit_skip, dit_skip);
+    if (dit_skip_on && n_steps < 16)
+        fprintf(stderr,
+                "f5_tts: WARNING DiT temporal-skip (CRISPASR_F5_DIT_SKIP=%d) with only %d ODE steps degrades "
+                "quality — pair it with a higher --tts-steps, not an aggressive low count.\n",
+                dit_skip, n_steps);
+
     // Initial noise y0 ~ N(0, 1)
     std::vector<float> x(T * mel_dim);
     if (!ctx->ref_init_noise.empty() && (int)ctx->ref_init_noise.size() == T * mel_dim) {
@@ -1604,6 +1844,17 @@ static std::vector<float> euler_solve(f5_tts_context* ctx,
             dump_stage(ctx, "time_embed", time_emb.data(), time_emb.size());
         }
 
+        // DiTReducio temporal skip: on a reuse step, apply the cached full velocity
+        // and skip both DiT forwards entirely.
+        if (dit_skip_on && step != 0 && step != n_steps - 1 && (step % dit_skip) != 0 && !v_step_cache.empty()) {
+            for (size_t i = 0; i < x.size(); i++)
+                x[i] += v_step_cache[i] * dt;
+            char lbl[64];
+            snprintf(lbl, sizeof(lbl), "ode_step_%d", step + 1);
+            dump_stage(ctx, lbl, x.data(), x.size());
+            continue;
+        }
+
         if (ctx->cfg_strength < 1e-5f) {
             // No CFG: single forward pass
             auto velocity = dit_forward(ctx, x.data(), T, mel_dim, cond.data(), text_emb.data(), text_dim,
@@ -1614,6 +1865,8 @@ static std::vector<float> euler_solve(f5_tts_context* ctx,
             for (size_t i = 0; i < x.size(); i++) {
                 x[i] += velocity[i] * dt;
             }
+            if (dit_skip_on)
+                v_step_cache.assign(velocity.begin(), velocity.end());
         } else {
             // CFG: conditioned + unconditioned forward. The DiT is identical
             // per arm (the cond/uncond difference is baked into `hidden` on the
@@ -1624,7 +1877,25 @@ static std::vector<float> euler_solve(f5_tts_context* ctx,
             // work per dispatch. Kept opt-in + off by default; the real lever
             // is DiT compute efficiency (F32→F16 activations). See PLAN §232.
             std::vector<float> v_cond, v_uncond;
-            if (f5_batch_cfg_enabled()) {
+            const float* v_unc_ptr = nullptr;
+            if (interval_on) {
+                // Cond fresh every step; uncond recomputed on the first + last step
+                // and every K-th step, otherwise reused from the cache (the approximation).
+                v_cond = dit_forward(ctx, x.data(), T, mel_dim, cond.data(), text_emb.data(), text_dim, time_emb.data(),
+                                     false, false, step);
+                if (v_cond.empty())
+                    return {};
+                const bool recompute_unc =
+                    (step == 0) || (step == n_steps - 1) || ((step % cfg_interval) == 0) || v_uncond_cache.empty();
+                if (recompute_unc) {
+                    v_uncond = dit_forward(ctx, x.data(), T, mel_dim, cond.data(), text_emb_uncond.data(), text_dim,
+                                           time_emb.data(), true, true, step);
+                    if (v_uncond.empty())
+                        return {};
+                    v_uncond_cache = v_uncond;
+                }
+                v_unc_ptr = v_uncond_cache.data();
+            } else if (f5_batch_cfg_enabled()) {
                 auto h_cond = f5_compute_hidden(ctx, x.data(), T, mel_dim, cond.data(), text_emb.data(), text_dim,
                                                 false, false, step);
                 auto h_uncond = f5_compute_hidden(ctx, x.data(), T, mel_dim, cond.data(), text_emb_uncond.data(),
@@ -1641,6 +1912,7 @@ static std::vector<float> euler_solve(f5_tts_context* ctx,
                 const size_t arm = (size_t)T * mel_dim;
                 v_cond.assign(v.begin(), v.begin() + arm);
                 v_uncond.assign(v.begin() + arm, v.begin() + 2 * arm);
+                v_unc_ptr = v_uncond.data();
             } else {
                 v_cond = dit_forward(ctx, x.data(), T, mel_dim, cond.data(), text_emb.data(), text_dim, time_emb.data(),
                                      false, false, step);
@@ -1648,13 +1920,18 @@ static std::vector<float> euler_solve(f5_tts_context* ctx,
                                        time_emb.data(), true, true, step);
                 if (v_cond.empty() || v_uncond.empty())
                     return {};
+                v_unc_ptr = v_uncond.data();
             }
 
             // CFG: v = v_cond + cfg * (v_cond - v_uncond)
             float cfg = ctx->cfg_strength;
+            if (dit_skip_on)
+                v_step_cache.resize(x.size());
             for (size_t i = 0; i < x.size(); i++) {
-                float v = v_cond[i] + cfg * (v_cond[i] - v_uncond[i]);
+                float v = v_cond[i] + cfg * (v_cond[i] - v_unc_ptr[i]);
                 x[i] += v * dt;
+                if (dit_skip_on)
+                    v_step_cache[i] = v;
             }
         }
 
@@ -1979,9 +2256,96 @@ void f5_tts_free(struct f5_tts_context* ctx) {
     delete ctx;
 }
 
+// Port of upstream F5-TTS preprocess_ref_audio_text (audio side): strip silence
+// and clip the reference to a max length before it drives the duration estimate.
+// Upstream splits the ref on >=1 s silences, keeps the leading speech, and clips
+// to 12 s (src/f5_tts/infer/utils_infer.py). We approximate that here: trim
+// leading/trailing silence, collapse internal silences longer than ~1 s down to
+// ~0.2 s, then clip to `max_sec`. Bounding ref_mel_T to actual speech keeps the
+// `ref_T / ref_text_len` speech-rate estimate honest (a ref padded with silence
+// otherwise inflates the estimate). Returns the processed PCM.
+static std::vector<float> f5_preprocess_ref_audio(const float* pcm, int n, int sr, float max_sec, bool trim_silence) {
+    std::vector<float> out(pcm, pcm + n);
+    if (trim_silence && n > 0) {
+        const int win = std::max(1, sr / 100); // 10 ms analysis window
+        const int n_win = n / win;
+        if (n_win > 2) {
+            std::vector<float> rms(n_win, 0.0f);
+            float peak = 1e-9f;
+            for (int w = 0; w < n_win; ++w) {
+                double s = 0;
+                for (int i = 0; i < win; ++i) {
+                    float x = pcm[w * win + i];
+                    s += (double)x * x;
+                }
+                rms[w] = (float)std::sqrt(s / win);
+                peak = std::max(peak, rms[w]);
+            }
+            // -50 dBFS full-scale silence gate, but never above 5 % of the ref's
+            // own peak so a quiet recording isn't wiped out entirely.
+            const float thr = std::min(0.00316f, peak * 0.05f);
+            auto silent = [&](int w) { return rms[w] < thr; };
+            const int min_sil = std::max(1, sr / win);        // 1 s of windows
+            const int keep_pad = std::max(1, (sr / win) / 5); // 0.2 s kept around gaps
+            int first = 0;
+            while (first < n_win && silent(first))
+                ++first;
+            int last = n_win - 1;
+            while (last >= 0 && silent(last))
+                --last;
+            if (first <= last) {
+                std::vector<float> keep;
+                keep.reserve((size_t)n);
+                int w = first;
+                while (w <= last) {
+                    if (!silent(w)) {
+                        int s = w;
+                        while (w <= last && !silent(w))
+                            ++w;
+                        keep.insert(keep.end(), pcm + (size_t)s * win, pcm + (size_t)w * win);
+                    } else {
+                        int s = w;
+                        while (w <= last && silent(w))
+                            ++w;
+                        int len = w - s;                            // internal silent run
+                        int kw = (len >= min_sil) ? keep_pad : len; // collapse long gaps only
+                        keep.insert(keep.end(), pcm + (size_t)s * win, pcm + (size_t)(s + kw) * win);
+                    }
+                }
+                if (!keep.empty())
+                    out.swap(keep);
+            }
+        }
+    }
+    if (max_sec > 0.0f) {
+        size_t maxn = (size_t)(max_sec * (float)sr);
+        if (out.size() > maxn)
+            out.resize(maxn);
+    }
+    return out;
+}
+
 int f5_tts_set_reference(struct f5_tts_context* ctx, const float* pcm_24k, int n_samples, const char* ref_text) {
     if (!ctx || !pcm_24k || n_samples <= 0)
         return -1;
+
+    // Reference preprocessing (upstream parity): silence-strip + clip. Gated so
+    // it can be turned off for byte-exact comparison against pre-#294 behavior.
+    // CRISPASR_F5_REF_MAX_SEC: clip length in seconds (default 12, matches
+    //   upstream; 0 disables the clip). CRISPASR_F5_REF_TRIM_SILENCE: 0 disables
+    //   the silence strip (default on).
+    const char* max_env = crispasr_env::get("CRISPASR_F5_REF_MAX_SEC");
+    float ref_max_sec = max_env ? (float)atof(max_env) : 12.0f;
+    const char* trim_env = crispasr_env::get("CRISPASR_F5_REF_TRIM_SILENCE");
+    bool ref_trim = !(trim_env && std::strcmp(trim_env, "0") == 0);
+    std::vector<float> ref_pcm =
+        f5_preprocess_ref_audio(pcm_24k, n_samples, ctx->hp.sample_rate, ref_max_sec, ref_trim);
+    if (ctx->verbosity >= 1 && (int)ref_pcm.size() != n_samples) {
+        fprintf(stderr, "f5_tts: ref preprocess %d -> %zu samples (%.2f -> %.2f s)\n", n_samples, ref_pcm.size(),
+                (float)n_samples / (float)ctx->hp.sample_rate, (float)ref_pcm.size() / (float)ctx->hp.sample_rate);
+    }
+    pcm_24k = ref_pcm.data();
+    n_samples = (int)ref_pcm.size();
 
     // Compute mel spectrogram of reference audio
     int T_ref;
@@ -2032,16 +2396,32 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
     // transcript length from audio duration at ~13 chars/sec (typical English
     // including spaces — calibrated against F5-TTS upstream defaults).
     int ref_T = ctx->ref_mel_T;
+    const float mel_fps = (float)ctx->hp.sample_rate / (float)ctx->hp.hop_length; // ~93.75 (24k / hop 256)
+    const float fixed_rate = mel_fps / 13.0f; // ~7.2 mel frames/char (English ~13 chars/s)
     int ref_text_len;
     if (ref_text.empty()) {
-        float mel_fps = (float)ctx->hp.sample_rate / (float)ctx->hp.hop_length;
         float ref_secs = (float)ref_T / mel_fps;
         ref_text_len = std::max(1, (int)(ref_secs * 13.0f));
     } else {
         ref_text_len = (int)ref_text.size();
     }
     int gen_text_len = (int)strlen(text);
-    int duration = ref_T + (int)((float)ref_T / (float)ref_text_len * (float)gen_text_len / ctx->speed);
+    // Per-char speech rate derived from the reference (mel frames per char).
+    // #294: a reference clip whose AUDIO is much shorter than its transcript
+    // implies collapses this rate and TRUNCATES the generated speech (a full
+    // sentence came out ~0.7 s). Clamp the rate into a sane English band so the
+    // generated length can't collapse (or balloon) on a mismatched ref; an
+    // over-estimate only adds trailing silence, which is trimmed. A ref that
+    // matches its transcript sits inside the band and is unaffected.
+    float rate = (float)ref_T / (float)std::max(1, ref_text_len);
+    // The clamp is an ADD-ON over the upstream formula (which has no clamp); gate
+    // it so it can be switched off. CRISPASR_F5_DURATION_CLAMP=0 restores the
+    // exact upstream `ref_T / ref_text_len * gen_text_len / speed` estimate.
+    const char* clamp_env = crispasr_env::get("CRISPASR_F5_DURATION_CLAMP");
+    bool duration_clamp = !(clamp_env && std::strcmp(clamp_env, "0") == 0);
+    if (duration_clamp)
+        rate = std::min(std::max(rate, fixed_rate * 0.75f), fixed_rate * 2.5f);
+    int duration = ref_T + (int)(rate * (float)gen_text_len / ctx->speed);
 
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "f5_tts: ref_T=%d duration=%d tokens=%zu text='%s'\n", ref_T, duration, tokens.size(),

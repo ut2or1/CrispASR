@@ -19,6 +19,7 @@
 
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #if defined(HAVE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
@@ -41,7 +42,7 @@
 static bool silero_lid_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("SILERO_LID_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_SILERO_LID_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -264,7 +265,7 @@ static int silero_lid_max_samples() {
 // scalar == GEMM or run on non-Apple.
 static bool silero_use_scalar() {
 #if defined(HAVE_ACCELERATE)
-    static const bool force_scalar = std::getenv("SILERO_FORCE_SCALAR") != nullptr;
+    static const bool force_scalar = crispasr_env::get("CRISPASR_SILERO_FORCE_SCALAR") != nullptr;
     return force_scalar;
 #else
     return true;
@@ -461,7 +462,7 @@ static void ffn_residual(float* x, int D, int T, const float* ff1_w, const float
 // SILERO_LID_TRACE=1: print per-checkpoint stats on both paths to localize a
 // divergence (layouts are flat-identical between the two implementations).
 static bool silero_lid_trace_enabled() {
-    static const bool v = std::getenv("SILERO_LID_TRACE") != nullptr;
+    static const bool v = crispasr_env::get("CRISPASR_SILERO_LID_TRACE") != nullptr;
     return v;
 }
 
@@ -475,7 +476,7 @@ static void silero_lid_trace(const char* path, const char* name, const float* d,
     }
     double mean = sum / n;
     double var = sq / n - mean * mean;
-    const char* oe = std::getenv("SILERO_LID_TRACE_OFF");
+    const char* oe = crispasr_env::get("CRISPASR_SILERO_LID_TRACE_OFF");
     size_t off = oe ? (size_t)atoll(oe) : 0;
     if (off + 3 >= n)
         off = 0;
@@ -713,7 +714,7 @@ static bool silero_lid_forward_ggml(silero_lid_context* ctx, const float* sample
     // the named checkpoint (genuine truncated output — appended set_output
     // snapshots can read already-reused buffers and lie).
     std::vector<std::pair<std::string, ggml_tensor*>> trace_pts;
-    if (const char* trunc = std::getenv("SILERO_LID_TRUNC")) {
+    if (const char* trunc = crispasr_env::get("CRISPASR_SILERO_LID_TRUNC")) {
         ggml_tensor* t = ggml_get_tensor(ctx0, trunc);
         if (!t && strcmp(trunc, "pooled") == 0)
             t = pooled;
@@ -749,7 +750,7 @@ static bool silero_lid_forward_ggml(silero_lid_context* ctx, const float* sample
         std::vector<float> buf(ggml_nelements(t));
         ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(float));
         silero_lid_trace("ggml", name.c_str(), buf.data(), buf.size());
-        if (const char* dir = std::getenv("SILERO_LID_DUMP")) {
+        if (const char* dir = crispasr_env::get("CRISPASR_SILERO_LID_DUMP")) {
             std::string p = std::string(dir) + "/" + name + ".bin";
             if (FILE* f = fopen(p.c_str(), "wb")) {
                 fwrite(buf.data(), sizeof(float), buf.size(), f);
@@ -1214,7 +1215,7 @@ extern "C" const char* silero_lid_detect(struct silero_lid_context* ctx, const f
         if (logits[i] > logits[best])
             best = i;
 
-    if (std::getenv("SILERO_LID_DEBUG")) {
+    if (crispasr_env::get("CRISPASR_SILERO_LID_DEBUG")) {
         std::vector<int> order(logits.size());
         for (int i = 0; i < (int)order.size(); i++)
             order[i] = i;

@@ -68,7 +68,7 @@ os.chdir(str(CRISPASR_DIR))
 # Configure with CUDA
 subprocess.check_call([
     "cmake", "-G", "Ninja", "-B", str(build_dir),
-    "-DCMAKE_BUILD_TYPE=Release",
+    "-DCMAKE_BUILD_TYPE=Release", "-DCRISPASR_NO_C2PA_NATIVE=ON",
     "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
     "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
 ], env={**os.environ, "CCACHE_DIR": str(WORK / ".ccache")})

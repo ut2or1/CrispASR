@@ -159,6 +159,22 @@ public:
             sp.text_temperature = params.temperature;
             sp.audio_temperature = params.temperature;
         }
+        // Only when the user EXPLICITLY set --max-new-tokens: the whisper_params
+        // default is 512, but moss-tts's own default is 4096, so `> 0` (always
+        // true) would silently shrink every synthesis to 512 frames (~41 s). Same
+        // trap as #292 — gate on the explicit flag, not the value.
+        if (params.max_new_tokens_explicit)
+            sp.max_new_tokens = params.max_new_tokens;
+        // Duration control: max_speech_tokens maps to MOSS-TTS max_audio_frames.
+        // 1s ≈ 12.5 tokens, so max_audio_frames is the token-level AR cap.
+        if (params.tts_max_speech_tokens >= 0)
+            sp.max_audio_frames = params.tts_max_speech_tokens;
+        if (params.tts_top_p >= 0.0f)
+            sp.audio_top_p = params.tts_top_p;
+        if (params.tts_top_k >= 0)
+            sp.audio_top_k = params.tts_top_k;
+        if (params.tts_repetition_penalty >= 0.0f)
+            sp.audio_repetition_penalty = params.tts_repetition_penalty;
         std::string lang;
         if (!params.language.empty() && params.language != "auto") {
             lang = crispasr_iso_to_english_lang(params.language);

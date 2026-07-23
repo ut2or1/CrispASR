@@ -515,6 +515,24 @@ class RegistryEntry:
     approx_size: str
 
 
+@dataclass
+class RegistryArtifact:
+    """One file in a backend's canonical default download bundle."""
+    kind: str
+    filename: str
+    url: str
+    approx_size: str
+
+
+@dataclass
+class RegistryBundle:
+    """The exact artifact bundle downloaded by ``-m auto``."""
+    backend: str
+    license: str
+    requires_acceptance: bool
+    artifacts: List[RegistryArtifact]
+
+
 def registry_lookup(backend: str, *, lib_path: Optional[str] = None) -> Optional[RegistryEntry]:
     """Look up the canonical GGUF for a backend. Returns ``None`` on miss."""
     return _registry_call("crispasr_registry_lookup_abi", backend, lib_path)
@@ -523,6 +541,91 @@ def registry_lookup(backend: str, *, lib_path: Optional[str] = None) -> Optional
 def registry_lookup_by_filename(filename: str, *, lib_path: Optional[str] = None) -> Optional[RegistryEntry]:
     """Look up the canonical GGUF by filename (exact, then fuzzy substring)."""
     return _registry_call("crispasr_registry_lookup_by_filename_abi", filename, lib_path)
+
+
+def registry_default_bundle(
+    backend: str, *, lib_path: Optional[str] = None
+) -> Optional[RegistryBundle]:
+    """Return the backend's exact canonical ``-m auto`` artifact bundle.
+
+    Artifacts are ordered as downloaded: primary model, inline companion,
+    then any extra companions. This API does not rewrite quant suffixes or
+    infer a recommendation. Returns ``None`` for an unknown backend.
+    """
+    if not backend:
+        return None
+    lib = ctypes.CDLL(lib_path or _find_lib())
+    info_symbol = "crispasr_registry_default_bundle_info_abi"
+    artifact_symbol = "crispasr_registry_default_bundle_artifact_abi"
+    if not hasattr(lib, info_symbol) or not hasattr(lib, artifact_symbol):
+        raise RuntimeError(
+            "default-bundle registry API not in loaded library — rebuild CrispASR."
+        )
+
+    info = getattr(lib, info_symbol)
+    info.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p, ctypes.c_int32,
+        ctypes.c_char_p, ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_int32),
+    ]
+    info.restype = ctypes.c_int
+    backend_buf = ctypes.create_string_buffer(256)
+    license_buf = ctypes.create_string_buffer(1024)
+    requires_acceptance = ctypes.c_int32()
+    count = info(
+        backend.encode("utf-8"),
+        backend_buf, len(backend_buf),
+        license_buf, len(license_buf),
+        ctypes.byref(requires_acceptance),
+    )
+    if count == 0:
+        return None
+    if count < 0:
+        raise RuntimeError(f"default-bundle registry lookup failed (rc={count}).")
+
+    artifact_fn = getattr(lib, artifact_symbol)
+    artifact_fn.argtypes = [
+        ctypes.c_char_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32),
+        ctypes.c_char_p, ctypes.c_int32,
+        ctypes.c_char_p, ctypes.c_int32,
+        ctypes.c_char_p, ctypes.c_int32,
+    ]
+    artifact_fn.restype = ctypes.c_int
+    kinds = {0: "primary", 1: "companion", 2: "extra"}
+    artifacts = []
+    for index in range(count):
+        kind = ctypes.c_int32()
+        filename_buf = ctypes.create_string_buffer(256)
+        url_buf = ctypes.create_string_buffer(2048)
+        size_buf = ctypes.create_string_buffer(64)
+        rc = artifact_fn(
+            backend.encode("utf-8"), index, ctypes.byref(kind),
+            filename_buf, len(filename_buf),
+            url_buf, len(url_buf),
+            size_buf, len(size_buf),
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"default-bundle artifact {index} lookup failed (rc={rc})."
+            )
+        if kind.value not in kinds:
+            raise RuntimeError(
+                f"default-bundle artifact {index} has unknown kind {kind.value}."
+            )
+        artifacts.append(RegistryArtifact(
+            kind=kinds[kind.value],
+            filename=filename_buf.value.decode("utf-8"),
+            url=url_buf.value.decode("utf-8"),
+            approx_size=size_buf.value.decode("utf-8"),
+        ))
+
+    return RegistryBundle(
+        backend=backend_buf.value.decode("utf-8"),
+        license=license_buf.value.decode("utf-8"),
+        requires_acceptance=requires_acceptance.value != 0,
+        artifacts=artifacts,
+    )
 
 
 def list_known_models(*, lib_path: Optional[str] = None) -> list:
@@ -1645,7 +1748,7 @@ class Session:
         return vocab
 
     # ---------------------------------------------------------------------
-    # TTS synthesis (vibevoice, qwen3-tts, moss-tts, moss-tts-local, omnivoice, kokoro, orpheus, chatterbox, outetts, indextts, voxcpm2, csm, dia, zonos-tts, bark, speecht5, parler-tts, pocket-tts, kugelaudio, tada, lfm2-audio, dots-tts)
+    # TTS synthesis (vibevoice, qwen3-tts, miotts, moss-tts, moss-tts-local, omnivoice, kokoro, orpheus, chatterbox, outetts, indextts, voxcpm2, csm, dia, zonos-tts, bark, speecht5, parler-tts, pocket-tts, kugelaudio, tada, lfm2-audio, dots-tts)
     # ---------------------------------------------------------------------
 
     def set_codec_path(self, path: str) -> None:
@@ -1661,6 +1764,16 @@ class Session:
         rc = self._lib.crispasr_session_set_codec_path(self._handle, path.encode("utf-8"))
         if rc != 0:
             raise RuntimeError(f"set_codec_path failed (rc={rc}) for backend {self.backend!r}")
+
+    def set_pcm_sample_rate(self, sample_rate: int) -> None:
+        """Declare the sample rate of PCM passed to the next audio call."""
+        if not hasattr(self._lib, "crispasr_session_set_pcm_sample_rate"):
+            raise RuntimeError("PCM sample-rate API not present in this libcrispasr build")
+        self._lib.crispasr_session_set_pcm_sample_rate.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.crispasr_session_set_pcm_sample_rate.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_pcm_sample_rate(self._handle, int(sample_rate))
+        if rc != 0:
+            raise RuntimeError(f"set_pcm_sample_rate failed (rc={rc})")
 
     def set_parakeet_att_context(self, left: int, right: int) -> None:
         """Set parakeet/canary local-attention window (issue #257).
@@ -2473,14 +2586,133 @@ class Session:
             self._lib.crispasr_pcm_free(ptr)
         return arr
 
+    def accept_marking_responsibility(self, attestation: str = "") -> None:
+        """Attest acceptance of AI-content marking/disclosure responsibility
+        (EU AI Act Art. 50). REQUIRED before :meth:`synthesize_raw` will return
+        unmarked audio; the default :meth:`synthesize` is watermarked and needs
+        no attestation. ``attestation`` is recorded for audit."""
+        if not hasattr(self._lib, "crispasr_session_accept_marking_responsibility"):
+            raise RuntimeError("marking-attestation API not present in this libcrispasr build")
+        self._lib.crispasr_session_accept_marking_responsibility.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p,
+        ]
+        self._lib.crispasr_session_accept_marking_responsibility.restype = ctypes.c_int
+        self._lib.crispasr_session_accept_marking_responsibility(self._handle, attestation.encode("utf-8"))
+
+    def synthesize_raw(self, text: str) -> "np.ndarray":
+        """UNMARKED synthesis (no watermark), for callers that post-process
+        before embedding the mark themselves. Hard-refused unless
+        :meth:`accept_marking_responsibility` was called first. Prefer
+        :meth:`synthesize` for the default watermarked output."""
+        if not hasattr(self._lib, "crispasr_session_synthesize_raw"):
+            raise RuntimeError("TTS raw API not present in this libcrispasr build")
+        self._lib.crispasr_session_synthesize_raw.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
+        ]
+        self._lib.crispasr_session_synthesize_raw.restype = ctypes.POINTER(ctypes.c_float)
+        self._lib.crispasr_pcm_free.argtypes = [ctypes.POINTER(ctypes.c_float)]
+        self._lib.crispasr_pcm_free.restype = None
+        n = ctypes.c_int(0)
+        ptr = self._lib.crispasr_session_synthesize_raw(self._handle, text.encode("utf-8"), ctypes.byref(n))
+        if not ptr or n.value <= 0:
+            raise RuntimeError(
+                "synthesize_raw returned no audio (attestation required? "
+                "call accept_marking_responsibility() first)"
+            )
+        try:
+            arr = np.ctypeslib.as_array(ptr, shape=(n.value,)).copy()
+        finally:
+            self._lib.crispasr_pcm_free(ptr)
+        return arr
+
+    def separate(self, pcm_stereo: "np.ndarray") -> dict:
+        """Source separation: split audio into named stems.
+
+        Input is stereo interleaved float32 PCM at the model's native
+        sample rate (44100 Hz for ``htdemucs``).  Returns a dict mapping
+        stem names (``"drums"``, ``"bass"``, ``"other"``, ``"vocals"``)
+        to stereo interleaved float32 numpy arrays.
+
+        Works with separation-capable backends — ``htdemucs``.
+        """
+        lib = self._lib
+        lib.crispasr_session_separate.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+        ]
+        lib.crispasr_session_separate.restype = ctypes.c_int
+        lib.crispasr_session_separate_n_stems.argtypes = [ctypes.c_void_p]
+        lib.crispasr_session_separate_n_stems.restype = ctypes.c_int
+        lib.crispasr_session_separate_stem_name.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.crispasr_session_separate_stem_name.restype = ctypes.c_char_p
+        lib.crispasr_session_separate_stem.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+        ]
+        lib.crispasr_session_separate_stem.restype = ctypes.POINTER(ctypes.c_float)
+        lib.crispasr_session_separate_sample_rate.argtypes = [ctypes.c_void_p]
+        lib.crispasr_session_separate_sample_rate.restype = ctypes.c_int
+
+        data = pcm_stereo.astype(np.float32)
+        n_samples = len(data) // 2  # stereo interleaved
+        n_stems = lib.crispasr_session_separate(
+            self._handle, data.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), n_samples,
+        )
+        if n_stems <= 0:
+            raise RuntimeError(f"separate failed for backend {self.backend!r}")
+
+        result = {}
+        for i in range(n_stems):
+            name_ptr = lib.crispasr_session_separate_stem_name(self._handle, i)
+            name = name_ptr.decode("utf-8") if name_ptr else f"stem{i}"
+            n_out = ctypes.c_int(0)
+            ptr = lib.crispasr_session_separate_stem(self._handle, i, ctypes.byref(n_out))
+            if ptr and n_out.value > 0:
+                sr = lib.crispasr_session_separate_sample_rate(self._handle)
+                n_ch = 2  # stereo
+                arr = np.ctypeslib.as_array(ptr, shape=(n_out.value * n_ch,)).copy()
+                result[name] = arr
+        return result
+
+    def pitch(self, pcm_mono: "np.ndarray", hop_ms: float = 10.0) -> "np.ndarray":
+        """Pitch (F0) estimation: mono audio in, a pitch track out.
+
+        Input is mono float32 PCM at the model's native sample rate
+        (16000 Hz for ``crepe``).  Returns an ``(n_frames, 3)`` float32
+        array whose columns are ``time_ms``, ``f0_hz`` and
+        ``voiced_prob``.
+
+        Works with pitch-capable backends — ``crepe``.
+        """
+        lib = self._lib
+        lib.crispasr_session_pitch.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_float,
+        ]
+        lib.crispasr_session_pitch.restype = ctypes.c_int
+        lib.crispasr_session_pitch_frames.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+        lib.crispasr_session_pitch_frames.restype = ctypes.POINTER(ctypes.c_float)
+
+        data = pcm_mono.astype(np.float32)
+        n = lib.crispasr_session_pitch(
+            self._handle, data.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(data), float(hop_ms),
+        )
+        if n <= 0:
+            raise RuntimeError(f"pitch failed for backend {self.backend!r}")
+
+        n_out = ctypes.c_int(0)
+        ptr = lib.crispasr_session_pitch_frames(self._handle, ctypes.byref(n_out))
+        if not ptr or n_out.value <= 0:
+            raise RuntimeError("pitch returned no frames")
+        return np.ctypeslib.as_array(ptr, shape=(n_out.value * 3,)).copy().reshape(-1, 3)
+
     def speech_to_speech(self, input_pcm: "np.ndarray", language: str = None) -> tuple:
         """Speech-to-speech: audio in → audio out via a single model pass.
 
         Supported on backends with S2S capability (``lfm2-audio``,
-        ``mini-omni2``).  Input is 16 kHz mono float32 PCM.  Returns a
+        ``mini-omni2``, ``sidon``, ``voxcpm2-vae``). Input is mono float32 PCM; call
+        :meth:`set_pcm_sample_rate` first when it is not 16 kHz. Returns a
         tuple ``(output_pcm, transcript)`` where *output_pcm* is a
-        float32 numpy array at the backend's TTS sample rate (typically
-        24 kHz) and *transcript* is the intermediate ASR text (may be
+        float32 numpy array at the backend's output sample rate (24 kHz
+        for conversational S2S, 48 kHz for Sidon and VoxCPM2 AudioVAE) and *transcript* is the
+        intermediate ASR text (may be
         empty if the backend doesn't produce one).
 
         Raises :class:`RuntimeError` if the C ABI lacks the symbol or
@@ -2669,12 +2901,27 @@ class TitaNet:
 
 
 class SpeakerDB:
-    """File-based speaker profile database for speaker identification."""
+    """Closed-roster speaker profile database (issue #266).
 
-    def __init__(self, dir_path: str, lib_path: str = None):
+    Named identification is a claimed-participant confirmation, never an
+    open 1:N search: ``expected_names`` (comma-separated, e.g.
+    ``"Alice,Bob"``) is the roster of enrolled participants you assert are
+    present in the audio, and the db is narrowed to exactly those
+    profiles. ``consent`` affirms a lawful basis + explicit consent from
+    every enrolled person (GDPR Art. 9); opening and enrolling refuse
+    without it.
+    """
+
+    def __init__(self, dir_path: str, expected_names: str = "", consent: bool = False, lib_path: str = None):
+        # Set _db before any check that can raise, so __del__ -> close()
+        # (which reads self._db) never sees a half-constructed instance —
+        # otherwise a no-consent ValueError during __init__ leaves _db
+        # unset and garbage collection prints a spurious "Exception
+        # ignored in __del__: AttributeError" for every refused instance.
+        self._db = None
         self._lib = ctypes.CDLL(lib_path or _find_lib())
-        self._lib.crispasr_speaker_db_load.argtypes = [ctypes.c_char_p]
-        self._lib.crispasr_speaker_db_load.restype = ctypes.c_void_p
+        self._lib.crispasr_speaker_db_open.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32]
+        self._lib.crispasr_speaker_db_open.restype = ctypes.c_void_p
         self._lib.crispasr_speaker_db_free.argtypes = [ctypes.c_void_p]
         self._lib.crispasr_speaker_db_free.restype = None
         self._lib.crispasr_speaker_db_count.argtypes = [ctypes.c_void_p]
@@ -2684,11 +2931,19 @@ class SpeakerDB:
             ctypes.c_float, ctypes.c_char_p, ctypes.c_int32,
         ]
         self._lib.crispasr_speaker_db_match.restype = ctypes.c_float
-        self._lib.crispasr_speaker_db_enroll.argtypes = [
-            ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
+        self._lib.crispasr_speaker_db_enroll2.argtypes = [
+            ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int32, ctypes.c_int32,
         ]
-        self._lib.crispasr_speaker_db_enroll.restype = ctypes.c_int32
-        self._db = self._lib.crispasr_speaker_db_load(dir_path.encode())
+        self._lib.crispasr_speaker_db_enroll2.restype = ctypes.c_int32
+        self._consent = bool(consent)
+        if not self._consent:
+            raise ValueError(
+                "SpeakerDB requires consent=True: matching named voiceprints is biometric "
+                "identification (GDPR Art. 9); affirm a lawful basis + explicit consent "
+                "from every enrolled person"
+            )
+        if expected_names:
+            self._db = self._lib.crispasr_speaker_db_open(dir_path.encode(), expected_names.encode(), 1)
         self._dir = dir_path
 
     @property
@@ -2708,12 +2963,16 @@ class SpeakerDB:
         return name, float(score)
 
     def enroll(self, name, embedding):
-        """Enroll a speaker with the given name and embedding."""
+        """Enroll a speaker with the given name and embedding.
+
+        The consent attestation given at construction is recorded in the
+        v2 .spkr profile (audit trail).
+        """
         import numpy as np
         emb = np.ascontiguousarray(embedding, dtype=np.float32)
-        rc = self._lib.crispasr_speaker_db_enroll(
+        rc = self._lib.crispasr_speaker_db_enroll2(
             self._dir.encode(), name.encode(),
-            emb.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(emb),
+            emb.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(emb), 1,
         )
         return rc == 0
 

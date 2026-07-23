@@ -47,7 +47,7 @@ build_dir.mkdir(exist_ok=True)
 with kh.build_heartbeat("cmake configure"):
     subprocess.check_call([
         "cmake", "-G", "Ninja", "-B", str(build_dir),
-        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_BUILD_TYPE=Release", "-DCRISPASR_NO_C2PA_NATIVE=ON",
         "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
         "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
     ], cwd=str(_CRISPASR_DIR), env={**os.environ, "CCACHE_DIR": str(WORK / ".ccache")})

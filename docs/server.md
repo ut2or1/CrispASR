@@ -94,6 +94,8 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `max_tokens` | Generated-token cap for supported autoregressive ASR backends |
 | `max_new_tokens` | Alias for `max_tokens` |
 | `frequency_penalty` | Opt-in repeated generated-token penalty for supported autoregressive ASR backends (`0.0` disabled) |
+| `offset_t_ms` | Start transcription this many ms into the audio (default: 0). Reported timestamps stay in original-audio time |
+| `duration_ms` | Transcribe only this many ms from `offset_t_ms` (default: 0 = to end) |
 | `translate` | `true`/`false` — translate to English (backends with `CAP_TRANSLATE`) |
 | `source_lang` | Source language for AST backends (canary, cohere) |
 | `target_lang` | Target language for AST backends |
@@ -103,6 +105,10 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `diarize_embedder` | Speaker-embedding model for cross-slice clustering (path or `auto`) |
 | `diarize_cluster_threshold` | Cosine merge threshold for embedding clustering (default: 0.5) |
 | `diarize_max_speakers` | Upper bound on speaker cluster count (default: 8) |
+| `vad_export` | `true`/`false` — include the computed VAD/chunk boundaries in the JSON response under `vad_segments` (default: `false`) |
+| `vad_import` | The `vad_segments` object from an earlier `vad_export` response. Reuses those boundaries and skips VAD entirely |
+| `vad_export_raw` | `true`/`false` — with `vad_export`, return raw VAD speech segments (chunk-independent, re-chunked per request) instead of chunk boundaries (default: `false`) |
+| `vad_import_strict` | `true`/`false` — with `vad_import`, reject (rather than warn) a chunk-boundary payload whose chunk length differs from this request (default: `false`) |
 | `vad` | `true`/`false` — enable VAD pre-processing |
 | `vad_threshold` | VAD speech probability threshold (default: 0.5) |
 | `vad_min_speech_duration_ms` | Minimum speech segment duration in ms (default: 250) |
@@ -133,6 +139,34 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `chunk_overlap` | Overlap context (seconds) around chunk boundaries |
 
 The `/inference` endpoint accepts the same CrispASR extension fields.
+
+### Reusing VAD boundaries across backends (#227)
+
+VAD (or the fixed-chunk fallback) runs on every request. To transcribe the same
+audio with several backends without paying it each time, ask for the boundaries
+once and hand them back afterwards:
+
+```bash
+# 1. Transcribe + get the boundaries back.
+curl -s -F file=@talk.wav -F vad=true -F vad_export=true \
+     -F response_format=verbose_json \
+     http://127.0.0.1:8080/v1/audio/transcriptions > first.json
+
+# 2. Extract the vad_segments object.
+jq '.vad_segments' first.json > vad.json
+
+# 3. Reuse it on later requests — no VAD model is run.
+curl -s -F file=@talk.wav -F "vad_import=<vad.json" \
+     -F response_format=verbose_json \
+     http://127.0.0.1:8080/v1/audio/transcriptions
+```
+
+`vad_segments` is the same wire format the CLI's `--vad-export` writes, so
+boundaries are interchangeable between the two. Boundaries are clamped to the
+audio of the request they're used on and out-of-range slices are dropped, so a
+stale set can't read out of bounds; a malformed one returns
+`invalid_request_error`. They are interpreted against the audio actually being
+processed — i.e. after any `offset_t_ms`/`duration_ms` window is applied.
 
 > **Parakeet segmentation (issue #257).** Backends that chunk internally
 > (parakeet/canary — full-attention FastConformer) now receive the whole clip
@@ -267,7 +301,7 @@ curl http://localhost:8080/v1/audio/speech \
 |---|---|---|
 | `input` | (required) | Text to synthesize. Capped at `--tts-max-input-chars` (default 4096); set to 0 to disable the cap. Long input is automatically split on sentence boundaries before synthesis (see [long-form chunking](#long-form-chunking-for-v1audiospeech) below). |
 | `model` | (ignored) | Read but not validated — we serve whatever was loaded via `-m` or `POST /load`. Surfaced in the synth log line. |
-| `voice` | server's `--voice` | Passed through verbatim to the backend's `params.tts_voice`. Each backend interprets it on its own terms — qwen3-tts CustomVoice as a speaker name (`vivian`, `ryan`); qwen3-tts Base as a path or (with `--voice-dir`) a bare name resolving to `<voice-dir>/<name>.{wav,gguf}`; orpheus as a preset (`tara`, `leah`); tada as a `tada-ref-*.gguf` path/name. For **tada the voice is switched per request without a restart** (#201): naming a different reference reloads it; `default`/`auto`/omitted keeps the currently-loaded voice. A `.wav` is not yet accepted for tada (convert to a `tada-ref.gguf` first). |
+| `voice` | server's `--voice` | Passed through verbatim to the backend's `params.tts_voice`. Each backend interprets it on its own terms — qwen3-tts CustomVoice as a speaker name (`vivian`, `ryan`); qwen3-tts Base as a path or (with `--voice-dir`) a bare name resolving to `<voice-dir>/<name>.{wav,gguf}`; orpheus as a preset (`tara`, `leah`); tada as a `tada-ref-*.gguf` path/name. For **tada the voice is switched per request without a restart** (#201): naming a different reference reloads it; `default`/`auto`/omitted keeps the currently-loaded voice. A `.wav` reference is cloned on the fly (needs `ref_text` + the encoder/aligner GGUFs) when the server runs with `CRISPASR_TADA_WAV_CLONE=1` — otherwise convert it to a `tada-ref.gguf` first. |
 | `instructions` | empty | Voice-direction prose for backends that support it (qwen3-tts VoiceDesign). Silently ignored on other backends so OpenAI clients targeting `gpt-4o-mini-tts` don't see 4xx errors. |
 | `seed` | `0` | RNG seed for sampling. `0` = non-deterministic. Same-seed + same-text produces bit-identical audio on all sampling-capable TTS backends (qwen3-tts, chatterbox, vibevoice, orpheus). |
 | `temperature` | server's `--temperature` | Sampling temperature for AR TTS backends. `0` = greedy; backends apply their own default (e.g. 0.8 for qwen3-tts) when the global default of 0.0 is unchanged. |
@@ -284,6 +318,7 @@ curl http://localhost:8080/v1/audio/speech \
 | `speed` | `1.0` | Tempo multiplier `0.25 .. 4.0` (OpenAI range). Applied as a post-synth linear resampler. Out-of-range returns 400 with `code=invalid_speed`. |
 | `response_format` | `"wav"` | `wav` (16-bit PCM RIFF, 24 kHz mono — default), `pcm` (OpenAI spec: 24 kHz signed 16-bit LE raw, no header), `f32` (crispasr-specific raw float32 for downstream DSP), or the compressed containers `mp3` / `aac` / `opus` — all encoded in-tree by [glint](https://github.com/CrispStrobe/glint), no build deps. `opus` returns a standard **Ogg Opus** file (`audio/ogg`); set `CRISPASR_OPUS_ENCODER=libopus` (build with libopus) to fall back to the legacy raw-packet framing (`audio/opus`) instead. |
 | `consent_attestation` | empty | Required when `voice` ends in `.wav` (voice cloning). A free-text statement attesting speaker consent, e.g. `"I have the speaker's consent"`. Logged for audit. |
+| `ref_text` | empty | Transcript of the `.wav` clone reference, used by TADA on-the-fly cloning (#201). A companion `<name>.txt` in `--voice-dir` is used when omitted. Ignored by backends that clone from audio alone. |
 | `spoken_disclaimer` | `true` | Set to `false` to skip the audible AI-disclosure prefix on voice-cloned output. Machine-readable provenance (watermark + C2PA) is always applied. When `false`, the caller assumes responsibility for providing appropriate AI-disclosure to end users. |
 
 > **Watermarking.** Every response is watermarked by default. There is **no
@@ -404,7 +439,8 @@ resp.stream_to_file("out.wav")
 ## Speech-to-speech endpoint
 
 `POST /v1/audio/speech-to-speech` runs end-to-end audio-in → audio-out
-on S2S-capable backends (`lfm2-audio`, `mini-omni2`). Non-S2S backends
+on S2S-capable backends (`lfm2-audio`, `mini-omni2`, `sidon`,
+`voxcpm2-vae`). Non-S2S backends
 return 400.
 
 ```bash

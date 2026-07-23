@@ -38,6 +38,7 @@ add_library(glint STATIC
     src/opus_c_api.cpp
     src/mp3_decoder.cpp
     src/aac_decoder.cpp
+    src/flac_decoder.cpp
     src/decoder_c_api.cpp
     src/decode_audio_c_api.cpp
     src/wav_io.cpp
@@ -45,6 +46,8 @@ add_library(glint STATIC
     src/encode_audio_c_api.cpp
     src/opus_mdct.cpp
     src/opus_ogg.cpp
+    src/vorbis_decoder.cpp
+    src/vorbis_c_api.cpp
     src/opus_celt_enc_energy.cpp
     src/opus_celt_enc_vq.cpp
     src/opus_celt_enc_bands.cpp

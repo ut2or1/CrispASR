@@ -44,6 +44,17 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
     # configure project version
     configure_file(${CMAKE_SOURCE_DIR}/bindings/javascript/package-tmpl.json ${CMAKE_SOURCE_DIR}/bindings/javascript/package.json @ONLY)
+
+    # Sync the pure-JS C2PA signer/verifier from the c2pa-audio submodule (single
+    # source of truth) into bindings/javascript so `crispasr/c2pa` and the JS
+    # tests use the current WAV/MP3/M4A/FLAC implementation. The copies are
+    # generated (gitignored); the originals live in third_party/c2pa-audio/js.
+    set(_c2pa_js_src ${CMAKE_SOURCE_DIR}/third_party/c2pa-audio/js)
+    if (EXISTS ${_c2pa_js_src}/c2pa.mjs)
+        foreach(_f c2pa.mjs c2pa-verify.mjs default-cert.mjs)
+            configure_file(${_c2pa_js_src}/${_f} ${CMAKE_SOURCE_DIR}/bindings/javascript/${_f} COPYONLY)
+        endforeach()
+    endif()
 else()
     set(CRISPASR_STANDALONE OFF)
 endif()

@@ -1,11 +1,12 @@
 {
   "name": "crispasr",
-  "version": "0.8.12",
+  "version": "0.8.21",
   "description": "CrispASR speech recognition",
   "main": "crispasr.js",
   "exports": {
     ".": "./crispasr.js",
-    "./c2pa": "./c2pa.mjs"
+    "./c2pa": "./c2pa.mjs",
+    "./c2pa-verify": "./c2pa-verify.mjs"
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",

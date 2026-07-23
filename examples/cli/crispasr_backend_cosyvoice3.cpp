@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <utility>
 #include <vector>
+#include "core/crispasr_env.h"
 
 namespace {
 
@@ -118,7 +119,7 @@ public:
 
         // ---- CAMPPlus ----
         std::string campplus_path;
-        const char* env_campplus = getenv("COSYVOICE3_CAMPPLUS_PATH");
+        const char* env_campplus = crispasr_env::get("CRISPASR_COSYVOICE3_CAMPPLUS_PATH");
         if (env_campplus && env_campplus[0])
             campplus_path = env_campplus;
         if (campplus_path.empty()) {
@@ -131,7 +132,7 @@ public:
 
         // ---- HiFT ----
         std::string hift_path;
-        const char* env_hift = getenv("COSYVOICE3_HIFT_PATH");
+        const char* env_hift = crispasr_env::get("CRISPASR_COSYVOICE3_HIFT_PATH");
         if (env_hift && env_hift[0])
             hift_path = env_hift;
         if (hift_path.empty()) {
@@ -159,7 +160,7 @@ public:
 
         // ---- Voices ----
         std::string voices_path;
-        const char* env_voices = getenv("COSYVOICE3_VOICES_PATH");
+        const char* env_voices = crispasr_env::get("CRISPASR_COSYVOICE3_VOICES_PATH");
         if (env_voices && env_voices[0])
             voices_path = env_voices;
         if (voices_path.empty()) {

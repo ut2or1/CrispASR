@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """Capture remaining regression transcripts: mimo-asr (with codec) + kugelaudio."""
 import json, os, subprocess, sys, time, shutil, traceback
@@ -33,6 +34,11 @@ def main():
     sys.path.insert(0, str(cdir / "tools" / "kaggle"))
     try:
         import kaggle_harness as kh
+        # Full harness regime: authenticate HF pulls from the attached token
+        # dataset (anon pulls get rate-limited); hf_transfer wedges multi-GB
+        # Kaggle downloads, so keep the plain resumable downloader.
+        kh.resolve_hf_token()
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
         kh.init_progress()
         kh.setup_hf_token()
         kh.install_build_toolchain()
@@ -47,7 +53,7 @@ def main():
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "cmake", "ninja"], check=False)
 
     bdir = cdir / "build"
-    cmake_args = ["-DCMAKE_BUILD_TYPE=Release"]
+    cmake_args = ["-DCMAKE_BUILD_TYPE=Release", "-DCRISPASR_NO_C2PA_NATIVE=ON"]
     if shutil.which("ninja"): cmake_args += ["-G", "Ninja"]
     if shutil.which("ccache"): cmake_args += ["-DCMAKE_C_COMPILER_LAUNCHER=ccache", "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"]
     subprocess.check_call(["cmake", "-B", str(bdir)] + cmake_args, cwd=str(cdir))

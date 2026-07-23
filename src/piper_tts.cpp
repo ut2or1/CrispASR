@@ -30,7 +30,8 @@
 #include "core/g2p_fr.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
-#include "phonemizer.h"            // strip_espeak_lang_markers (#169)
+#include "core/crispasr_env.h"
+#include "phonemizer.h" // strip_espeak_lang_markers (#169)
 // crispasr_cache is part of crispasr-lib, not piper-tts; guard behind CRISPASR_BUILD.
 #ifdef CRISPASR_BUILD
 #include "crispasr_cache.h"
@@ -55,7 +56,7 @@
 static bool piper_use_scalar() {
     static int v = -1;
     if (v < 0)
-        v = (getenv("PIPER_FORCE_SCALAR") != nullptr) ? 1 : 0;
+        v = (crispasr_env::get("CRISPASR_PIPER_FORCE_SCALAR") != nullptr) ? 1 : 0;
     return v != 0;
 }
 #endif
@@ -67,7 +68,7 @@ static bool piper_use_scalar() {
 static bool piper_tts_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("PIPER_TTS_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_PIPER_TTS_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;

@@ -666,6 +666,12 @@ bool crispasr_write_json(const std::string& path, const std::vector<crispasr_seg
             f << ",\n      \"emotion\":    \"" << json_escape(s.emotion) << "\"";
         if (!s.itn_flag.empty())
             f << ",\n      \"itn_flag\":   \"" << json_escape(s.itn_flag) << "\"";
+        // #292: chunk scope. Only present on multi-chunk runs (single-pass leaves
+        // chunk_id at -1). Diarize "(speaker N)" labels are chunk-local, so a
+        // consumer must not assume "speaker 1" in different chunk_ids is the same
+        // person — segments sharing a chunk_id share a speaker numbering.
+        if (s.chunk_id >= 0)
+            f << ",\n      \"chunk_id\":   " << s.chunk_id;
         // NOTE ON UNITS (issue #228): segment `offsets` above are in milliseconds
         // (t0/t1 are the internal centisecond timebase * 10). For back-compat the
         // per-word / per-token `t0`/`t1` fields are kept in their original
@@ -918,6 +924,43 @@ void crispasr_print_alternatives(const std::vector<crispasr_segment>& segs, int 
     fflush(stdout);
 }
 
+void crispasr_print_confidence(const std::vector<crispasr_segment>& segs) {
+    for (const auto& seg : segs) {
+        // No token-level confidence (backend didn't emit tokens) — fall back to
+        // the plain segment text so the flag still yields readable output.
+        bool any_tok = false;
+        for (const auto& tok : seg.tokens) {
+            if (!tok.is_special) {
+                any_tok = true;
+                break;
+            }
+        }
+        if (!any_tok) {
+            if (!seg.text.empty())
+                printf("%s\n", seg.text.c_str());
+            continue;
+        }
+        bool first = true;
+        for (const auto& tok : seg.tokens) {
+            if (tok.is_special)
+                continue;
+            // Tokens carry the leading-space word-boundary convention; strip it
+            // so the annotation attaches to the word, not a stray gap.
+            const char* t = tok.text.c_str();
+            while (*t == ' ')
+                ++t;
+            if (!*t)
+                continue;
+            printf("%s%s", first ? "" : " ", t);
+            first = false;
+            if (tok.confidence >= 0.0f)
+                printf("[%.0f%%]", tok.confidence * 100.0f);
+        }
+        printf("\n");
+    }
+    fflush(stdout);
+}
+
 void crispasr_print_stdout(const std::vector<crispasr_disp_segment>& segs, bool show_timestamps) {
     if (show_timestamps) {
         for (const auto& s : segs) {
@@ -1118,6 +1161,11 @@ std::string crispasr_segments_to_diarized_json(const std::vector<crispasr_segmen
         js << "      \"speaker\": \"" << json_escape(spk) << "\",\n";
 
         js << "      \"type\": \"transcript.text.segment\"";
+        // #292: chunk scope — diarize speaker labels are CHUNK-LOCAL, so a
+        // consumer must not treat the same label across different chunk_ids as
+        // the same person. Present only on multi-chunk runs (single-pass = -1).
+        if (s.chunk_id >= 0)
+            js << ",\n      \"chunk_id\": " << s.chunk_id;
 
         // Word-level timestamps if available.
         if (!s.words.empty()) {
@@ -1162,6 +1210,8 @@ std::string crispasr_segments_to_native_json(const std::vector<crispasr_segment>
         if (!s.speaker.empty()) {
             js << ",\n      \"speaker\": \"" << json_escape(s.speaker) << "\"";
         }
+        if (s.chunk_id >= 0) // #292: chunk-local speaker scope (multi-chunk only)
+            js << ",\n      \"chunk_id\": " << s.chunk_id;
         if (!s.tokens.empty()) {
             js << ",\n      \"tokens\": [\n";
             for (size_t j = 0; j < s.tokens.size(); j++) {

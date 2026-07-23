@@ -197,6 +197,17 @@ namespace CrispASR
             IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string text,
             out int outNSamples);
 
+        // UNMARKED synthesis — hard-refused unless accept_marking_responsibility was called first.
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_synthesize_raw(
+            IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string text,
+            out int outNSamples);
+
+        // Attest acceptance of AI-content marking/disclosure duty (EU AI Act Art. 50).
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_accept_marking_responsibility(
+            IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string attestation);
+
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void crispasr_pcm_free(IntPtr pcm);
 
@@ -329,6 +340,106 @@ namespace CrispASR
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void crispasr_vad_free(IntPtr spans);
 
+        // ---- Logging ----
+        // ggml_log_callback: void (*)(ggml_log_level level, const char* text, void* user_data)
+        // Cdecl is mandatory: native calls this back with the C calling convention,
+        // and the delegate default (StdCall) would corrupt the stack on every log
+        // line on the platforms CrispASR actually ships to.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        internal delegate void GgmlLogCallback(int level, [MarshalAs(UnmanagedType.LPUTF8Str)] string? text, IntPtr userData);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void whisper_log_set(GgmlLogCallback? logCallback, IntPtr userData);
+
+        // ---- Music / task backends (tab, beats, chords, piano, pitch, separate, convert) ----
+        // Every `_events`/`_spans`/`_notes`/`_frames`/`_emissions`/`_stem`/`_audio`
+        // getter returns a SESSION-OWNED float* valid only until the next run call
+        // or session close — copy out immediately, never free it (unlike synthesize,
+        // which owns its buffer and needs crispasr_pcm_free).
+
+        // tab (guitar tablature)
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_tab(IntPtr s, float[] pcm, int nSamples, int sampleRate);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_tab_n_frames(IntPtr s);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_tab_emissions(IntPtr s, out int nFrames, out int nStrings, out int nClasses);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_tab_silent_class(IntPtr s);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern float crispasr_session_tab_frame_period(IntPtr s);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_tab_string_open_midi(IntPtr s, int stringIndex);
+
+        // beats (beat / downbeat tracking)
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_beats(IntPtr s, float[] pcm, int nSamples, int sampleRate);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_beats_n_events(IntPtr s);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_beats_events(IntPtr s, out int nEvents);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern float crispasr_session_beats_tempo_bpm(IntPtr s);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_beats_sample_rate(IntPtr s);
+
+        // chords
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_chords(IntPtr s, float[] pcm, int nSamples, int sampleRate);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_chords_n_spans(IntPtr s);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_chords_spans(IntPtr s, out int nSpans);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_chords_span_name(IntPtr s, int idx);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_chords_vocab_size(IntPtr s);
+
+        // piano transcription
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_piano(IntPtr s, float[] pcm16k, int nSamples);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_piano_n_notes(IntPtr s);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_piano_notes(IntPtr s, out int nNotes);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_piano_sample_rate(IntPtr s);
+
+        // pitch (F0)
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_pitch(IntPtr s, float[] pcm16k, int nSamples, float hopMs);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_pitch_n_frames(IntPtr s);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_pitch_frames(IntPtr s, out int nFrames);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_pitch_sample_rate(IntPtr s);
+
+        // source separation
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_separate(IntPtr s, float[] pcmStereo, int nSamples);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_separate_n_stems(IntPtr s);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_separate_stem_name(IntPtr s, int stemIdx);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_separate_stem(IntPtr s, int stemIdx, out int nSamples);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_separate_sample_rate(IntPtr s);
+
+        // voice conversion (RVC content -> speaker)
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_convert(IntPtr s, float[] content, int nFrames,
+            float[] f0Hz, int speakerId, float[]? noiseZp, float[]? noiseSine);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_convert_audio(IntPtr s, out int nSamples);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_convert_content_dim(IntPtr s);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_convert_n_speakers(IntPtr s);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_convert_sample_rate(IntPtr s);
+
         // ---- Streaming ----
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr crispasr_session_stream_open(
@@ -388,10 +499,12 @@ namespace CrispASR
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern float crispasr_titanet_cosine_sim(float[] a, float[] b, int dim);
 
-        // ---- Speaker database ----
+        // ---- Speaker database (closed-roster, consent-gated — issue #266) ----
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr crispasr_speaker_db_load(
-            [MarshalAs(UnmanagedType.LPUTF8Str)] string dirPath);
+        internal static extern IntPtr crispasr_speaker_db_open(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string dirPath,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string expectedNamesCsv,
+            int consentAttested);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void crispasr_speaker_db_free(IntPtr db);
@@ -405,10 +518,10 @@ namespace CrispASR
             byte[] outName, int outCap);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int crispasr_speaker_db_enroll(
+        internal static extern int crispasr_speaker_db_enroll2(
             [MarshalAs(UnmanagedType.LPUTF8Str)] string dirPath,
             [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
-            float[] embedding, int dim);
+            float[] embedding, int dim, int consentAttested);
 
         // ---- Text translation ----
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -426,6 +539,21 @@ namespace CrispASR
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_registry_lookup_abi(
             [MarshalAs(UnmanagedType.LPUTF8Str)] string backend,
+            byte[] outFilename, int filenameCap,
+            byte[] outUrl, int urlCap,
+            byte[] outSize, int sizeCap);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_registry_default_bundle_info_abi(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string backend,
+            byte[] outBackend, int backendCap,
+            byte[] outLicense, int licenseCap,
+            out int outRequiresAcceptance);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_registry_default_bundle_artifact_abi(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string backend,
+            int index, out int outKind,
             byte[] outFilename, int filenameCap,
             byte[] outUrl, int urlCap,
             byte[] outSize, int sizeCap);

@@ -287,6 +287,26 @@ CRISPASR_SESSION_API int crispasr_registry_lookup_by_filename_abi(const char* fi
                                                                   int32_t filename_cap, char* out_url, int32_t url_cap,
                                                                   char* out_size, int32_t size_cap);
 CRISPASR_SESSION_API int crispasr_registry_list_backends_abi(char* out_csv, int32_t out_cap);
+typedef enum crispasr_registry_artifact_kind {
+    CRISPASR_REGISTRY_ARTIFACT_PRIMARY = 0,
+    CRISPASR_REGISTRY_ARTIFACT_COMPANION = 1,
+    CRISPASR_REGISTRY_ARTIFACT_EXTRA = 2,
+} crispasr_registry_artifact_kind;
+// Return the artifact count for a backend's exact `-m auto` default bundle,
+// or 0 when the backend is unknown. On success, also writes the canonical
+// backend key and registry licence (which may be empty). Negative values are
+// argument/buffer errors.
+CRISPASR_SESSION_API int crispasr_registry_default_bundle_info_abi(const char* backend, char* out_backend,
+                                                                   int32_t backend_cap, char* out_license,
+                                                                   int32_t license_cap,
+                                                                   int32_t* out_requires_acceptance);
+// Return one default-bundle artifact by index. 0 = success, 1 = unknown
+// backend/index, -1 = invalid arguments, 2 = an output buffer is too small.
+CRISPASR_SESSION_API int crispasr_registry_default_bundle_artifact_abi(const char* backend, int32_t index,
+                                                                       int32_t* out_kind, char* out_filename,
+                                                                       int32_t filename_cap, char* out_url,
+                                                                       int32_t url_cap, char* out_size,
+                                                                       int32_t size_cap);
 CRISPASR_SESSION_API int crispasr_session_result_n_segments(crispasr_session_result* r);
 CRISPASR_SESSION_API const char* crispasr_session_result_segment_text(crispasr_session_result* r, int i);
 CRISPASR_SESSION_API int64_t crispasr_session_result_segment_t0(crispasr_session_result* r, int i);
@@ -320,9 +340,25 @@ CRISPASR_SESSION_API void crispasr_session_result_free(crispasr_session_result* 
 // values = full attention; INT_MIN,INT_MIN = clear (use the model default).
 // No-op for non-parakeet backends. Returns 0 on success.
 CRISPASR_SESSION_API int crispasr_session_set_parakeet_att_context(crispasr_session* s, int left, int right);
+// Set the active backend's companion codec/tokenizer model. For OmniVoice this
+// is its HiggsAudioV2 tokenizer; for Chatterbox it is S3Gen.
 CRISPASR_SESSION_API int crispasr_session_set_codec_path(crispasr_session* s, const char* path);
+// Set the active TTS backend's voice from its native format. Chatterbox accepts
+// a conditioning GGUF or reference WAV; OmniVoice accepts a reference WAV and
+// uses ref_text_or_null as its transcript. Returns -3 when the active backend
+// has no voice-setting implementation.
 CRISPASR_SESSION_API int crispasr_session_set_voice(crispasr_session* s, const char* path,
                                                     const char* ref_text_or_null);
+// #201: configure the TADA encoder + aligner GGUFs used for on-the-fly voice
+// cloning, i.e. crispasr_session_set_voice(s, "ref.wav", "<transcript>") on a
+// TADA session. The .wav clone path is opt-in (experimental) — enable it with
+// the env var CRISPASR_TADA_WAV_CLONE=1; otherwise a .wav voice is rejected as
+// before. Either path may be NULL to clear it and fall back to
+// auto-resolution (next to the model, then the cache dir). The aligner is
+// language-specific (tada-aligner-<lang>.gguf); the language follows the
+// session's source-language hint. No-op (returns -1) for non-TADA sessions.
+CRISPASR_SESSION_API int crispasr_session_tada_set_makeref_models(crispasr_session* s, const char* encoder_gguf,
+                                                                  const char* aligner_gguf);
 CRISPASR_SESSION_API int crispasr_session_set_speaker_name(crispasr_session* s, const char* name);
 CRISPASR_SESSION_API int crispasr_session_set_speaker_id(crispasr_session* s, int id);
 CRISPASR_SESSION_API int crispasr_session_n_speakers(crispasr_session* s);
@@ -330,8 +366,11 @@ CRISPASR_SESSION_API const char* crispasr_session_get_speaker_name(crispasr_sess
 CRISPASR_SESSION_API int crispasr_session_set_instruct(crispasr_session* s, const char* instruct);
 CRISPASR_SESSION_API int crispasr_session_is_custom_voice(crispasr_session* s);
 CRISPASR_SESSION_API int crispasr_session_is_voice_design(crispasr_session* s);
+// UNMARKED synthesis — hard-refused unless crispasr_session_accept_marking_responsibility() was called first.
 CRISPASR_SESSION_API float* crispasr_session_synthesize_raw(crispasr_session* s, const char* text, int* out_n_samples);
 CRISPASR_SESSION_API float* crispasr_session_synthesize(crispasr_session* s, const char* text, int* out_n_samples);
+// Attest acceptance of AI-content marking/disclosure duty (required for _raw); recorded for audit.
+CRISPASR_SESSION_API int crispasr_session_accept_marking_responsibility(crispasr_session* s, const char* attestation);
 
 // Streaming synthesis: fires `cb` once per sentence chunk with that chunk's
 // watermarked PCM (backend-native sample rate, same as synthesize) as it is
@@ -346,6 +385,159 @@ CRISPASR_SESSION_API void crispasr_pcm_free(float* pcm);
 CRISPASR_SESSION_API float* crispasr_session_speech_to_speech(crispasr_session* s, const float* in_samples,
                                                               int n_in_samples, char** out_text, int* out_n_samples);
 CRISPASR_SESSION_API int crispasr_session_set_hotwords(crispasr_session* s, const char* hotwords, float boost);
+
+// Source separation: split audio into N stems (drums, bass, other, vocals).
+// Input: stereo interleaved PCM at the model's native rate (44100 Hz for htdemucs).
+// Returns stem count (>0) on success, -1 on error. Call crispasr_session_separate_stem
+// to retrieve individual stem PCM after a successful separate call.
+CRISPASR_SESSION_API int crispasr_session_separate(crispasr_session* s, const float* pcm_stereo, int n_samples);
+CRISPASR_SESSION_API int crispasr_session_separate_n_stems(crispasr_session* s);
+CRISPASR_SESSION_API const char* crispasr_session_separate_stem_name(crispasr_session* s, int stem_idx);
+// Returns pointer to interleaved stereo PCM for stem_idx. Owned by the session;
+// valid until the next separate() call or session close. *out_n_samples receives
+// the per-channel sample count.
+CRISPASR_SESSION_API const float* crispasr_session_separate_stem(crispasr_session* s, int stem_idx, int* out_n_samples);
+CRISPASR_SESSION_API int crispasr_session_separate_sample_rate(crispasr_session* s);
+
+// Pitch (F0) estimation: monophonic pitch track from mono PCM at the model's
+// native rate (16000 Hz for crepe). `hop_ms` <= 0 uses the model default (10 ms).
+// Returns the frame count (>0) on success, -1 on error. Frames stay valid until
+// the next pitch() call or session close.
+CRISPASR_SESSION_API int crispasr_session_pitch(crispasr_session* s, const float* pcm_16k, int n_samples, float hop_ms);
+CRISPASR_SESSION_API int crispasr_session_pitch_n_frames(crispasr_session* s);
+// Single frame by index. Any out_* pointer may be NULL. Returns 0 on success.
+CRISPASR_SESSION_API int crispasr_session_pitch_frame(crispasr_session* s, int idx, float* out_time_ms,
+                                                      float* out_f0_hz, float* out_voiced_prob);
+// Flat view of every frame: 3 floats per frame {time_ms, f0_hz, voiced_prob},
+// frame-major. Owned by the session. *out_n_frames receives the frame count.
+CRISPASR_SESSION_API const float* crispasr_session_pitch_frames(crispasr_session* s, int* out_n_frames);
+CRISPASR_SESSION_API int crispasr_session_pitch_sample_rate(crispasr_session* s);
+
+// Voice conversion (SVC, RVC). Input is CONTENTVEC FEATURES, not audio: the
+// consumer owns the content encoder, which is why this has no CLI verb.
+// `content` is n_frames * content_dim frame-major; `f0_hz` is n_frames values
+// in Hz with 0.0 marking unvoiced (the coarse mel-quantised pitch is derived
+// internally — those constants are model-side and replicating them in the
+// caller guarantees drift). Returns the sample count (>0), -1 on error.
+//
+// STOCHASTIC BY DESIGN. Pass NULL for both noise buffers in production. Passing
+// explicit buffers replays a specific draw, which is the only way to compare
+// against another implementation — waveform correlation against a reference run
+// is invalid here because the reference disagrees with itself.
+//   noise_zp   : inter_channels * n_frames, or NULL
+//   noise_sine : n_frames * upsample_product, or NULL
+CRISPASR_SESSION_API int crispasr_session_convert(crispasr_session* s, const float* content, int n_frames,
+                                                  const float* f0_hz, int speaker_id, const float* noise_zp,
+                                                  const float* noise_sine);
+// Session-owned mono PCM from the last convert(), at convert_sample_rate().
+CRISPASR_SESSION_API const float* crispasr_session_convert_audio(crispasr_session* s, int* out_n_samples);
+// 256 (v1, layer 9 + final_proj) or 768 (v2, final layer). Check this against
+// your encoder before calling: a v1/v2 mismatch is silent otherwise.
+CRISPASR_SESSION_API int crispasr_session_convert_content_dim(crispasr_session* s);
+CRISPASR_SESSION_API int crispasr_session_convert_n_speakers(crispasr_session* s);
+// The checkpoint's native rate (32k/40k/48k) — not a constant.
+CRISPASR_SESSION_API int crispasr_session_convert_sample_rate(crispasr_session* s);
+
+// Chord recognition: mono PCM at any rate (resampled internally to the
+// model's 22050 Hz) -> a chord timeline. Returns the span count (>0) on
+// success, 0 for "ran, found nothing", -1 on error or a backend with no
+// chord arm.
+//
+// NOTE ON WEIGHTS: the shipped BTC weights are CC-BY-NC-SA (trained on
+// Isophonics et al.), so they are NOT licensed for commercial use even though
+// this library is MIT. The registry refuses to download them without an
+// explicit licence acceptance (CLI: --accept-license cc-by-nc-sa-4.0; env:
+// CRISPASR_ACCEPT_LICENSE). A commercial product must ship its own weights.
+// --- Guitar tablature (tabcnn) -------------------------------------------
+//
+// EMISSION SCORES, not a decided tablature. crispasr_session_tab() runs the
+// model and returns the frame count; crispasr_session_tab_emissions() hands
+// back a flat [frame][string][class] grid of LOG-probabilities, valid until the
+// next call or session close. The constrained Viterbi/DP that turns those into
+// a playable fingering (one note per string, fret range, capo, hand span) is
+// yours — argmaxing this grid ignores every playability constraint.
+//
+// Weights are CC BY 4.0 (EGSet12, https://zenodo.org/records/11406378): attribution
+// required when redistributing.
+CRISPASR_SESSION_API int crispasr_session_tab(crispasr_session* s, const float* pcm, int n_samples, int sample_rate);
+CRISPASR_SESSION_API int crispasr_session_tab_n_frames(crispasr_session* s);
+CRISPASR_SESSION_API const float* crispasr_session_tab_emissions(crispasr_session* s, int* out_n_frames,
+                                                                 int* out_n_strings, int* out_n_classes);
+// Class index meaning "string not played" — read it, never assume it.
+CRISPASR_SESSION_API int crispasr_session_tab_silent_class(crispasr_session* s);
+CRISPASR_SESSION_API float crispasr_session_tab_frame_period(crispasr_session* s);
+// Open-string MIDI pitch per string (0 = lowest), or -1 if unknown.
+CRISPASR_SESSION_API int crispasr_session_tab_string_open_midi(crispasr_session* s, int string);
+
+CRISPASR_SESSION_API int crispasr_session_chords(crispasr_session* s, const float* pcm, int n_samples, int sample_rate);
+CRISPASR_SESSION_API int crispasr_session_chords_n_spans(crispasr_session* s);
+// Flat, session-owned view of the last result: 4 floats per span, span-major,
+// as {start_ms, end_ms, label, confidence}. Valid until the next
+// crispasr_session_chords call or session close. `label` is an index into the
+// vocabulary and is a float for the same reason piano_notes' midi_note is —
+// a mixed int/float struct misreads through a flat float view. Resolve it to
+// a chord name with crispasr_session_chords_span_name.
+CRISPASR_SESSION_API const float* crispasr_session_chords_spans(crispasr_session* s, int* out_n_spans);
+// Chord name for span `idx`, e.g. "C", "Am", "G:7", or "N" for no-chord.
+// Session-owned; NULL if idx is out of range.
+CRISPASR_SESSION_API const char* crispasr_session_chords_span_name(crispasr_session* s, int idx);
+// 25 (maj/min + N) or 170 (full quality set). The shipped default is 170; set
+// CRISPASR_BTC_MAJ_MIN=1 to collapse the output to maj/min.
+CRISPASR_SESSION_API int crispasr_session_chords_vocab_size(crispasr_session* s);
+
+// Beat and downbeat tracking: mono PCM at the model's native rate (22050 Hz
+// for beat-this) -> a beat grid. Returns the beat count, or -1 on error, on a
+// sample-rate mismatch, or on a backend with no beat arm.
+//
+// NO DBN. The postprocessing is peak-picking only, which is the point of the
+// model: madmom's Dynamic Bayesian Network is Boeck-patented and licensed
+// non-commercially, so a beat tracker that used one could not ship in a
+// commercial product. beat-this is MIT for code AND weights and depends on no
+// part of madmom, so unlike the chord arm above there is no licence gate here.
+CRISPASR_SESSION_API int crispasr_session_beats(crispasr_session* s, const float* pcm, int n_samples, int sample_rate);
+CRISPASR_SESSION_API int crispasr_session_beats_n_events(crispasr_session* s);
+// Flat, session-owned view of the last result: 2 floats per beat, beat-major,
+// as {time_s, is_downbeat}. Valid until the next crispasr_session_beats call
+// or session close. is_downbeat is 0.0f or 1.0f — a float, for the same reason
+// chords' label is: a mixed int/float struct misreads through a flat view.
+//
+// EVERY DOWNBEAT IS ALSO A BEAT. The postprocessor snaps each downbeat onto
+// its nearest beat, so the downbeats are a strict subset and callers never
+// have to merge two lists to reconstruct the grid.
+CRISPASR_SESSION_API const float* crispasr_session_beats_events(crispasr_session* s, int* out_n_events);
+// Median-interval tempo estimate in BPM from the last result, or 0 with fewer
+// than two beats. Median rather than mean: a single missed or doubled beat
+// skews a mean badly and both are routine.
+CRISPASR_SESSION_API float crispasr_session_beats_tempo_bpm(crispasr_session* s);
+// Native input rate the loaded beat model expects, in Hz (22050 for
+// beat-this), or 0 when the backend has no beat arm — so it doubles as a
+// capability probe. crispasr_session_beats REJECTS a mismatch rather than
+// resampling: silently resampling audio would move every beat time.
+CRISPASR_SESSION_API int crispasr_session_beats_sample_rate(crispasr_session* s);
+
+// Polyphonic piano transcription: mono PCM at the model's native rate
+// (16000 Hz for piano-transcription) -> note events.
+//
+// Returns note count (>0) on success, 0 for "ran, found nothing", -1 on error
+// or a backend with no piano arm. Retrieve the notes with
+// crispasr_session_piano_notes after a successful call.
+//
+// This exists so consumers get STRUCTURED note events. The CLI adapter renders
+// each note into a crispasr_segment whose text reads like "C4 v=80"; parsing
+// that string back into a note is lossy and was never the intended seam.
+CRISPASR_SESSION_API int crispasr_session_piano(crispasr_session* s, const float* pcm_16k, int n_samples);
+CRISPASR_SESSION_API int crispasr_session_piano_n_notes(crispasr_session* s);
+// Flat, session-owned view of the last result: 4 floats per note, note-major,
+// as {onset_ms, offset_ms, midi_note, velocity}. Valid until the next
+// crispasr_session_piano call or session close — copy if you need to keep it.
+//
+// All four fields are float even though midi_note and velocity are logically
+// integers. That is deliberate: a mixed int/float struct read through a flat
+// float view misreads the int lanes, and this layout lets a binding do one
+// typed-array read (the same reason crispasr_session_pitch_frames is flat).
+// midi_note is 21-108 (A0-C8); velocity is 0-127.
+CRISPASR_SESSION_API const float* crispasr_session_piano_notes(crispasr_session* s, int* out_n_notes);
+CRISPASR_SESSION_API int crispasr_session_piano_sample_rate(crispasr_session* s);
 CRISPASR_SESSION_API const char* crispasr_session_last_synth_error(crispasr_session* s);
 CRISPASR_SESSION_API char* crispasr_session_translate_text(crispasr_session* s, const char* text, const char* src_lang,
                                                            const char* tgt_lang, int max_tokens);
@@ -446,11 +638,25 @@ CRISPASR_SESSION_API void* crispasr_titanet_init(const char* model_path, int32_t
 CRISPASR_SESSION_API void crispasr_titanet_free(void* ctx);
 CRISPASR_SESSION_API int32_t crispasr_titanet_embed(void* ctx, const float* pcm_16k, int32_t n_samples, float* out);
 CRISPASR_SESSION_API float crispasr_titanet_cosine_sim(const float* a, const float* b, int32_t dim);
-CRISPASR_SESSION_API void* crispasr_speaker_db_load(const char* dir_path);
+// Speaker database — closed-roster, consent-gated (issue #266).
+// `expected_names_csv` is the comma-separated roster of enrolled
+// participants the caller asserts are present in the audio (e.g.
+// "Alice,Bob"); the db is narrowed to exactly those profiles.
+// `consent_attested` affirms a lawful basis + explicit consent from
+// every enrolled person (GDPR Art. 9). Open 1:N identification is
+// deliberately unsupported: crispasr_speaker_db_open refuses without
+// both, and the legacy ungated _load/_enroll symbols below refuse at
+// runtime (kept so old callers fail loudly, not at link time).
+CRISPASR_SESSION_API void* crispasr_speaker_db_open(const char* dir_path, const char* expected_names_csv,
+                                                    int32_t consent_attested);
 CRISPASR_SESSION_API void crispasr_speaker_db_free(void* db);
 CRISPASR_SESSION_API int32_t crispasr_speaker_db_count(const void* db);
 CRISPASR_SESSION_API float crispasr_speaker_db_match(const void* db, const float* embedding, int32_t dim,
                                                      float threshold, char* out_name, int32_t out_cap);
+CRISPASR_SESSION_API int32_t crispasr_speaker_db_enroll2(const char* dir_path, const char* name, const float* embedding,
+                                                         int32_t dim, int32_t consent_attested);
+// Legacy (pre-#266) entry points — always refuse at runtime.
+CRISPASR_SESSION_API void* crispasr_speaker_db_load(const char* dir_path);
 CRISPASR_SESSION_API int32_t crispasr_speaker_db_enroll(const char* dir_path, const char* name, const float* embedding,
                                                         int32_t dim);
 CRISPASR_SESSION_API void* crispasr_speaker_embedder_make_abi(const char* model_spec, int32_t n_threads,

@@ -24,6 +24,70 @@ TEST_CASE("registry: lookup unknown backend returns false", "[unit][registry]") 
     REQUIRE_FALSE(found);
 }
 
+TEST_CASE("registry: default bundle reports the exact canonical artifacts", "[unit][registry]") {
+    CrispasrRegistryBundle bundle;
+    REQUIRE(crispasr_registry_default_bundle("omnivoice", bundle));
+    REQUIRE(bundle.backend == "omnivoice");
+    REQUIRE_FALSE(bundle.requires_license_acceptance);
+    REQUIRE(bundle.artifacts.size() == 2);
+    REQUIRE(bundle.artifacts[0].kind == CrispasrRegistryArtifactKind::Primary);
+    REQUIRE(bundle.artifacts[0].filename == "omnivoice-f16.gguf");
+    REQUIRE(bundle.artifacts[1].kind == CrispasrRegistryArtifactKind::Companion);
+    REQUIRE(bundle.artifacts[1].filename == "omnivoice-tokenizer-f16.gguf");
+}
+
+TEST_CASE("registry: default bundle resolves aliases and includes extras", "[unit][registry]") {
+    CrispasrRegistryBundle bundle;
+    REQUIRE(crispasr_registry_default_bundle("cosyvoice3", bundle));
+    REQUIRE(bundle.backend == "cosyvoice3-tts");
+    REQUIRE(bundle.artifacts.size() == 6);
+    REQUIRE(bundle.artifacts[0].kind == CrispasrRegistryArtifactKind::Primary);
+    REQUIRE(bundle.artifacts[1].kind == CrispasrRegistryArtifactKind::Companion);
+    for (size_t i = 2; i < bundle.artifacts.size(); ++i) {
+        REQUIRE(bundle.artifacts[i].kind == CrispasrRegistryArtifactKind::Extra);
+        REQUIRE(bundle.artifacts[i].approx_size.empty());
+    }
+}
+
+TEST_CASE("registry: default bundle preserves license metadata", "[unit][registry]") {
+    CrispasrRegistryBundle bundle;
+    REQUIRE(crispasr_registry_default_bundle("voxtral-tts", bundle));
+    REQUIRE_FALSE(bundle.license.empty());
+    REQUIRE(bundle.requires_license_acceptance);
+}
+
+TEST_CASE("registry: default bundle rejects unknown backends", "[unit][registry]") {
+    CrispasrRegistryBundle bundle;
+    REQUIRE_FALSE(crispasr_registry_default_bundle("nonexistent-backend-xyz", bundle));
+}
+
+TEST_CASE("registry: every default bundle starts with its lookup result", "[unit][registry]") {
+    for (int i = 0; i < crispasr_registry_count(); ++i) {
+        CrispasrRegistryEntry entry;
+        REQUIRE(crispasr_registry_get_at(i, entry));
+
+        CrispasrRegistryEntry canonical;
+        REQUIRE(crispasr_registry_lookup(entry.backend, canonical));
+        CrispasrRegistryBundle bundle;
+        REQUIRE(crispasr_registry_default_bundle(entry.backend, bundle));
+        REQUIRE_FALSE(bundle.artifacts.empty());
+        REQUIRE(bundle.backend == canonical.backend);
+        REQUIRE(bundle.license == canonical.license);
+        REQUIRE(bundle.requires_license_acceptance == crispasr_license_requires_acceptance(canonical.license));
+        REQUIRE(bundle.artifacts[0].kind == CrispasrRegistryArtifactKind::Primary);
+        REQUIRE(bundle.artifacts[0].filename == canonical.filename);
+        REQUIRE(bundle.artifacts[0].url == canonical.url);
+        REQUIRE(bundle.artifacts[0].approx_size == canonical.approx_size);
+        if (!canonical.companion_filename.empty()) {
+            REQUIRE(bundle.artifacts.size() >= 2);
+            REQUIRE(bundle.artifacts[1].kind == CrispasrRegistryArtifactKind::Companion);
+            REQUIRE(bundle.artifacts[1].filename == canonical.companion_filename);
+            REQUIRE(bundle.artifacts[1].url == canonical.companion_url);
+            REQUIRE(bundle.artifacts[1].approx_size == canonical.companion_approx_size);
+        }
+    }
+}
+
 TEST_CASE("registry: parakeet entry has correct filename", "[unit][registry]") {
     CrispasrRegistryEntry e;
     bool found = crispasr_registry_lookup("parakeet", e);
@@ -228,7 +292,8 @@ TEST_CASE("registry: all entries with companions have companion_approx_size set"
     const int n = crispasr_registry_count();
     for (int i = 0; i < n; ++i) {
         CrispasrRegistryEntry e;
-        if (!crispasr_registry_get_at(i, e)) continue;
+        if (!crispasr_registry_get_at(i, e))
+            continue;
         if (!e.companion_filename.empty()) {
             REQUIRE(!e.companion_approx_size.empty());
         }

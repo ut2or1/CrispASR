@@ -40,6 +40,7 @@
 #include "core/mel.h"
 #include "core/wav_reader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 #include "chatterbox_campplus.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -78,7 +79,7 @@ namespace {
 static bool cosyvoice3_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("COSYVOICE3_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_COSYVOICE3_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -1306,7 +1307,7 @@ extern "C" float* cosyvoice3_tts_step_speech(struct cosyvoice3_tts_context* ctx,
     // 256-token bucket to the T=1 attention graph. The graph is rebuilt when
     // generation crosses a bucket boundary; short requests avoid attending
     // over the entire (normally 512-token) CLI budget on every step.
-    const char* kv_bucket_env = std::getenv("COSYVOICE3_KV_BUCKET");
+    const char* kv_bucket_env = crispasr_env::get("CRISPASR_COSYVOICE3_KV_BUCKET");
     const bool use_kv_bucket = !kv_bucket_env || strcmp(kv_bucket_env, "0") != 0;
     const int kv_bucket = ((n_past + 1 + 255) / 256) * 256;
     const int fixed_kv = use_kv_bucket ? std::min(ctx->kv_max_ctx, kv_bucket) : ctx->kv_max_ctx;
@@ -3474,8 +3475,30 @@ float* cv3_run_solve_euler(cosyvoice3_tts_context* ctx, const float* mu, int T_m
     std::vector<float> mu_zero(mel_n, 0.0f);
     std::vector<float> cond_zero(mel_n, 0.0f);
     std::vector<float> spks_zero((size_t)spk_out, 0.0f);
-    const char* cfg_batch_env = std::getenv("COSYVOICE3_CFG_BATCH");
+    const char* cfg_batch_env = crispasr_env::get("CRISPASR_COSYVOICE3_CFG_BATCH");
     bool use_cfg_batch = !cfg_batch_env || strcmp(cfg_batch_env, "0") != 0;
+
+    // Interval-CFG (opt-in, APPROXIMATE — mirrors OMNIVOICE_CFG_INTERVAL): recompute
+    // the uncond CFG forward only every K steps and reuse the cached uncond dphi in
+    // between; the cond forward stays fresh every step; the first AND last step
+    // always recompute uncond. This uses a slightly stale uncond, so it CHANGES the
+    // output and stays gated OFF by default (K=1 = exact). It requires the SEPARATE
+    // 2-forward path — the batched path (COSYVOICE3_CFG_BATCH) fuses cond+uncond into
+    // one graph, so there is no uncond forward to skip; K>1 therefore forces separate
+    // forwards. Only active when K>1 && cfg_rate!=0, so at the default the legacy path
+    // below is byte-for-byte unchanged. Gated CRISPASR_COSYVOICE3_CFG_INTERVAL.
+    const int cfg_interval = [] {
+        const char* e = std::getenv("CRISPASR_COSYVOICE3_CFG_INTERVAL");
+        const int k = e ? atoi(e) : 1;
+        return k < 1 ? 1 : k;
+    }();
+    const bool interval_on = cfg_interval > 1 && cfg_rate != 0.0f;
+    if (interval_on)
+        use_cfg_batch = false;       // interval needs the standalone uncond forward to skip
+    std::vector<float> uncond_cache; // last computed uncond dphi [mel_n]; reused between recomputes
+    if (interval_on && std::getenv("CRISPASR_COSYVOICE3_CFG_INTERVAL_DEBUG"))
+        fprintf(stderr, "cosyvoice3_tts: interval-CFG K=%d (uncond recomputed every %d steps; first+last always)\n",
+                cfg_interval, cfg_interval);
 
     double t = t_span[0];
     double dt = t_span[1] - t_span[0];
@@ -3485,7 +3508,26 @@ float* cv3_run_solve_euler(cosyvoice3_tts_context* ctx, const float* mu, int T_m
         const float w_cond = 1.0f + cfg_rate;
         const float w_unc = cfg_rate;
         float* dphi_cond = nullptr;
-        if (cfg_rate == 0.0f) {
+        if (interval_on) {
+            // Cond fresh every step; uncond recomputed on the first + last step and
+            // every K-th step, otherwise reused from uncond_cache (the approximation).
+            dphi_cond = cv3_run_estimator_full(ctx, x.data(), T_mel, mu, spks_proj, cond, sin_emb.data());
+            if (!dphi_cond)
+                return nullptr;
+            const bool recompute_unc = (step == 1) || (step == n_steps) || (((step - 1) % cfg_interval) == 0);
+            if (recompute_unc || uncond_cache.empty()) {
+                float* dphi_unc = cv3_run_estimator_full(ctx, x.data(), T_mel, mu_zero.data(), spks_zero.data(),
+                                                         cond_zero.data(), sin_emb.data());
+                if (!dphi_unc) {
+                    free(dphi_cond);
+                    return nullptr;
+                }
+                uncond_cache.assign(dphi_unc, dphi_unc + mel_n);
+                free(dphi_unc);
+            }
+            for (size_t i = 0; i < mel_n; i++)
+                dphi_cond[i] = w_cond * dphi_cond[i] - w_unc * uncond_cache[i];
+        } else if (cfg_rate == 0.0f) {
             dphi_cond = cv3_run_estimator_full(ctx, x.data(), T_mel, mu, spks_proj, cond, sin_emb.data());
             if (!dphi_cond)
                 return nullptr;
@@ -5525,7 +5567,7 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
         fprintf(stderr, "cosyvoice3_tts: synth: generated %zu speech tokens\n", gen_tokens.size());
     }
 
-    if (const char* dump = std::getenv("COSYVOICE3_DUMP_TOKENS")) {
+    if (const char* dump = crispasr_env::get("CRISPASR_COSYVOICE3_DUMP_TOKENS")) {
         FILE* f = std::fopen(dump, "w");
         if (f) {
             std::fprintf(f, "text_ids(%zu):", text_ids.size());
@@ -5588,7 +5630,7 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
     // min() also respects a model GGUF that ships fewer steps. Override with
     // COSYVOICE3_FLOW_STEPS.
     int flow_steps = std::min((int)ctx->flow.hp.cfm_n_steps, 6);
-    if (const char* env_steps = std::getenv("COSYVOICE3_FLOW_STEPS")) {
+    if (const char* env_steps = crispasr_env::get("CRISPASR_COSYVOICE3_FLOW_STEPS")) {
         char* end = nullptr;
         const long parsed = std::strtol(env_steps, &end, 10);
         if (end != env_steps && *end == '\0' && parsed >= 1 && parsed <= 100) {

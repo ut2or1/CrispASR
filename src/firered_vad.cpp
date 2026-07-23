@@ -6,6 +6,7 @@
 #include "firered_vad.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "gguf.h"
@@ -26,7 +27,7 @@
 static bool firered_vad_use_scalar() {
     static int v = -1;
     if (v < 0)
-        v = (getenv("FIRERED_VAD_FORCE_SCALAR") != nullptr) ? 1 : 0;
+        v = (crispasr_env::get("CRISPASR_FIRERED_VAD_FORCE_SCALAR") != nullptr) ? 1 : 0;
     return v != 0;
 }
 #endif
@@ -42,7 +43,7 @@ static bool firered_vad_use_scalar() {
 static bool firered_vad_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("FIRERED_VAD_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_FIRERED_VAD_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;

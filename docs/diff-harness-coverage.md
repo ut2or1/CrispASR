@@ -82,7 +82,9 @@ archived at `cstr/chatterbox-GGUF/diff-harness-ref/`.
 | `tada-tts` | `tools/reference_backends/tada_tts.py` | — | — | **no** | torch, torchaudio, transformers |
 | `titanet` | `tools/reference_backends/titanet.py` | — | — | **no** | nemo, torch |
 | `vibevoice` | `tools/reference_backends/vibevoice.py` | — | — | **no** | librosa, safetensors, torch |
+| `tabcnn` | `tools/reference_backends/tabcnn.py` | — | — | yes | amt-tools, librosa, torch |
 | `voxcpm2-tts` | `tools/reference_backends/voxcpm2_tts.py` | — | — | yes | torch, voxcpm |
+| `voxcpm2-vae` | `tools/reference_backends/voxcpm2_vae.py` | — | — | **dumper only — see note** | torch, voxcpm |
 | `voxtral` | `tools/reference_backends/voxtral.py` | — | — | yes | torch, transformers |
 | `voxtral4b` | `tools/reference_backends/voxtral4b.py` | — | — | yes | torch, transformers |
 | `zonos-tts` | `tools/reference_backends/zonos_tts_reference.py` | — | — | yes | soundfile, torch, torchaudio |
@@ -94,6 +96,17 @@ because the reference archive is missing. Bootstrap the env, dump an
 archive, place it where the harness expects, and the existing diff
 code starts working.
 
+- `btc` (alias `btc-chords`) — **no frozen archive by design**: the reference
+  dump is regenerated on demand by passing a 4th argument (the output path) to
+  `python tools/btc_torch_parity.py`, which also doubles as the numpy/torch
+  spec for the port. Run with `crispasr-diff btc <model.gguf> <ref.gguf>
+  <audio>`; the branch lives in `examples/cli/crispasr_diff_main.cpp` and the
+  comparison itself in `btc_chords_diff()` (`src/btc_chords.cpp`). The tool
+  dumps 14 stages and 13 are scored (`input_feat` is replayed as the input
+  rather than scored). **RESULT: 13/13 stages pass at cos 1.000000, in both f32
+  and f16.** Weights (`cstr/btc-chords-GGUF`) are CC-BY-NC-SA — the registry
+  needs `--accept-license cc-by-nc-sa-4.0` / `CRISPASR_ACCEPT_LICENSE` to fetch
+  them; the upstream BTC code and CrispASR itself are MIT.
 - `canary` — `tools/bootstrap_ref_env.sh canary` then `python tools/dump_reference.py --backend canary --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/canary-ref.gguf`
 - `chatterbox` — `tools/bootstrap_ref_env.sh chatterbox` then `python tools/dump_reference.py --backend chatterbox --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/chatterbox-ref.gguf`
 - `cohere` — `tools/bootstrap_ref_env.sh cohere` then `python tools/dump_reference.py --backend cohere --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/cohere-ref.gguf`
@@ -130,7 +143,14 @@ code starts working.
 - `qwen3-tts-codec` — `tools/bootstrap_ref_env.sh qwen3-tts-codec` then `python tools/dump_reference.py --backend qwen3-tts-codec --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/qwen3-tts-codec-ref.gguf`
 - `qwen3-tts-spk` — `tools/bootstrap_ref_env.sh qwen3-tts-spk` then `python tools/dump_reference.py --backend qwen3-tts-spk --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/qwen3-tts-spk-ref.gguf`
 - `sensevoice` — `tools/bootstrap_ref_env.sh sensevoice` then `python tools/dump_reference.py --backend sensevoice --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/sensevoice-ref.gguf`
+- `tabcnn` — `pip install amt-tools librosa` then `python tools/dump_reference.py --backend tabcnn --model-dir <best_TabCNN_tablature_trancription_model> --audio <guitar.wav> --output /Volumes/backups/ai/tabcnn-ref.gguf`, then `build/bin/crispasr-diff tabcnn tabcnn-f32.gguf /Volumes/backups/ai/tabcnn-ref.gguf <guitar.wav>`. The archive stores the raw `audio`, and the diff runs the FULL pipeline from the waveform rather than replaying features — `model.frontend` is empty, so the CQT lives outside the network and a feature-replaying diff would never test it (the BTC blind spot). ⚠️ `cqt_db` is stored TRANSPOSED to `[T, n_bins]` to match `core/cqt.h`; librosa's native `[n_bins, T]` compared flat reads cos 0.66 with the norms matching, which is the transpose signature.
 - `voxcpm2-tts` — `tools/bootstrap_ref_env.sh voxcpm2-tts` then `python tools/dump_reference.py --backend voxcpm2-tts --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/voxcpm2-tts-ref.gguf`
+- `voxcpm2-vae` — ⚠️ **dumper only, no C++ consumer.** `tools/reference_backends/voxcpm2_vae.py` is registered in
+  `dump_reference.py` and produces `input_16k` / `vae_latent_patches` / `output_48k`, but
+  `examples/cli/crispasr_diff_main.cpp` has no `voxcpm2-vae` branch and `src/voxcpm2_vae.h` exposes no
+  stage-extraction entry point, so nothing can read the archive back. Producing a `ref.gguf` today therefore
+  proves nothing about the runtime. Closing this needs a `voxcpm2_vae_extract_stage()` alongside
+  `voxcpm2_extract_stage()` plus the diff-main branch — track it before treating the VAE as harness-covered.
 - `voxtral` — `tools/bootstrap_ref_env.sh voxtral` then `python tools/dump_reference.py --backend voxtral --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/voxtral-ref.gguf`
 - `voxtral4b` — `tools/bootstrap_ref_env.sh voxtral4b` then `python tools/dump_reference.py --backend voxtral4b --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/voxtral4b-ref.gguf`
 - `zonos-tts` — `tools/bootstrap_ref_env.sh zonos-tts` then `python tools/dump_reference.py --backend zonos-tts --model-dir <dir> --audio samples/jfk.wav --output /Volumes/backups/ai/zonos-tts-ref.gguf`

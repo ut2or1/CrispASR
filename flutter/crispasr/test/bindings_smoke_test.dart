@@ -101,6 +101,8 @@ void main() {
       'crispasr_cache_dir_abi',
       'crispasr_registry_lookup_abi',
       'crispasr_registry_lookup_by_filename_abi',
+      'crispasr_registry_default_bundle_info_abi',
+      'crispasr_registry_default_bundle_artifact_abi',
       // Canonical C-ABI version symbol (was `crispasr_dart_helpers_version`
       // before the file moved to `src/crispasr_c_api.cpp`).
       'crispasr_c_api_version',

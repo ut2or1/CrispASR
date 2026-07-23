@@ -22,7 +22,7 @@ source tests/env-live-tests.sh
 ctest --test-dir build --rerun-failed --output-on-failure --timeout 300
 ```
 
-Key env vars: `CRISPASR_MODELS_DIR`, `CRISPASR_MODEL_WHISPER`, `PARAFORMER_MODEL`.
+Key env vars: `CRISPASR_MODELS_DIR`, `CRISPASR_MODEL_WHISPER`, `CRISPASR_PARAFORMER_MODEL`.
 See `tests/env-live-tests.sh` for the full list.
 
 ## Lint

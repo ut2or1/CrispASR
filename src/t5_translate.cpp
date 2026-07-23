@@ -15,6 +15,7 @@
 #include "core/beam_decode.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (§232 t5 GPU path)
+#include "core/crispasr_env.h"
 #if defined(GGML_USE_METAL)
 #include "ggml-metal.h" // ggml_backend_is_metal (§232 CUDA/Vulkan-default gate)
 #endif
@@ -28,6 +29,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -42,7 +44,7 @@
 static bool t5_translate_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("T5_TRANSLATE_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_T5_TRANSLATE_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -1159,13 +1161,19 @@ extern "C" char* t5_translate(struct t5_translate_context* ctx, const char* text
     } else {
         int offset = prompt_len;
         for (int step = 0; step < max_new_tokens; step++) {
-            int best_id = 0;
-            float best_val = logits[0];
-            for (int i = 1; i < hp.vocab_size; i++) {
-                if (logits[i] > best_val) {
+            // NaN-robust argmax (see lfm2_audio note): seed -inf, skip non-finite,
+            // abort if the whole row is non-finite (else best_id=-1 gets pushed).
+            int best_id = -1;
+            float best_val = -std::numeric_limits<float>::infinity();
+            for (int i = 0; i < hp.vocab_size; i++) {
+                if (std::isfinite(logits[i]) && logits[i] > best_val) {
                     best_val = logits[i];
                     best_id = i;
                 }
+            }
+            if (best_id < 0) {
+                fprintf(stderr, "t5_translate: non-finite logits — aborting decode\n");
+                break;
             }
             if (best_id == hp.eos_token_id)
                 break;

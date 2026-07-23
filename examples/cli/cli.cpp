@@ -11,6 +11,7 @@
 #include "crispasr_stream_punc.h"      // streaming punctuation mode helpers (#112)
 #include "crispasr_cache.h"            // crispasr_cache::ensure_cached_file (for --hf-repo, #128)
 #include "core/gpu_backend_pref.h"     // crispasr_set_gpu_backend_pref (#214)
+#include "core/win_compat.h"           // setenv/unsetenv shims for MSVC
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
 #include "crispasr_output.h"   // crispasr_make_disp_segments — split-on-punct (#29)
@@ -391,6 +392,7 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.no_auto_aligner = true;
     } else if (arg == "-n" || arg == "--max-new-tokens") {
         params.max_new_tokens = std::stoi(ARGV_NEXT);
+        params.max_new_tokens_explicit = true;
     } else if (arg == "--frequency-penalty") {
         params.frequency_penalty = std::stof(ARGV_NEXT);
     } else if (arg == "-ck" || arg == "--chunk-seconds") {
@@ -484,6 +486,12 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.titanet_model = ARGV_NEXT;
     } else if (arg == "--speaker-threshold" || arg == "-st") {
         params.speaker_threshold = std::stof(ARGV_NEXT);
+    } else if (arg == "--expect-speakers") {
+        // Closed roster (issue #266): the deployer asserts these enrolled,
+        // consenting participants are present in the recording; matching
+        // runs per global speaker cluster and ONLY against these names.
+        // Required for --speaker-db matching — there is no open 1:N mode.
+        params.expect_speakers = ARGV_NEXT;
     } else if (arg == "--diarize-embedder") {
         params.diarize_embedder = ARGV_NEXT;
     } else if (arg == "--diarize-speakers") {
@@ -641,6 +649,15 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.tts_no_spoken_disclaimer = true;
     } else if (arg == "--no-watermark") {
         params.tts_no_watermark = true;
+    } else if (arg == "--accept-marking-responsibility") {
+        // Explicit attestation required to honor any provenance opt-out
+        // (--no-watermark / --no-spoken-disclaimer / --no-c2pa). By passing this
+        // the operator affirms AI-content marking/disclosure responsibility is theirs.
+        params.tts_marking_responsibility_accepted = true;
+        if (params.tts_marking_attestation.empty())
+            params.tts_marking_attestation = "CLI --accept-marking-responsibility flag";
+    } else if (arg == "--no-c2pa") {
+        params.tts_no_c2pa = true;
     } else if (arg == "--cors-origin") {
         params.server_cors_origin = ARGV_NEXT;
     } else if (arg == "--chat-model") {
@@ -668,6 +685,18 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.translate_source_lang = whisper_param_turn_lowercase(ARGV_NEXT);
     } else if (arg == "-trtl" || arg == "--tr-tl" || arg == "--translate-target-lang") {
         params.translate_target_lang = whisper_param_turn_lowercase(ARGV_NEXT);
+    } else if (arg == "--accept-license") {
+        if (++i >= argc) {
+            fprintf(stderr, "error: --accept-license requires an SPDX tag (or \"all\")\n");
+            return false;
+        }
+        params.accept_license = argv[i];
+        // Publish via the env var the library already consults rather than
+        // calling into crispasr-lib: cli.cpp links ahead of it (see the
+        // left-to-right static-link note in examples/cli/CMakeLists.txt), and
+        // this reaches every resolve path — CLI, session C-ABI, server —
+        // without threading a parameter through 46 call sites.
+        setenv("CRISPASR_ACCEPT_LICENSE", params.accept_license.c_str(), /*overwrite=*/1);
     } else if (arg == "--auto-download") {
         params.auto_download = true;
     } else if (arg == "--hf-repo" || arg == "-hfr") {
@@ -777,6 +806,46 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.vad_samples_overlap = std::stof(ARGV_NEXT);
     } else if (arg == "--vad-stitch") {
         params.vad_stitch = true;
+    } else if (arg == "--vad-export") {
+        params.vad_export_file = ARGV_NEXT;
+        params.vad = true; // #227: export implies VAD
+    } else if (arg == "--vad-import") {
+        params.vad_import_file = ARGV_NEXT;
+        params.vad = true; // #227: import implies VAD
+    } else if (arg == "--vad-import-strict") {
+        params.vad_import_strict = true; // #227: refuse a chunk-length mismatch
+    } else if (arg == "--vad-export-raw") {
+        params.vad_export_file = ARGV_NEXT;
+        params.vad_export_raw = true; // #227: export raw speech segments, not chunks
+        params.vad = true;
+    } else if (arg == "--separate") {
+        params.separate = true; // §248 source separation task
+    } else if (arg == "--stems") {
+        params.stems = ARGV_NEXT;
+    } else if (arg == "--sep-output-dir") {
+        params.sep_output_dir = ARGV_NEXT;
+    } else if (arg == "--beats") {
+        params.beats = true; // beat / downbeat tracking task — beat-this
+    } else if (arg == "--beats-format") {
+        params.beats_format = ARGV_NEXT;
+    } else if (arg == "--piano") {
+        params.piano = true; // piano transcription task — note events out
+    } else if (arg == "--piano-format") {
+        params.piano_format = ARGV_NEXT;
+    } else if (arg == "--tab") {
+        params.tab = true; // guitar tablature task — tabcnn
+    } else if (arg == "--tab-format") {
+        params.tab_format = ARGV_NEXT;
+    } else if (arg == "--chords") {
+        params.chords = true; // chord recognition task — btc
+    } else if (arg == "--chords-format") {
+        params.chords_format = ARGV_NEXT;
+    } else if (arg == "--pitch") {
+        params.pitch = true; // pitch (F0) task — crepe
+    } else if (arg == "--pitch-format") {
+        params.pitch_format = ARGV_NEXT;
+    } else if (arg == "--pitch-hop-ms") {
+        params.pitch_hop_ms = std::stof(ARGV_NEXT);
     } else {
         return false;
     }
@@ -931,7 +1000,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.print_special ? "true" : "false");
     fprintf(stderr, "  -pc,       --print-colors         [%-7s] print colors\n",
             params.print_colors ? "true" : "false");
-    fprintf(stderr, "             --print-confidence     [%-7s] print confidence\n",
+    fprintf(stderr,
+            "             --print-confidence     [%-7s] print per-token confidence (word[NN%%]) after the transcript\n",
             params.print_confidence ? "true" : "false");
     fprintf(stderr, "  -pp,       --print-progress       [%-7s] print progress\n",
             params.print_progress ? "true" : "false");
@@ -1043,6 +1113,29 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
                     "segmentation + session-scoped speaker clustering for stable per-recording (speaker N) labels. "
                     "Transient only: identifies no one, no voiceprint database, no names stored. See "
                     "docs/diarization-speakers.md\n");
+    fprintf(stderr,
+            "  --speaker-db DIR                  [%-7s] directory of enrolled voiceprint profiles (<name>.spkr). "
+            "Identification runs per global speaker cluster and ONLY against the closed roster named via "
+            "--expect-speakers; requires --speaker-db-consent. See docs/diarization-speakers.md\n",
+            params.speaker_db.c_str());
+    fprintf(stderr,
+            "  --expect-speakers NAMES           [%-7s] comma-separated enrolled participants you assert are "
+            "present in this recording (e.g. \"Alice,Bob\"). REQUIRED with --speaker-db: matching is a "
+            "claimed-participant confirmation, never an open who-is-this search. Unmatched clusters keep "
+            "anonymous (speaker N) labels\n",
+            params.expect_speakers.c_str());
+    fprintf(stderr,
+            "  --enroll-speaker NAME             [%-7s] enroll the input audio as NAME into --speaker-db "
+            "and exit. Requires --speaker-db-consent (records the consent attestation in the profile)\n",
+            params.enroll_speaker.c_str());
+    fprintf(stderr,
+            "  --speaker-threshold X, -st X      [%-7.2f] cosine threshold for cluster-to-profile matching "
+            "(below it a cluster stays anonymous)\n",
+            params.speaker_threshold);
+    fprintf(stderr,
+            "  --titanet-model PATH              [%-7s] TitaNet GGUF for enrollment/identification "
+            "embeddings (default: auto-download)\n",
+            params.titanet_model.c_str());
     fprintf(stderr,
             "  --speaker-db-consent              [%-7s] REQUIRED to use the biometric named-profile path "
             "(--enroll-speaker / --speaker-db). Affirms you have a lawful basis (GDPR Art. 9) and explicit "
@@ -1168,14 +1261,16 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr, "             --s2s                   [%-7s] speech-to-speech mode: audio input → audio output\n",
             params.s2s ? "true" : "false");
     fprintf(stderr,
-            "             --s2s-output FNAME      [%-7s] output path: .wav, .mp3, .aac (default: s2s_output.wav)\n",
+            "             --s2s-output FNAME      [%-7s] output path: .wav, .mp3, .m4a, .mp4, .aac, .opus (default: "
+            "s2s_output.wav)\n",
             params.s2s_output.c_str());
 
     fprintf(stderr, "\nText-to-speech (TTS) options:\n");
     fprintf(stderr,
             "             --tts \"TEXT\"            synthesise TEXT and write audio to --tts-output (24 kHz mono)\n");
     fprintf(stderr,
-            "             --tts-output FNAME      [%-7s] output path: .wav, .mp3, .aac (default: tts_output.wav)\n",
+            "             --tts-output FNAME      [%-7s] output path: .wav, .mp3, .m4a, .mp4, .aac, .opus (default: "
+            "tts_output.wav)\n",
             params.tts_output.c_str());
     fprintf(stderr, "             --tts-stream            stream s16le mono PCM to stdout per sentence (pipe to a "
                     "player); logs stay on stderr\n");
@@ -1183,13 +1278,29 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "             --voice PATH            [%-7s] voice prompt: GGUF voice pack or reference WAV\n"
             "                                                 (.wav → 1.5B WAV cloning; .gguf → voice pack)\n",
             params.tts_voice.c_str());
-    fprintf(stderr,
-            "             --i-have-rights                    required for voice cloning (.wav); attests consent\n"
-            "                                                 of the cloned speaker or that it is your own voice\n"
-            "             --no-spoken-disclaimer              skip audible AI-disclosure prefix on voice-cloned\n"
-            "                                                 output (watermark + C2PA provenance still applied)\n"
-            "             --no-watermark                     disable AI-content watermark on TTS output; marking\n"
-            "                                                 responsibility then rests with the operator\n");
+    fprintf(
+        stderr,
+        "             --i-have-rights                    required for voice cloning (.wav); attests consent\n"
+        "             --accept-license TAG                accept a restricted model licence (SPDX tag, or 'all');\n"
+        "                                                required before downloading cc-by-nc-*/gemma/llama* weights\n"
+        "                                                 of the cloned speaker or that it is your own voice\n"
+        "             --no-spoken-disclaimer              skip audible AI-disclosure prefix on voice-cloned\n"
+        "                                                 output (watermark + C2PA provenance still applied)\n"
+        "             --no-watermark                     disable AI-content audio watermark on TTS output;\n"
+        "                                                 marking responsibility then rests with the operator.\n"
+        "                                                 REQUIRES --accept-marking-responsibility. Honored only\n"
+        "                                                 when the output still carries a C2PA manifest\n"
+        "                                                 (WAV/MP3/M4A/MP4); for raw .aac/.opus and --tts-stream\n"
+        "                                                 it is overridden (watermark kept) so no CLI output is\n"
+        "                                                 ever fully unmarked.\n"
+        "             --no-c2pa                          disable C2PA Content Credentials signing on synthesized\n"
+        "                                                 output. REQUIRES --accept-marking-responsibility. On the\n"
+        "                                                 CLI the audio watermark is then forced on (watertight);\n"
+        "                                                 on the server the operator takes on the marking duty.\n"
+        "             --accept-marking-responsibility   explicit attestation REQUIRED to honor any provenance\n"
+        "                                                 opt-out (--no-watermark / --no-spoken-disclaimer /\n"
+        "                                                 --no-c2pa): you affirm AI-content marking/disclosure\n"
+        "                                                 duty is yours.\n");
     fprintf(stderr,
             "             --ref-text \"TEXT\"        reference transcription (qwen3-tts/f5-tts; auto-transcribed "
             "if omitted)\n");
@@ -1297,6 +1408,61 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr,
             "  -vo N,     --vad-samples-overlap         N [%-7.2f] VAD samples overlap (seconds between segments)\n",
             params.vad_samples_overlap);
+    fprintf(stderr,
+            "             --vad-export FILE            [%-7s] write computed VAD/chunk boundaries to FILE (JSON)\n",
+            params.vad_export_file.empty() ? "none" : params.vad_export_file.c_str());
+    fprintf(
+        stderr,
+        "             --vad-import FILE            [%-7s] read segment boundaries from FILE instead of running VAD\n"
+        "             --vad-import-strict          [%-7s] refuse (not warn) if the file's chunk length differs\n"
+        "             --vad-export-raw FILE        [%-7s] export RAW speech segments (chunk-independent, re-chunked on "
+        "import)\n",
+        params.vad_import_file.empty() ? "none" : params.vad_import_file.c_str(),
+        params.vad_import_strict ? "true" : "false", params.vad_export_raw ? "true" : "false");
+    fprintf(stderr,
+            "             --separate                  [%-7s] source separation task; writes <input>_<stem>.wav "
+            "(mel-band-roformer / htdemucs, arch auto-detected)\n",
+            params.separate ? "true" : "false");
+    fprintf(stderr, "             --stems LIST                [%-7s] comma-separated stems to write (default all)\n",
+            params.stems.empty() ? "all" : params.stems.c_str());
+    fprintf(stderr,
+            "             --sep-output-dir DIR        [%-7s] directory for separated stems (default: next to "
+            "input)\n",
+            params.sep_output_dir.empty() ? "none" : params.sep_output_dir.c_str());
+    fprintf(stderr,
+            "             --pitch                     [%-7s] pitch (F0) task; prints time_ms/f0_hz/voiced_prob per "
+            "frame (crepe, arch auto-detected)\n",
+            params.pitch ? "true" : "false");
+    fprintf(stderr, "             --pitch-format FMT          [%-7s] pitch output format: text or json\n",
+            params.pitch_format.empty() ? "text" : params.pitch_format.c_str());
+    fprintf(stderr, "             --pitch-hop-ms MS           [%-7.1f] pitch analysis hop in milliseconds\n",
+            params.pitch_hop_ms);
+    fprintf(stderr,
+            "             --piano                     [%-7s] piano transcription; prints "
+            "onset/offset/midi/name/velocity per note\n",
+            params.piano ? "true" : "false");
+    fprintf(stderr, "             --piano-format FMT          [%-7s] piano output format: text or json\n",
+            params.piano_format.empty() ? "text" : params.piano_format.c_str());
+    fprintf(stderr,
+            "             --chords                    [%-7s] chord recognition; prints start/end/chord per span "
+            "(btc, arch auto-detected). Weights are CC-BY-NC-SA — needs "
+            "--accept-license cc-by-nc-sa-4.0\n",
+            params.chords ? "true" : "false");
+    fprintf(stderr, "             --chords-format FMT         [%-7s] chord output format: text or json\n",
+            params.chords_format.empty() ? "text" : params.chords_format.c_str());
+    fprintf(stderr,
+            "             --tab                       [%-7s] guitar tablature; prints per-frame fret per string "
+            "(tabcnn, arch auto-detected). Emission SCORES — displayed frets are a plain argmax with no "
+            "playability constraints; use the C ABI for a real decoder. CC BY 4.0, attribution required\n",
+            params.tab ? "true" : "false");
+    fprintf(stderr, "             --tab-format FMT            [%-7s] tab output format: text or json\n",
+            params.tab_format.empty() ? "text" : params.tab_format.c_str());
+    fprintf(stderr,
+            "             --beats                     [%-7s] beat/downbeat tracking; prints time and beat|downbeat "
+            "per line (beat-this, arch auto-detected). MIT weights, no DBN\n",
+            params.beats ? "true" : "false");
+    fprintf(stderr, "             --beats-format FMT          [%-7s] beat output format: text or json\n",
+            params.beats_format.empty() ? "text" : params.beats_format.c_str());
     fprintf(stderr, "\n");
 }
 
@@ -2220,6 +2386,44 @@ int main(int argc, char** argv) {
         return crispasr_run_backend(params);
     }
 
+    // §248: --separate is a standalone source-separation verb. Route straight to
+    // the dispatcher (crispasr_run_separate) before any ASR backend detection —
+    // the separation model is not a transcribe backend and must not be loaded as
+    // whisper.
+    if (params.separate) {
+        return crispasr_run_backend(params);
+    }
+
+    // --pitch is a standalone pitch-estimation verb, same shape as --separate:
+    // audio in, pitch frames out. Route before any ASR backend detection.
+    if (params.pitch) {
+        return crispasr_run_backend(params);
+    }
+
+    // --chords is a standalone chord-recognition verb, same shape as --pitch:
+    // audio in, a chord timeline out. Route before any ASR backend detection —
+    // otherwise the BTC GGUF is handed to whisper_model_load, which rejects it
+    // as "invalid model data (bad magic)".
+    if (params.chords) {
+        return crispasr_run_backend(params);
+    }
+
+    // --piano is a standalone piano-transcription verb, same shape as --chords:
+    // audio in, note events out. Route before any ASR backend detection —
+    // otherwise the piano GGUF is handed to whisper_model_load, which rejects
+    // it as "invalid model data (bad magic)".
+    if (params.piano) {
+        return crispasr_run_backend(params);
+    }
+
+    // --beats is a standalone beat-tracking verb, same shape as --chords:
+    // audio in, a beat/downbeat grid out. Route before any ASR backend
+    // detection — otherwise the beat-this GGUF is handed to
+    // whisper_model_load, which rejects it as "invalid model data (bad magic)".
+    if (params.beats) {
+        return crispasr_run_backend(params);
+    }
+
     if (params.fname_inp.empty() && !params.stream && params.tts_text.empty() && params.text_input.empty() &&
         !params.make_ref && !params.align) {
         fprintf(stderr, "error: no input files specified\n");
@@ -2236,6 +2440,15 @@ int main(int argc, char** argv) {
             params.backend = "whisper"; // any backend, enrollment exits before init
         const int rc = crispasr_run_backend(params);
         return rc;
+    }
+
+    // Issue #227: --vad-export is a standalone verb that only needs audio +
+    // Silero VAD — no ASR model required. Route to crispasr_run_backend()
+    // which handles the short circuit before backend init.
+    if (!params.vad_export_file.empty() && !params.fname_inp.empty()) {
+        if (params.backend.empty())
+            params.backend = "whisper"; // any backend name, export exits before init
+        return crispasr_run_backend(params);
     }
 
     // crispasr backend dispatch ---------------------------------------------
@@ -2266,8 +2479,14 @@ int main(int argc, char** argv) {
             }
         }
 
+        // --vad-import is implemented in crispasr_run.cpp's process_one_input,
+        // which the LEGACY whisper path below never reaches. Without this the
+        // flag was accepted and silently did nothing: `--vad-import
+        // /nonexistent.json` returned 0 and transcribed normally, so the whole
+        // point of #227 (pay VAD once, reuse across models) was a no-op in the
+        // most ordinary invocation. Route those runs through the dispatch.
         if (explicit_backend || model_is_auto || auto_detected_non_whisper || params.stream ||
-            !params.tts_text.empty()) {
+            !params.tts_text.empty() || !params.vad_import_file.empty()) {
             const int rc = crispasr_run_backend(params);
 #if defined(_WIN32)
             // Bypass global C++ destructors (ggml Vulkan device teardown can
@@ -2281,6 +2500,22 @@ int main(int argc, char** argv) {
         }
     }
     // -----------------------------------------------------------------------
+
+    // The legacy whisper-native path below (issue #266) has never wired up
+    // named speaker identification: it predates crispasr_apply_global_speaker_stages()
+    // and does not run the post-merge cluster-matching stage the unified
+    // dispatcher (crispasr_run_backend / crispasr_run.cpp) uses. Warn once so
+    // --speaker-db doesn't silently do nothing.
+    if (!params.speaker_db.empty()) {
+        static bool warned_legacy_speaker_db = false;
+        if (!warned_legacy_speaker_db) {
+            warned_legacy_speaker_db = true;
+            fprintf(stderr, "crispasr: warning: --speaker-db is ignored on the legacy whisper path "
+                            "(no --backend given). Named speaker identification is only supported via "
+                            "the unified backend dispatch — pass --backend whisper (or any other "
+                            "backend) to use --speaker-db.\n");
+        }
+    }
 
     if (params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1) {
         fprintf(stderr, "error: unknown language '%s'\n", params.language.c_str());
@@ -2527,8 +2762,10 @@ int main(int argc, char** argv) {
             // FireRedVAD (GGUF) is not compatible with whisper's internal
             // Silero-only VAD loader (#34). Detect and warn.
             const bool firered_vad = crispasr_vad_is_firered(params);
-            const std::string resolved_vad_path = firered_vad ? "" : crispasr_resolve_vad_model(params);
-            wparams.vad = firered_vad ? false : params.vad;
+            const bool webrtc_vad = crispasr_vad_is_webrtc(params);
+            const bool external_vad = firered_vad || webrtc_vad;
+            const std::string resolved_vad_path = external_vad ? "" : crispasr_resolve_vad_model(params);
+            wparams.vad = external_vad ? false : params.vad;
             wparams.vad_model_path = resolved_vad_path.c_str();
             if (firered_vad) {
                 fprintf(stderr, "crispasr: warning: FireRedVAD is not supported in the legacy whisper path.\n"

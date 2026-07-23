@@ -89,6 +89,11 @@ void crispasr_print_stdout(const std::vector<crispasr_disp_segment>& segs, bool 
 // confidence and top-N alternative candidates, inspired by antirez/voxtral.c.
 void crispasr_print_alternatives(const std::vector<crispasr_segment>& segs, int n_alt);
 
+// Print each segment's transcript with an inline per-token confidence
+// annotation (`--print-confidence`). One line per segment: `word[95%]
+// word[88%] ...`. Segments with no token-level info print their plain text.
+void crispasr_print_confidence(const std::vector<crispasr_segment>& segs);
+
 // ---------------------------------------------------------------------------
 // String-based formatters (for HTTP server responses, in-memory use).
 // These mirror the file-based writers above but return std::string.

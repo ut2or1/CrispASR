@@ -59,6 +59,10 @@ int moss_diarize_transcribe_segments(struct moss_diarize_context* ctx, const flo
 // Set hotwords for prompt injection (comma-separated). Pass NULL to clear.
 void moss_diarize_set_hotwords(struct moss_diarize_context* ctx, const char* hotwords);
 
+// #292: forward --max-new-tokens. <= 0 keeps the backend's 1024 default (diarize
+// output is long; the global 512 truncates single-pass long audio).
+void moss_diarize_set_max_new_tokens(struct moss_diarize_context* ctx, int max_new_tokens);
+
 // Beam search width. 1 = greedy (default); >1 = beam search.
 void moss_diarize_set_beam_size(struct moss_diarize_context* ctx, int beam_size);
 

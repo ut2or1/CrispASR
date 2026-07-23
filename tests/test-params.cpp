@@ -51,6 +51,9 @@ TEST_CASE("whisper_params: speaker_db / enroll_speaker / diarize_embedder defaul
     REQUIRE(kDefaults.speaker_db.empty());
     REQUIRE(kDefaults.enroll_speaker.empty());
     REQUIRE(kDefaults.diarize_embedder.empty());
+    // #266: no default claimed roster — --speaker-db matching hard-errors
+    // until the deployer names the participants via --expect-speakers.
+    REQUIRE(kDefaults.expect_speakers.empty());
 }
 
 TEST_CASE("whisper_params: speaker_threshold defaults to 0.7", "[unit]") {

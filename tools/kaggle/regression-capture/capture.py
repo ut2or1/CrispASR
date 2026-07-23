@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """
 CrispASR regression transcript capture — Kaggle GPU kernel.
@@ -46,6 +47,11 @@ def main():
     # Harness (best effort)
     try:
         import kaggle_harness as kh
+        # Full harness regime: authenticate HF pulls from the attached token
+        # dataset (anon pulls get rate-limited); hf_transfer wedges multi-GB
+        # Kaggle downloads, so keep the plain resumable downloader.
+        kh.resolve_hf_token()
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
         kh.init_progress()
         kh.setup_hf_token()
         kh.install_build_toolchain()
@@ -69,7 +75,7 @@ def main():
     results["_status"] = "building"
     save_results()
     build_dir = _CRISPASR_DIR / "build"
-    cmake_args = ["-DCMAKE_BUILD_TYPE=Release"]
+    cmake_args = ["-DCMAKE_BUILD_TYPE=Release", "-DCRISPASR_NO_C2PA_NATIVE=ON"]
     if shutil.which("ninja"):
         cmake_args += ["-G", "Ninja"]
     if shutil.which("ccache"):

@@ -58,6 +58,9 @@ void moss_transcribe_transcribe_cb(struct moss_transcribe_context* ctx, const fl
 // Beam search. 1 = greedy (default). >1 = beam search (core_beam_decode).
 void moss_transcribe_set_beam_size(struct moss_transcribe_context* ctx, int beam_size);
 
+// #292: forward --max-new-tokens. <= 0 keeps the backend's 512 default.
+void moss_transcribe_set_max_new_tokens(struct moss_transcribe_context* ctx, int max_new_tokens);
+
 // ---- Stage helpers for differential testing (crispasr-diff) ----
 
 // Compute 128-bin log-mel spectrogram (Whisper-style, n_fft 400, hop 160).

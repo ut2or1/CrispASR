@@ -11,6 +11,7 @@
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -35,7 +36,7 @@
 static bool omniasr_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("OMNIASR_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_OMNIASR_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -176,7 +177,7 @@ struct omniasr_perf {
 };
 
 static void omniasr_perf_print(const omniasr_perf& p, int n_samples, int verbosity) {
-    const char* bench = getenv("OMNIASR_BENCH");
+    const char* bench = crispasr_env::get("CRISPASR_OMNIASR_BENCH");
     if (verbosity < 2 && (!bench || !bench[0]))
         return;
     const double audio_s = n_samples / 16000.0;
@@ -665,7 +666,7 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
     ggml_context* ctx0 = ggml_init(gp);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 65536, false);
 
-    const char* dump_dir = getenv("OMNIASR_DUMP_DIR");
+    const char* dump_dir = crispasr_env::get("CRISPASR_OMNIASR_DUMP_DIR");
 
     // Input normalization: layer_norm(waveform) — zero mean, unit variance
     // This is a wav2vec2 convention, required for OmniASR.

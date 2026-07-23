@@ -10,6 +10,7 @@
 // DRY: reuses core/gguf_loader.h, core/mel.h, core/fastconformer.h, core/attention.h
 
 #include "lfm2_audio.h"
+#include "core/crispasr_env.h"
 #include "core/win_compat.h"
 
 #include "ggml.h"
@@ -31,6 +32,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -45,7 +47,7 @@
 static bool lfm2_audio_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("LFM2_AUDIO_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_LFM2_AUDIO_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -1323,14 +1325,20 @@ char* lfm2_audio_transcribe(lfm2_audio_context* ctx, const float* samples, int n
     }
 
     for (int step = 0; step < max_tokens; step++) {
-        // Greedy argmax
-        int best_id = 0;
-        float best_val = logits[0];
-        for (int i = 1; i < (int)logits.size(); i++) {
-            if (logits[i] > best_val) {
+        // Greedy argmax — NaN-robust: a non-finite logits[0] would freeze best_id
+        // at 0 (x > NaN is always false), silently spewing token 0. Seed from
+        // -inf, skip non-finite, and abort if the whole row is non-finite.
+        int best_id = -1;
+        float best_val = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < (int)logits.size(); i++) {
+            if (std::isfinite(logits[i]) && logits[i] > best_val) {
                 best_val = logits[i];
                 best_id = i;
             }
+        }
+        if (best_id < 0) {
+            fprintf(stderr, "lfm2_audio: non-finite logits — aborting decode\n");
+            break;
         }
 
         // Stop on <|im_end|> or <|endoftext|>
@@ -1670,7 +1678,7 @@ float* lfm2_audio_run_lfm(lfm2_audio_context* ctx, const float* samples, int n_s
 
     // Run all 16 LFM2 layers, with optional per-layer snapshots
     std::vector<ggml_tensor*> layer_snaps(hp.lfm_n_layers, nullptr);
-    bool do_snaps = (std::getenv("LFM2_SNAP_LAYERS") != nullptr);
+    bool do_snaps = (crispasr_env::get("CRISPASR_LFM2_SNAP_LAYERS") != nullptr);
 
     for (uint32_t i = 0; i < hp.lfm_n_layers; i++) {
         x = lfm2_build_layer(ctx0, x, model.lfm_layers[i], positions, mask, hidden, n_heads, n_kv, hd, T, norm_eps);

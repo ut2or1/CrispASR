@@ -47,8 +47,11 @@ std::string crispasr_resolve_vad_model(const whisper_params& p) {
         return "";
     // Explicit path (not a keyword) — use as-is
     if (!v.empty() && v != "auto" && v != "default" && v != "silero" && v != "firered" && v != "whisper-vad" &&
-        v != "marblenet")
+        v != "marblenet" && v != "webrtc")
         return v;
+    // `--vad -vm webrtc` → WebRTC GMM VAD (no model file, pure algorithmic, BSD-3)
+    if (v == "webrtc")
+        return "webrtc";
     // `--vad -vm firered` → auto-download FireRedVAD (2.4 MB, F1=97.57%)
     if (v == "firered")
         return crispasr_cache::ensure_cached_file(kVadFireredFile, kVadFireredUrl, p.no_prints, "crispasr[vad]",
@@ -68,6 +71,10 @@ std::string crispasr_resolve_vad_model(const whisper_params& p) {
 bool crispasr_vad_is_firered(const whisper_params& p) {
     std::string path = crispasr_resolve_vad_model(p);
     return !path.empty() && is_firered_vad_path(path);
+}
+
+bool crispasr_vad_is_webrtc(const whisper_params& p) {
+    return p.vad_model == "webrtc";
 }
 
 std::vector<crispasr_audio_slice> crispasr_compute_audio_slices(const float* samples, int n_samples, int sample_rate,
@@ -96,6 +103,9 @@ std::vector<crispasr_audio_slice> crispasr_compute_audio_slices(const float* sam
         // that case). We detect this by checking if the model file exists
         // and is readable — if it does, the VAD ran and "no speech" is the
         // correct answer.
+        // WebRTC VAD has no model file — the sentinel "webrtc" means it ran.
+        if (vad_path == "webrtc")
+            return slices;
         FILE* f = fopen(vad_path.c_str(), "rb");
         if (f) {
             fclose(f);

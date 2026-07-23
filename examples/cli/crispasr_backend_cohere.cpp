@@ -14,6 +14,7 @@
 #include "crispasr_backend_utils.h"
 #include "whisper_params.h"
 #include "core/ngram_loop_fix.h"
+#include "core/crispasr_env.h"
 
 #include "cohere.h"
 
@@ -47,7 +48,7 @@ public:
         cp.no_punctuation = !p.punctuation;
         cp.diarize = false;
         cp.verbosity = p.no_prints ? 0 : 1;
-        if (getenv("CRISPASR_VERBOSE") || getenv("COHERE_BENCH"))
+        if (getenv("CRISPASR_VERBOSE") || crispasr_env::get("CRISPASR_COHERE_BENCH"))
             cp.verbosity = 2;
 
         ctx_ = cohere_init_from_file(p.model.c_str(), cp);

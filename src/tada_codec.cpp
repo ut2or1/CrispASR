@@ -21,6 +21,7 @@
 #include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -48,7 +49,7 @@
 static bool tada_codec_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("TADA_CODEC_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_TADA_CODEC_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -838,7 +839,7 @@ float* tada_codec_decode(struct tada_codec_context* ctx, const float* features, 
     }
 
     const bool dump_stats = [] {
-        const char* e = std::getenv("TADA_CODEC_DUMP");
+        const char* e = crispasr_env::get("CRISPASR_TADA_CODEC_DUMP");
         return e && *e && *e != '0';
     }();
     if (dump_stats) {

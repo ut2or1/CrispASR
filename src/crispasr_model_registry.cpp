@@ -5,6 +5,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#ifdef _WIN32
+#include <io.h>
+#define isatty _isatty
+#define fileno _fileno
+#else
+#include <unistd.h>
+#endif
 #include <cstdio>
 #include <vector>
 
@@ -42,6 +50,12 @@ struct ExtraList {
 constexpr Entry k_registry[] = {
     {"whisper", "ggml-base.bin",
      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin", "~147 MB", nullptr, nullptr},
+    // Tiron (#295, EXPERIMENTAL): Whisper large-v3 + inline <|speakerN|> markers.
+    // `--backend tiron -m auto` (alias → whisper backend in crispasr_backend.cpp);
+    // the whisper loader auto-detects the speaker vocab and enables the tiron
+    // constrained-decoding grammar. Apache-2.0 (base Trelis/tiron).
+    {"tiron", "tiron-q4_k.bin",
+     "https://huggingface.co/cstr/tiron-GGML/resolve/main/tiron-q4_k.bin", "~889 MB", nullptr, nullptr},
     // AudioSeal (Meta FAIR) — optional NEURAL watermark model (MIT code + weights).
     // Not a transcription/TTS backend: resolved by the name "audioseal" when the
     // user passes `--watermark-model auto`. CrispASR's built-in zero-dependency
@@ -49,6 +63,17 @@ constexpr Entry k_registry[] = {
     // SOTA upgrade (imperceptible + robust neural watermark). #260.
     {"audioseal", "audioseal.gguf",
      "https://huggingface.co/cstr/audioseal-GGUF/resolve/main/audioseal.gguf", "~89 MB", nullptr, nullptr},
+    // §248 source separation (--separate). Mel-Band RoFormer vocal/instrumental
+    // split; MIT weights (KimberleyJSN) + MIT code (lucidrains). Resolved when
+    // `--separate` runs with the default separation backend key.
+    {"mel-band-roformer", "mel-band-roformer-vocals-f16.gguf",
+     "https://huggingface.co/cstr/mel-band-roformer-vocals-GGUF/resolve/main/mel-band-roformer-vocals-f16.gguf",
+     "~436 MB", nullptr, nullptr},
+    // Sidon v0.1 (SaruLab) speech restoration (--s2s). w2v-BERT predictor +
+    // continuous DAC decoder; MIT. Q8_0 is the best-fidelity practical quant
+    // (predictor cos 0.998 vs the upstream F32; ASR round-trip identical). #283.
+    {"sidon", "sidon-v0.1-q8_0.gguf",
+     "https://huggingface.co/cstr/Sidon-GGUF/resolve/main/sidon-v0.1-q8_0.gguf", "~335 MB", nullptr, nullptr},
     {"nemotron", "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
      "https://huggingface.co/cstr/nemotron-3.5-asr-streaming-0.6b-GGUF/resolve/main/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
      "~458 MB", nullptr, nullptr},
@@ -320,6 +345,103 @@ constexpr Entry k_registry[] = {
      nullptr, nullptr,
      "CC-BY-NC-4.0 — NON-COMMERCIAL use only (base model mistralai/Voxtral-4B-TTS-2603; see "
      "https://huggingface.co/mistralai/Voxtral-4B-TTS-2603)"},
+    {"htdemucs", "htdemucs-q4_k.gguf",
+     "https://huggingface.co/cstr/htdemucs-GGUF/resolve/main/htdemucs-q4_k.gguf", "~38 MB", nullptr, nullptr},
+    // BTC chord recognition (--chords). Upstream CODE is MIT, but the SHIPPED
+    // WEIGHTS are CC-BY-NC-SA: they were trained on Isophonics / Robbie
+    // Williams / UsPop2002 chord annotations, which are non-commercial. The
+    // licence field below is what arms the acceptance gate — without it these
+    // would download silently to commercial users.
+    //
+    // DEFAULT IS THE 170-CLASS MODEL: it collapses to the 25-class maj/min
+    // vocabulary on demand (CRISPASR_BTC_MAJ_MIN=1), whereas a 25-class model
+    // can never be expanded. One model, two output modes.
+    {"btc-chords", "btc-chords-large-f16.gguf",
+     "https://huggingface.co/cstr/btc-chords-GGUF/resolve/main/btc-chords-large-f16.gguf", "~6 MB", nullptr, nullptr,
+     nullptr, "cc-by-nc-sa-4.0"},
+    {"btc-chords-large", "btc-chords-large-f16.gguf",
+     "https://huggingface.co/cstr/btc-chords-GGUF/resolve/main/btc-chords-large-f16.gguf", "~6 MB", nullptr, nullptr,
+     nullptr, "cc-by-nc-sa-4.0"},
+    {"btc-chords-majmin", "btc-chords-f16.gguf",
+     "https://huggingface.co/cstr/btc-chords-GGUF/resolve/main/btc-chords-f16.gguf", "~6 MB", nullptr, nullptr, nullptr,
+     "cc-by-nc-sa-4.0"},
+    // q8_0 — 4.5 MB, and indistinguishable from f16: 13/13 diff stages, and on
+    // 257 s of real music vs the torch reference root 99.17 % / tetrads
+    // 98.52 % (f16 is 99.17 / 98.56). NO q4_k is published: it costs 3.1 points
+    // of tetrad accuracy (95.46 %) to save 0.6 MB. Quantize from the f16 — only
+    // 73/213 tensors are quantizable, so a q8_0 built from f32 lands at 7.5 MB,
+    // LARGER than the f16 it was meant to shrink.
+    {"btc-chords-q8_0", "btc-chords-large-q8_0.gguf",
+     "https://huggingface.co/cstr/btc-chords-GGUF/resolve/main/btc-chords-large-q8_0.gguf", "~4.5 MB", nullptr, nullptr,
+     nullptr, "cc-by-nc-sa-4.0"},
+    {"btc-chords-majmin-q8_0", "btc-chords-q8_0.gguf",
+     "https://huggingface.co/cstr/btc-chords-GGUF/resolve/main/btc-chords-q8_0.gguf", "~4.4 MB", nullptr, nullptr,
+     nullptr, "cc-by-nc-sa-4.0"},
+    // Beat This! beat/downbeat tracking (--beats). MIT for code AND weights,
+    // so no licence gate — deliberately unlike btc-chords above. The reason it
+    // can be MIT at all is that it needs no DBN: madmom's is Boeck-patented and
+    // non-commercial, and this model reaches SOTA without one.
+    //
+    // DEFAULT IS F16: cos >= 0.9999997 per stage against the torch reference,
+    // with the residual flat across all 12 sub-blocks (weight quantisation, not
+    // drift). f32 is exact (cos = 1.00000000, rel err ~1e-6) and is kept for
+    // parity debugging, not for production — it is 2x the size for no
+    // measurable difference in detected beats.
+    // TabCNN guitar tablature (--tab). Weights are CC BY 4.0 from the EGSet12
+    // record (https://zenodo.org/records/11406378) — attribution required, commercial
+    // use permitted. This is the GuitarProFX-augmented variant: the vanilla
+    // GuitarSet-trained model collapses from tablature F1 0.748 to 0.447 on
+    // real electric guitar, the augmented one recovers to 0.585 (DAFx-24).
+    {"tabcnn", "tabcnn-f16.gguf", "https://huggingface.co/cstr/tabcnn-GGUF/resolve/main/tabcnn-f16.gguf", "~1.8 MB",
+     nullptr, nullptr, nullptr, "cc-by-4.0"},
+    // Quants get their OWN entries or `-m auto` can never reach them — the exact
+    // gap that left crepe's q8_0/q4_k unreachable on HF for weeks. Both preserve
+    // head.weight at f32; measured on EGSet12 track 01 they are indistinguishable
+    // from f16 (F1 0.7749 vs 0.7732, within noise), so q4_k is the size pick.
+    // NOTE the "q4_k" file is really Q4_0 — no tensor is 256-aligned, so k-quants
+    // fall back. The name follows the request, not the content.
+    {"tabcnn-q8_0", "tabcnn-q8_0.gguf", "https://huggingface.co/cstr/tabcnn-GGUF/resolve/main/tabcnn-q8_0.gguf",
+     "~1.1 MB", nullptr, nullptr, nullptr, "cc-by-4.0"},
+    {"tabcnn-q4_k", "tabcnn-q4_k.gguf", "https://huggingface.co/cstr/tabcnn-GGUF/resolve/main/tabcnn-q4_k.gguf",
+     "~0.7 MB", nullptr, nullptr, nullptr, "cc-by-4.0"},
+    {"beat-this", "beat-this-f16.gguf",
+     "https://huggingface.co/cstr/beat-this-GGUF/resolve/main/beat-this-f16.gguf", "~41 MB", nullptr, nullptr, nullptr,
+     "MIT"},
+    {"beat-this-f32", "beat-this-f32.gguf",
+     "https://huggingface.co/cstr/beat-this-GGUF/resolve/main/beat-this-f32.gguf", "~81 MB", nullptr, nullptr, nullptr,
+     "MIT"},
+    // CREPE monophonic F0 (--pitch). MIT weights + MIT code (torchcrepe).
+    // DEFAULT IS TINY: measured RTF 0.28 on Metal vs 2.0 for full, and full is
+    // 38x the MACs per frame. `full` stays available for offline accuracy.
+    {"crepe", "crepe-tiny-f16.gguf",
+     "https://huggingface.co/cstr/crepe-GGUF/resolve/main/crepe-tiny-f16.gguf", "~1.0 MB", nullptr, nullptr, nullptr,
+     "MIT"},
+    {"crepe-tiny", "crepe-tiny-f16.gguf",
+     "https://huggingface.co/cstr/crepe-GGUF/resolve/main/crepe-tiny-f16.gguf", "~1.0 MB", nullptr, nullptr, nullptr,
+     "MIT"},
+    {"crepe-full", "crepe-full-f16.gguf",
+     "https://huggingface.co/cstr/crepe-GGUF/resolve/main/crepe-full-f16.gguf", "~44.5 MB", nullptr, nullptr, nullptr,
+     "MIT"},
+    // Quantized CREPE. These were uploaded to cstr/crepe-GGUF but had NO
+    // registry entry, so `-m auto` could never select them. Measured against
+    // the f16 of the same capacity on a 3 s tone (test-crepe-parity):
+    //   tiny q8_0  cos 0.999993   f0 872.54 vs 872.44 Hz
+    //   tiny q4_k  cos 0.998757   f0 871.84 vs 872.44 Hz
+    //   full q8_0  cos 0.999999   f0 880.69 vs 880.69 Hz (identical)
+    //   full q4_k  cos 0.999933   f0 880.87 vs 880.69 Hz
+    // All four are usable; q4_k tiny at 0.26 MB is the mobile pick.
+    {"crepe-tiny-q8_0", "crepe-tiny-q8_0.gguf",
+     "https://huggingface.co/cstr/crepe-GGUF/resolve/main/crepe-tiny-q8_0.gguf", "~0.5 MB", nullptr, nullptr, nullptr,
+     "MIT"},
+    {"crepe-tiny-q4_k", "crepe-tiny-q4_k.gguf",
+     "https://huggingface.co/cstr/crepe-GGUF/resolve/main/crepe-tiny-q4_k.gguf", "~0.3 MB", nullptr, nullptr, nullptr,
+     "MIT"},
+    {"crepe-full-q8_0", "crepe-full-q8_0.gguf",
+     "https://huggingface.co/cstr/crepe-GGUF/resolve/main/crepe-full-q8_0.gguf", "~22.6 MB", nullptr, nullptr, nullptr,
+     "MIT"},
+    {"crepe-full-q4_k", "crepe-full-q4_k.gguf",
+     "https://huggingface.co/cstr/crepe-GGUF/resolve/main/crepe-full-q4_k.gguf", "~12.0 MB", nullptr, nullptr, nullptr,
+     "MIT"},
     {"glm-asr", "glm-asr-nano-q4_k.gguf",
      "https://huggingface.co/cstr/glm-asr-nano-GGUF/resolve/main/glm-asr-nano-q4_k.gguf", "~1.2 GB", nullptr, nullptr},
     {"moonshine", "moonshine-tiny-q4_k.gguf",
@@ -568,6 +690,18 @@ constexpr Entry k_registry[] = {
     // degrades audio earlier than the backbone). Default download is the Q4_K
     // backbone (~5 GB) paired with the F16 codec. (URLs populated at ship after
     // the GGUF upload — see Phase 6.)
+    // MioCodec v2 — standalone audio codec (44.1kHz, 25Hz tokens, MIT).
+    {"miocodec", "miocodec-v2-44k-q8_0.gguf",
+     "https://huggingface.co/cstr/miocodec-v2-44k-GGUF/resolve/main/miocodec-v2-44k-q8_0.gguf",
+     "~155 MB"},
+    // MioTTS-0.6B (Qwen3 LLM + MioCodec-25Hz-24kHz, Apache-2.0).
+    // Single GGUF, tokenizer.json loaded at runtime.
+    {"miotts", "miotts-0.6b-q8_0.gguf",
+     "https://huggingface.co/cstr/miotts-0.6b-GGUF/resolve/main/miotts-0.6b-q8_0.gguf",
+     "~723 MB"},
+    {"piano-transcription", "piano-transcription-f16.gguf",
+     "https://huggingface.co/cstr/piano-transcription-GGUF/resolve/main/piano-transcription-f16.gguf",
+     "~77 MB"},
     {"moss-tts", "moss-tts-v1.5-q4_k.gguf",
      "https://huggingface.co/cstr/moss-tts-v1.5-GGUF/resolve/main/moss-tts-v1.5-q4_k.gguf",
      "~5 GB",
@@ -1327,8 +1461,105 @@ void download_extras(const Entry& e, bool quiet, const std::string& cache_dir_ov
     }
 }
 
+// ---------------------------------------------------------------------------
+// Restricted-licence acceptance gate.
+//
+// Mirrors CrispEmbed's examples/cli/model_mgr.{h,cpp} so the two repos behave
+// identically: acceptance is per-licence (an exact SPDX tag, or "all"), keyed
+// off a tag rather than a substring, and `allow_download` alone is NEVER
+// sufficient for a restricted model.
+//
+// Registry entries carry human prose today (e.g. "CC-BY-NC-4.0 — NON-COMMERCIAL
+// use only (base model ...)"), so normalise to the leading SPDX-ish token first
+// rather than rewriting every entry. New entries should use a bare tag.
+// ---------------------------------------------------------------------------
+
+static std::string license_tag(const std::string& lic) {
+    std::string t;
+    for (char c : lic) {
+        if (c == ' ' || c == '\t' || c == '(' || c == ',')
+            break;
+        if ((unsigned char)c >= 0x80) // em-dash and friends
+            break;
+        t += (char)tolower((unsigned char)c);
+    }
+    while (!t.empty() && (t.back() == '-' || t.back() == '.'))
+        t.pop_back();
+    return t;
+}
+
+// True when the tag designates a licence the user must explicitly accept.
+// Same list as CrispEmbed, so a future gemma/llama model is gated on arrival
+// instead of shipping ungated.
+static bool license_requires_acceptance_tag(const std::string& tag) {
+    if (tag.rfind("cc-by-nc", 0) == 0)
+        return true;
+    if (tag.rfind("llama", 0) == 0)
+        return true;
+    static const char* restricted[] = {"gemma", "qwen-research", "mistral-ai-research", "lfm1.0", "other", nullptr};
+    for (const char** p = restricted; *p; ++p)
+        if (tag == *p)
+            return true;
+    return false;
+}
+
 static bool license_is_nc(const std::string& lic) {
-    return lic.find("NC") != std::string::npos || lic.find("NonCommercial") != std::string::npos;
+    return license_requires_acceptance_tag(license_tag(lic));
+}
+
+// Has the user accepted this specific licence? Exact tag, or "all" / "*".
+// Checked against the caller-supplied string, then the process-level setting,
+// then CRISPASR_ACCEPT_LICENSE.
+static bool license_accepted(const std::string& lic, const std::string& accepted_arg) {
+    const std::string tag = license_tag(lic);
+    auto matches = [&](const std::string& acc) {
+        if (acc.empty())
+            return false;
+        if (acc == "all" || acc == "*")
+            return true;
+        return license_tag(acc) == tag;
+    };
+    if (matches(accepted_arg))
+        return true;
+    if (const char* env = std::getenv("CRISPASR_ACCEPT_LICENSE"))
+        if (matches(env))
+            return true;
+    return false;
+}
+
+// Gate a restricted model BEFORE any bytes are fetched. Returns true to
+// proceed. On a TTY the user is shown the licence and prompted; otherwise the
+// download is refused with instructions. `allow_download` alone is NOT enough.
+static bool license_gate_allows_download(const CrispasrRegistryEntry& e, const std::string& accepted_license) {
+    if (e.license.empty() || !license_is_nc(e.license))
+        return true;
+    if (license_accepted(e.license, accepted_license))
+        return true;
+
+    const std::string tag = license_tag(e.license);
+    fprintf(stderr, "crispasr: model '%s' is released under a restricted licence:\n", e.filename.c_str());
+    fprintf(stderr, "  Licence: %s\n", e.license.c_str());
+    if (tag.rfind("cc-by-nc", 0) == 0)
+        fprintf(stderr, "  Notice:  NON-COMMERCIAL USE ONLY — see the upstream model card for terms.\n");
+    else
+        fprintf(stderr, "  Notice:  review the upstream model card for the full licence terms.\n");
+
+    if (isatty(fileno(stdin))) {
+        fprintf(stderr, "Download %s (%s) and accept this licence? [y/N] ", e.filename.c_str(), e.approx_size.c_str());
+        fflush(stderr);
+        int c = fgetc(stdin);
+        if (c == 'y' || c == 'Y')
+            return true;
+        fprintf(stderr, "crispasr: declined — not downloading.\n");
+        return false;
+    }
+
+    fprintf(stderr,
+            "crispasr: refusing to download without explicit licence acceptance.\n"
+            "  Pass --accept-license %s (or set CRISPASR_ACCEPT_LICENSE=%s).\n"
+            "  --auto-download / -m auto alone is NOT sufficient for a restricted licence.\n",
+            tag.c_str(), tag.c_str());
+    return false;
 }
 
 void print_license_note(const CrispasrRegistryEntry& e, bool quiet) {
@@ -1346,12 +1577,48 @@ void print_license_note(const CrispasrRegistryEntry& e, bool quiet) {
 
 } // namespace
 
+std::string crispasr_license_tag(const std::string& license) {
+    return license_tag(license);
+}
+
+bool crispasr_license_requires_acceptance(const std::string& license) {
+    return license_is_nc(license);
+}
+
+bool crispasr_license_accepted(const std::string& license, const std::string& accepted) {
+    return license_accepted(license, accepted);
+}
+
 bool crispasr_registry_lookup(const std::string& backend, CrispasrRegistryEntry& out,
                               const std::string& preferred_quant) {
     const Entry* e = find_by_backend(backend);
     if (!e)
         return false;
     fill(out, *e, preferred_quant);
+    return true;
+}
+
+bool crispasr_registry_default_bundle(const std::string& backend, CrispasrRegistryBundle& out) {
+    const Entry* e = find_by_backend(backend);
+    if (!e)
+        return false;
+
+    out = {};
+    out.backend = e->backend;
+    out.license = e->license ? e->license : "";
+    out.requires_license_acceptance = crispasr_license_requires_acceptance(out.license);
+    out.artifacts.push_back(
+        {CrispasrRegistryArtifactKind::Primary, e->filename, e->url, e->approx_size ? e->approx_size : ""});
+
+    if (e->companion_file && e->companion_url) {
+        out.artifacts.push_back({CrispasrRegistryArtifactKind::Companion, e->companion_file, e->companion_url,
+                                 e->companion_size ? e->companion_size : (e->approx_size ? e->approx_size : "")});
+    }
+
+    if (const ExtraCompanion* extras = find_extras(e->backend)) {
+        for (const ExtraCompanion* it = extras; it->file && it->url; ++it)
+            out.artifacts.push_back({CrispasrRegistryArtifactKind::Extra, it->file, it->url, ""});
+    }
     return true;
 }
 
@@ -1411,7 +1678,7 @@ bool crispasr_find_cached_model(CrispasrRegistryEntry& out, const std::string& c
 
 std::string crispasr_resolve_model(const std::string& model_arg, const std::string& backend_name, bool quiet,
                                    const std::string& cache_dir_override, bool allow_download,
-                                   const std::string& preferred_quant) {
+                                   const std::string& preferred_quant, const std::string& accepted_license) {
     // Concrete path that exists on disk — pass through.
     if (model_arg != "auto" && model_arg != "default") {
         FILE* f = fopen(model_arg.c_str(), "rb");
@@ -1437,11 +1704,19 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
 
         if (have_match) {
             const std::string cached = crispasr_cache::dir(cache_dir_override) + "/" + match.filename;
-            if (crispasr_cache::file_present(cached))
+            if (crispasr_cache::file_present(cached)) {
+                // A previously-downloaded restricted model used to load in
+                // total silence — state the licence on every load, not just
+                // the one where it happened to be fetched.
+                print_license_note(match, quiet);
                 return cached;
+            }
         }
 
         if (have_match && allow_download) {
+            // Restricted-licence gate BEFORE any bytes are fetched.
+            if (!license_gate_allows_download(match, accepted_license))
+                return "";
             if (!quiet) {
                 fprintf(stderr, "crispasr: model '%s' not found locally — downloading %s (%s)\n", model_arg.c_str(),
                         match.filename.c_str(), match.approx_size.c_str());
@@ -1471,6 +1746,12 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
                 backend_name.c_str());
         return "";
     }
+
+    // Restricted-licence gate BEFORE any bytes are fetched. Skipped when the
+    // file is already cached (acceptance happened at download time).
+    if (!crispasr_cache::file_present(crispasr_cache::dir(cache_dir_override) + "/" + e.filename) &&
+        !license_gate_allows_download(e, accepted_license))
+        return "";
 
     if (!quiet)
         fprintf(stderr, "crispasr: resolving %s (%s) via -m auto\n", e.filename.c_str(), e.approx_size.c_str());

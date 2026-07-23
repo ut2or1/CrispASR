@@ -276,9 +276,15 @@ combine_static_libraries() {
     # Also search _deps/ for FetchContent-built static libs (opus, ogg,
     # opusfile, opencore-amr) that crispasr-lib links via PRIVATE but
     # whose objects must be in combined.a for the xcframework consumer.
+    # glint is the in-tree clean-room codec suite (glint/CMakeLists.txt); its
+    # libglint.a lands under build/glint/, and crispasr-lib links it PUBLIC. It
+    # was NOT in these roots, so the iOS xcframework link failed with undefined
+    # glint_aac_dec_*/glint_opus_* (v0.8.20 build-xcframework). Same drift this
+    # comment already flags for crisp_lid/punc/truecase — the root list is hand-
+    # maintained and a new subdirectory target has to be added here.
     done < <(find "${base_dir}/${build_dir}/src" "${base_dir}/${build_dir}/crisp_audio" \
                   "${base_dir}/${build_dir}/crisp_lid" "${base_dir}/${build_dir}/crisp_punc" \
-                  "${base_dir}/${build_dir}/crisp_truecase" \
+                  "${base_dir}/${build_dir}/crisp_truecase" "${base_dir}/${build_dir}/glint" \
                   "${base_dir}/${build_dir}/_deps" \
                   -path "*/${release_dir}/*.a" -print0 2>/dev/null)
     if [ ${#src_libs[@]} -gt 0 ]; then

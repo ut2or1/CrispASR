@@ -137,3 +137,22 @@ omnivoice-encode-ref.gguf
 a.out
 a.out.js
 a.out.wasm
+
+# F7 repo hygiene — session throwaway artifacts that keep showing up untracked.
+# (Deliberately NOT ignoring source WIP or release notes — those stay visible so
+# their owners commit/remove them: examples/cli/*.cpp, RELEASE_NOTES_*.md, etc.)
+*.log
+/failed_logs.txt
+*.latents
+/*.gguf
+/ggml-*.bin
+/probe_mime*
+/.codex-scratch/
+/models-test/
+/issue*-sample/
+# Kaggle bundled-fallback harnesses — regenerated per push (already ignored one-by-one)
+tools/kaggle/*/kaggle_harness.py
+
+# Agent/worktree scratch dir convention (see .claude/CLAUDE.md) — temp
+# clips, enrollment DBs, and log captures from live validation runs.
+/scratch/

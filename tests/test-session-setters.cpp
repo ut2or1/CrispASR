@@ -12,6 +12,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "crispasr.h"
+#include "crispasr_session.h" // crispasr_session_open_explicit (#282 load-path test)
 
 // ─── single-float setters ──────────────────────────────────────────────────
 
@@ -121,4 +122,17 @@ TEST_CASE("session: last_synth_error null-handle → empty string", "[unit][sett
     const char* err = crispasr_session_last_synth_error(nullptr);
     REQUIRE(err != nullptr);
     REQUIRE(err[0] == '\0');
+}
+
+// ─── #282: lazy dynamic-backend load path ─────────────────────────────────
+// g_open_use_gpu_tls defaults to true, so crispasr_session_open_explicit runs
+// ensure_dynamic_backends_loaded() (→ ggml_backend_load_all()) before the model
+// is loaded. On a CPU-only CI box no GPU plugins are found; the load must be a
+// safe no-op and a missing model must fail cleanly to nullptr, not crash. The
+// second call proves the std::call_once guard makes repeat opens safe.
+TEST_CASE("session open: GPU-default open of missing model loads plugins and returns null safely", "[unit][setters]") {
+    crispasr_session* s1 = crispasr_session_open_explicit("/nonexistent/crispasr-282.gguf", "whisper", 1);
+    REQUIRE(s1 == nullptr);
+    crispasr_session* s2 = crispasr_session_open_explicit("/nonexistent/crispasr-282.gguf", "whisper", 1);
+    REQUIRE(s2 == nullptr);
 }

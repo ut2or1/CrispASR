@@ -81,6 +81,13 @@ jobs:
         run: |
           python -m pytest tests/test_backend_config.py -v || \
           python -m unittest tests/test_backend_config.py -v
+      # Perf-regression compare logic (docs/perf-sweep/PLAN.md TODO-4). Model-free —
+      # guards the hard/soft-gate logic used by the nightly perf snapshot step below.
+      - name: Run perf-baseline compare unit tests
+        run: |
+          python tools/perf_baseline_compare.py --selftest
+          python -m pytest tests/test_perf_baseline_compare.py -v || \
+          python tests/test_perf_baseline_compare.py -v
 
   # Dry-run preflight: confirm every pinned HF artifact in the
   # manifest actually exists (GGUF + fixture ref.gguf + fixture
@@ -239,6 +246,30 @@ jobs:
         run: |
           mkdir -p "$WORK_DIR"
           tests/regression/run_one.py "${{ matrix.backend }}"
+
+      # F2: cross-surface (CLI vs session C-ABI) parity — best-effort guard
+      # against the #257 dual-dispatch class. Parakeet only for now (the one
+      # backend that historically diverged). Builds the shared lib for the
+      # python session side and runs the harness against the model run_one.py
+      # just fetched. continue-on-error + skip-guards mean it can never break
+      # the regression job; it reports PASS/FAIL/SKIP for visibility.
+      - name: Cross-surface parity (parakeet, best-effort)
+        if: startsWith(matrix.backend, 'parakeet')
+        continue-on-error: true
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          cmake -S . -B build-shared -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DBUILD_SHARED_LIBS=ON -DCRISPASR_BUILD_TESTS=OFF -DCRISPASR_BUILD_EXAMPLES=OFF || exit 0
+          cmake --build build-shared --target crispasr-lib -j"$(nproc)" || exit 0
+          pip install -q numpy || true
+          model=$(find "${{ runner.temp }}/regression-${{ matrix.backend }}" ~/.cache/huggingface \
+                   -name '*.gguf' 2>/dev/null | head -1)
+          lib=$(find build-shared -name 'libcrispasr.so' | head -1)
+          [ -n "$model" ] && [ -n "$lib" ] || { echo "SKIP: model/lib not found"; exit 0; }
+          CRISPASR_BIN=build-regression/bin/crispasr CRISPASR_LIB_PATH="$lib" \
+            CRISPASR_PARITY_BACKEND=parakeet CRISPASR_PARITY_MODEL="$model" \
+            bash tests/test-surface-parity.sh || true
 
       - name: Free disk
         if: always()

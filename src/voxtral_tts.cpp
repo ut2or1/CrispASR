@@ -33,6 +33,7 @@
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h"
+#include "core/crispasr_env.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -293,13 +294,13 @@ static inline float vtts_randn(uint64_t* s) {
 // ---------------------------------------------------------------------------
 
 static bool env_bool(const char* name) {
-    const char* v = std::getenv(name);
+    const char* v = crispasr_env::get(name);
     return v && (*v == '1' || *v == 'y' || *v == 'Y');
 }
 
 // Env int with fallback (returns def if unset/unparseable/<=0).
 static int env_int(const char* name, int def) {
-    const char* v = std::getenv(name);
+    const char* v = crispasr_env::get(name);
     if (!v || !*v)
         return def;
     int n = atoi(v);
@@ -1889,8 +1890,11 @@ extern "C" int voxtral_tts_llm_diff(const char* model_gguf, const char* ref_gguf
 #else
     setenv("CRISPASR_VOXTRAL_TTS_DIFF_DUMP", dir_s.c_str(), 1);
 #endif
-    const char* text = getenv("VOXTRAL_TTS_TEXT") ? getenv("VOXTRAL_TTS_TEXT") : "Hello world.";
-    const char* voice = getenv("VOXTRAL_TTS_VOICE") ? getenv("VOXTRAL_TTS_VOICE") : "neutral_female";
+    const char* text = crispasr_env::get("CRISPASR_VOXTRAL_TTS_TEXT") ? crispasr_env::get("CRISPASR_VOXTRAL_TTS_TEXT")
+                                                                      : "Hello world.";
+    const char* voice = crispasr_env::get("CRISPASR_VOXTRAL_TTS_VOICE")
+                            ? crispasr_env::get("CRISPASR_VOXTRAL_TTS_VOICE")
+                            : "neutral_female";
     int n_samples = 0;
     float* pcm = voxtral_tts_synthesize(ctx, text, voice, &n_samples); // dumps mine.c1.<stage> (frame 0)
     if (pcm)

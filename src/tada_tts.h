@@ -60,6 +60,25 @@ int tada_set_codec_path(struct tada_context* ctx, const char* path);
 // This bypasses the Encoder and provides voice conditioning directly.
 int tada_load_prompt(struct tada_context* ctx, const char* path);
 
+// Set the voice prompt directly from in-memory acoustic features (as produced
+// by tada_encoder_encode's tada_encoder_result), bypassing the GGUF file that
+// tada_load_prompt reads. `token_values` is (n_tokens, embed_dim) row-major;
+// `token_positions` is (n_tokens,) aligner frame indices (may be NULL to skip
+// the time-gap conditioning); `prompt_text` is the transcript of the reference
+// audio (may be NULL). Produces byte-identical context state to
+// tada_encoder_write_ref_gguf() + tada_load_prompt(). Returns 0 on success.
+int tada_set_prompt_values(struct tada_context* ctx, const float* token_values, int n_tokens, int embed_dim,
+                           const float* token_positions, const char* prompt_text);
+
+// On-the-fly voice cloning: run the encoder + aligner over reference PCM +
+// its transcript and apply the result as the voice prompt in-memory — the
+// no-temp-GGUF equivalent of the CLI `--make-ref` pipeline. `audio_24k` is
+// 24 kHz mono float32. `encoder_gguf` / `aligner_gguf` are the TADA encoder and
+// (language-matched) aligner GGUF paths. Returns 0 on success, non-zero on
+// error (encoder/aligner load or encode failure).
+int tada_make_ref_from_pcm(struct tada_context* ctx, const char* encoder_gguf, const char* aligner_gguf,
+                           const float* audio_24k, int n_samples_24k, const char* transcript);
+
 // Set generation seed for reproducibility.
 void tada_set_seed(struct tada_context* ctx, uint64_t seed);
 

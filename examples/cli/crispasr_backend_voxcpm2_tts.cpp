@@ -10,6 +10,7 @@
 
 #include "core/audio_resample.h"
 #include "core/wav_reader.h"
+#include "core/crispasr_env.h"
 
 #include "voxcpm2_tts.h"
 
@@ -46,15 +47,15 @@ public:
 
         // CFM inference steps (quality vs speed tradeoff)
         // Default 10; can be lowered to 3 for real-time on slow hardware
-        const char* env_steps = getenv("VOXCPM2_INFERENCE_STEPS");
+        const char* env_steps = crispasr_env::get("CRISPASR_VOXCPM2_INFERENCE_STEPS");
         if (env_steps)
             cp.inference_steps = atoi(env_steps);
 
-        const char* env_cfg = getenv("VOXCPM2_CFG_VALUE");
+        const char* env_cfg = crispasr_env::get("CRISPASR_VOXCPM2_CFG_VALUE");
         if (env_cfg)
             cp.cfg_value = (float)atof(env_cfg);
 
-        const char* env_max = getenv("VOXCPM2_MAX_LEN");
+        const char* env_max = crispasr_env::get("CRISPASR_VOXCPM2_MAX_LEN");
         if (env_max)
             cp.max_len = atoi(env_max);
 

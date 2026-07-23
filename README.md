@@ -23,6 +23,12 @@ live transcription + TTS + language detection, auto-deployed from `hf-space/`.
 
 ### What's new (v0.8.9)
 
+- **Piano transcription (§250, new task):** transcribe piano audio to MIDI note events — 88 keys at 100fps using ByteDance/Kong's CRNN architecture (4× ConvBlock + BiGRU + regression post-processing). F16 GGUF = 77 MB. `--backend piano-transcription -m piano-transcription-f16.gguf -f piano.wav`.
+- **Source separation (§248, new task):** `--separate` splits a mix into stems (`<input>_<stem>.wav`) — **mel-band-roformer** (vocal/instrumental, MIT) and **htdemucs** (4-stem), architecture auto-detected from the GGUF. Mel-Band RoFormer diff harness validated end-to-end (every stage cos=1.0, reconstructed waveform bit-exact). `--stems vocals,drums` selects a subset; `--sep-output-dir` sets the output location.
+- **Guitar tablature (new task):** `--tab` prints a per-frame fret-per-string grid (`time_sec`, then one column per string, `-` for unplayed; `--tab-format json` for JSON with per-string confidences) via **TabCNN** (Wiggins & Kim, ISMIR 2019; backend key `tabcnn`), architecture auto-detected from the GGUF. **CC BY 4.0 weights** from the EGSet12 record — attribution required, commercial use permitted. What the backend emits is **emission scores, not a decided tablature**: the CLI's displayed frets are a plain argmax with no playability constraints applied. Real consumers take the log-probabilities through `crispasr_session_tab_emissions()` and run their own constrained Viterbi/DP (one note per string, fret range, capo, hand span). Validated end to end against EGSet12 ground truth at tablature F1 0.773 vs the torch reference's 0.771. See [docs/cli.md](docs/cli.md#guitar-tablature---tab).
+- **Beat / downbeat tracking (new task):** `--beats` prints a beat grid (`time_sec`, `beat|downbeat` per line; `--beats-format json` for JSON) via **Beat This!** (CPJKU, ISMIR 2024; backend key `beat-this`), architecture auto-detected from the GGUF. **MIT for code AND weights**, and critically **no DBN**: postprocessing is peak-picking only, so unlike most beat trackers it carries none of madmom's patented, non-commercially-licensed Dynamic Bayesian Network. Every downbeat is also reported as a beat. See [docs/cli.md](docs/cli.md#beat-tracking---beats).
+- **Chord recognition (new task):** `--chords` prints a chord timeline in `.lab` layout (`start_sec`, `end_sec`, `chord`; `--chords-format json` for JSON) via **BTC** (Bi-directional Transformer, ISMIR 2019), architecture auto-detected from the GGUF. Defaults to the 170-class vocabulary, reducible to maj/min with `CRISPASR_BTC_MAJ_MIN=1`. **The weights are CC-BY-NC-SA (non-commercial)** even though this library and the upstream code are MIT — downloading them requires `--accept-license cc-by-nc-sa-4.0`. See [docs/cli.md](docs/cli.md#chord-recognition---chords).
+- **Pitch / F0 estimation (new task):** `--pitch` prints a monophonic pitch track (`time_ms`, `f0_hz`, `voiced_prob` per frame; `--pitch-format json` for JSON) via **CREPE** (MIT), architecture auto-detected from the GGUF. Ships `crepe-tiny-f16.gguf` (~1.0 MB, RTF 0.28 on Metal) as the default with `crepe-full-f16.gguf` (~44.5 MB) available from `cstr/crepe-GGUF`. See [docs/cli.md](docs/cli.md#pitch--f0-estimation---pitch).
 - **MOSS-Transcribe-Diarize (#242, v0.8.9):** joint ASR + speaker diarization + timestamps in a single 0.9B model. Stock Whisper encoder + VQAdaptor + Qwen3-0.6B. Diff harness 4/4 cos=1.0. `--backend moss-diarize -m auto`.
 - **dots.tts full pipeline (#200, v0.8.9):** PatchEncoder RoPE + QK-norm fix, BigVGAN vocoder working e2e, voice cloning via CAM++ speaker encoder. `--tts-steps` / `--tts-cfg-scale` wired.
 - **Irodori-TTS VoiceDesign (v0.8.9):** caption-conditioned voice design for Irodori TTS.
@@ -54,7 +60,9 @@ live transcription + TTS + language detection, auto-deployed from `hf-space/`.
 - [Streaming & live transcription](docs/streaming.md)
 - [Server mode (HTTP API)](docs/server.md)
 - [CLI reference](docs/cli.md) — flags, VAD, CTC alignment, output formats, auto-download, audio formats
+- [Environment variables](docs/environment-variables.md) — the `CRISPASR_<BACKEND>_<FEATURE>` convention, global knobs, and every per-backend variable
 - [Language bindings](docs/bindings.md) — Python / Rust / Dart / Go / Java / JavaScript / Ruby / mobile
+- [Benchmarking CrispASR](docs/benchmarking.md) — how to measure transcribe time (not cold start): server/in-process reps, proof-of-work rules, phase-timing env vars
 - [Architecture](docs/architecture.md) — layered layout, `src/core/` primitives, regression discipline
 - [Contributing — adding a new backend](docs/contributing.md) — 5-file recipe, ground-truth diff workflow
 - [Regression matrix](docs/regression-matrix.md) — `tools/test-all-backends.py` capability tiers
@@ -68,7 +76,9 @@ live transcription + TTS + language detection, auto-deployed from `hf-space/`.
 ## Supported backends
 
 CrispASR ships **43 ASR backends** for transcription/translation and
-**48 TTS engines** for synthesis (91 total in the [feature matrix](docs/feature-matrix.md)).
+**48 TTS engines** for synthesis. It also ships audio-to-audio S2S backends,
+including Sidon restoration and the VoxCPM2 AudioVAE speech upscaler; see the [feature matrix](docs/feature-matrix.md)
+for the complete capability list.
 Pick at the CLI with `--backend NAME`, or omit it to let the binary auto-detect
 from the GGUF metadata. Jump to the [TTS table](#text-to-speech-models) for the synthesis side.
 
@@ -130,10 +140,28 @@ from the GGUF metadata. Jump to the [TTS table](#text-to-speech-models) for the 
 | **moss-audio** | [`OpenMOSS-Team/MOSS-Audio-4B-Instruct`](https://huggingface.co/cstr/MOSS-Audio-4B-Instruct-GGUF) | 32L Whisper encoder + DeepStack 3-tap + 36L Qwen3 LM; audio understanding + ASR ([more](docs/architecture.md#moss-audio)) | zh, en | Apache-2.0 |
 | **moss-transcribe** | [`OpenMOSS-Team/MOSS-Transcribe-preview-2B`](https://huggingface.co/cstr/MOSS-Transcribe-preview-2B-GGUF) | Qwen3-Omni audio encoder (32L, windowed attn) + GatedMLP adapter + Qwen3-1.7B LM; ASR ([more](docs/architecture.md#moss-transcribe)) | zh, en | Apache-2.0 |
 | **moss-diarize** | [`OpenMOSS-Team/MOSS-Transcribe-Diarize-0.9B`](https://huggingface.co/cstr/MOSS-Transcribe-Diarize-0.9B-GGUF) | Stock Whisper encoder (24L, 80 mel) + 4x merge + VQAdaptor + Qwen3-0.6B LM; joint ASR + speaker diarization + timestamps | multi | Apache-2.0 |
+| **whisper** *(tiron)* ⚠️*experimental* | [`Trelis/tiron`](https://huggingface.co/cstr/tiron-GGML) (base [`Trelis/tiron`](https://huggingface.co/Trelis/tiron)) | Whisper large-v3 with an extended vocab: emits inline `<|speakerN|>` markers + 20 ms timestamps for joint transcription + per-window speaker attribution, via a constrained-decoding grammar; cross-window linking to stable speakers (#295) | multi (en focus) | Apache-2.0 |
 | **funasr** | [`FunAudioLLM/Fun-ASR-Nano-2512`](https://huggingface.co/cstr/funasr-nano-GGUF) | 70-block SANM encoder + 2-block Transformer adaptor + Qwen3-0.6B LLM | zh, yue, en, ja, ko | FunASR Model License v1.1 (commercial OK w/ attribution) |
 | **fun-asr-mlt-nano** | [`FunAudioLLM/Fun-ASR-MLT-Nano-2512`](https://huggingface.co/cstr/funasr-mlt-nano-GGUF) | Same architecture, multilingual decoder | 31 langs incl. de, fr, es, pt, ru, ar, hi, vi, th, ko | FunASR Model License v1.1 |
 | **paraformer** | [`funasr/paraformer-zh`](https://huggingface.co/cstr/paraformer-zh-GGUF) | 50-block SANM encoder + CIF predictor + 16-block NAR decoder (single-pass, non-autoregressive); character-level vocab (8404); 220M params | zh, en | FunASR Model License (commercial OK w/ attribution) |
 | **sensevoice** | [`FunAudioLLM/SenseVoiceSmall`](https://huggingface.co/cstr/sensevoice-small-GGUF) | 70-block SANM encoder + CTC head; emits transcript + language ID + emotion + audio-event in one forward pass (non-AR, 15× faster than Whisper-Large); structured C ABI + `-oj` JSON expose the four tags as separate fields | 50+ langs; native LID + emotion + audio-event tags | FunASR Model License v1.1 |
+
+### Speech-to-speech audio upscaling and restoration
+
+| Backend | Model | Architecture | Input / output | License |
+|---|---|---|---|---|
+| **sidon** | [`KevinAHM/Sidon-GGUF`](https://huggingface.co/KevinAHM/Sidon-GGUF) (base [`sarulab-speech/sidon-v0.1`](https://huggingface.co/sarulab-speech/sidon-v0.1)) | w2v-BERT 2.0 predictor + continuous DAC decoder ([more](docs/architecture.md#sidon)) | 16 kHz mono → restored 48 kHz mono | MIT |
+| **voxcpm2-vae** | AudioVAE V2 from [`openbmb/VoxCPM2`](https://huggingface.co/openbmb/VoxCPM2), converted with `--vae-only` | Isolated causal AudioVAE encoder + decoder ([more](docs/architecture.md#voxcpm2-vae)) | 16 kHz mono → upscaled 48 kHz mono | Apache-2.0 |
+
+```bash
+huggingface-cli download KevinAHM/Sidon-GGUF sidon-v0.1-f16.gguf --local-dir models
+crispasr -m models/sidon-v0.1-f16.gguf -f input.wav --s2s --s2s-output restored.wav
+
+python models/convert-voxcpm2-to-gguf.py --input openbmb/VoxCPM2 \
+  --output models/voxcpm2-vae-f32.gguf --vae-only
+crispasr -m models/voxcpm2-vae-f32.gguf -f input.wav --s2s \
+  --s2s-output upscaled.wav
+```
 
 ### Text-to-Speech models
 
@@ -143,6 +171,7 @@ quick-start commands and engine selection guidance.
 
 | Backend | Models | Architecture | Languages | License |
 |---------|--------|-------------|-----------|---------|
+| **miotts** | [`MioTTS-0.6B`](https://huggingface.co/cstr/miotts-0.6b-GGUF) | Qwen3 LLM + MioCodec-v2 FSQ codec (25 Hz, 44.1 kHz output) | ja, en | Apache-2.0 |
 | **vibevoice-tts** | [`VibeVoice-Realtime-0.5B`](https://huggingface.co/cstr/vibevoice-realtime-0.5b-GGUF), [`VibeVoice-1.5B`](https://huggingface.co/cstr/vibevoice-1.5b-GGUF) | DPM-Solver++ + σ-VAE decoder; voice presets or cloning | en, zh | MIT |
 | **kugelaudio** | [`kugelaudio-0-open`](https://huggingface.co/cstr/kugelaudio-0-open-GGUF) | Qwen2.5-7B LM + 4L DiT diffusion + acoustic VAE decoder; voice cloning | multilingual | Apache-2.0 |
 | **qwen3-tts** | [`Qwen3-TTS-12Hz-0.6B-Base`](https://huggingface.co/cstr/qwen3-tts-0.6b-base-GGUF), [`1.7B-Base`](https://huggingface.co/cstr/qwen3-tts-1.7b-base-GGUF), [`1.7B-VoiceDesign`](https://huggingface.co/cstr/qwen3-tts-1.7b-voicedesign-GGUF) | Qwen3 talker LM + 12 Hz RVQ ([more](docs/architecture.md#qwen3-tts)) | multilingual | Apache-2.0 |
@@ -262,6 +291,15 @@ Work with all backends.
 | **CLD3** | Text language ID | Embedding-bag → FC + ReLU → softmax (~1.5 MB F32) | 109 ISO 639-1 | Apache-2.0 | [`cstr/cld3-GGUF`](https://huggingface.co/cstr/cld3-GGUF) |
 | **GlotLID-V3** | Text language ID | fastText supervised, flat softmax | 2102 ISO 639-3 + script | Apache-2.0 | [`cstr/glotlid-GGUF`](https://huggingface.co/cstr/glotlid-GGUF) |
 | **LID-176** | Text language ID | fastText supervised, hierarchical softmax | 176 ISO 639-1 | CC-BY-SA-3.0 | [`cstr/fasttext-lid176-GGUF`](https://huggingface.co/cstr/fasttext-lid176-GGUF) |
+
+### Audio codecs
+
+Shared codec modules used by TTS backends. Also available standalone for encode/decode.
+
+| Model | Architecture | Sample Rate | Token Rate | License | HuggingFace |
+|---|---|---|---|---|---|
+| **MioCodec v2** | WavLM encoder → FSQ(12800) → Transformer decoder + AdaLN-Zero + SnakeBeta upsampler + iSTFT | 44.1 kHz | 25 Hz (341 bps) | MIT | [`cstr/miocodec-v2-44k-GGUF`](https://huggingface.co/cstr/miocodec-v2-44k-GGUF) |
+| **SNAC 24 kHz** | 3-codebook RVQ + decoder blocks (stride 8/8/4/2) | 24 kHz | 3×12.5 Hz | MIT | [`cstr/snac-24khz-GGUF`](https://huggingface.co/cstr/snac-24khz-GGUF) |
 
 All runtimes share ggml-based inference. The speech-LLM backends (**qwen3**, **voxtral**, **voxtral4b**, **granite**, **glm-asr**, **kyutai-stt**) inject audio encoder frames directly into an autoregressive language model's input embeddings, instead of using a dedicated CTC/transducer/seq2seq decoder. The **fastconformer-ctc** backend hosts the NeMo FastConformer-CTC standalone ASR family — `stt_en_fastconformer_ctc_{large,xlarge,xxlarge}` and the architecturally-identical `parakeet-ctc-{0.6b,1.1b}` (different training data + tokenizer, same encoder + head shape) — with greedy CTC decoding. Same C++ runtime as the canary-ctc aligner.
 

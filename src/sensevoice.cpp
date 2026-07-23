@@ -19,6 +19,7 @@
 #include "core/lfr.h"
 #include "core/sanm.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include <algorithm>
 #include <cassert>
@@ -43,7 +44,7 @@
 static bool sensevoice_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("SENSEVOICE_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_SENSEVOICE_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -689,7 +690,7 @@ extern "C" sensevoice_context* sensevoice_init_from_file(const char* path, sense
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 
-    if (const char* s = std::getenv("SENSEVOICE_NO_FA")) {
+    if (const char* s = crispasr_env::get("CRISPASR_SENSEVOICE_NO_FA")) {
         if (*s && *s != '0')
             ctx->enc_flash_attn = false;
     }

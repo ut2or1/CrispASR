@@ -32,6 +32,7 @@
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -65,7 +66,7 @@ namespace {
 static bool zonos_tts_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("ZONOS_TTS_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_ZONOS_TTS_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -473,7 +474,7 @@ struct zonos_tts_context* zonos_tts_init_from_file(const char* path_model, struc
     // Try to load speaker embedding from file, else use random Gaussian.
     ctx->cond_state.speaker_emb.resize(128);
     {
-        const char* spk_path = getenv("ZONOS_SPEAKER_EMB_PATH");
+        const char* spk_path = crispasr_env::get("CRISPASR_ZONOS_SPEAKER_EMB_PATH");
         if (!spk_path)
             spk_path = "/mnt/storage/zonos-tts/jfk_speaker_emb.bin";
         FILE* sf = fopen(spk_path, "rb");
@@ -1479,7 +1480,7 @@ static float* run_backbone(zonos_tts_context* ctx, const float* embeds, int T, i
         if (out_hidden) {
             ggml_backend_tensor_get(hs, out_hidden, 0, (size_t)d * sizeof(float));
         } else if (n_past == 0) {
-            const char* ddir = getenv("ZONOS_CPP_DUMP_DIR");
+            const char* ddir = crispasr_env::get("CRISPASR_ZONOS_CPP_DUMP_DIR");
             if (ddir) {
                 std::vector<float> hs_buf(d);
                 ggml_backend_tensor_get(hs, hs_buf.data(), 0, (size_t)d * sizeof(float));
@@ -1956,7 +1957,7 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
     // Python prepare_conditioning() returns cat([cond, uncond]) → (2, T, d_model).
     // We write the same layout: cond rows first, then uncond rows.
     {
-        const char* dump_dir = getenv("ZONOS_CPP_DUMP_DIR");
+        const char* dump_dir = crispasr_env::get("CRISPASR_ZONOS_CPP_DUMP_DIR");
         if (dump_dir) {
             // Write phoneme IDs
             {
@@ -2087,7 +2088,7 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
                     best_u = i;
             fprintf(stderr, "zonos_tts: DIFF uncond prefill cb0 argmax=%d (%.2f)\n", best_u, logits_uncond[best_u]);
         }
-        const char* dump_dir = getenv("ZONOS_CPP_DUMP_DIR");
+        const char* dump_dir = crispasr_env::get("CRISPASR_ZONOS_CPP_DUMP_DIR");
         if (!dump_dir)
             dump_dir = "/mnt/storage/zonos-tts";
         char df_path[512];
@@ -2152,7 +2153,7 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
 
         // Dump CFG-blended logits at step 0 for comparison with Python
         if (step == 0) {
-            const char* ddir = getenv("ZONOS_CPP_DUMP_DIR");
+            const char* ddir = crispasr_env::get("CRISPASR_ZONOS_CPP_DUMP_DIR");
             if (ddir) {
                 char dp[512];
                 snprintf(dp, sizeof(dp), "%s/cpp_cfg_step0_logits.npy", ddir);

@@ -89,6 +89,9 @@ void mimo_asr_set_ask(struct mimo_asr_context* ctx, const char* prompt);
 // core_beam_decode replay-from-prefix (§167f, needs Kaggle for testing).
 void mimo_asr_set_beam_size(struct mimo_asr_context* ctx, int beam_size);
 
+// #292: forward --max-new-tokens. n <= 0 keeps the backend's 256 default.
+void mimo_asr_set_max_new_tokens(struct mimo_asr_context* ctx, int n);
+
 // Per-token streaming callback.
 typedef void (*mimo_asr_token_cb)(int tok_id, float prob, void* userdata);
 

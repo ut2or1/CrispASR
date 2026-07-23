@@ -285,7 +285,7 @@ with heartbeat("build.configure"):
     sh_stream(
         f"cmake -G {'Ninja' if _HAS_NINJA else 'Unix Makefiles'} "
         f"-B {BUILD} -S {REPO} "
-        f"-DCMAKE_BUILD_TYPE=Release "
+        f"-DCMAKE_BUILD_TYPE=Release -DCRISPASR_NO_C2PA_NATIVE=ON "
         f"{_ccache_flags}"
         f"{cmake_extra}"
     )

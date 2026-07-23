@@ -49,6 +49,8 @@ void higgs_stt_set_ask(struct higgs_stt_context* ctx, const char* instruction);
 // Beam search width. 1 = greedy (default); >1 = beam search (core_beam_decode,
 // replay-from-prefix). beam=1 is token-identical to the greedy path.
 void higgs_stt_set_beam_size(struct higgs_stt_context* ctx, int beam_size);
+// #292: forward --max-new-tokens. <= 0 keeps the backend's 1024 default.
+void higgs_stt_set_max_new_tokens(struct higgs_stt_context* ctx, int n);
 
 // ---- Stage-1 helpers exposed for differential testing ----------------------
 //

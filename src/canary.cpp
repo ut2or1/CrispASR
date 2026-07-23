@@ -19,6 +19,7 @@
 //   <|startoftranscript|> <|src|> <|tgt|> <|pnc|> <|notimestamp|> <|nodiarize|> ...
 
 #include "canary.h"
+#include "core/crispasr_env.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -68,7 +69,7 @@
 static bool canary_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("CANARY_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_CANARY_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -250,6 +251,9 @@ struct canary_context {
 
     // §90 beam-search width. 1 = greedy (default).
     int beam_size = 1;
+    // #292: decode cap; forwarded from --max-new-tokens when the user set it,
+    // else this default. Clamped to the model's decoder context at use.
+    int max_new_tokens = 256;
 };
 
 // ===========================================================================
@@ -1437,6 +1441,12 @@ extern "C" void canary_set_beam_size(struct canary_context* ctx, int n) {
     ctx->beam_size = n > 0 ? n : 1;
 }
 
+// #292: forward --max-new-tokens. <= 0 keeps the 256 default.
+extern "C" void canary_set_max_new_tokens(struct canary_context* ctx, int n) {
+    if (ctx && n > 0)
+        ctx->max_new_tokens = n;
+}
+
 extern "C" int canary_n_vocab(struct canary_context* ctx) {
     return (int)ctx->model.hparams.vocab_size;
 }
@@ -1794,8 +1804,12 @@ static canary_result* canary_finish_from_encoder(canary_context* ctx, const floa
 
     // 5. Greedy decode
     const int eos = canary_str_to_token(ctx, "<|endoftext|>");
-    const int max_steps = 256;
     const int max_ctx = (int)ctx->model.hparams.max_dec_ctx;
+    // #292: honor --max-new-tokens, clamped to the model's decoder context so a
+    // large value can't run past the trained window / KV allocation.
+    int max_steps = ctx->max_new_tokens > 0 ? ctx->max_new_tokens : 256;
+    if (max_ctx > 0 && max_steps > max_ctx)
+        max_steps = max_ctx;
 
     std::vector<int> generated = prompt;
     std::vector<float> emitted_p; // softmax prob per generated non-prompt token

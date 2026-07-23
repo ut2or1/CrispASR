@@ -6,6 +6,7 @@
 
 #include "pyannote_seg.h"
 #include "core/gguf_loader.h"
+#include "core/crispasr_env.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -35,7 +36,7 @@
 static bool pyannote_seg_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("PYANNOTE_SEG_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_PYANNOTE_SEG_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -184,7 +185,7 @@ static bool pyannote_use_legacy() {
 // PYANNOTE_SEG_DUMP=<path>: write the (T,7) log-prob output as raw F32 for
 // A/B comparison between the ggml and legacy paths.
 static void pyannote_seg_dump(const float* logp, int T) {
-    const char* p = std::getenv("PYANNOTE_SEG_DUMP");
+    const char* p = crispasr_env::get("CRISPASR_PYANNOTE_SEG_DUMP");
     if (!p || !logp)
         return;
     if (FILE* f = fopen(p, "wb")) {

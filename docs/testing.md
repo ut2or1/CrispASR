@@ -66,6 +66,7 @@ other vars derive from it unless individually overridden.
 | `CRISPASR_MODEL_DIA` | Dia TTS live tests | Q4_K GGUF (~892 MB) |
 | `CRISPASR_MODEL_OUTETTS` | OuteTTS live tests | Q4_K GGUF (~600 MB) |
 | `CRISPASR_MODEL_WAVTOK` | WavTokenizer (OuteTTS codec) | F16 GGUF (~100 MB) |
+| `CRISPASR_MODEL_BTC_CHORDS` | BTC chord-recognition live tests | F32 GGUF (~11.7 MB). Default: `$CRISPASR_MODELS_DIR/btc-chords-large-f32.gguf`. Weights are CC-BY-NC-SA — see below. |
 
 ### Test groups
 
@@ -82,6 +83,15 @@ other vars derive from it unless individually overridden.
 | #462 | Backend regression | Auto-download (many backends) | 600s |
 | #463 | Benchmark-quick | parakeet-tdt-0.6b-v3 | 300s |
 | #464 | Progress output | Auto-download (whisper + parakeet) | 300s |
+| — | BTC chords (`test-btc-chords`, tag `[btc-chords]`) | btc-chords-large-f32.gguf (~11.7 MB) | — |
+
+> **BTC chord weights are non-commercial.** `test-btc-chords` (3 test cases /
+> 41 assertions, ctest label `live`, drives the session C-ABI) needs a BTC GGUF
+> from `cstr/btc-chords-GGUF`. The upstream BTC *code* is MIT, but the shipped
+> *weights* are CC-BY-NC-SA (trained on Isophonics / Robbie Williams /
+> UsPop2002 chord annotations), so the registry refuses to download them
+> without `--accept-license cc-by-nc-sa-4.0` (or the `CRISPASR_ACCEPT_LICENSE`
+> env var). CrispASR itself stays MIT.
 
 ### Auto-download and model cache
 

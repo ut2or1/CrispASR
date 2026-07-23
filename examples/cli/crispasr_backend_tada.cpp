@@ -13,13 +13,22 @@
 
 #include "tada_tts.h"
 
+// crispasr_audio_load_at_rate lives in the shared lib (crispasr_audio.cpp);
+// forward-declare it so the #201 .wav-clone path can decode a reference clip
+// straight to 24 kHz without pulling in the audio header.
+extern "C" int crispasr_audio_load_at_rate(const char* path, int target_rate, float** out_pcm, int* out_samples,
+                                           int* out_sample_rate);
+
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <sys/stat.h>
 #include <vector>
+#include "core/crispasr_env.h"
 
 namespace {
 
@@ -118,7 +127,7 @@ public:
         // (#192, N=4). A redundant override here is exactly how that 4 (and a
         // parallel session's 8) shipped; inheriting the tested library default
         // keeps one source of truth. Opt in to >1 with TADA_NUM_CANDIDATES.
-        if (const char* env = std::getenv("TADA_NUM_CANDIDATES"); env && *env) {
+        if (const char* env = crispasr_env::get("CRISPASR_TADA_NUM_CANDIDATES"); env && *env) {
             int n = atoi(env);
             if (n >= 1)
                 cp.num_acoustic_candidates = n;
@@ -129,29 +138,29 @@ public:
         // values (do_sample=True, temp=0.6, top_k=0, top_p=0.9, rep_penalty=1.1).
         // Override via env vars. --temperature (above) still sets cp.temperature.
         cp.text_do_sample = true;
-        if (const char* e = std::getenv("TADA_DO_SAMPLE"); e && *e)
+        if (const char* e = crispasr_env::get("CRISPASR_TADA_DO_SAMPLE"); e && *e)
             cp.text_do_sample = !(e[0] == '0' || e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N');
-        if (const char* e = std::getenv("TADA_TEMPERATURE"); e && *e)
+        if (const char* e = crispasr_env::get("CRISPASR_TADA_TEMPERATURE"); e && *e)
             cp.temperature = (float)atof(e);
-        if (const char* e = std::getenv("TADA_TOP_P"); e && *e)
+        if (const char* e = crispasr_env::get("CRISPASR_TADA_TOP_P"); e && *e)
             cp.text_top_p = (float)atof(e);
-        if (const char* e = std::getenv("TADA_TOP_K"); e && *e)
+        if (const char* e = crispasr_env::get("CRISPASR_TADA_TOP_K"); e && *e)
             cp.text_top_k = atoi(e);
-        if (const char* e = std::getenv("TADA_REPETITION_PENALTY"); e && *e)
+        if (const char* e = crispasr_env::get("CRISPASR_TADA_REPETITION_PENALTY"); e && *e)
             cp.text_repetition_penalty = (float)atof(e);
 
         // Acoustic flow-matching knobs (#197): the "quick and dirty" vs "slow and
         // accurate" axis. num_fm_steps is the primary quality lever (more ODE
         // steps = slower, higher fidelity). Defaults match upstream
         // InferenceOptions (10 / 1.6 / 0.9); override via env or per request.
-        if (const char* e = std::getenv("TADA_NUM_FM_STEPS"); e && *e) {
+        if (const char* e = crispasr_env::get("CRISPASR_TADA_NUM_FM_STEPS"); e && *e) {
             int n = atoi(e);
             if (n > 0)
                 cp.num_fm_steps = n;
         }
-        if (const char* e = std::getenv("TADA_ACOUSTIC_CFG"); e && *e)
+        if (const char* e = crispasr_env::get("CRISPASR_TADA_ACOUSTIC_CFG"); e && *e)
             cp.acoustic_cfg = (float)atof(e);
-        if (const char* e = std::getenv("TADA_NOISE_TEMP"); e && *e)
+        if (const char* e = crispasr_env::get("CRISPASR_TADA_NOISE_TEMP"); e && *e)
             cp.noise_temp = (float)atof(e);
 
         // Remember the resolved sampler defaults so a server can override them
@@ -207,20 +216,12 @@ public:
             const std::string& v = p.tts_voice;
             bool is_wav = v.size() >= 4 && (v.substr(v.size() - 4) == ".wav" || v.substr(v.size() - 4) == ".WAV");
             if (is_wav) {
-                // Direct .wav cloning isn't wired into the synth path yet; the
-                // voice reference must be a tada-ref.gguf. Build one from the
-                // .wav with the built-in make-ref pipeline (no Python needed):
-                fprintf(stderr,
-                        "crispasr[tada]: --voice with a .wav is not supported directly at synth time.\n"
-                        "  Build a reference GGUF from it once with the CLI --make-ref pipeline:\n"
-                        "    crispasr -m <tada-model.gguf> --make-ref \\\n"
-                        "      --voice %s --ref-text \"Exact words spoken in the audio.\" \\\n"
-                        "      --make-ref-output tada-ref-custom.gguf\n"
-                        "    (needs tada-encoder-*.gguf + tada-aligner-*.gguf next to the model,\n"
-                        "     or pass --make-ref-encoder/--make-ref-aligner)\n"
-                        "  Then synthesize with: --voice tada-ref-custom.gguf\n",
-                        v.c_str());
-                return false; // explicit voice couldn't be honored — fail loudly, don't use default
+                // #201: opt-in on-the-fly clone (CRISPASR_TADA_WAV_CLONE=1). On
+                // success the prompt is set in-memory, so prompt_path stays empty
+                // and the load block below is skipped. Off/failed → fail loudly
+                // (clone_from_wav prints how to enable / build a tada-ref.gguf).
+                if (!clone_from_wav(p))
+                    return false;
             } else {
                 prompt_path = crispasr_resolve_model_cli(p.tts_voice, p.backend, p.no_prints, p.cache_dir,
                                                          p.auto_download, p.model_quant);
@@ -232,7 +233,7 @@ public:
                     return false; // explicit voice couldn't be honored — fail loudly, don't use default
                 }
             }
-        } else if (const char* env = getenv("TADA_PROMPT_CACHE"); env && *env) {
+        } else if (const char* env = crispasr_env::get("CRISPASR_TADA_PROMPT_CACHE"); env && *env) {
             prompt_path = env;
         } else {
             prompt_path = discover_prompt(p.model, p.language);
@@ -276,6 +277,111 @@ public:
         return true;
     }
 
+    // #201: resolve a make-ref aux GGUF (encoder / aligner) — explicit path →
+    // next to the model → cache dir → auto-download from the TADA HF repo.
+    // Mirrors crispasr_run.cpp's resolve_aux so the adapter (server) path finds
+    // the same files the CLI make-ref pipeline does.
+    std::string resolve_makeref_aux(const whisper_params& p, const std::string& configured,
+                                    const std::string& fname) const {
+        auto present = [](const std::string& f) {
+            struct stat st;
+            return !f.empty() && stat(f.c_str(), &st) == 0;
+        };
+        if (present(configured))
+            return configured;
+        std::string mdir;
+        {
+            auto s = p.model.find_last_of("/\\");
+            mdir = (s == std::string::npos) ? std::string(".") : p.model.substr(0, s);
+        }
+        std::string local = mdir + "/" + fname;
+        if (present(local))
+            return local;
+        std::string cached = crispasr_cache::dir(p.cache_dir) + "/" + fname;
+        if (crispasr_cache::file_present(cached))
+            return cached;
+        if (p.auto_download) {
+            const std::string base = (p.backend == "tada-1b" || p.backend == "tada-tts-1b")
+                                         ? "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/"
+                                         : "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/";
+            return crispasr_cache::ensure_cached_file(fname, base + fname, p.no_prints, "crispasr", p.cache_dir);
+        }
+        return std::string();
+    }
+
+    // #201: on-the-fly clone from a reference WAV + its transcript
+    // (p.tts_ref_text), applied to ctx_ in memory via tada_make_ref_from_pcm —
+    // the no-temp-GGUF path the server needs. Opt-in, default OFF: without
+    // CRISPASR_TADA_WAV_CLONE=1 a .wav voice is rejected as before. On success
+    // sets last_voice_key_ and returns true.
+    bool clone_from_wav(const whisper_params& p) {
+        const std::string& v = p.tts_voice; // ends in .wav (callers gate on that)
+        if (const char* g = crispasr_env::get("CRISPASR_TADA_WAV_CLONE"); !g || atoi(g) == 0) {
+            fprintf(stderr, "crispasr[tada]: --voice with a .wav is opt-in — set CRISPASR_TADA_WAV_CLONE=1 to clone "
+                            "at synth time, or build a tada-ref.gguf with --make-ref.\n");
+            return false;
+        }
+        // Resolve the WAV + optional companion transcript, mirroring the server
+        // voice-dir convention (qwen3-tts): a bare name that isn't an existing
+        // path is taken relative to --voice-dir, with <stem>.txt as the ref-text
+        // when the request didn't supply one. The server path-traversal guard
+        // already rejected '..', absolute and '/'-containing names.
+        std::string wav = v;
+        std::string ref_text = p.tts_ref_text;
+        {
+            struct stat st;
+            const bool bare = v.find('/') == std::string::npos && v.find('\\') == std::string::npos;
+            if (stat(wav.c_str(), &st) != 0 && bare && !p.tts_voice_dir.empty() && v.find("..") == std::string::npos) {
+                wav = p.tts_voice_dir + "/" + v;
+                if (ref_text.empty()) {
+                    const std::string stem = v.substr(0, v.size() - 4); // strip ".wav"
+                    std::ifstream tf(p.tts_voice_dir + "/" + stem + ".txt");
+                    if (tf.good()) {
+                        std::stringstream ss;
+                        ss << tf.rdbuf();
+                        ref_text = ss.str();
+                        while (!ref_text.empty() && isspace((unsigned char)ref_text.back()))
+                            ref_text.pop_back();
+                    }
+                }
+            }
+        }
+        if (ref_text.empty()) {
+            fprintf(stderr, "crispasr[tada]: cloning from a .wav needs the transcript — pass --ref-text (CLI), the "
+                            "ref_text field (server), or a companion <name>.txt in the voice dir.\n");
+            return false;
+        }
+        const std::string enc = resolve_makeref_aux(p, p.make_ref_encoder, "tada-encoder-f16.gguf");
+        const std::string lang = tada_prompt_lang_suffix(p.language);
+        const std::string alang = lang.empty() ? std::string("en") : lang;
+        std::string ali = resolve_makeref_aux(p, p.make_ref_aligner, "tada-aligner-" + alang + ".gguf");
+        if (ali.empty() && alang != "en")
+            ali = resolve_makeref_aux(p, p.make_ref_aligner, "tada-aligner-en.gguf");
+        if (enc.empty() || ali.empty()) {
+            fprintf(stderr, "crispasr[tada]: .wav cloning needs the encoder + aligner GGUFs (add --auto-download, "
+                            "pass --make-ref-encoder/--make-ref-aligner, or place them next to the model).\n");
+            return false;
+        }
+        float* pcm = nullptr;
+        int n = 0, sr = 0;
+        if (crispasr_audio_load_at_rate(wav.c_str(), 24000, &pcm, &n, &sr) != 0 || !pcm || n <= 0) {
+            fprintf(stderr, "crispasr[tada]: .wav cloning: failed to decode '%s'\n", wav.c_str());
+            if (pcm)
+                free(pcm);
+            return false;
+        }
+        int rc = tada_make_ref_from_pcm(ctx_, enc.c_str(), ali.c_str(), pcm, n, ref_text.c_str());
+        free(pcm);
+        if (rc != 0) {
+            fprintf(stderr, "crispasr[tada]: .wav cloning failed (rc=%d)\n", rc);
+            return false;
+        }
+        last_voice_key_ = v;
+        if (!p.no_prints)
+            fprintf(stderr, "crispasr[tada]: cloned voice in-memory from '%s'\n", wav.c_str());
+        return true;
+    }
+
     // Switch the voice reference for this request (#201). Mirrors chatterbox's
     // per-call voice key: reload the prompt only when the request names a
     // different voice than the one currently loaded, so a long-running server
@@ -287,12 +393,9 @@ public:
             return true; // keep whatever is loaded
         const bool is_wav = v.size() >= 4 && (v.substr(v.size() - 4) == ".wav" || v.substr(v.size() - 4) == ".WAV");
         if (is_wav) {
-            fprintf(stderr,
-                    "crispasr[tada]: voice '%s' is a .wav — direct .wav voice cloning is not yet "
-                    "supported at query time. Convert it to a tada-ref.gguf first "
-                    "(models/convert-tada-ref-to-gguf.py or the CLI --make-ref pipeline) and pass that.\n",
-                    v.c_str());
-            return false;
+            // #201: per-request on-the-fly clone (opt-in, default OFF). This is
+            // the server's primary path for a .wav voice + ref_text.
+            return clone_from_wav(p);
         }
         std::string ref =
             crispasr_resolve_model_cli(v, p.backend, p.no_prints, p.cache_dir, p.auto_download, p.model_quant);

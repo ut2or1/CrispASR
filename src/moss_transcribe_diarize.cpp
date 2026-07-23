@@ -24,6 +24,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -41,6 +42,7 @@
 #include "core/bpe.h"
 #include "core/gpu_backend_pref.h"
 #include "core/ngram_loop_fix.h"
+#include "core/crispasr_env.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -53,7 +55,7 @@
 static bool moss_diarize_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("MOSS_DIARIZE_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_MOSS_DIARIZE_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -213,6 +215,11 @@ struct moss_diarize_context {
     int n_threads = 4;
     std::string model_path;
     int beam_size = 1;
+    // Decode cap. Diarize output is long (speaker tags + timestamps + text), so
+    // the default is 1024 rather than the global 512 — a single-pass 300 s file
+    // otherwise truncated (#292). The CLI/session forwards --max-new-tokens here
+    // when the user set it explicitly; unset keeps this 1024 default.
+    int max_new_tokens = 1024;
     std::string hotwords;
     std::string ask_override; // custom system instruction (set_ask)
     std::string language;     // language hint
@@ -1390,7 +1397,8 @@ static char* moss_diarize_impl(struct moss_diarize_context* ctx, const float* sa
     free(audio_embeds);
 
     // 6. KV cache + prefill
-    int max_ctx = n_prompt + 1024;
+    const int max_new = ctx->max_new_tokens > 0 ? ctx->max_new_tokens : 1024;
+    int max_ctx = n_prompt + max_new;
     if (ctx->kv_k) {
         if (ctx->kv_max_ctx < max_ctx) {
             if (ctx->kv_buf)
@@ -1415,9 +1423,8 @@ static char* moss_diarize_impl(struct moss_diarize_context* ctx, const float* sa
     if (!logits)
         return nullptr;
 
-    // 7. Decode
+    // 7. Decode  (max_new computed above, honors --max-new-tokens, #292)
     std::vector<int32_t> generated;
-    const int max_new = 1024; // diarize output can be longer
     if (ctx->beam_size > 1) {
         auto replay = [&vocab](moss_diarize_context* c, const int32_t* toks, int n, int prompt_len) -> float* {
             float* emb = moss_diarize_embed_tokens(c, toks, n);
@@ -1441,13 +1448,21 @@ static char* moss_diarize_impl(struct moss_diarize_context* ctx, const float* sa
             generated.pop_back();
     } else {
         for (int step = 0; step < max_new; step++) {
-            int best_id = 0;
-            float best_val = logits[0];
-            for (int i = 1; i < vocab; i++)
-                if (logits[i] > best_val) {
+            // NaN-robust argmax (see canary_qwen note): seed -inf, skip non-finite,
+            // abort if the whole row is non-finite.
+            int best_id = -1;
+            float best_val = -std::numeric_limits<float>::infinity();
+            for (int i = 0; i < vocab; i++)
+                if (std::isfinite(logits[i]) && logits[i] > best_val) {
                     best_val = logits[i];
                     best_id = i;
                 }
+            if (best_id < 0) {
+                free(logits);
+                logits = nullptr;
+                fprintf(stderr, "moss_diarize: non-finite logits at step %d — aborting decode\n", step);
+                break;
+            }
             free(logits);
             logits = nullptr;
             if (ctx->params.verbosity >= 2 && step < 10)
@@ -1527,6 +1542,14 @@ extern "C" void moss_diarize_set_hotwords(struct moss_diarize_context* ctx, cons
 extern "C" void moss_diarize_set_beam_size(struct moss_diarize_context* ctx, int beam_size) {
     if (ctx)
         ctx->beam_size = beam_size > 0 ? beam_size : 1;
+}
+
+// #292: forward the user's --max-new-tokens. Pass <= 0 to keep the 1024 default
+// (the caller decides "explicit" — see the CLI adapter's max_new_tokens_explicit
+// gate, so an unset CLI default of 512 does not silently shrink this backend).
+extern "C" void moss_diarize_set_max_new_tokens(struct moss_diarize_context* ctx, int max_new_tokens) {
+    if (ctx && max_new_tokens > 0)
+        ctx->max_new_tokens = max_new_tokens;
 }
 
 extern "C" void moss_diarize_set_ask(struct moss_diarize_context* ctx, const char* instruction) {

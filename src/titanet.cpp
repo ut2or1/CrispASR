@@ -15,6 +15,7 @@
 #include "titanet.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -41,7 +42,7 @@
 // to validate scalar == GEMM or run on non-Apple.
 static bool titanet_use_scalar() {
 #if defined(HAVE_ACCELERATE)
-    static const bool force_scalar = std::getenv("TITANET_FORCE_SCALAR") != nullptr;
+    static const bool force_scalar = crispasr_env::get("CRISPASR_TITANET_FORCE_SCALAR") != nullptr;
     return force_scalar;
 #else
     return true;
@@ -59,7 +60,7 @@ static bool titanet_use_scalar() {
 static bool titanet_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("TITANET_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_TITANET_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -404,7 +405,7 @@ static bool titanet_use_legacy() {
 // TITANET_DUMP=<path>: append each L2-normalized embedding as raw F32 —
 // A/B comparison between the ggml and legacy paths.
 static void titanet_dump_emb(const float* emb, int dim) {
-    const char* p = std::getenv("TITANET_DUMP");
+    const char* p = crispasr_env::get("CRISPASR_TITANET_DUMP");
     if (!p)
         return;
     if (FILE* f = fopen(p, "ab")) {
@@ -940,7 +941,7 @@ extern "C" int titanet_embed(struct titanet_context* ctx, const float* pcm_16k, 
         return 0;
 
     // Debug: optionally load reference mel features
-    const char* ref_path = getenv("TITANET_REF_MEL");
+    const char* ref_path = crispasr_env::get("CRISPASR_TITANET_REF_MEL");
     if (ref_path && *ref_path) {
         FILE* f = fopen(ref_path, "rb");
         if (f) {

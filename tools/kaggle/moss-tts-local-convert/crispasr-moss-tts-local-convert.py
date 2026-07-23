@@ -42,6 +42,7 @@ def main():
     sys.path.insert(0, str(REPO / "tools" / "kaggle"))
     try:
         import kaggle_harness as kh
+        kh.init_progress()
         tok = kh.resolve_hf_token()
     except Exception:  # noqa: BLE001
         tok = os.environ.get("HF_TOKEN")

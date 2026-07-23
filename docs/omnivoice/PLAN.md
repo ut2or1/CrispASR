@@ -5,8 +5,77 @@ stranded GPU commit `feat/omnivoice-gpu` = "run the LLM on GPU").
 
 ## NOW — active work
 
-**Status (2026-07-15): OmniVoice RTF #2 — codec-decode FASTCONV landed on branch
-`perf/omnivoice-254-decode-rtf` (worktree `.claude/worktrees/omnivoice-rtf-decode`).**
+**Status (2026-07-16): OmniVoice RTF #4 — fused stage0 step graph, branch
+`feat/omnivoice-rtf-stage0` (worktree `.claude/worktrees/omnivoice-rtf-stage0`).**
+
+Reporter re-benched after single-shot (#254 last comment): CUDA RTF still 0.17
+vs omnivoice.cpp 0.144 — gen 3.55 s vs their 3.02 s for ~22 s audio (decode now
+free). Structural read of the step loop found the residual ~44 ms/step of host
+overhead: per-step ~18 MB audio-embedding readback + single-threaded codebook
+sum + ~5 MB embed re-upload, a full-sequence ~39 MB logits readback (only the
+target slice is used), single-threaded triple-log-softmax CFG scoring (~13M
+`exp`/step), and multi-MB per-step vector allocs (+ a full `u_logits` copy).
+
+- ✅ **Fused per-step graph (`OMNIVOICE_FUSED_STEP`, default ON when persistent):**
+  token ids in (→ ~140 KB int32 upload), in-graph `get_rows` + cb-ascending
+  chained adds (bitwise == host sum) + concat with a device-resident text-embed
+  tensor (own buffer, gallocr-alias-proof), transformer unchanged, `ggml_cont`
+  view of ONLY the target logit slices out. Modes: cond-only / uncond-only /
+  unified. Embed tables are F16 even in quant GGUFs (quantize rule), so the
+  in-graph `get_rows` stays CUDA-graph-capture-safe (fork's
+  TAG_GET_ROWS_CUDA_GRAPHS disables capture only for quantized `get_rows`).
+- ✅ **Threaded CFG scoring** (`ov_parallel_for` over target positions; the
+  position-Gumbel draws are precomputed serially so the rng stream is
+  bit-identical; sampled path `class_temp>0` stays serial). Scoring buffers
+  hoisted; interval-CFG uses the persistent `u_buf` — no more 18 MB/step copy.
+- ✅ **Byte-identity (M1 Metal, q8_0, `OMNIVOICE_DUMP_CODES` + cmp):** legacy vs
+  fused BYTE-IDENTICAL on ALL five config classes — (a) reporter's paragraph,
+  2-forward path (modes 0+1, 4360 codes); (b) fox + `OMNIVOICE_UNIFIED_CFG=1`
+  (mode 2, 520 codes); (c) fox + `OMNIVOICE_CFG_INTERVAL=2` (interval-CFG
+  u_buf caching); (d) fox + `OMNIVOICE_GUIDANCE=0` (cond-only, no uncond arm).
+  ASR roundtrip on the fused paragraph clean (all #254 words present). 907/907
+  unit tests pass.
+- ✅ **Default policy:** fused ON for CPU/Metal (proven above); **legacy stays
+  the default on CUDA** until the roundtrip runs there (LEARNING 35 — never
+  flip a GPU default blind). `OMNIVOICE_FUSED_STEP=1` opts in on CUDA.
+- ⏳ **CUDA A/B blocked on quota:** both Kaggle accounts exhausted (30 h/wk,
+  ~2 days to reset); alternative: the A1000 box. Kernel is ready:
+  `tools/kaggle/omnivoice-fused-step-ab/` (legacy vs fused vs fused+2-forward,
+  reporter's paragraph, byte-identity gate + median gen s + per-stage bench;
+  `CRISPASR_REF=main`). Local M1 timing is load-noise (loadavg 100–290 all
+  day; legacy vs fused gen 370→234 s directional only, decode-stage noise
+  3.8× between arms of identical code).
+- ✅ **Reference-voice disk cache shipped (2026-07-16):** the reporter's last
+  ask (omnivoice.cpp `--ref-rvq` parity). Automatic content-addressed cache of
+  the RVQ ref codes (FNV-1a over preprocessed pcm + encoder fingerprint, OVC1
+  file, same dir resolution as the pocket_tts latents cache);
+  `CRISPASR_OMNIVOICE_VOICE_CACHE=0` disables. Verified: run 2 logs "voice
+  codes loaded from cache", codes byte-identical, WAV audio data bit-identical.
+- ✅ **M1 matched-load per-stage A/B (load≈29 both arms):** fused vs legacy gen
+  is NEUTRAL on Metal (96.3 s vs 93.7 s totals, per-forward medians within
+  noise) — unified memory made the legacy host overhead nearly free (embeds
+  0.9 s of ~94 s), so the fused win is CUDA-specific (2.3×). Default fused
+  everywhere stands (identical output, neutral Metal, big CUDA).
+  Same-box omnivoice.cpp: its Metal backend fails to init on macOS 26 (bf16
+  Metal-shader compile error in their ggml), CPU-only path is gen 728 s
+  (RTF 34) vs our Metal ~90-116 s — CrispASR is the only implementation with
+  a working GPU path on this Mac.
+- ✅ **CUDA A/B verdict IN (2026-07-16, reporter, RTX 5070 Ti):** `cmp`
+  byte-identical on CUDA; gen 3.55 s → **1.53 s (2.3×)**, RTF 0.17 → **0.07**
+  (vs omnivoice.cpp 0.144 — CrispASR is now ~2× FASTER than the reference
+  implementation); single CUDA-graph warmup. Per-step 45.9 ms = fwd 27.4 +
+  score_cfg 11.6 + read_logits 5.2 + sample 1.5. → **CUDA default flipped to
+  fused** (this commit). Reporter's remaining ask: reference-voice caching to
+  disk (omnivoice.cpp feature parity) — next work item.
+- 📣 **Reporter A/B requested (2026-07-16):** asked the #254 reporter (RTX
+  5070 Ti — the exact platform) to run `OMNIVOICE_FUSED_STEP=0` vs `=1` with
+  `OMNIVOICE_DUMP_CODES` + `cmp` on current main
+  (issue comment 4995155233). Whichever lands first — reporter, Kaggle
+  quota (~07-18), or the A1000 — gates the CUDA default flip.
+- **Next (when GPU access returns):** run the Kaggle/A1000 A/B → if
+  byte-identical + faster on CUDA, flip the CUDA default to fused and ask the
+  reporter to re-bench. Expected: kills the ~44 ms/step host overhead that is
+  the residual RTF 0.17-vs-0.144 gap.
 
 Reporter's residual complaint after the over-length + word-drop fixes: "CrispASR
 is still slower than alternative implementations" and "decoding is on cpu, which
@@ -31,17 +100,15 @@ copies amortized over few frames).
   summary at normal verbosity (`gen Xs + decode Ys = Zs for Ws audio (RTF …)`) —
   no more wrapping in `time`.
 - ✅ **Landed on `main`** (`6a1b1903b`, rebased past the 0.8.11 release bump).
-- 🧪 **GPU/Metal codec decode (`OMNIVOICE_CODEC_GPU`, default OFF, shipped as scaffold):**
+- ✅ **GPU codec decode (`OMNIVOICE_CODEC_GPU`, default ON for CUDA, opt-in elsewhere):**
   every decode op is Metal-supported (CONV_TRANSPOSE_1D/IM2COL/MUL_MAT/SIN/CAST/
   GET_ROWS), output equivalent (max |Δ| ≈ 54/32768, inaudible). **But on M1 Metal it
   LOSES to CPU-FASTCONV:** decode 1.15→1.73 s (short) and 11.2→19.6 s (437-frame) —
-  ~40 modest-channel convs are dispatch-bound on Metal and contend with the
-  concurrently-Metal LLM (the dev-guide "small-op GPU dispatch is launch-bound"
-  case). Kept OFF (verified-but-slower → opt-in). **May still win on CUDA** (the
-  unified-CFG precedent in this same PLAN flipped a Metal-loser into a +13% CUDA
-  win) → needs a Kaggle CUDA A/B before any default flip. Box was loaded (gen
-  37→58 s between runs) so numbers are directional, not clean — but the conservative
-  default (OFF) is unaffected.
+  ~40 modest-channel convs are dispatch-bound on Metal, so Metal remains CPU by
+  default. CUDA validation on RTX 5070 Ti reduced a 7.52 s clip's decode from
+  ~1.4 s on CPU to ~34 ms with PCM cosine 0.99999986; issue #254 independently
+  reported 0.05–0.11 s CUDA decode. `OMNIVOICE_CODEC_GPU=0` restores CPU placement,
+  while `=1` opts non-CUDA GPU backends into the existing path.
 - ⏭ **Remaining lever:** the LLM `gen` phase is already at per-step parity with
   omnivoice.cpp, so headroom there is kernel-level (their ggml fork). A persistent
   decode graph (build/alloc once, reuse across chunks) could cut the GPU dispatch

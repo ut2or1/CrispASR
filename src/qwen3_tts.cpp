@@ -73,6 +73,7 @@
 #include "core/gguf_loader.h"
 #include "core/mel.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -113,20 +114,20 @@ namespace {
 // ---------------------------------------------------------------------------
 
 bool env_bool(const char* k) {
-    const char* v = std::getenv(k);
+    const char* v = crispasr_env::get(k);
     return v && *v && std::strcmp(v, "0") != 0;
 }
 // Returns the env var as bool when set; falls back to `dflt` when unset/empty.
 // Use this for env-overridable knobs whose default is ON.
 bool env_bool_default(const char* k, bool dflt) {
-    const char* v = std::getenv(k);
+    const char* v = crispasr_env::get(k);
     if (!v || !*v) {
         return dflt;
     }
     return std::strcmp(v, "0") != 0;
 }
 const char* env_str(const char* k) {
-    const char* v = std::getenv(k);
+    const char* v = crispasr_env::get(k);
     return (v && *v) ? v : nullptr;
 }
 
@@ -137,7 +138,7 @@ const char* env_str(const char* k) {
 static bool qwen3_tts_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("QWEN3_TTS_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_QWEN3_TTS_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -895,12 +896,12 @@ static bool qwen3_tts_codec_backend_is_cuda(const qwen3_tts_context* c) {
 }
 
 static bool qwen3_tts_codec_decode_uses_cuda(const qwen3_tts_context* c) {
-    const bool force_cpu = std::getenv("QWEN3_TTS_CODEC_CPU") != nullptr;
+    const bool force_cpu = crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_CPU") != nullptr;
     if (force_cpu || !qwen3_tts_codec_backend_is_cuda(c)) {
         return false;
     }
-    return std::getenv("QWEN3_TTS_CODEC_FORCE_METAL") != nullptr || std::getenv("QWEN3_TTS_CODEC_GPU") != nullptr ||
-           qwen3_tts_codec_use_gpu_by_default(c);
+    return crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_FORCE_METAL") != nullptr ||
+           crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_GPU") != nullptr || qwen3_tts_codec_use_gpu_by_default(c);
 }
 
 // ---------------------------------------------------------------------------
@@ -1179,7 +1180,7 @@ ggml_cgraph* build_graph_code_pred_kv(qwen3_tts_context* c, int n_past, int n_to
     // The flag will go back to default-ON once the CUDA path is fixed.
     // o15_force >= 0 pins the topology choice (CP_DIRECT builds O15-shaped
     // graphs regardless of the env); < 0 keeps the env-driven behaviour.
-    const bool o15 = o15_force >= 0 ? o15_force != 0 : env_bool_default("QWEN3_TTS_O15", false);
+    const bool o15 = o15_force >= 0 ? o15_force != 0 : env_bool_default("CRISPASR_QWEN3_TTS_O15", false);
     const int Lk = o15 ? c->cp_kv_max_ctx : (n_past + T);
 
     ggml_context* ctx0 = arena_ctx;
@@ -1273,7 +1274,7 @@ ggml_cgraph* build_graph_code_pred_kv(qwen3_tts_context* c, int n_past, int n_to
 }
 
 static ggml_backend_sched_t code_pred_pick_sched(qwen3_tts_context* c) {
-    const char* cp_be = env_str("QWEN3_TTS_CP_BACKEND");
+    const char* cp_be = env_str("CRISPASR_QWEN3_TTS_CP_BACKEND");
     if (cp_be && std::strncmp(cp_be, "cpu", 3) == 0 && c->cp_cpu_pinned && c->cp_sched) {
         return c->cp_sched;
     }
@@ -1520,7 +1521,7 @@ float* run_talker_kv(qwen3_tts_context* c, const float* embeds, int n_tokens, in
     // Dispatched only when env opt-in, a bucket fits the current n_past, and
     // the direct dispatch hasn't been disabled (unsupported op on the
     // backend / init failure — then every step falls back to dynamic).
-    if (n_tokens == 1 && env_bool("QWEN3_TTS_LK_BUCKET") && c->talker_dir_state >= 0) {
+    if (n_tokens == 1 && env_bool("CRISPASR_QWEN3_TTS_LK_BUCKET") && c->talker_dir_state >= 0) {
         const int needed = n_past + 1;
         const int idx = talker_pick_bucket(needed);
         if (idx >= 0) {
@@ -1571,8 +1572,8 @@ static float* run_talker_kv_dynamic(qwen3_tts_context* c, const float* embeds, i
     c->cp_t1_gf = nullptr;
     c->cp_t1_allocated = false;
 
-    const bool bench = env_bool("QWEN3_TTS_BENCH");
-    const bool prof = env_bool("QWEN3_TTS_PROF");
+    const bool bench = env_bool("CRISPASR_QWEN3_TTS_BENCH");
+    const bool prof = env_bool("CRISPASR_QWEN3_TTS_PROF");
     const double t_build0 = bench ? now_ms() : 0.0;
     ggml_cgraph* gf = build_graph_talker_kv(c, n_past, n_tokens);
     const double t_build1 = bench ? now_ms() : 0.0;
@@ -1684,7 +1685,7 @@ static float* run_talker_kv_bucket(qwen3_tts_context* c, const float* embeds, in
     // compute_meta) run only outside the AR loop, so cp_t1_gf invalidation
     // for them is handled at their own call sites if/when needed.
 
-    const bool bench = env_bool("QWEN3_TTS_BENCH");
+    const bool bench = env_bool("CRISPASR_QWEN3_TTS_BENCH");
     const double t_build0 = bench ? now_ms() : 0.0;
     ggml_cgraph* gf = talker_bucket_get_or_build(c, idx);
     if (!gf) {
@@ -2011,7 +2012,7 @@ static float* run_code_pred_direct(qwen3_tts_context* c, const float* embeds, in
     const int mask_Lk = c->cp_kv_max_ctx;
     ggml_cgraph* gf = (n_tokens == 1) ? c->cp_dir_gf : c->cp_dir0_gf;
 
-    const bool bench = env_bool("QWEN3_TTS_BENCH");
+    const bool bench = env_bool("CRISPASR_QWEN3_TTS_BENCH");
     const double t0 = bench ? now_ms() : 0.0;
 
     if (n_tokens == 1) {
@@ -2083,7 +2084,7 @@ float* run_code_pred_kv(qwen3_tts_context* c, const float* embeds, int n_tokens,
     // no dispatch cost to save and the per-step lm_head slot blit
     // (~2.2 MB memcpy x14/frame) makes it ~2x SLOWER. Env always wins.
     const bool cp_direct_default = c->backend && c->backend != c->backend_cpu;
-    if (env_bool_default("QWEN3_TTS_CP_DIRECT", cp_direct_default) && !c->cp_cpu_pinned &&
+    if (env_bool_default("CRISPASR_QWEN3_TTS_CP_DIRECT", cp_direct_default) && !c->cp_cpu_pinned &&
         (n_tokens == 1 || (n_tokens == 2 && n_past == 0))) {
         float* r_dir = run_code_pred_direct(c, embeds, n_tokens, n_past, lm_head);
         if (r_dir) {
@@ -2098,7 +2099,7 @@ float* run_code_pred_kv(qwen3_tts_context* c, const float* embeds, int n_tokens,
     const int d_in_eff = (c->cp_mtp_fused && c->code_pred.small_to_mtp_w) ? (int)c->code_pred.small_to_mtp_w->ne[0] : d;
 
     // Default OFF — see #56: ggml_set_rows-based reuse asserts on CUDA.
-    const bool o15 = env_bool_default("QWEN3_TTS_O15", false);
+    const bool o15 = env_bool_default("CRISPASR_QWEN3_TTS_O15", false);
     const int actual_Lk = n_past + n_tokens;
     const int mask_Lk = o15 ? c->cp_kv_max_ctx : actual_Lk;
 
@@ -2139,12 +2140,12 @@ float* run_code_pred_kv(qwen3_tts_context* c, const float* embeds, int n_tokens,
     // frames. Requires O15 (mask + kv_indices path). Eliminates the per-frame
     // build+reset+alloc for step 0 (~0.5-3 ms/frame depending on contention).
     const bool use_step0_cache =
-        (o15 && n_tokens == 2 && n_past == 0 && !c->cp_cpu_pinned && env_bool("QWEN3_TTS_CP_STEP0_CACHE"));
+        (o15 && n_tokens == 2 && n_past == 0 && !c->cp_cpu_pinned && env_bool("CRISPASR_QWEN3_TTS_CP_STEP0_CACHE"));
     if (use_step0_cache) {
         ggml_cgraph* s0_gf = cp_step0_get_or_build(c);
         ggml_backend_sched_t s0_sched = cp_step0_pick_sched(c);
         if (s0_gf && s0_sched) {
-            const bool bench_s0 = env_bool("QWEN3_TTS_BENCH");
+            const bool bench_s0 = env_bool("CRISPASR_QWEN3_TTS_BENCH");
             const double t0 = bench_s0 ? now_ms() : 0.0;
             if (!c->cp_step0_reserved) {
                 ggml_backend_sched_reset(s0_sched);
@@ -2189,8 +2190,8 @@ float* run_code_pred_kv(qwen3_tts_context* c, const float* embeds, int n_tokens,
         // Fall through to default path on init failure.
     }
 
-    const bool bench = env_bool("QWEN3_TTS_BENCH");
-    const bool prof = env_bool("QWEN3_TTS_PROF");
+    const bool bench = env_bool("CRISPASR_QWEN3_TTS_BENCH");
+    const bool prof = env_bool("CRISPASR_QWEN3_TTS_PROF");
     const double t_build0 = bench ? now_ms() : 0.0;
 
     // skip_plan=true: reuse the cached T=1 graph on a dedicated scheduler
@@ -2267,7 +2268,7 @@ float* run_code_pred_kv(qwen3_tts_context* c, const float* embeds, int n_tokens,
     // CPU / older-ggml setups only. With the skip off, O15 on 0.6B Metal is
     // ~5% slower than O15=0 (re-alloc cost > build-once saving at this size), so
     // O15 stays default-OFF; its win is on CUDA 1.7B (the crash this PR fixes).
-    const bool skip_realloc = can_skip && c->cp_t1_allocated && env_bool("QWEN3_TTS_O15_SKIP_REALLOC");
+    const bool skip_realloc = can_skip && c->cp_t1_allocated && env_bool("CRISPASR_QWEN3_TTS_O15_SKIP_REALLOC");
     const double t_reset0 = bench ? now_ms() : 0.0;
     if (!skip_realloc) {
         ggml_backend_sched_reset(sched);
@@ -2363,7 +2364,7 @@ bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, con
     // qwen3_tts_context_default_params(), so untouched callers keep
     // the historical behaviour.
     const float temperature = c->params.temperature > 0 ? c->params.temperature : 0.9f;
-    const char* dump_dir = env_str("QWEN3_TTS_DUMP_DIR");
+    const char* dump_dir = env_str("CRISPASR_QWEN3_TTS_DUMP_DIR");
 
     // ---- step 0: inputs_embeds = (past_hidden, last_id_hidden), n_past=0 ----
     // For 1.7B variants (talker_hidden=2048, cp_hidden=1024) the talker's
@@ -2392,7 +2393,7 @@ bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, con
         std::memcpy(step0.data(), past_hidden_d, (size_t)d * sizeof(float));
         std::memcpy(step0.data() + d, last_id_hidden_d, (size_t)d * sizeof(float));
     }
-    if (getenv("QWEN3_TTS_EMBD_CHECK")) {
+    if (crispasr_env::get("CRISPASR_QWEN3_TTS_EMBD_CHECK")) {
         float ph_l1 = 0.0f, lih_l1 = 0.0f;
         for (int j = 0; j < d; j++)
             ph_l1 += std::abs(past_hidden_d[j]);
@@ -2420,7 +2421,7 @@ bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, con
         snprintf(name, sizeof(name), "cp_f%03d_step00_logits", frame_idx);
         dump_f32(dump_dir, name, logits0, hp.cp_vocab_size);
     }
-    if (getenv("QWEN3_TTS_EMBD_CHECK")) {
+    if (crispasr_env::get("CRISPASR_QWEN3_TTS_EMBD_CHECK")) {
         float l1 = 0.0f;
         int top_idx = 0;
         float top_val = logits0[0];
@@ -2462,7 +2463,7 @@ bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, con
         }
         int32_t prev = out_codes15[i - 1];
         bool ok = false;
-        const bool use_cache = !env_bool("QWEN3_TTS_NO_EMBD_CACHE");
+        const bool use_cache = !env_bool("CRISPASR_QWEN3_TTS_NO_EMBD_CACHE");
         if (use_cache && i - 1 < (int)c->codec_embd_cache.size() && c->codec_embd_cache[i - 1]) {
             ok = c->codec_embd_cache[i - 1].get_row_into(prev, emb_in_buf.data());
         } else {
@@ -3315,7 +3316,7 @@ bool build_icl_prefill_embeds(qwen3_tts_context* c, const std::string& syn_text,
     off += bridge.size();
     std::memcpy(prefill_embeds.data() + off, icl_input.data(), (size_t)icl_len * d * sizeof(float));
 
-    if (const char* dd = env_str("QWEN3_TTS_DUMP_DIR")) {
+    if (const char* dd = env_str("CRISPASR_QWEN3_TTS_DUMP_DIR")) {
         dump_f32(dd, "icl_role", role_emb, (size_t)3 * d);
         dump_f32(dd, "icl_bridge", bridge.data(), bridge.size());
         dump_f32(dd, "icl_codec_input", codec_input_emb.data(), codec_input_emb.size());
@@ -3725,7 +3726,7 @@ bool build_voicedesign_prefill_embeds(qwen3_tts_context* c, const std::string& i
     trailing_text_hidden.assign(tts_pad, tts_pad + d);
     M_trailing = 1;
 
-    if (const char* dd = env_str("QWEN3_TTS_DUMP_DIR")) {
+    if (const char* dd = env_str("CRISPASR_QWEN3_TTS_DUMP_DIR")) {
         dump_f32(dd, "vd_instruct_emb", instruct_emb, (size_t)M_instruct * d);
         dump_f32(dd, "vd_role", role_emb, (size_t)3 * d);
         dump_f32(dd, "vd_bridge", bridge.data(), bridge.size());
@@ -3773,7 +3774,7 @@ bool build_voicedesign_prefill_embeds(qwen3_tts_context* c, const std::string& i
 //   3. F32 conv kernels baked at load (see load_codec) so ggml_conv_1d
 //      doesn't cast multi-MB F16 kernels inside every graph.
 static bool codec_fastconv_enabled() {
-    return env_bool_default("QWEN3_TTS_CODEC_FASTCONV", true);
+    return env_bool_default("CRISPASR_QWEN3_TTS_CODEC_FASTCONV", true);
 }
 
 static ggml_tensor* codec_causal_conv1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, int stride,
@@ -4135,9 +4136,9 @@ static bool load_codec(qwen3_tts_context* c, const char* path) {
     //   QWEN3_TTS_CODEC_GPU=1         — explicit GPU override (no-op when
     //                                   GPU is already the default).
     //   QWEN3_TTS_CODEC_CPU=1         — force CPU codec for A/B timing.
-    const bool force_metal = std::getenv("QWEN3_TTS_CODEC_FORCE_METAL") != nullptr;
-    const bool force_gpu = std::getenv("QWEN3_TTS_CODEC_GPU") != nullptr;
-    const bool force_cpu = std::getenv("QWEN3_TTS_CODEC_CPU") != nullptr;
+    const bool force_metal = crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_FORCE_METAL") != nullptr;
+    const bool force_gpu = crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_GPU") != nullptr;
+    const bool force_cpu = crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_CPU") != nullptr;
     const bool default_gpu = qwen3_tts_codec_use_gpu_by_default(c);
     const bool codec_gpu = force_metal || force_gpu || (!force_cpu && default_gpu);
     ggml_backend_t weight_backend = codec_gpu ? c->backend : c->backend_cpu;
@@ -4416,9 +4417,9 @@ static bool codec_trace_eval_cb(struct ggml_tensor* t, bool ask, void* user_data
 //   QWEN3_TTS_CODEC_GPU=1         — explicit GPU override (usually no-op).
 //   QWEN3_TTS_CODEC_CPU=1         — force CPU codec for A/B timing.
 static ggml_backend_sched_t codec_pick_sched(qwen3_tts_context* c) {
-    const bool force_metal = std::getenv("QWEN3_TTS_CODEC_FORCE_METAL") != nullptr;
-    const bool force_gpu = std::getenv("QWEN3_TTS_CODEC_GPU") != nullptr;
-    const bool force_cpu = std::getenv("QWEN3_TTS_CODEC_CPU") != nullptr;
+    const bool force_metal = crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_FORCE_METAL") != nullptr;
+    const bool force_gpu = crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_GPU") != nullptr;
+    const bool force_cpu = crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_CPU") != nullptr;
     const bool codec_gpu = force_metal || force_gpu || (!force_cpu && qwen3_tts_codec_use_gpu_by_default(c));
     if (codec_gpu) {
         // Dedicated GPU scheduler — isolates codec memory pool from talker/main
@@ -4497,12 +4498,12 @@ static float* codec_decode_window(qwen3_tts_context* c, const int32_t* codes_t, 
     }
 
     codec_trace_state ts{sched, 0, ggml_graph_n_nodes(gf)};
-    if (std::getenv("QWEN3_TTS_CODEC_TRACE")) {
+    if (crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_TRACE")) {
         fprintf(stderr, "qwen3_tts: codec: tracing %d nodes\n", ts.total);
         ggml_backend_sched_set_eval_callback(sched, codec_trace_eval_cb, &ts);
     }
     ggml_status st = ggml_backend_sched_graph_compute(sched, gf);
-    if (std::getenv("QWEN3_TTS_CODEC_TRACE")) {
+    if (crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_TRACE")) {
         ggml_backend_sched_set_eval_callback(sched, nullptr, nullptr);
     }
     // Sync GPU to drain the command queue before reading back.
@@ -4563,13 +4564,13 @@ static float* codec_decode_codes(qwen3_tts_context* c, const int32_t* codes, int
     const int cuda_chunk_cap = 64;
     int chunk = cuda_codec ? cuda_chunk_cap : 150;
     int ctx = cuda_codec ? std::max(window, 96) : 128;
-    if (const char* e = std::getenv("QWEN3_TTS_CODEC_CHUNK"))
+    if (const char* e = crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_CHUNK"))
         chunk = atoi(e);
-    if (const char* e = std::getenv("QWEN3_TTS_CODEC_CTX"))
+    if (const char* e = crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_CTX"))
         ctx = atoi(e);
     if (ctx < window)
         ctx = window; // left-context must cover the sliding window
-    if (cuda_codec && !std::getenv("QWEN3_TTS_CODEC_ALLOW_FULL")) {
+    if (cuda_codec && !crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_ALLOW_FULL")) {
         if (chunk <= 0) {
             chunk = cuda_chunk_cap;
         } else if (chunk > cuda_chunk_cap) {
@@ -4678,7 +4679,8 @@ static float* codec_extract_stage(qwen3_tts_context* c, const int32_t* codes, in
     }
 
     codec_trace_state ts{sched, 0, ggml_graph_n_nodes(gf)};
-    const bool trace = std::getenv("QWEN3_TTS_CODEC_TRACE") || std::getenv("QWEN3_TTS_CODEC_FORCE_METAL");
+    const bool trace = crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_TRACE") ||
+                       crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_FORCE_METAL");
     if (trace) {
         fprintf(stderr, "qwen3_tts: codec: tracing %d nodes (sched=%s, stage=%s)\n", ts.total,
                 sched == c->codec_sched ? "codec_cpu" : "main", stage_name);
@@ -5997,7 +5999,7 @@ extern "C" struct qwen3_tts_context* qwen3_tts_init_from_file(const char* path_m
     // Off by default: interleaved A/B bench 2026-05-23 (M1, Q8_0 0.6B,
     // 94 frames) shows neutral for Q8_0 — ~129 ms/frame with and without.
     // F16 case untested locally; flip with QWEN3_TTS_FUSED_QKV=1 to bench.
-    if (env_bool("QWEN3_TTS_FUSED_QKV")) {
+    if (env_bool("CRISPASR_QWEN3_TTS_FUSED_QKV")) {
         auto& blocks = c->talker.blocks;
         // PLAN #60d: type gate dropped May 2026 — Q-format byte-concat
         // works the same as F16/F32. Buffer switched from CPU to default-
@@ -6068,7 +6070,7 @@ extern "C" struct qwen3_tts_context* qwen3_tts_init_from_file(const char* path_m
     }
     c->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 
-    const char* cp_be = env_str("QWEN3_TTS_CP_BACKEND");
+    const char* cp_be = env_str("CRISPASR_QWEN3_TTS_CP_BACKEND");
     if (cp_be && std::strncmp(cp_be, "cpu", 3) == 0) {
         if (!copy_cp_weights_to_cpu(c, code_pred_cpu_copy_type_from_env(cp_be))) {
             fprintf(stderr, "qwen3_tts: code_pred CPU pin requested but copy failed; using main backend\n");
@@ -6085,7 +6087,7 @@ extern "C" struct qwen3_tts_context* qwen3_tts_init_from_file(const char* path_m
     // q8_0 realization with no extra dispatch and no precision shift. Skipped
     // when code_pred is CPU-pinned (cp_cpu_pinned keeps the external
     // projection), or via QWEN3_TTS_CP_MTP_NOFUSE=1 for A/B bisection.
-    c->cp_mtp_fused = c->code_pred.small_to_mtp_w && !c->cp_cpu_pinned && !env_bool("QWEN3_TTS_CP_MTP_NOFUSE");
+    c->cp_mtp_fused = c->code_pred.small_to_mtp_w && !c->cp_cpu_pinned && !env_bool("CRISPASR_QWEN3_TTS_CP_MTP_NOFUSE");
     if (c->cp_mtp_fused && c->params.verbosity >= 1) {
         fprintf(stderr, "qwen3_tts: small_to_mtp fused into code_pred graph (no per-step projection dispatch)\n");
     }
@@ -6801,15 +6803,15 @@ static bool qwen3_tts_generate_codes_ar(qwen3_tts_context* ctx, const char* text
         }
     }
 
-    const bool bench = env_bool("QWEN3_TTS_BENCH");
-    const bool dbg = env_bool("QWEN3_TTS_DEBUG");
-    const char* dump_dir = env_str("QWEN3_TTS_DUMP_DIR");
+    const bool bench = env_bool("CRISPASR_QWEN3_TTS_BENCH");
+    const bool dbg = env_bool("CRISPASR_QWEN3_TTS_DEBUG");
+    const char* dump_dir = env_str("CRISPASR_QWEN3_TTS_DUMP_DIR");
     const auto& hp = ctx->hp;
     const int d = (int)hp.d_model;
     const int n_groups = (int)hp.n_code_groups; // 16
     int max_frames =
         ctx->params.max_codec_steps > 0 ? ctx->params.max_codec_steps : (ctx->kv_max_ctx > 0 ? ctx->kv_max_ctx : 1500);
-    if (const char* mf = getenv("QWEN3_TTS_MAX_FRAMES")) {
+    if (const char* mf = crispasr_env::get("CRISPASR_QWEN3_TTS_MAX_FRAMES")) {
         const int v = std::atoi(mf);
         if (v > 0)
             max_frames = v;
@@ -6818,7 +6820,7 @@ static bool qwen3_tts_generate_codes_ar(qwen3_tts_context* ctx, const char* text
 
     // PRNG seed — explicit request / CLI params take priority, then env, then default 42.
     uint64_t rng = 42;
-    if (const char* s = env_str("QWEN3_TTS_SEED")) {
+    if (const char* s = env_str("CRISPASR_QWEN3_TTS_SEED")) {
         rng = (uint64_t)std::strtoull(s, nullptr, 10);
     }
     if (ctx->params.seed != 0)
@@ -6881,13 +6883,13 @@ static bool qwen3_tts_generate_codes_ar(qwen3_tts_context* ctx, const char* text
         dump_f32(dump_dir, "talker_prefill_logits", logits, hp.vocab_size);
     }
     if (dbg) {
-        const char* cp_be = env_str("QWEN3_TTS_CP_BACKEND");
+        const char* cp_be = env_str("CRISPASR_QWEN3_TTS_CP_BACKEND");
         fprintf(stderr, "qwen3_tts: code_pred backend=%s\n", (cp_be && *cp_be) ? cp_be : "main");
     }
 
     int n_past = T_pre;
 
-    const bool embd_cache_enabled = !env_bool("QWEN3_TTS_NO_EMBD_CACHE");
+    const bool embd_cache_enabled = !env_bool("CRISPASR_QWEN3_TTS_NO_EMBD_CACHE");
 
     // ---- AR loop: 1 talker step + 15 code_predictor steps per frame ----
     if (!cp_kv_alloc(ctx)) {
@@ -6936,7 +6938,7 @@ static bool qwen3_tts_generate_codes_ar(qwen3_tts_context* ctx, const char* text
             logits[eos] = -INFINITY;
         }
         int cb0 = top_k_sample(logits, (int)hp.vocab_size, talker_top_k, talker_temp, &rng);
-        if (getenv("QWEN3_TTS_EMBD_CHECK"))
+        if (crispasr_env::get("CRISPASR_QWEN3_TTS_EMBD_CHECK"))
             fprintf(stderr, "qwen3_tts: frame=%d cb0=%d rng=%llu\n", frame, cb0, (unsigned long long)rng);
         free(logits);
         logits = nullptr;
@@ -7030,7 +7032,7 @@ static bool qwen3_tts_generate_codes_ar(qwen3_tts_context* ctx, const char* text
             t_loop_next_emb += now_ms() - t_next;
         }
 
-        if (getenv("QWEN3_TTS_EMBD_CHECK") && frame < 1) {
+        if (crispasr_env::get("CRISPASR_QWEN3_TTS_EMBD_CHECK") && frame < 1) {
             fprintf(stderr, "qwen3_tts: frame=%d codes: cb0=%d cb1..4=%d %d %d %d\n", frame, cb0, cb1_15[0], cb1_15[1],
                     cb1_15[2], cb1_15[3]);
             float s = 0.0f;
@@ -7289,7 +7291,7 @@ extern "C" float* qwen3_tts_synthesize(struct qwen3_tts_context* ctx, const char
     // Set QWEN3_TTS_SKIP_REF_DECODE=0 to opt out (e.g. for A/B
     // verification, or in case a future codec graph variant grows
     // rolling state and the equivalence breaks).
-    const char* skip_env = std::getenv("QWEN3_TTS_SKIP_REF_DECODE");
+    const char* skip_env = crispasr_env::get("CRISPASR_QWEN3_TTS_SKIP_REF_DECODE");
     const bool skip_ref = !skip_env || skip_env[0] != '0';
 
     qwen3_tts_bench_stage _bs_codec("codec_decode");
@@ -7385,7 +7387,7 @@ extern "C" float* qwen3_tts_synthesize_streaming(struct qwen3_tts_context* ctx, 
         overlap_frames = 96;
     }
 
-    const bool bench = env_bool("QWEN3_TTS_BENCH");
+    const bool bench = env_bool("CRISPASR_QWEN3_TTS_BENCH");
     const auto& hp = ctx->hp;
     const int n_groups = (int)hp.n_code_groups; // 16
     const int n_q = (int)ctx->codec.hp.n_q;

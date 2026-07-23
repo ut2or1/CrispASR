@@ -105,6 +105,8 @@ public:
         if (!ctx_)
             return out;
 
+        // #292: forward --max-new-tokens only when explicit; 0 keeps the backend default.
+        mini_omni2_set_max_new_tokens(ctx_, params.max_new_tokens_explicit ? params.max_new_tokens : 0);
         char* text = mini_omni2_transcribe(ctx_, samples, n_samples);
         if (!text)
             return out;

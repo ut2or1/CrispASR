@@ -300,5 +300,73 @@ namespace CrispASR.Tests
             stream.Feed(new float[16000]);
             stream.Flush();
         }
+
+        private static string? VadModel =>
+            Environment.GetEnvironmentVariable("CRISPASR_VAD_MODEL");
+
+        // Regression guard for issue #291: VadSegments must return SECONDS, not
+        // the raw whisper centiseconds. With a 4 s clip, a span end in seconds is
+        // <= ~4; if the centisecond bug returned, it would be ~400. Skips without
+        // a VAD model so the suite still runs where none is provisioned.
+        [Fact]
+        public void VadSegments_ReturnsSeconds_NotCentiseconds()
+        {
+            if (!CanLoadLibrary() || string.IsNullOrEmpty(VadModel)) return;
+            const int sr = 16000;
+            const int seconds = 4;
+            var pcm = new float[sr * seconds];
+            // A 300 ms tone burst near the start so VAD has something to find.
+            for (int i = sr / 2; i < sr / 2 + sr * 3 / 10; i++)
+                pcm[i] = 0.3f * MathF.Sin(2f * MathF.PI * 220f * i / sr);
+
+            var spans = Session.VadSegments(VadModel!, pcm, sr);
+            foreach (var span in spans)
+            {
+                Assert.True(span.T0 >= 0.0 && span.T0 <= seconds + 0.5,
+                    $"T0={span.T0} out of seconds range for a {seconds}s clip (centisecond bug?)");
+                Assert.True(span.T1 >= span.T0 && span.T1 <= seconds + 0.5,
+                    $"T1={span.T1} out of seconds range for a {seconds}s clip (centisecond bug?)");
+            }
+        }
+
+        // Logging control (issue #291): these must not throw and must leave the
+        // native side in a usable state. Runs without any model.
+        [Fact]
+        public void Logging_Controls_DoNotThrow()
+        {
+            if (!CanLoadLibrary()) return;
+            CrispASR.Logging.Silence();
+            CrispASR.Logging.SetMinLevel(CrispASR.LogLevel.Warn);
+            var captured = new System.Collections.Generic.List<string>();
+            CrispASR.Logging.SetCallback((lvl, msg) => captured.Add(msg));
+            // Trigger some native logging via a backend query, then restore default.
+            _ = Session.AvailableBackends();
+            CrispASR.Logging.SetCallback(null);
+        }
+
+        // Task backends (tab/beats/chords/piano/pitch/separate/convert) were bound
+        // in SessionMusic.cs but never live-tested. This runs Session.Tab against a
+        // real tabcnn model when CRISPASR_MODEL_TABCNN is set, asserting the flat
+        // emission grid the C++/CUDA path already validates round-trips through the
+        // C# marshalling (shape, silent_class, per-string open MIDI). Skips cleanly
+        // without a model, like every other live test here.
+        private static string? TabModel =>
+            Environment.GetEnvironmentVariable("CRISPASR_MODEL_TABCNN");
+
+        [Fact]
+        public void Tab_EmissionsHaveExpectedShape()
+        {
+            if (!CanLoadLibrary() || string.IsNullOrEmpty(TabModel)) return;
+            using var s = Session.Open(TabModel!, "tabcnn", 2);
+            const int sr = 22050;
+            var pcm = new float[sr]; // 1 s of silence is enough to exercise the path
+            var emis = s.Tab(pcm, sr);
+            Assert.Equal(6, emis.Strings);            // 6 guitar strings
+            Assert.Equal(21, emis.Classes);           // silent + 20 frets
+            Assert.True(emis.Frames > 0, "expected >0 frames");
+            Assert.Equal(emis.Frames * emis.Strings * emis.Classes, emis.LogProbs.Length);
+            Assert.InRange(emis.SilentClass, 0, emis.Classes - 1);
+            Assert.Equal(6, emis.StringOpenMidi.Length);
+        }
     }
 }

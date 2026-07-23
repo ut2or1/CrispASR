@@ -283,6 +283,27 @@ class TestRegistryAndCache(unittest.TestCase):
             self.assertIsInstance(entry.filename, str)
             self.assertGreater(len(entry.filename), 0)
 
+    def test_registry_default_bundle(self):
+        from crispasr import registry_default_bundle
+        bundle = registry_default_bundle("omnivoice", lib_path=LIB_PATH)
+        self.assertIsNotNone(bundle)
+        self.assertEqual(bundle.backend, "omnivoice")
+        self.assertEqual(
+            [artifact.kind for artifact in bundle.artifacts],
+            ["primary", "companion"],
+        )
+        self.assertEqual(bundle.artifacts[0].filename, "omnivoice-f16.gguf")
+        self.assertEqual(
+            bundle.artifacts[1].filename,
+            "omnivoice-tokenizer-f16.gguf",
+        )
+
+    def test_registry_default_bundle_unknown(self):
+        from crispasr import registry_default_bundle
+        self.assertIsNone(
+            registry_default_bundle("nonexistent-backend-xyz", lib_path=LIB_PATH)
+        )
+
 
 @unittest.skipUnless(LIB_PATH, "libwhisper not built")
 class TestKokoroPhonemeCacheClear(unittest.TestCase):

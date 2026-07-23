@@ -173,3 +173,31 @@ TEST_CASE("make_disp_segments: speaker preserved through split", "[unit][max-len
     REQUIRE(disp[0].speaker == "(speaker 0) ");
     REQUIRE(disp[1].speaker == "(speaker 0) ");
 }
+
+// =========================================================================
+// Issue #292: chunk-local speaker scope (chunk_id)
+// =========================================================================
+
+TEST_CASE("diarized_json: chunk_id emitted only when >= 0", "[unit][diarized_json][issue-292]") {
+    // Two segments in different chunks with the SAME "(speaker 0)" label — the
+    // whole point of chunk_id is that these are NOT necessarily the same person.
+    auto a = make_seg("hello", 0, 100, "(speaker 0) ");
+    a.chunk_id = 0;
+    auto b = make_seg("goodbye", 12000, 12100, "(speaker 0) ");
+    b.chunk_id = 2;
+    std::vector<crispasr_segment> segs = {a, b};
+    std::string out = crispasr_segments_to_diarized_json(segs, 130.0, "en", "transcribe", 0.0f);
+    // Both chunk ids present, so a consumer can distinguish chunk 0 from chunk 2.
+    REQUIRE(out.find("\"chunk_id\": 0") != std::string::npos);
+    REQUIRE(out.find("\"chunk_id\": 2") != std::string::npos);
+}
+
+TEST_CASE("diarized_json: single-pass run emits NO chunk_id", "[unit][diarized_json][issue-292]") {
+    // Default chunk_id is -1 (single pass / unchunked). It must be absent so a
+    // consumer never sees a spurious scope on a run that had exactly one chunk.
+    auto s = make_seg("one pass", 0, 500, "(speaker 1) ");
+    REQUIRE(s.chunk_id == -1); // the struct default
+    std::vector<crispasr_segment> segs = {s};
+    std::string out = crispasr_segments_to_diarized_json(segs, 5.0, "en", "transcribe", 0.0f);
+    REQUIRE(out.find("chunk_id") == std::string::npos);
+}

@@ -16,6 +16,7 @@
 #include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 #include "moonshine-tokenizer.h"
 
 #include "ggml.h"
@@ -40,7 +41,7 @@
 static bool moonshine_stream_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("MOONSHINE_STREAM_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_MOONSHINE_STREAM_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -307,7 +308,7 @@ extern "C" struct moonshine_streaming_context* moonshine_streaming_init_from_fil
     // Load weights via core_gguf (mmap, backend buffer). §232: on GPU, split
     // encoder->GPU / decoder->CPU (opt out with MOONSHINE_ALL_GPU=1).
     core_gguf::WeightLoad wl;
-    const char* all_gpu_env = std::getenv("MOONSHINE_ALL_GPU");
+    const char* all_gpu_env = crispasr_env::get("CRISPASR_MOONSHINE_ALL_GPU");
     const bool all_gpu = all_gpu_env && all_gpu_env[0] == '1';
     bool loaded;
     if (ctx->use_gpu && !all_gpu) {
@@ -599,7 +600,7 @@ static int run_encoder(moonshine_streaming_context* ctx, const float* frontend_o
     int head_dim = (int)hp.enc_head_dim;
     int kv_heads = (int)hp.enc_kv_heads;
     float ln_eps = 1e-5f;
-    bool verbose = ctx->verbosity >= 2 || getenv("MOONSHINE_STREAMING_BENCH");
+    bool verbose = ctx->verbosity >= 2 || crispasr_env::get("CRISPASR_MOONSHINE_STREAMING_BENCH");
 
     // #215e UAF fix: always rebuild (sched gallocr regrow frees cached buffers).
     if (ctx->cached_enc_ctx) {

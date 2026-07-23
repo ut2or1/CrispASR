@@ -15,6 +15,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/crispasr_env.h"
 
 class GraniteNleBackend : public CrispasrBackend {
 public:
@@ -34,7 +35,7 @@ public:
         granite_nle_context_params cp = granite_nle_context_default_params();
         cp.n_threads = params.n_threads;
         cp.verbosity = params.no_prints ? 0 : 1;
-        if (getenv("CRISPASR_VERBOSE") || getenv("GRANITE_NLE_BENCH"))
+        if (getenv("CRISPASR_VERBOSE") || crispasr_env::get("CRISPASR_GRANITE_NLE_BENCH"))
             cp.verbosity = 2;
         cp.use_gpu = params.use_gpu;
         ctx_ = granite_nle_init_from_file(params.model.c_str(), cp);

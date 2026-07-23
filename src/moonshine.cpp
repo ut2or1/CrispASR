@@ -5,7 +5,9 @@
 #include "core/attention.h"
 #include "core/beam_decode.h"
 #include "core/gguf_loader.h"
+#include "core/repeat_break.h"     // fix/moonshine-repeat-break: decode-time loop break
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -15,6 +17,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -29,7 +32,7 @@
 static bool moonshine_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("MOONSHINE_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_MOONSHINE_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -67,6 +70,10 @@ struct moonshine_context {
     bool use_gpu = false;
     float temperature = 0.0f; // 0 = greedy argmax; > 0 = multinomial sampling
     int beam_size = 1;        // 1 = greedy/sampled; >1 = beam search (deterministic)
+    // #292: ceiling on generated tokens. Moonshine is a short-form model, so the
+    // default 194 (~30 s) is architectural; --max-new-tokens raises the ceiling
+    // for callers who force single-pass long audio.
+    int max_new_tokens = 194;
     // Sticky per-call seed override for best-of-N. 0 = derive deterministically
     // from the input audio buffer (the historical default — repeated calls
     // with the same input give identical samples). Non-zero values let the
@@ -219,7 +226,7 @@ struct moonshine_context* moonshine_init_with_params(struct moonshine_init_param
     // CPU-local, bit-identical output, and the encoder still runs on GPU.
     // Opt out with MOONSHINE_ALL_GPU=1 (restores the legacy all-GPU load for A/B).
     core_gguf::WeightLoad wl;
-    const char* all_gpu_env = std::getenv("MOONSHINE_ALL_GPU");
+    const char* all_gpu_env = crispasr_env::get("CRISPASR_MOONSHINE_ALL_GPU");
     const bool all_gpu = all_gpu_env && all_gpu_env[0] == '1';
     bool loaded;
     if (ctx->use_gpu && !all_gpu) {
@@ -623,7 +630,7 @@ static int moonshine_run_encoder(struct moonshine_context* ctx, const float* aud
         // is opt-in (MOONSHINE_ENC_ATTN=manual) for A/B on other GPUs / larger
         // moonshine variants where the tradeoff may differ. See PLAN §232.
         bool manual_attn = false;
-        if (const char* e = std::getenv("MOONSHINE_ENC_ATTN")) {
+        if (const char* e = crispasr_env::get("CRISPASR_MOONSHINE_ENC_ATTN")) {
             if (std::strcmp(e, "manual") == 0)
                 manual_attn = true;
             else if (std::strcmp(e, "flash") == 0)
@@ -1080,8 +1087,9 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
 
     // 2. Init KV caches
     int max_gen = (int)(ceil((double)n_samples / 16000.0 * 6.5));
-    if (max_gen > 194) {
-        max_gen = 194;
+    const int gen_ceiling = ctx->max_new_tokens > 0 ? ctx->max_new_tokens : 194; // #292
+    if (max_gen > gen_ceiling) {
+        max_gen = gen_ceiling;
     }
     int max_len = max_gen + 1; // +1 for BOS
 
@@ -1225,6 +1233,12 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
     if (!greedy_fast)
         logits.resize((size_t)hp.vocab_size);
 
+    // Decode-time repetition-loop break (on by default; see the loop body).
+    const bool repeat_break = [] {
+        const char* e = std::getenv("CRISPASR_MOONSHINE_NO_REPEAT_BREAK");
+        return !(e && e[0] && e[0] != '0');
+    }();
+
     for (int step = 0; step < max_len; step++) {
         int32_t picked = 0;
         float picked_prob = 0.0f;
@@ -1242,22 +1256,30 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
             const int V = (int)hp.vocab_size;
 
             if (!sample) {
-                // Greedy argmax (with probs requested)
-                int32_t best = 0;
-                float best_val = logits[0];
-                for (int i = 1; i < V; i++) {
-                    if (logits[i] > best_val) {
+                // Greedy argmax — NaN-robust (see canary_qwen note): seed -inf,
+                // skip non-finite. If the whole row is non-finite, route through
+                // the EOS path below to terminate cleanly instead of spewing 0.
+                int32_t best = -1;
+                float best_val = -std::numeric_limits<float>::infinity();
+                for (int i = 0; i < V; i++) {
+                    if (std::isfinite(logits[i]) && logits[i] > best_val) {
                         best_val = logits[i];
                         best = i;
                     }
                 }
-                picked = best;
-                if (out_token_probs) {
-                    float mx = best_val;
-                    float s = 0.f;
-                    for (int i = 0; i < V; i++)
-                        s += expf(logits[i] - mx);
-                    picked_prob = 1.0f / s;
+                if (best < 0) {
+                    fprintf(stderr, "moonshine: non-finite logits — stopping decode\n");
+                    picked = (int32_t)hp.eos_token_id;
+                } else {
+                    picked = best;
+                    if (out_token_probs) {
+                        float mx = best_val;
+                        float s = 0.f;
+                        for (int i = 0; i < V; i++)
+                            if (std::isfinite(logits[i]))
+                                s += expf(logits[i] - mx);
+                        picked_prob = 1.0f / s;
+                    }
                 }
             } else {
                 // Multinomial sample from softmax(logits / T).
@@ -1298,6 +1320,14 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
         if (out_token_probs)
             out_token_probs->push_back(picked_prob);
         token = picked;
+
+        // Decode-time repetition break: on hard audio (e.g. a chunked long-audio
+        // slice) greedy decode can get stuck in a short token cycle and burn
+        // every remaining step. Stop as soon as a period-<=8 block repeats 4x —
+        // saves the wasted compute; core_ngram::fix_loops still cleans residue.
+        // Disable with CRISPASR_MOONSHINE_NO_REPEAT_BREAK=1.
+        if (repeat_break && core_repeat::tail_is_repetition(out_tokens))
+            break;
     }
 
     auto t_decode_done = std::chrono::high_resolution_clock::now();
@@ -1366,6 +1396,12 @@ extern "C" void moonshine_set_temperature(struct moonshine_context* ctx, float t
 extern "C" void moonshine_set_seed(struct moonshine_context* ctx, uint64_t seed) {
     if (ctx)
         ctx->seed_override = seed;
+}
+
+// #292: forward --max-new-tokens. <= 0 keeps the 194 short-form default.
+extern "C" void moonshine_set_max_new_tokens(struct moonshine_context* ctx, int max_new_tokens) {
+    if (ctx && max_new_tokens > 0)
+        ctx->max_new_tokens = max_new_tokens;
 }
 
 extern "C" void moonshine_set_beam_size(struct moonshine_context* ctx, int beam_size) {

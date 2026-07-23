@@ -36,6 +36,16 @@ jobs:
       - name: Smoke test - list backends
         run: ./build/bin/crispasr --list-backends
 
+      # Guards the drift docs/contributing.md warns about: a backend reachable
+      # from the CLI factory but missing from the c_api dispatch, the
+      # available_backends list, or the generated feature matrix (and the
+      # reverse — advertised by the C ABI but unreachable from the CLI). Exits 1
+      # only on a REQUIRED gap; registry/test/README gaps stay advisory. Run on
+      # Linux deliberately: the script's Go cgo-LDFLAGS drift check is unreliable
+      # on macOS, where Metal/BLAS default on and pollute the linux link line.
+      - name: Backend wiring audit
+        run: python3 tools/check-backend-wiring.py --crispasr ./build/bin/crispasr
+
   # ===========================================================================
   # Linux x86_64 — AMR opencore FetchContent static build (opt-in gate guard)
   # ===========================================================================
@@ -257,14 +267,34 @@ jobs:
         with:
           submodules: recursive
 
+      # CRISPASR_BUILD_TESTS stays ON here (unlike the other smoke-only
+      # platform jobs) so the speaker-db unit tests below actually run.
+      # This is the only CI leg that exercises the .spkr v2 Windows write
+      # path (CreateDirectoryA branch in src/speaker_db.cpp) and the
+      # tests/test-speaker-db.cpp _WIN32 make_temp_dir() path.
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCRISPASR_BUILD_TESTS=OFF
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCRISPASR_BUILD_TESTS=ON
 
       - name: Build
         run: cmake --build build --config Release --target crispasr-cli -j $env:NUMBER_OF_PROCESSORS
 
       - name: Smoke test
         run: .\build\bin\Release\crispasr.exe --list-backends
+
+      # Scoped, low-risk unit-test leg: build only the speaker-db-related
+      # Catch2 targets (not the full, never-Windows-tested tests/ suite) and
+      # filter ctest to just their test cases. test-params/test-speaker-db/
+      # test-speaker-cluster are self-contained (Catch2 + crispasr-lib only,
+      # test-params also links `common`); no POSIX-only helpers are compiled
+      # into them. Untouched targets elsewhere in tests/CMakeLists.txt are
+      # configured but never built, so their (OPTIONAL) ctest discovery
+      # files are simply absent — ctest -R below only ever sees tests from
+      # the three targets built here.
+      - name: Build speaker-db unit tests
+        run: cmake --build build --config Release --target test-speaker-db --target test-speaker-cluster --target test-params -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Run speaker-db unit tests
+        run: ctest --test-dir build -C Release -R "speaker|cluster|centroid|whisper_params" -E "live|NOT_BUILT" --output-on-failure --timeout 120
 
   # ===========================================================================
   # iOS (cross-compile gate — no runtime test)

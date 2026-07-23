@@ -82,14 +82,17 @@ static bool ffmpeg_subprocess_decode(const std::string& fname, std::vector<float
 }
 
 bool read_audio_data(const std::string& fname, std::vector<float>& pcmf32, std::vector<std::vector<float>>& pcmf32s,
-                     bool stereo) {
+                     bool stereo, int target_rate) {
+    // target_rate <= 0 → default 16 kHz (backward compat).
+    const int effective_rate = (target_rate > 0) ? target_rate : CRISPASR_SAMPLE_RATE;
+
     std::vector<uint8_t> audio_data; // used for pipe input from stdin or ffmpeg decoding output
 
     ma_result result;
     ma_decoder_config decoder_config;
     ma_decoder decoder;
 
-    decoder_config = ma_decoder_config_init(ma_format_f32, stereo ? 2 : 1, CRISPASR_SAMPLE_RATE);
+    decoder_config = ma_decoder_config_init(ma_format_f32, stereo ? 2 : 1, effective_rate);
 
     if (fname == "-") {
 #ifdef _WIN32
@@ -117,8 +120,8 @@ bool read_audio_data(const std::string& fname, std::vector<float>& pcmf32, std::
         // Container miniaudio can't open (.opus / .aac / .m4a / .webm / .amr / …):
         // decode via the crispasr_audio_load C ABI first — it covers these
         // natively (glint AAC/Opus, AudioToolbox/fdk-aac, libopus WebM, opencore
-        // AMR, …) at 16 kHz mono, no ffmpeg. Falls through to ffmpeg only if it
-        // can't handle the format either.
+        // AMR, …) at the requested rate, no ffmpeg. Falls through to ffmpeg
+        // only if it can't handle the format either.
         if (stereo) {
             float* L = nullptr;
             float* R = nullptr;
@@ -140,7 +143,7 @@ bool read_audio_data(const std::string& fname, std::vector<float>& pcmf32, std::
         } else {
             float* buf = nullptr;
             int fr = 0, sr = 0;
-            if (crispasr_audio_load(fname.c_str(), &buf, &fr, &sr) == 0) {
+            if (crispasr_audio_load_at_rate(fname.c_str(), effective_rate, &buf, &fr, &sr) == 0) {
                 pcmf32.assign(buf, buf + fr);
                 crispasr_audio_free(buf);
                 return true;

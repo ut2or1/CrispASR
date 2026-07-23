@@ -9,6 +9,7 @@
 #include "core/fft.h"
 #include "core/kaldi_fbank.h"
 #include "core/mel.h"
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -31,7 +32,7 @@ namespace chatterbox_campplus {
 static bool cb_campplus_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("CB_CAMPPLUS_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_CB_CAMPPLUS_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -871,7 +872,7 @@ std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runti
     init_cache(*state, m);
     cache.initialised = true;
 
-    const bool dbg = std::getenv("CHATTERBOX_DEBUG") != nullptr;
+    const bool dbg = crispasr_env::get("CRISPASR_CHATTERBOX_DEBUG") != nullptr;
 
     // FCM head: (T, 80) → (320, T)
     int C_fcm = 0, T_fcm = 0;

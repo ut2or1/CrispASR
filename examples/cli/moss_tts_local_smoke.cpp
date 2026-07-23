@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "core/crispasr_env.h"
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -26,7 +27,7 @@ int main(int argc, char** argv) {
     const int max_frames = argc >= 4 ? atoi(argv[3]) : 40;
 
     moss_tts_local_context_params cp = moss_tts_local_context_default_params();
-    const char* no_gpu = getenv("MOSS_TTS_LOCAL_NO_GPU");
+    const char* no_gpu = crispasr_env::get("CRISPASR_MOSS_TTS_LOCAL_NO_GPU");
     if (no_gpu && *no_gpu && *no_gpu != '0')
         cp.use_gpu = false;
 

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/crispasr_env.h"
 
 class Gemma4E2BBackend : public CrispasrBackend {
 public:
@@ -56,7 +57,7 @@ public:
         gemma4_e2b_context_params cp = gemma4_e2b_context_default_params();
         cp.n_threads = params.n_threads;
         cp.verbosity = params.no_prints ? 0 : 1;
-        if (getenv("CRISPASR_VERBOSE") || getenv("GEMMA4_E2B_BENCH"))
+        if (getenv("CRISPASR_VERBOSE") || crispasr_env::get("CRISPASR_GEMMA4_E2B_BENCH"))
             cp.verbosity = 2;
         cp.use_gpu = params.use_gpu;
         // Honor -tp / --temperature so CAP_TEMPERATURE is real, not just a

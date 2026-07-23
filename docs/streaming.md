@@ -365,3 +365,9 @@ crispasr_session_synthesize_streaming(session, "…", on_chunk, user);
 Note: for diffusion backends (e.g. irodori) the per-*sentence* granularity above
 is the real latency win — a diffusion utterance is generated in full before it is
 decoded, so there is no sub-sentence audio to emit early.
+
+### Source separation (htdemucs)
+
+HTDemucs processes audio in overlapping chunks with cross-fading, but this is
+internal chunking for memory management, not real-time streaming. The `streaming`
+capability flag indicates support for chunked processing of long audio files.

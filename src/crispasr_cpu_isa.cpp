@@ -2,6 +2,11 @@
 
 #include "crispasr_cpu_isa.h"
 
+// ggml_cpu_has_*(): build-time constants compiled into libggml-cpu, i.e. the ISA
+// ggml's own kernels actually emit — which is what SIGILLs in #261, and which our
+// own TU macros cannot see. Safe to call before ggml_cpu_init().
+#include "ggml-cpu.h"
+
 #include <cstdint>
 #include <vector>
 
@@ -103,41 +108,65 @@ IsaCheck check() {
 
     struct Feature {
         const char* name;
-        bool required;  // did THIS build emit instructions for it?
+        bool required;  // does ANY binary in this process emit instructions for it?
         bool available; // does the host CPU (+OS) support it?
     };
 
-    const std::vector<Feature> feats = {
+    // "required" has TWO sources and must be the OR of both:
+    //
+    //   1. Our own TUs' compile-time macros (__AVX2__, __BMI2__, ...).
+    //   2. What libggml-cpu.so was built with. `ggml_cpu_has_*()` return
+    //      build-time constants compiled INTO libggml-cpu, so they report ggml's
+    //      own ARCH_FLAGS (GGML_NATIVE / -march=native, GGML_BMI2, ...), which
+    //      CMake picks independently of the flags used for CrispASR's sources.
+    //
+    // (2) is the one #261 turns on. Source 1 alone is a FALSE NEGATIVE: the
+    // reporter's host printed "cpu-isa: OK — built for baseline x86-64 (no AVX)"
+    // (true for our TUs) and then still died with SIGILL on a BMI2 instruction
+    // inside libggml-cpu's ggml_cpu_init(). A baseline-built crispasr_cpu_isa.cpp
+    // simply cannot see BMI2 that ggml baked into a different shared object.
+    //
+    // Calling these first is safe: they are constant returns and do NOT invoke
+    // ggml_cpu_init() (the actual SIGILL site, reached only via
+    // ggml_backend_cpu_reg → get_reg → ggml_backend_dev_count).
 #if defined(__AVX512F__)
-        {"AVX512F", true, h.avx512f},
+    constexpr bool own_avx512f = true;
 #else
-        {"AVX512F", false, h.avx512f},
+    constexpr bool own_avx512f = false;
 #endif
 #if defined(__AVX2__)
-        {"AVX2", true, h.avx2},
+    constexpr bool own_avx2 = true;
 #else
-        {"AVX2", false, h.avx2},
+    constexpr bool own_avx2 = false;
 #endif
 #if defined(__FMA__)
-        {"FMA", true, h.fma},
+    constexpr bool own_fma = true;
 #else
-        {"FMA", false, h.fma},
+    constexpr bool own_fma = false;
 #endif
 #if defined(__F16C__)
-        {"F16C", true, h.f16c},
+    constexpr bool own_f16c = true;
 #else
-        {"F16C", false, h.f16c},
+    constexpr bool own_f16c = false;
 #endif
 #if defined(__BMI2__)
-        {"BMI2", true, h.bmi2},
+    constexpr bool own_bmi2 = true;
 #else
-        {"BMI2", false, h.bmi2},
+    constexpr bool own_bmi2 = false;
 #endif
 #if defined(__AVX__)
-        {"AVX", true, h.avx},
+    constexpr bool own_avx = true;
 #else
-        {"AVX", false, h.avx},
+    constexpr bool own_avx = false;
 #endif
+
+    const std::vector<Feature> feats = {
+        {"AVX512F", own_avx512f || ggml_cpu_has_avx512() != 0, h.avx512f},
+        {"AVX2", own_avx2 || ggml_cpu_has_avx2() != 0, h.avx2},
+        {"FMA", own_fma || ggml_cpu_has_fma() != 0, h.fma},
+        {"F16C", own_f16c || ggml_cpu_has_f16c() != 0, h.f16c},
+        {"BMI2", own_bmi2 || ggml_cpu_has_bmi2() != 0, h.bmi2},
+        {"AVX", own_avx || ggml_cpu_has_avx() != 0, h.avx},
     };
 
     for (const auto& f : feats) {

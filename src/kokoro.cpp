@@ -34,9 +34,11 @@
 #include "core/align.h"
 #include "core/attention.h"
 #include "core/conv.h"
+#include "core/dac_decoder.h" // core_dac::fastconv_cache (FASTCONV kernel bake)
 #include "core/gguf_loader.h"
 #include "core/lstm.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -68,7 +70,7 @@
 namespace {
 
 bool env_bool(const char* k) {
-    const char* v = std::getenv(k);
+    const char* v = crispasr_env::get(k);
     return v && *v && std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0;
 }
 
@@ -79,7 +81,7 @@ bool env_bool(const char* k) {
 bool kokoro_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("KOKORO_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_KOKORO_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -228,6 +230,10 @@ struct kokoro_context {
     ggml_context* ctx_perm = nullptr;
     ggml_backend_buffer_t buf_perm = nullptr;
     std::vector<uint8_t> compute_meta;
+
+    // FASTCONV: baked F32 copies of the F16 conv kernels (cast-kill). Owns its own
+    // ctx+buffer; freed in kokoro_free before the backend.
+    core_dac::fastconv_cache fc;
 
     // Voice pack (secondary GGUF).
     kokoro_voice_pack vp;
@@ -1340,7 +1346,7 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
     // production builds pay zero cost. Used to bisect the ggml_norm
     // Metal regression — keep available for the next per-op-level bug.
     static const bool s_dbg = []() {
-        const char* v = std::getenv("KOKORO_DEBUG_INTERMEDIATES");
+        const char* v = crispasr_env::get("CRISPASR_KOKORO_DEBUG_INTERMEDIATES");
         return v && *v && *v != '0';
     }();
     auto run_stack = [&](const char* prefix, const char* stage_branch, ggml_tensor* in) -> ggml_tensor* {
@@ -2351,7 +2357,7 @@ static float* kokoro_run_generator(kokoro_context* c, const int32_t* raw_ids, in
     }
 
     // 3. Build `har` (22, T_har) on CPU.
-    const char* seed_env = std::getenv("KOKORO_SEED");
+    const char* seed_env = crispasr_env::get("CRISPASR_KOKORO_SEED");
     uint32_t seed = seed_env ? (uint32_t)std::strtoul(seed_env, nullptr, 0) : 0x12345u;
     std::mt19937 rng(seed);
     int T_har = 0;
@@ -2563,7 +2569,7 @@ extern "C" struct kokoro_context_params kokoro_context_default_params(void) {
     //                              the M1 hang doesn't apply and CPU path
     //                              is dramatically slower than the GPU.
     // Mirrors the QWEN3_TTS_CODEC_GPU pattern from the qwen3-tts codec.
-    p.gen_force_metal = env_bool("KOKORO_GEN_FORCE_METAL") || env_bool("KOKORO_GEN_GPU");
+    p.gen_force_metal = env_bool("CRISPASR_KOKORO_GEN_FORCE_METAL") || env_bool("CRISPASR_KOKORO_GEN_GPU");
     p.flash_attn = true;
     p.length_scale = 1.0f;
     std::strncpy(p.espeak_lang, "en-us", sizeof(p.espeak_lang) - 1);
@@ -2718,6 +2724,39 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
         }
     }
 
+    // ---- FASTCONV: bake one F32 copy of each F16 conv kernel and re-point the
+    // c->tensors map entry to it. kokoro feeds these kernels straight to
+    // ggml_conv_1d, which casts an F16 kernel → F32 inside EVERY graph when the
+    // activations are F32; baking that cast once makes it a no-op, bitwise-equal.
+    // The ConvTranspose1d upsamples (dec.gen.ups.{0,1}) use the SEPARATE F32
+    // `ups_w_perm` buffers built just above (from the original F16 src), so swapping
+    // their c->tensors entry is harmless (that entry is unused afterwards). The
+    // depthwise-convt path (core_convt::convt1d_depthwise_2x_k3) casts F16→F32
+    // internally too, so an already-F32 base just skips that cast. Gated
+    // CRISPASR_KOKORO_FASTCONV (default on — numerically equivalent).
+    {
+        const char* env = getenv("CRISPASR_KOKORO_FASTCONV");
+        const bool fc_on = !env || env[0] != '0';
+        std::vector<ggml_tensor*> kernels;
+        for (auto& kv : c->tensors) {
+            ggml_tensor* w = kv.second;
+            if (w && w->type == GGML_TYPE_F16 && ggml_n_dims(w) == 3)
+                kernels.push_back(w);
+        }
+        c->fc.bake(c->backend, kernels, fc_on);
+        int swapped = 0;
+        for (auto& kv : c->tensors) {
+            ggml_tensor* baked = c->fc.get(kv.second);
+            if (baked != kv.second) {
+                kv.second = baked;
+                swapped++;
+            }
+        }
+        if (getenv("CRISPASR_KOKORO_FASTCONV_DEBUG"))
+            fprintf(stderr, "kokoro: FASTCONV %s: %zu F16 3D conv kernels, %d baked+swapped\n", fc_on ? "ON" : "OFF",
+                    kernels.size(), swapped);
+    }
+
     // ---- Schedulers ----
     {
         ggml_backend_t backends[2];
@@ -2765,9 +2804,9 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
         if (c->gen_backend != c->backend_cpu) {
             // Disambiguate which env var was set so the log line tells the
             // operator which knob is in effect.
-            if (env_bool("KOKORO_GEN_GPU"))
+            if (env_bool("CRISPASR_KOKORO_GEN_GPU"))
                 gpu_label = "GPU (KOKORO_GEN_GPU)";
-            else if (env_bool("KOKORO_GEN_FORCE_METAL"))
+            else if (env_bool("CRISPASR_KOKORO_GEN_FORCE_METAL"))
                 gpu_label = "GPU (KOKORO_GEN_FORCE_METAL)";
         }
         fprintf(stderr, "kokoro: loaded %zu tensors from '%s'  gen=%s\n", c->tensors.size(), path_model,
@@ -3519,6 +3558,7 @@ extern "C" void kokoro_set_length_scale(struct kokoro_context* ctx, float scale)
 extern "C" void kokoro_free(struct kokoro_context* ctx) {
     if (!ctx)
         return;
+    ctx->fc.free(); // FASTCONV baked kernels (before the backend is freed)
     if (ctx->gen_sched)
         ggml_backend_sched_free(ctx->gen_sched);
     if (ctx->sched)

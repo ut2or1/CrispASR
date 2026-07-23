@@ -37,6 +37,7 @@
 #include "core/gguf_loader.h"
 #include "core/wordpiece.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -68,7 +69,7 @@ namespace {
 static bool bark_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("BARK_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_BARK_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -258,7 +259,7 @@ struct bark_context {
 namespace {
 
 static const char* bark_dump_dir() {
-    static const char* d = std::getenv("BARK_DUMP_DIR");
+    static const char* d = crispasr_env::get("CRISPASR_BARK_DUMP_DIR");
     return d;
 }
 
@@ -1095,16 +1096,20 @@ static std::vector<int32_t> tokenize_text(bark_context* ctx, const char* text, i
     std::vector<int32_t> tokens;
 
     if (ctx->tokenizer.loaded) {
-        // BERT WordPiece: [CLS] tokens... [SEP], then offset by TEXT_ENCODING_OFFSET
+        // BERT WordPiece, then offset by TEXT_ENCODING_OFFSET. Bark tokenizes with
+        // add_special_tokens=False — NO [CLS]/[SEP]. The reference
+        // (suno/bark `_tokenize` and transformers BarkProcessor both use
+        // add_special_tokens=False): e.g. "The quick brown fox …" →
+        // [10117,69609,31299,174,…] ('The','quick','brown','f','##ox',…) with no
+        // 101/102. Prepending [CLS] shifted the whole prompt right by one token,
+        // which made the semantic model hallucinate a spurious leading word and
+        // truncate early (WER 0.78 vs the reference's 0.00).
         std::vector<int32_t> wp_ids = ctx->tokenizer.tokenize(text);
-        // Bark prepends [CLS]=101 and appends [SEP]=102
-        tokens.push_back((int32_t)(101 + pp.text_encoding_offset));
         for (int32_t id : wp_ids) {
-            if ((int)tokens.size() >= max_len - 1)
+            if ((int)tokens.size() >= max_len)
                 break;
             tokens.push_back(id + (int32_t)pp.text_encoding_offset);
         }
-        tokens.push_back((int32_t)(102 + pp.text_encoding_offset));
 
         if (ctx->params.verbosity >= 2) {
             fprintf(stderr, "bark: BERT tokenized %d tokens (max=%d)\n", (int)tokens.size(), max_len);
@@ -1145,12 +1150,25 @@ static std::vector<int32_t> generate_text_semantic(bark_context* ctx, const char
     // 1. Tokenize text -> padded to 256
     std::vector<int32_t> text_tokens = tokenize_text(ctx, text, ctx_len);
 
-    // 2. Semantic history (from speaker or all-PAD)
+    // 2. Semantic history (from speaker or all-PAD). Must match the reference
+    // exactly (transformers modeling_bark.py / suno bark generate_text_semantic):
+    //
+    //     semantic_history = history_prompt["semantic_prompt"][-256:]      # LAST 256
+    //     semantic_history = pad(semantic_history, (0, 256 - len), SEMANTIC_PAD)
+    //
+    // i.e. take the LAST ctx_len tokens and LEFT-align them, padding on the
+    // RIGHT. We previously took the FIRST ctx_len and right-aligned them — both
+    // wrong. It matters: v2/en_speaker_3's semantic_prompt is 427 tokens, so we
+    // conditioned on tokens [0,256) instead of the reference's [171,427),
+    // i.e. an entirely different slice of the speaker prompt. That mis-primed
+    // the semantic stage (spurious leading word, dropped tail).
     std::vector<int32_t> sem_hist(ctx_len, (int32_t)pp.semantic_pad_token);
     if (ctx->speaker.loaded && !ctx->speaker.semantic_prompt.empty()) {
-        int copy_len = std::min((int)ctx->speaker.semantic_prompt.size(), ctx_len);
+        const int n_prompt = (int)ctx->speaker.semantic_prompt.size();
+        const int copy_len = std::min(n_prompt, ctx_len);
+        const int src_off = n_prompt - copy_len; // tail slice: [n_prompt-copy_len, n_prompt)
         for (int i = 0; i < copy_len; i++) {
-            sem_hist[(size_t)(ctx_len - copy_len + i)] = ctx->speaker.semantic_prompt[(size_t)i];
+            sem_hist[(size_t)i] = ctx->speaker.semantic_prompt[(size_t)(src_off + i)];
         }
     }
 
@@ -2274,7 +2292,7 @@ float* bark_synthesize(struct bark_context* ctx, const char* text, int* out_n_sa
     // Usage: BARK_DECODE_CODES=/path/to/fine_codes.bin:8:148
     //        (path:n_codebooks:n_timesteps)
     {
-        const char* dc = std::getenv("BARK_DECODE_CODES");
+        const char* dc = crispasr_env::get("CRISPASR_BARK_DECODE_CODES");
         if (dc) {
             std::string spec(dc);
             // Parse path:n_cb:n_t

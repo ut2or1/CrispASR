@@ -63,6 +63,11 @@ try:
     sys.path.insert(0, str(REPO / "tools" / "kaggle"))
     try:
         import kaggle_harness as kh
+        # Full harness regime: authenticate HF pulls from the attached token
+        # dataset (anon pulls get rate-limited); hf_transfer wedges multi-GB
+        # Kaggle downloads, so keep the plain resumable downloader.
+        kh.resolve_hf_token()
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
         kh.init_progress()
     except Exception:
         sys.path.insert(0, str(Path(__file__).resolve().parent))

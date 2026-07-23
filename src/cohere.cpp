@@ -8,6 +8,7 @@
 // Tensor naming follows export_gguf.py / cohere-arch.h.
 
 #include "cohere.h"
+#include "core/crispasr_env.h"
 #include "cohere-arch.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -54,7 +55,7 @@ static bool cohere_debug_enabled(void) {
     static bool init = false;
     static bool enabled = false;
     if (!init) {
-        enabled = getenv("COHERE_DEBUG") != nullptr;
+        enabled = crispasr_env::get("CRISPASR_COHERE_DEBUG") != nullptr;
         init = true;
     }
     return enabled;
@@ -64,7 +65,7 @@ static bool cohere_bench_enabled(void) {
     static bool init = false;
     static bool enabled = false;
     if (!init) {
-        enabled = getenv("COHERE_BENCH") != nullptr;
+        enabled = crispasr_env::get("CRISPASR_COHERE_BENCH") != nullptr;
         init = true;
     }
     return enabled;
@@ -207,7 +208,7 @@ static void cohere_perf_print(const cohere_perf& p, int n_samples, int sample_ra
     // e.g. the beam-search KV snapshot that drove the #161 regression).
     // Opt-in via COHERE_GAPS=1 (or COHERE_BENCH=1) to keep the default
     // report compact.
-    if (std::getenv("COHERE_GAPS") || std::getenv("COHERE_BENCH")) {
+    if (crispasr_env::get("CRISPASR_COHERE_GAPS") || crispasr_env::get("CRISPASR_COHERE_BENCH")) {
         const int64_t accounted = p.t_features_us + p.t_enc_build_us + p.t_enc_alloc_us + p.t_enc_compute_us +
                                   p.t_cross_kv_us + p.t_crosskv_read_us + p.t_reserve_us + p.t_dec_build_us +
                                   p.t_dec_alloc_us + p.t_dec_compute_us + p.t_dec_logits_us;
@@ -1913,7 +1914,7 @@ struct cohere_context* cohere_init_from_file(const char* path_model, struct cohe
     // NOTE: ggml_backend_cpu_set_n_threads is NOT called by default —
     // profiling showed it regressed perf for our small matrix sizes.
     {
-        const char* env = getenv("COHERE_THREADS");
+        const char* env = crispasr_env::get("CRISPASR_COHERE_THREADS");
         if (env) {
             int n = atoi(env);
             if (n > 0)
@@ -1931,7 +1932,7 @@ struct cohere_context* cohere_init_from_file(const char* path_model, struct cohe
     }
 
     {
-        const char* dev_env = getenv("COHERE_DEVICE");
+        const char* dev_env = crispasr_env::get("CRISPASR_COHERE_DEVICE");
         if (dev_env && strlen(dev_env) > 0) {
             ctx->ggml_backend = ggml_backend_init_by_name(dev_env, nullptr);
             if (!ctx->ggml_backend) {
@@ -1955,7 +1956,7 @@ struct cohere_context* cohere_init_from_file(const char* path_model, struct cohe
     COHERE_VLOG(vb, "cohere: backend: %s%s\n", ggml_backend_name(ctx->ggml_backend), using_gpu ? "" : " (CPU-only)");
 
     // Apply thread count only when explicitly requested via env var
-    if (getenv("COHERE_THREADS")) {
+    if (crispasr_env::get("CRISPASR_COHERE_THREADS")) {
         COHERE_VLOG(vb, "cohere: applying n_threads=%d to CPU backend [COHERE_THREADS override]\n", params.n_threads);
         ggml_backend_cpu_set_n_threads(ctx->ggml_backend_cpu, params.n_threads);
         if (!using_gpu) {
@@ -2278,7 +2279,7 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
 
     // Optional per-op profiling (COHERE_PROF=1, single-chunk only)
     cohere_prof_state prof_state;
-    bool do_prof = !do_chunked && (getenv("COHERE_PROF") != nullptr);
+    bool do_prof = !do_chunked && (crispasr_env::get("CRISPASR_COHERE_PROF") != nullptr);
 
     {
         cohere_bench_stage _b_enc("encoder (all chunks)");
@@ -3124,7 +3125,7 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
         // Set COHERE_DUMP_ATTN=/path/to/file.bin to activate.
         // Format: int32 n_tok, int32 n_heads, int32 T_enc, then
         //         n_tok × n_heads × T_enc float32 row-major.
-        if (const char* dump_path = getenv("COHERE_DUMP_ATTN")) {
+        if (const char* dump_path = crispasr_env::get("CRISPASR_COHERE_DUMP_ATTN")) {
             if (FILE* fp = fopen(dump_path, "wb")) {
                 int32_t hdr[3] = {n_tok, n_heads, T_enc};
                 fwrite(hdr, sizeof(hdr), 1, fp);

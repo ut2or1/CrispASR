@@ -11,6 +11,7 @@
 #include "core/gguf_loader.h"
 #include "core/hifigan.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -35,7 +36,7 @@
 static bool fastpitch_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("FASTPITCH_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_FASTPITCH_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -800,13 +801,13 @@ static ggml_tensor* build_decoder_graph(ggml_context* gctx, const fastpitch_tts_
 static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, float** pcm_out, int* sample_rate_out) {
     const auto& hp = ctx->hp;
     const int D = hp.symbols_embedding_dim;
-    const char* dump_dir = getenv("FASTPITCH_DUMP_DIR");
+    const char* dump_dir = crispasr_env::get("CRISPASR_FASTPITCH_DUMP_DIR");
 
     // ── Step 1: Tokenize ──
     std::vector<int> token_ids;
 
     // Allow teacher-forcing tokens from file (for diff testing)
-    const char* force_tokens_path = getenv("FASTPITCH_FORCE_TOKENS");
+    const char* force_tokens_path = crispasr_env::get("CRISPASR_FASTPITCH_FORCE_TOKENS");
     if (force_tokens_path) {
         FILE* f = fopen(force_tokens_path, "rb");
         if (f) {

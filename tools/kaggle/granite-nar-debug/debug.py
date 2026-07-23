@@ -28,7 +28,7 @@ subprocess.run("apt-get update -qq && apt-get install -y cmake ninja-build g++ c
                shell=True, capture_output=True)
 
 bdir = cdir / "build"
-cmake_args = ["-DCMAKE_BUILD_TYPE=Debug"]  # Debug build for better backtraces
+cmake_args = ["-DCMAKE_BUILD_TYPE=Debug", "-DCRISPASR_NO_C2PA_NATIVE=ON"]  # Debug build for better backtraces
 if shutil.which("ninja"): cmake_args += ["-G", "Ninja"]
 subprocess.check_call(["cmake", "-B", str(bdir)] + cmake_args, cwd=str(cdir))
 subprocess.check_call(["cmake", "--build", str(bdir), "-j2"], cwd=str(cdir))

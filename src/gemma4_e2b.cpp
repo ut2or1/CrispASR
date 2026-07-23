@@ -17,6 +17,7 @@
 #include "core/greedy_decode.h"
 #include "core/mel.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -40,7 +41,7 @@
 static bool gemma4_e2b_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("GEMMA4_E2B_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_GEMMA4_E2B_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -1515,7 +1516,7 @@ static char* g4e_run_prompt(gemma4_e2b_context* ctx, const std::vector<int32_t>&
         return nullptr;
     auto& m = ctx->model;
     auto& lhp = m.llm_hp;
-    const bool verbose = ctx->verbosity >= 2 || getenv("GEMMA4_E2B_BENCH");
+    const bool verbose = ctx->verbosity >= 2 || crispasr_env::get("CRISPASR_GEMMA4_E2B_BENCH");
     const int d = (int)lhp.hidden_size;
     const int total = (int)prompt_ids.size();
 
@@ -2116,7 +2117,7 @@ static char* gemma4_e2b_transcribe_impl(struct gemma4_e2b_context* ctx, const fl
     auto& m = ctx->model;
     auto& ahp = m.audio_hp;
     auto& lhp = m.llm_hp;
-    const bool verbose = ctx->verbosity >= 2 || getenv("GEMMA4_E2B_BENCH");
+    const bool verbose = ctx->verbosity >= 2 || crispasr_env::get("CRISPASR_GEMMA4_E2B_BENCH");
     const float eps = lhp.rms_norm_eps;
     gemma4_e2b_bench_stage _b_total("total");
 

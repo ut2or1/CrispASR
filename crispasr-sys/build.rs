@@ -198,6 +198,45 @@ fn configure_and_build(src_root: &Path) -> PathBuf {
             .arg("-DCMAKE_CXX_COMPILER_LAUNCHER=ccache");
     }
 
+    // ggml defaults GGML_NATIVE=ON (`-march=native`), which is wrong whenever
+    // the compile host is not the machine the binary will run on — and it
+    // hard-fails under Rosetta 2: clang's host-CPU probe reports the Apple
+    // Silicon die (`apple-m2`) while targeting x86_64, which cc rejects with
+    // `error: unknown target CPU`. Disable it for any host≠target cross build
+    // and for every x86_64 macOS build (a Rosetta toolchain looks like a
+    // native x86_64 host, so the cross check alone can't catch it; real Intel
+    // Mac builds are distribution artifacts that must not be tuned to the
+    // build box either). ggml's per-ISA defaults (AVX2/FMA/F16C on x86) still
+    // apply, so the result is portable without dropping to scalar kernels.
+    // Set CRISPASR_FORCE_GGML_NATIVE=1 to opt back in.
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let cross_build = target_arch != std::env::consts::ARCH;
+    if env::var_os("CRISPASR_FORCE_GGML_NATIVE").is_none()
+        && (cross_build || (target_os == "macos" && target_arch == "x86_64"))
+    {
+        configure.arg("-DGGML_NATIVE=OFF");
+    }
+
+    // ggml's own cmake auto-detects ccache/sccache as a compiler launcher.
+    // Under the Ninja generator, sccache fails on the GGML_METAL_EMBED_LIBRARY
+    // assembly object (ninja emits depfile rules for the .s compile; sccache
+    // cannot produce the .d and aborts the build). The explicit ccache
+    // launcher above is unaffected, so just disable ggml's auto-detection.
+    configure.arg("-DGGML_CCACHE=OFF");
+
+    // The session/back-end library is consumed with raw PCM input; the
+    // optional .opus/.amr file-decode extras would link Homebrew/system
+    // dylibs by absolute path (libopusfile, libopencore-amr, ...) and break
+    // the library on machines without them. Keep the build self-contained.
+    configure
+        .arg("-DCRISPASR_OPUS=OFF")
+        .arg("-DCRISPASR_AMR=OFF");
+
+    // Rebrandable library file name (CRISPASR_LIB_NAME env, also used for the
+    // link-lib directive) — keeps downstream bundles free of the project name.
+    configure.arg(format!("-DCRISPASR_LIB_OUTPUT_NAME={}", link_lib_name()));
+
     if cfg!(feature = "cuda") {
         configure.arg("-DGGML_CUDA=ON");
     }
@@ -250,6 +289,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CRISPASR_SYS_LIB_DIR");
     println!("cargo:rerun-if-env-changed=CRISPASR_LIB_DIR");
     println!("cargo:rerun-if-env-changed=CRISPASR_LIB_NAME");
+    println!("cargo:rerun-if-env-changed=CRISPASR_FORCE_GGML_NATIVE");
 
     let lib_name = link_lib_name();
 

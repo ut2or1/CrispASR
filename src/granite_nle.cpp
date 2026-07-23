@@ -42,6 +42,7 @@
 #include "core/gguf_loader.h"
 #include "core/mel.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include <algorithm>
 #include <chrono>
@@ -301,7 +302,7 @@ struct granite_nle_context {
 static bool granite_nle_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("GRANITE_NLE_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_GRANITE_NLE_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -1273,7 +1274,7 @@ extern "C" float* granite_nle_run_encoder(struct granite_nle_context* ctx, const
     // debugging). The graph path also populates ctx->last_ctc_logits and
     // ctx->last_bpe_logits.
     bool use_graph = true;
-    if (const char* e = std::getenv("GRANITE_DISABLE_ENCODER_GRAPH"))
+    if (const char* e = crispasr_env::get("CRISPASR_GRANITE_DISABLE_ENCODER_GRAPH"))
         if (e[0] != '0' && e[0] != '\0')
             use_graph = false;
     if (use_graph) {
@@ -1855,7 +1856,7 @@ extern "C" float* granite_nle_run_llm_editing(struct granite_nle_context* ctx, c
                 s / (n_text * vocab));
     }
 
-    if (const char* p = std::getenv("GRANITE_NLE_EDIT_DUMP")) {
+    if (const char* p = crispasr_env::get("CRISPASR_GRANITE_NLE_EDIT_DUMP")) {
         FILE* fp = std::fopen(p, "wb");
         if (fp) {
             std::fwrite(result, sizeof(float), (size_t)vocab * n_text, fp);

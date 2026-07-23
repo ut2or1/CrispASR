@@ -6,10 +6,11 @@
 //
 //   static bool xxx_bench_enabled() {
 //       static int v = -1;
-//       if (v < 0) { const char* e = getenv("XXX_BENCH");
+//       if (v < 0) { const char* e = crispasr_env::get("CRISPASR_XXX_BENCH");
 //                     v = (e && *e && *e != '0') ? 1 : 0; }
 //       return v != 0;
 //   }
+// (the bare XXX_BENCH form still works as a deprecated alias — see core/crispasr_env.h)
 //
 // This test exercises the pattern's contract directly (no model load):
 //   • default (env unset) → false

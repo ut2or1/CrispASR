@@ -6,6 +6,7 @@
 //   - Same projector topology (stack-4-frames + 2×Linear)
 
 #include "voxtral4b.h"
+#include "core/crispasr_env.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -49,7 +50,7 @@
 static bool voxtral4b_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("VOXTRAL4B_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_VOXTRAL4B_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;

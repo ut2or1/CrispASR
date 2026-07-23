@@ -13,6 +13,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -83,8 +85,8 @@ TEST_CASE("speaker_db: enroll then match returns the nearest enrolled name", "[u
     const std::vector<float> alice = norm({1, 0, 0, 0, 0, 0, 0, 0});
     const std::vector<float> bob = norm({0, 1, 0, 0, 0, 0, 0, 0});
 
-    REQUIRE(speaker_db_enroll(dir.c_str(), "alice", alice.data(), D));
-    REQUIRE(speaker_db_enroll(dir.c_str(), "bob", bob.data(), D));
+    REQUIRE(speaker_db_enroll(dir.c_str(), "alice", alice.data(), D, /*consent=*/true));
+    REQUIRE(speaker_db_enroll(dir.c_str(), "bob", bob.data(), D, /*consent=*/true));
 
     speaker_db* db = speaker_db_load(dir.c_str());
     REQUIRE(db != nullptr);
@@ -108,7 +110,7 @@ TEST_CASE("speaker_db: enroll then match returns the nearest enrolled name", "[u
 
 TEST_CASE("speaker_db: a dissimilar voice is rejected (below threshold => no name)", "[unit]") {
     const std::string dir = make_temp_dir();
-    REQUIRE(speaker_db_enroll(dir.c_str(), "alice", norm({1, 0, 0, 0, 0, 0, 0, 0}).data(), D));
+    REQUIRE(speaker_db_enroll(dir.c_str(), "alice", norm({1, 0, 0, 0, 0, 0, 0, 0}).data(), D, /*consent=*/true));
 
     speaker_db* db = speaker_db_load(dir.c_str());
     REQUIRE(db != nullptr);
@@ -123,7 +125,7 @@ TEST_CASE("speaker_db: a dissimilar voice is rejected (below threshold => no nam
 
 TEST_CASE("speaker_db: threshold gates an otherwise-close match", "[unit]") {
     const std::string dir = make_temp_dir();
-    REQUIRE(speaker_db_enroll(dir.c_str(), "alice", norm({1, 0, 0, 0, 0, 0, 0, 0}).data(), D));
+    REQUIRE(speaker_db_enroll(dir.c_str(), "alice", norm({1, 0, 0, 0, 0, 0, 0, 0}).data(), D, /*consent=*/true));
     speaker_db* db = speaker_db_load(dir.c_str());
 
     // cosine ~0.707 with alice: matches at 0.7 but is rejected at 0.8.
@@ -135,12 +137,82 @@ TEST_CASE("speaker_db: threshold gates an otherwise-close match", "[unit]") {
 
 TEST_CASE("speaker_db: dimension mismatch never matches", "[unit]") {
     const std::string dir = make_temp_dir();
-    REQUIRE(speaker_db_enroll(dir.c_str(), "alice", norm({1, 0, 0, 0, 0, 0, 0, 0}).data(), D));
+    REQUIRE(speaker_db_enroll(dir.c_str(), "alice", norm({1, 0, 0, 0, 0, 0, 0, 0}).data(), D, /*consent=*/true));
     speaker_db* db = speaker_db_load(dir.c_str());
 
     // Querying with a different dimensionality (e.g. wrong embedder) must
     // not produce a false identification.
     const std::vector<float> q4 = norm({1, 0, 0, 0});
     REQUIRE(speaker_db_match(db, q4.data(), 4, 0.0f, nullptr) == nullptr);
+    speaker_db_free(db);
+}
+
+// ── Issue #266: consent gate + closed-roster narrowing + legacy format ──────
+
+TEST_CASE("speaker_db: enrollment refuses without a consent attestation", "[unit]") {
+    const std::string dir = make_temp_dir();
+    const std::vector<float> v = norm({1, 0, 0, 0, 0, 0, 0, 0});
+    REQUIRE_FALSE(speaker_db_enroll(dir.c_str(), "alice", v.data(), D, /*consent=*/false));
+
+    // Nothing may have been written.
+    speaker_db* db = speaker_db_load(dir.c_str());
+    REQUIRE(speaker_db_count(db) == 0);
+    speaker_db_free(db);
+}
+
+TEST_CASE("speaker_db: retain narrows to the claimed roster (no open 1:N)", "[unit]") {
+    const std::string dir = make_temp_dir();
+    REQUIRE(speaker_db_enroll(dir.c_str(), "alice", norm({1, 0, 0, 0, 0, 0, 0, 0}).data(), D, /*consent=*/true));
+    REQUIRE(speaker_db_enroll(dir.c_str(), "bob", norm({0, 1, 0, 0, 0, 0, 0, 0}).data(), D, /*consent=*/true));
+    REQUIRE(speaker_db_enroll(dir.c_str(), "carol", norm({0, 0, 1, 0, 0, 0, 0, 0}).data(), D, /*consent=*/true));
+
+    speaker_db* db = speaker_db_load(dir.c_str());
+    REQUIRE(speaker_db_count(db) == 3);
+
+    // Claim two of three (with whitespace + one name that isn't enrolled).
+    REQUIRE(speaker_db_retain(db, " alice , carol , mallory ") == 2);
+    REQUIRE(speaker_db_count(db) == 2);
+    REQUIRE(std::string(speaker_db_name(db, 0)) == "alice");
+    REQUIRE(std::string(speaker_db_name(db, 1)) == "carol");
+
+    // The unclaimed profile must be unreachable: a query that would have
+    // matched bob now stays unmatched.
+    const std::vector<float> near_bob = norm({0.1f, 0.9f, 0, 0, 0, 0, 0, 0});
+    REQUIRE(speaker_db_match(db, near_bob.data(), D, 0.7f, nullptr) == nullptr);
+    speaker_db_free(db);
+}
+
+TEST_CASE("speaker_db: retain with an empty roster keeps nothing", "[unit]") {
+    const std::string dir = make_temp_dir();
+    REQUIRE(speaker_db_enroll(dir.c_str(), "alice", norm({1, 0, 0, 0, 0, 0, 0, 0}).data(), D, /*consent=*/true));
+    speaker_db* db = speaker_db_load(dir.c_str());
+    REQUIRE(speaker_db_retain(db, "") == 0);
+    REQUIRE(speaker_db_count(db) == 0);
+    speaker_db_free(db);
+}
+
+TEST_CASE("speaker_db: legacy v1 profiles (no consent trailer) still load", "[unit]") {
+    const std::string dir = make_temp_dir();
+    const std::vector<float> alice = norm({1, 0, 0, 0, 0, 0, 0, 0});
+
+    // Hand-write a v1 file: magic, version=1, dim, embedding — no trailer.
+    {
+        FILE* f = fopen((dir + "/alice.spkr").c_str(), "wb");
+        REQUIRE(f != nullptr);
+        const char magic[4] = {'S', 'P', 'K', 'R'};
+        const uint32_t version = 1, dim = D;
+        REQUIRE(fwrite(magic, 1, 4, f) == 4);
+        REQUIRE(fwrite(&version, 4, 1, f) == 1);
+        REQUIRE(fwrite(&dim, 4, 1, f) == 1);
+        REQUIRE(fwrite(alice.data(), sizeof(float), D, f) == (size_t)D);
+        fclose(f);
+    }
+
+    speaker_db* db = speaker_db_load(dir.c_str());
+    REQUIRE(speaker_db_count(db) == 1);
+    float score = 0.0f;
+    const char* name = speaker_db_match(db, alice.data(), D, 0.9f, &score);
+    REQUIRE(name != nullptr);
+    REQUIRE(std::string(name) == "alice");
     speaker_db_free(db);
 }

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/crispasr_env.h"
 
 // Read a mono WAV file into float PCM + sample rate.
 // Handles WAVs with extra chunks before the data chunk.
@@ -112,7 +113,7 @@ public:
             if (!p.tts_codec_model.empty()) {
                 bert_path = p.tts_codec_model;
             } else {
-                const char* env = std::getenv("MELOTTS_BERT");
+                const char* env = crispasr_env::get("CRISPASR_MELOTTS_BERT");
                 if (env && *env) {
                     bert_path = env;
                 } else {
@@ -171,7 +172,7 @@ public:
                     cp.verbosity = p.no_prints ? 0 : 1;
                     ov2_ctx_ = openvoice2_init_from_file(tcc_path.c_str(), cp);
                     if (ov2_ctx_) {
-                        const char* dd = std::getenv("OV2_DUMP_DIR");
+                        const char* dd = crispasr_env::get("CRISPASR_OV2_DUMP_DIR");
                         if (dd)
                             openvoice2_set_dump_dir(ov2_ctx_, dd);
                         if (!p.no_prints)

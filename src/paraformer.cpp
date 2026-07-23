@@ -13,6 +13,7 @@
 #include "core/sanm.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (§232 paraformer GPU path)
+#include "core/crispasr_env.h"
 #if defined(GGML_USE_METAL)
 #include "ggml-metal.h" // ggml_backend_is_metal (§232 CUDA/Vulkan-default gate)
 #endif
@@ -37,7 +38,7 @@
 static bool paraformer_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("PARAFORMER_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_PARAFORMER_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;

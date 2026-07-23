@@ -5,6 +5,7 @@
 
 #include "ecapa_lid.h"
 #include "core/gguf_loader.h"
+#include "core/crispasr_env.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -35,7 +36,7 @@
 // non-Apple.
 static bool ecapa_use_scalar() {
 #if defined(HAVE_ACCELERATE)
-    static const bool force_scalar = std::getenv("ECAPA_FORCE_SCALAR") != nullptr;
+    static const bool force_scalar = crispasr_env::get("CRISPASR_ECAPA_FORCE_SCALAR") != nullptr;
     return force_scalar;
 #else
     return true;
@@ -49,7 +50,7 @@ static bool ecapa_use_scalar() {
 static bool ecapa_lid_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("ECAPA_LID_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_ECAPA_LID_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -391,7 +392,7 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
         return nullptr;
 
     // Debug: optionally load reference fbank
-    const char* ref_path = getenv("ECAPA_REF_FBANK");
+    const char* ref_path = crispasr_env::get("CRISPASR_ECAPA_REF_FBANK");
     if (ref_path && *ref_path) {
         FILE* f = fopen(ref_path, "rb");
         if (f) {
@@ -805,7 +806,7 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
             emb[i] = (float)s;
         }
 
-        if (std::getenv("ECAPA_TIMING")) {
+        if (crispasr_env::get("CRISPASR_ECAPA_TIMING")) {
             double asp_ms =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - asp_t0).count();
             fprintf(stderr, "ecapa_lid: ASP head (T=%d) %.1f ms %s\n", T_mfa, asp_ms,

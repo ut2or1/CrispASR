@@ -5,6 +5,7 @@
 // AUDIOSEAL_GGUF environment variable pointing at an audioseal.gguf.
 
 #include "audioseal.h"
+#include "core/crispasr_env.h"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -61,7 +62,7 @@ TEST_CASE("audioseal_nbits with null returns 16", "[unit][audioseal]") {
 
 namespace {
 const char* get_gguf_path() {
-    return std::getenv("AUDIOSEAL_GGUF");
+    return crispasr_env::get("CRISPASR_AUDIOSEAL_GGUF");
 }
 
 std::vector<float> make_sine_16k(int n_samples, float freq = 440.0f, float amp = 0.3f) {

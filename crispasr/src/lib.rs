@@ -1797,6 +1797,32 @@ pub struct RegistryEntry {
     pub approx_size: String,
 }
 
+/// Role of one artifact in a canonical model download bundle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegistryArtifactKind {
+    Primary,
+    Companion,
+    Extra,
+}
+
+/// One file in a backend's canonical default download bundle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistryArtifact {
+    pub kind: RegistryArtifactKind,
+    pub filename: String,
+    pub url: String,
+    pub approx_size: String,
+}
+
+/// The exact artifact bundle downloaded by `-m auto`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistryBundle {
+    pub backend: String,
+    pub license: String,
+    pub requires_acceptance: bool,
+    pub artifacts: Vec<RegistryArtifact>,
+}
+
 /// Look up the canonical GGUF for a backend (whisper, parakeet, canary,
 /// voxtral, voxtral4b, granite, granite-4.1, qwen3, cohere, wav2vec2). Returns `None`
 /// on miss.
@@ -1830,6 +1856,93 @@ pub fn registry_lookup(backend: &str) -> Result<Option<RegistryEntry>, String> {
 /// Look up by filename (exact match, then fuzzy substring).
 pub fn registry_lookup_by_filename(filename: &str) -> Result<Option<RegistryEntry>, String> {
     registry_call_inner(filename, false)
+}
+
+/// Return the backend's exact canonical `-m auto` artifact bundle.
+///
+/// Artifacts are ordered as downloaded: primary model, inline companion,
+/// then any extra companions. No preferred quant is applied. Returns `None`
+/// when the backend has no registry entry.
+pub fn registry_default_bundle(backend: &str) -> Result<Option<RegistryBundle>, String> {
+    if backend.is_empty() {
+        return Ok(None);
+    }
+    let backend_c = CString::new(backend).map_err(|e| format!("backend NUL: {e}"))?;
+    let mut canonical_buf = [0u8; 256];
+    let mut license_buf = [0u8; 1024];
+    let mut requires_acceptance = 0;
+    let count = unsafe {
+        crispasr_sys::crispasr_registry_default_bundle_info_abi(
+            backend_c.as_ptr(),
+            canonical_buf.as_mut_ptr() as *mut c_char,
+            canonical_buf.len() as c_int,
+            license_buf.as_mut_ptr() as *mut c_char,
+            license_buf.len() as c_int,
+            &mut requires_acceptance,
+        )
+    };
+    if count == 0 {
+        return Ok(None);
+    }
+    if count < 0 {
+        return Err(format!(
+            "default-bundle registry lookup failed (rc={count})"
+        ));
+    }
+
+    fn slice_to_string(buf: &[u8]) -> String {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).into_owned()
+    }
+
+    let mut artifacts = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let mut kind = 0;
+        let mut filename_buf = [0u8; 256];
+        let mut url_buf = [0u8; 2048];
+        let mut size_buf = [0u8; 64];
+        let rc = unsafe {
+            crispasr_sys::crispasr_registry_default_bundle_artifact_abi(
+                backend_c.as_ptr(),
+                index,
+                &mut kind,
+                filename_buf.as_mut_ptr() as *mut c_char,
+                filename_buf.len() as c_int,
+                url_buf.as_mut_ptr() as *mut c_char,
+                url_buf.len() as c_int,
+                size_buf.as_mut_ptr() as *mut c_char,
+                size_buf.len() as c_int,
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "default-bundle artifact {index} lookup failed (rc={rc})"
+            ));
+        }
+        let kind = match kind {
+            0 => RegistryArtifactKind::Primary,
+            1 => RegistryArtifactKind::Companion,
+            2 => RegistryArtifactKind::Extra,
+            value => {
+                return Err(format!(
+                    "default-bundle artifact {index} has unknown kind {value}"
+                ))
+            }
+        };
+        artifacts.push(RegistryArtifact {
+            kind,
+            filename: slice_to_string(&filename_buf),
+            url: slice_to_string(&url_buf),
+            approx_size: slice_to_string(&size_buf),
+        });
+    }
+
+    Ok(Some(RegistryBundle {
+        backend: slice_to_string(&canonical_buf),
+        license: slice_to_string(&license_buf),
+        requires_acceptance: requires_acceptance != 0,
+        artifacts,
+    }))
 }
 
 fn registry_call_inner(key: &str, by_backend: bool) -> Result<Option<RegistryEntry>, String> {

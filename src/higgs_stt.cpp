@@ -13,6 +13,7 @@
 // See qwen3-asr-todo.md for the full plan.
 
 #include "higgs_stt.h"
+#include "core/crispasr_env.h"
 #include "../crisp_audio/include/crisp_audio.h"
 
 #ifndef M_PI
@@ -53,7 +54,7 @@
 static bool higgs_stt_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("HIGGS_STT_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_HIGGS_STT_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -255,7 +256,8 @@ struct higgs_stt_context {
     int kv_n_used = 0;
 
     int n_threads = 4;
-    int beam_size = 1; // 1 = greedy (default); >1 = beam search (core_beam_decode)
+    int beam_size = 1;         // 1 = greedy (default); >1 = beam search (core_beam_decode)
+    int max_new_tokens = 1024; // #292: decode cap; forwarded from --max-new-tokens when set, else this default.
 
     // Shared audio-tower runtime (loaded lazily on first audio call). The
     // higgs_stt_audio_tower struct above is kept around so existing in-tree
@@ -1525,6 +1527,13 @@ extern "C" void higgs_stt_set_beam_size(higgs_stt_context* ctx, int beam_size) {
         ctx->beam_size = beam_size > 0 ? beam_size : 1;
 }
 
+// #292: forward --max-new-tokens. <= 0 keeps the backend's 1024 default (the KV
+// cache is sized from this, so raising it grows the cache accordingly).
+extern "C" void higgs_stt_set_max_new_tokens(higgs_stt_context* ctx, int n) {
+    if (ctx && n > 0)
+        ctx->max_new_tokens = n;
+}
+
 extern "C" char* higgs_stt_transcribe(higgs_stt_context* ctx, const float* samples, int n_samples) {
     if (!ctx || !samples || n_samples <= 0)
         return strdup("");
@@ -1581,7 +1590,8 @@ extern "C" char* higgs_stt_transcribe(higgs_stt_context* ctx, const float* sampl
     free(audio);
 
     // ---- KV-cached greedy decode ----
-    if (!higgs_stt_kv_init(ctx, std::max(4096, T_prompt + 1024))) {
+    const int higgs_max_new = ctx->max_new_tokens > 0 ? ctx->max_new_tokens : 1024;
+    if (!higgs_stt_kv_init(ctx, std::max(4096, T_prompt + higgs_max_new))) {
         free(te);
         return strdup("");
     }
@@ -1591,7 +1601,7 @@ extern "C" char* higgs_stt_transcribe(higgs_stt_context* ctx, const float* sampl
     free(te);
     int n_past = T_prompt;
     std::vector<int32_t> out_ids;
-    const int max_new = 1024;
+    const int max_new = higgs_max_new; // #292: honors --max-new-tokens (see kv_init above)
     const int eos1 = (int)hp.im_end_token_id;
     const int eos2 = (int)hp.pad_token_id; // <|endoftext|>
 
@@ -1646,7 +1656,7 @@ extern "C" char* higgs_stt_transcribe(higgs_stt_context* ctx, const float* sampl
 
     // ---- detokenize + post-process ----
     std::string text = core_bpe::detokenize(ctx->vocab.id_to_token, out_ids.data(), out_ids.size());
-    if (getenv("HIGGS_DEBUG")) {
+    if (crispasr_env::get("CRISPASR_HIGGS_DEBUG")) {
         fprintf(stderr, "[higgs] raw %zu tokens, raw text:\n>>>%s<<<\n", out_ids.size(), text.c_str());
     }
     // Strip an optional <think>...</think> reasoning block.

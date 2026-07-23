@@ -50,6 +50,7 @@ add_executable(${TARGET}
     crispasr_backend_dia.cpp
     crispasr_backend_dots_tts.cpp
     crispasr_backend_voxcpm2_tts.cpp
+    crispasr_backend_voxcpm2_vae.cpp
     crispasr_backend_cosyvoice3.cpp
     crispasr_backend_kokoro.cpp
     crispasr_backend_piper.cpp
@@ -57,6 +58,13 @@ add_executable(${TARGET}
     crispasr_backend_m2m100.cpp
     crispasr_backend_t5.cpp
     crispasr_backend_glm_asr.cpp
+    crispasr_backend_htdemucs.cpp
+    crispasr_backend_crepe.cpp
+    crispasr_backend_btc.cpp
+    crispasr_backend_rvc.cpp
+    crispasr_piano_cli.cpp
+    crispasr_backend_beat_this.cpp
+    crispasr_backend_mel_band_roformer.cpp
     crispasr_backend_kyutai_stt.cpp
     crispasr_backend_firered_asr.cpp
     crispasr_backend_moonshine.cpp
@@ -65,6 +73,8 @@ add_executable(${TARGET}
     crispasr_backend_omniasr.cpp
     crispasr_backend_mimo_asr.cpp
     crispasr_backend_ark_asr.cpp
+    crispasr_backend_miotts.cpp
+    crispasr_backend_piano_transcription.cpp
     crispasr_backend_moss_audio.cpp
     crispasr_backend_moss_tts.cpp
     crispasr_backend_moss_tts_local.cpp
@@ -73,10 +83,17 @@ add_executable(${TARGET}
     crispasr_backend_funasr.cpp
     crispasr_backend_paraformer.cpp
     crispasr_backend_sensevoice.cpp
+    crispasr_backend_sidon.cpp
     crispasr_backend_speecht5.cpp
     crispasr_backend_zonos.cpp
     crispasr_aligner_cli.cpp
     crispasr_vad_cli.cpp
+    crispasr_separate_cli.cpp
+    crispasr_beats_cli.cpp
+    crispasr_chords_cli.cpp
+    crispasr_tab_cli.cpp
+    crispasr_backend_tabcnn.cpp
+    crispasr_pitch_cli.cpp
     crispasr_lid_cli.cpp
     crispasr_diarize_cli.cpp
     crispasr_output.cpp
@@ -173,7 +190,10 @@ target_include_directories(crispasr-diff-lib PUBLIC
 target_link_libraries(crispasr-diff-lib PUBLIC
     crispasr-core
     ggml
-)
+ btc-chords
+    tabcnn
+    rvc-svc
+    beatrice-pitch)
 set_target_properties(crispasr-diff-lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------
@@ -219,11 +239,15 @@ target_link_libraries(crispasr-diff PRIVATE
     funasr
     paraformer
     sensevoice
+    sidon
     cosyvoice3_tts
     csm-tts
     parler-tts
     mini-omni2
     dots-tts
+    miotts
+    miocodec
+    crepe
     crispasr-diff-lib
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
@@ -339,11 +363,13 @@ target_link_libraries(${TARGET} PRIVATE
     funasr
     paraformer
     sensevoice
+    sidon
     moss_audio
     moss_tts
     moss_tts_local
     moss_transcribe
     moss_transcribe_diarize
+    miotts
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
     $<$<BOOL:${WIN32}>:winhttp>
@@ -427,3 +453,7 @@ target_link_libraries(crispasr-chat PRIVATE
 )
 include(DefaultTargetOptions)
 install(TARGETS crispasr-chat RUNTIME BUNDLE DESTINATION bin)
+
+add_executable(crispasr-f0-eval crispasr_f0_eval.cpp)
+target_link_libraries(crispasr-f0-eval PRIVATE crispasr-lib crepe beatrice-pitch)
+target_include_directories(crispasr-f0-eval PRIVATE ${CMAKE_SOURCE_DIR}/src)

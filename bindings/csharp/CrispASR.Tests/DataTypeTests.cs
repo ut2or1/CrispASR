@@ -186,5 +186,65 @@ namespace CrispASR.Tests
             Assert.Equal("", su.Text);
             Assert.Equal(0, su.Counter);
         }
+
+        // ---- Music / task-backend result types (newly bound; issue #291 follow-up) ----
+
+        [Fact]
+        public void BeatEvent_And_Result()
+        {
+            var b = new BeatEvent(1.25, true);
+            Assert.Equal(1.25, b.TimeSeconds);
+            Assert.True(b.IsDownbeat);
+            var r = new BeatResult(new[] { b }, 120.0);
+            Assert.Single(r.Beats);
+            Assert.Equal(120.0, r.TempoBpm);
+        }
+
+        [Fact]
+        public void ChordSpan_Properties()
+        {
+            var c = new ChordSpan(0.5, 2.0, 3, 0.9f, "Am");
+            Assert.Equal(0.5, c.StartSeconds);
+            Assert.Equal(2.0, c.EndSeconds);
+            Assert.Equal(3, c.Label);
+            Assert.Equal("Am", c.Name);
+        }
+
+        [Fact]
+        public void PianoNote_Properties()
+        {
+            var n = new PianoNote(0.1, 0.6, 60, 100);
+            Assert.Equal(0.1, n.OnsetSeconds);
+            Assert.Equal(60, n.MidiNote);
+            Assert.Equal(100, n.Velocity);
+        }
+
+        [Fact]
+        public void PitchFrame_Properties()
+        {
+            var p = new PitchFrame(0.02, 220.0f, 0.95f);
+            Assert.Equal(0.02, p.TimeSeconds);
+            Assert.Equal(220.0f, p.F0Hz);
+            Assert.Equal(0.95f, p.VoicedProb);
+        }
+
+        [Fact]
+        public void Stem_Properties()
+        {
+            var s = new Stem("vocals", new float[] { 0f, 0f, 1f, 1f }, 2);
+            Assert.Equal("vocals", s.Name);
+            Assert.Equal(2, s.PerChannelSamples);
+            Assert.Equal(4, s.Interleaved.Length);
+        }
+
+        [Fact]
+        public void TabEmissions_Indexing()
+        {
+            var t = new TabEmissions(2, 6, 21, new float[2 * 6 * 21], 20, 0.0232f, new[] { 40, 45, 50, 55, 59, 64 });
+            Assert.Equal(6, t.Strings);
+            Assert.Equal(20, t.SilentClass);
+            Assert.Equal(6, t.StringOpenMidi.Length);
+            Assert.Equal(2 * 6 * 21, t.LogProbs.Length);
+        }
     }
 }

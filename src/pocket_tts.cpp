@@ -31,6 +31,7 @@
 #include "core/gguf_loader.h"
 #include "core/sentencepiece.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -68,7 +69,7 @@ namespace {
 static bool pocket_tts_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("POCKET_TTS_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_POCKET_TTS_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -1369,7 +1370,7 @@ static void backbone_forward_step(pocket_tts_context* pctx, const float* x_in, f
 // Dispatch: ggml or manual backbone forward step.
 // --no-gpu (use_gpu=false) forces legacy manual path; env var POCKET_MANUAL_BACKBONE=1 also works.
 static void backbone_step(pocket_tts_context* pctx, const float* x_in, float* out) {
-    if (!pctx->params.use_gpu || getenv("POCKET_MANUAL_BACKBONE")) {
+    if (!pctx->params.use_gpu || crispasr_env::get("CRISPASR_POCKET_MANUAL_BACKBONE")) {
         backbone_forward_step(pctx, x_in, out);
     } else {
         backbone_forward_step_ggml(pctx, x_in, out);
@@ -1440,7 +1441,7 @@ static void flow_net_eval(pocket_tts_context* pctx, const float* cond, // (d_mod
     vec_add(y.data(), t_combined.data(), c_emb.data(), FD);
 
     // Dump y for diff
-    if (getenv("POCKET_DUMP_DIR")) {
+    if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
         float yn = 0, tcn = 0, cn = 0;
         for (int i = 0; i < FD; i++) {
             yn += y[i] * y[i];
@@ -1480,7 +1481,7 @@ static void flow_net_eval(pocket_tts_context* pctx, const float* cond, // (d_mod
         for (int i = 0; i < FD; i++)
             x[i] += gate[i] * h_out[i];
 
-        if (getenv("POCKET_DUMP_DIR")) {
+        if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
             float xn = 0, gn = 0, hn = 0;
             for (int i = 0; i < FD; i++) {
                 xn += x[i] * x[i];
@@ -1505,7 +1506,7 @@ static void flow_net_eval(pocket_tts_context* pctx, const float* cond, // (d_mod
     layer_norm(normed.data(), x.data(), FD, nullptr, nullptr, 1e-6f);
 
     // Dump pre-modulation x norm and post-modulation for debugging
-    if (getenv("POCKET_DUMP_DIR")) {
+    if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
         float x_norm = 0, normed_norm = 0;
         for (int i = 0; i < FD; i++) {
             x_norm += x[i] * x[i];
@@ -1894,8 +1895,8 @@ static void mimi_decode_ggml(pocket_tts_context* pctx, const float* latent_seq, 
     }
 
     // Dump post-upsample (same as manual path for comparison)
-    if (pctx->verbosity >= 2 || getenv("POCKET_DUMP_DIR")) {
-        const char* dd = getenv("POCKET_DUMP_DIR");
+    if (pctx->verbosity >= 2 || crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
+        const char* dd = crispasr_env::get("CRISPASR_POCKET_DUMP_DIR");
         if (dd) {
             // Convert to channels-first for dump compatibility with manual path
             std::vector<float> dump_cf(OD * T_xfmr);
@@ -1971,7 +1972,7 @@ static void mimi_decode_ggml(pocket_tts_context* pctx, const float* latent_seq, 
 
     // Dump hook: mark post-transformer output
     ggml_tensor* post_xfmr = x;
-    if (getenv("POCKET_DUMP_DIR")) {
+    if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
         ggml_set_name(post_xfmr, "post_xfmr");
         ggml_set_output(post_xfmr);
     }
@@ -2034,13 +2035,13 @@ static void mimi_decode_ggml(pocket_tts_context* pctx, const float* latent_seq, 
     }
 
     // Dump post-transformer if requested
-    if (getenv("POCKET_DUMP_DIR")) {
+    if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
         ggml_tensor* pxfmr = ggml_graph_get_tensor(gf, "post_xfmr");
         if (pxfmr) {
             int n_elem = (int)ggml_nelements(pxfmr);
             std::vector<float> xfmr_data(n_elem);
             ggml_backend_tensor_get(pxfmr, xfmr_data.data(), 0, n_elem * sizeof(float));
-            const char* dd = getenv("POCKET_DUMP_DIR");
+            const char* dd = crispasr_env::get("CRISPASR_POCKET_DUMP_DIR");
             std::string p = std::string(dd) + "/cpp_mimi_post_xfmr.f32";
             FILE* f = fopen(p.c_str(), "wb");
             if (f) {
@@ -2494,8 +2495,8 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
     int T_xfmr = T_up_causal;
 
     // Dump post-upsample
-    if (pctx->verbosity >= 2 || getenv("POCKET_DUMP_DIR")) {
-        const char* dd = getenv("POCKET_DUMP_DIR");
+    if (pctx->verbosity >= 2 || crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
+        const char* dd = crispasr_env::get("CRISPASR_POCKET_DUMP_DIR");
         if (dd) {
             std::string p = std::string(dd) + "/cpp_mimi_upsample.f32";
             FILE* f = fopen(p.c_str(), "wb");
@@ -2538,8 +2539,8 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
     }
 
     // Dump post-transformer
-    if (getenv("POCKET_DUMP_DIR")) {
-        const char* dd = getenv("POCKET_DUMP_DIR");
+    if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
+        const char* dd = crispasr_env::get("CRISPASR_POCKET_DUMP_DIR");
         std::string p = std::string(dd) + "/cpp_mimi_post_xfmr.f32";
         FILE* f = fopen(p.c_str(), "wb");
         if (f) {
@@ -2878,7 +2879,7 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
         // POCKET_MIMI_DUMP=<path>: dump the (deterministic) conditioning
         // latents for scalar-vs-batched A/B — the sampler is stochastic, so
         // WAV comparison cannot validate the encoder.
-        if (const char* dp = std::getenv("POCKET_MIMI_DUMP")) {
+        if (const char* dp = crispasr_env::get("CRISPASR_POCKET_MIMI_DUMP")) {
             if (FILE* f = fopen(dp, "wb")) {
                 fwrite(*latent_out, sizeof(float), (size_t)T_down * LD, f);
                 fclose(f);
@@ -3121,8 +3122,8 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     //   cpp_latents.f32      — (n_frames, latent_dim) AR latent sequence
     //   cpp_pcm.f32          — final PCM
     // POCKET_FORCE_LATENTS=f : teacher-force AR latents from file f
-    const char* pocket_dump_dir = getenv("POCKET_DUMP_DIR");
-    const char* pocket_force_lat = getenv("POCKET_FORCE_LATENTS");
+    const char* pocket_dump_dir = crispasr_env::get("CRISPASR_POCKET_DUMP_DIR");
+    const char* pocket_force_lat = crispasr_env::get("CRISPASR_POCKET_FORCE_LATENTS");
     auto dump_path = [&](const char* name) -> std::string {
         return std::string(pocket_dump_dir ? pocket_dump_dir : ".") + "/" + name;
     };
@@ -3165,7 +3166,7 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
         max_frames = std::min(max_frames, 500); // ~40s max
     }
     // Allow env override for testing
-    if (const char* mf_env = getenv("POCKET_MAX_FRAMES")) {
+    if (const char* mf_env = crispasr_env::get("CRISPASR_POCKET_MAX_FRAMES")) {
         max_frames = std::atoi(mf_env);
         if (max_frames <= 0)
             max_frames = 25;
@@ -3322,7 +3323,7 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
             // Allow forcing step-0 noise from file for diff testing
             bool noise_forced = false;
             if (frame == 0) {
-                const char* nf = getenv("POCKET_FORCE_NOISE");
+                const char* nf = crispasr_env::get("CRISPASR_POCKET_FORCE_NOISE");
                 if (nf) {
                     FILE* fn = fopen(nf, "rb");
                     if (fn) {
@@ -3400,7 +3401,7 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     {
         pocket_tts_bench_stage _bs("mimi_decode");
         // use_gpu=false forces the manual CPU Mimi path; env POCKET_MANUAL_MIMI=1 also.
-        bool force_cpu_mimi = !ctx->params.use_gpu || getenv("POCKET_MANUAL_MIMI");
+        bool force_cpu_mimi = !ctx->params.use_gpu || crispasr_env::get("CRISPASR_POCKET_MANUAL_MIMI");
 
         // Vulkan workgroup-limit guard (issue #256). The Mimi decoder transformer
         // dispatches ~T_xfmr^2 workgroups over the causal attention (T_xfmr scales
@@ -3413,7 +3414,7 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
             const char* be_name = ggml_backend_name(ctx->backend);
             if (be_name && strstr(be_name, "Vulkan")) {
                 int max_frames = 120;
-                if (const char* env = getenv("POCKET_VULKAN_MIMI_MAX_FRAMES"))
+                if (const char* env = crispasr_env::get("CRISPASR_POCKET_VULKAN_MIMI_MAX_FRAMES"))
                     max_frames = atoi(env);
                 if (max_frames > 0 && n_gen_frames > max_frames) {
                     force_cpu_mimi = true;

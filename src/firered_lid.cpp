@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include "core/crispasr_env.h"
 
 // ===========================================================================
 // Bench instrumentation — `FIRERED_LID_BENCH=1` for per-stage timings.
@@ -21,7 +22,7 @@
 static bool firered_lid_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("FIRERED_LID_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_FIRERED_LID_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;

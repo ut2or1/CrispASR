@@ -24,6 +24,8 @@
 #include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/fft.h"     // core_fft::fft_radix2_wrapper (STFT: FFT instead of O(N^2) DFT)
 #include "core/gguf_loader.h"
+#include "core/tts_ref_cache.h" // content-addressed reference-embedding cache
+#include "core/crispasr_env.h"
 
 #if defined(HAVE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
@@ -48,7 +50,7 @@
 static bool openvoice2_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("OPENVOICE2_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_OPENVOICE2_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -281,7 +283,7 @@ extern "C" struct openvoice2_context* openvoice2_init_from_file(const char* path
     ctx->verbosity = params.verbosity;
     ctx->tau = params.tau;
     {
-        const char* e = std::getenv("OV2_TAU");
+        const char* e = crispasr_env::get("CRISPASR_OV2_TAU");
         if (e)
             ctx->tau = (float)std::atof(e);
     }
@@ -546,7 +548,7 @@ static void stft_magnitude(const float* pcm, int n_samples, int fft_size, int ho
 // OV2_FORCE_SCALAR=1 to validate scalar == GEMM or run on non-Apple.
 static bool ov2_use_scalar() {
 #if defined(HAVE_ACCELERATE)
-    static const bool fs = std::getenv("OV2_FORCE_SCALAR") != nullptr;
+    static const bool fs = crispasr_env::get("CRISPASR_OV2_FORCE_SCALAR") != nullptr;
     return fs;
 #else
     return true;
@@ -1187,6 +1189,42 @@ static bool hifigan_decode_cpu(openvoice2_context* ctx, const std::vector<float>
     return true;
 }
 
+// Compute the 256-d target speaker embedding from a raw reference PCM, with a
+// content-addressed on-disk cache. The encode (resample + STFT + the 6-conv
+// ref_enc) is deterministic given the reference audio, so cache the embedding
+// and skip the whole pipeline on repeat runs — every caller (CLI, C ABI) that
+// re-uses the same reference benefits across process invocations. Key = hash of
+// (ref_pcm bytes, ref_sr). Disable with CRISPASR_TTS_REF_CACHE=0. Mirrors the
+// irodori-latent / indextts-cond content cache.
+static bool openvoice2_target_se(openvoice2_context* ctx, const float* ref_pcm, int n_ref, int ref_sr,
+                                 std::vector<float>& out_se) {
+    const uint64_t key = crispasr_ref_cache::fnv1a(ref_pcm, (size_t)n_ref * sizeof(float)) ^
+                         crispasr_ref_cache::fnv1a(&ref_sr, sizeof(ref_sr));
+    {
+        std::vector<uint32_t> shape;
+        std::vector<float> se;
+        if (crispasr_ref_cache::get_floats("openvoice2-se", &key, sizeof(key), shape, se) && shape.size() == 1 &&
+            shape[0] == 256 && se.size() == 256) {
+            out_se = std::move(se);
+            if (ctx->verbosity >= 1)
+                fprintf(stderr, "openvoice2: target_se from cache (256-d)\n");
+            return true;
+        }
+    }
+
+    std::vector<float> ref_22k;
+    resample_linear(ref_pcm, n_ref, ref_sr, ctx->hp.sample_rate, ref_22k);
+    int T_ref = 0;
+    std::vector<float> ref_spec;
+    stft_magnitude(ref_22k.data(), (int)ref_22k.size(), ctx->hp.filter_length, ctx->hp.hop_length, ctx->hp.win_length,
+                   ref_spec, T_ref);
+    if (!ref_enc_forward(ctx, ref_spec, T_ref, out_se))
+        return false;
+    if (out_se.size() == 256)
+        crispasr_ref_cache::put_floats("openvoice2-se", &key, sizeof(key), {256u}, out_se.data(), out_se.size());
+    return true;
+}
+
 // ── Main voice conversion API ────────────────────────────────────────
 
 extern "C" bool openvoice2_convert(struct openvoice2_context* ctx, const float* src_pcm, int n_src, int src_sr,
@@ -1199,37 +1237,35 @@ extern "C" bool openvoice2_convert(struct openvoice2_context* ctx, const float* 
 
     openvoice2_bench_stage _bs_total("convert");
 
-    // Resample to target sample rate
-    std::vector<float> src_22k, ref_22k;
+    // Resample source to target sample rate. The reference is resampled inside
+    // openvoice2_target_se, and only on a cache miss.
+    std::vector<float> src_22k;
     {
         openvoice2_bench_stage _bs("resample");
         resample_linear(src_pcm, n_src, src_sr, target_sr, src_22k);
-        resample_linear(ref_pcm, n_ref, ref_sr, target_sr, ref_22k);
     }
 
     if (ctx->verbosity >= 1)
-        fprintf(stderr, "openvoice2: src %d→%d samples, ref %d→%d samples\n", n_src, (int)src_22k.size(), n_ref,
-                (int)ref_22k.size());
+        fprintf(stderr, "openvoice2: src %d→%d samples\n", n_src, (int)src_22k.size());
 
-    // 1. STFT of source and reference
-    int T_src, T_ref;
-    std::vector<float> src_spec, ref_spec;
+    // 1. STFT of source
+    int T_src;
+    std::vector<float> src_spec;
     {
         openvoice2_bench_stage _bs("stft");
         stft_magnitude(src_22k.data(), (int)src_22k.size(), hp.filter_length, hp.hop_length, hp.win_length, src_spec,
                        T_src);
-        stft_magnitude(ref_22k.data(), (int)ref_22k.size(), hp.filter_length, hp.hop_length, hp.win_length, ref_spec,
-                       T_ref);
     }
 
     if (ctx->verbosity >= 1)
-        fprintf(stderr, "openvoice2: STFT — src T=%d, ref T=%d (%d bins)\n", T_src, T_ref, hp.spec_channels);
+        fprintf(stderr, "openvoice2: STFT — src T=%d (%d bins)\n", T_src, hp.spec_channels);
 
-    // 2. Extract target speaker embedding from reference
+    // 2. Extract target speaker embedding from reference (content-addressed
+    //    cache: resample + STFT + ref_enc skipped entirely on a cache hit).
     std::vector<float> target_se;
     {
         openvoice2_bench_stage _bs("ref_enc");
-        if (!ref_enc_forward(ctx, ref_spec, T_ref, target_se)) {
+        if (!openvoice2_target_se(ctx, ref_pcm, n_ref, ref_sr, target_se)) {
             fprintf(stderr, "openvoice2: ref_enc failed\n");
             return false;
         }
@@ -1331,7 +1367,7 @@ extern "C" bool openvoice2_convert(struct openvoice2_context* ctx, const float* 
     // The voice converter produces weak output (±0.3) on synthetic MeloTTS input;
     // normalization makes it audible without amplifying noise beyond tanh clipping.
     {
-        const char* no_norm = std::getenv("OV2_NO_NORMALIZE");
+        const char* no_norm = crispasr_env::get("CRISPASR_OV2_NO_NORMALIZE");
         if (!no_norm || std::strcmp(no_norm, "1") != 0) {
             float peak = 0.0f;
             for (auto v : pcm) {
@@ -1365,16 +1401,8 @@ extern "C" bool openvoice2_extract_speaker_embedding(struct openvoice2_context* 
     if (!ctx || !ref_pcm || !out_embedding)
         return false;
 
-    std::vector<float> ref_22k;
-    resample_linear(ref_pcm, n_ref, ref_sr, ctx->hp.sample_rate, ref_22k);
-
-    int T_ref;
-    std::vector<float> ref_spec;
-    stft_magnitude(ref_22k.data(), (int)ref_22k.size(), ctx->hp.filter_length, ctx->hp.hop_length, ctx->hp.win_length,
-                   ref_spec, T_ref);
-
     std::vector<float> emb;
-    if (!ref_enc_forward(ctx, ref_spec, T_ref, emb))
+    if (!openvoice2_target_se(ctx, ref_pcm, n_ref, ref_sr, emb) || emb.size() != 256)
         return false;
 
     memcpy(out_embedding, emb.data(), 256 * sizeof(float));

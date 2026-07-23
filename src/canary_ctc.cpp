@@ -10,6 +10,7 @@
 // sanity checking.
 
 #include "canary_ctc.h"
+#include "core/crispasr_env.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -51,7 +52,7 @@
 static bool canary_ctc_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("CANARY_CTC_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_CANARY_CTC_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;

@@ -22,6 +22,7 @@
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -53,7 +54,7 @@ namespace {
 static bool chatterbox_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("CHATTERBOX_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_CHATTERBOX_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -1865,7 +1866,7 @@ static bool run_t3_kv_b2(chatterbox_context* c, const float* embeds, int n_past,
     // re-alloc is unmeasured. Accumulates into static counters, printed by the
     // caller via chatterbox_b2_alloc_report().
     static const bool s_bench_b2 = []() {
-        const char* s = std::getenv("CHATTERBOX_BENCH_B2");
+        const char* s = crispasr_env::get("CRISPASR_CHATTERBOX_BENCH_B2");
         return s && *s && std::strcmp(s, "0") != 0;
     }();
     int64_t t_ba0 = s_bench_b2 ? ggml_time_us() : 0;
@@ -3367,7 +3368,7 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
     }
     cap_text_tokens(ctx, text_tokens, is_gpt2); // #182: bound to positional table
 
-    if (ctx->params.verbosity >= 2 || std::getenv("CHATTERBOX_DEBUG")) {
+    if (ctx->params.verbosity >= 2 || crispasr_env::get("CRISPASR_CHATTERBOX_DEBUG")) {
         fprintf(stderr, "chatterbox: text_tokens(%zu) %s = [", text_tokens.size(),
                 is_gpt2 ? "(no SOT/EOT for turbo)" : "[SOT,...,EOT]");
         for (size_t i = 0; i < text_tokens.size(); ++i) {
@@ -3633,7 +3634,7 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
         valid.push_back(S3GEN_SIL);
     }
 
-    if (ctx->params.verbosity >= 2 || std::getenv("CHATTERBOX_DEBUG")) {
+    if (ctx->params.verbosity >= 2 || crispasr_env::get("CRISPASR_CHATTERBOX_DEBUG")) {
         fprintf(stderr, "chatterbox: speech_tokens(%zu) first=[", valid.size());
         for (size_t i = 0; i < valid.size() && i < 12; ++i)
             fprintf(stderr, "%d%s", (int)valid[i], i + 1 == valid.size() || i == 11 ? "" : ",");
@@ -3800,7 +3801,7 @@ extern "C" float* chatterbox_synthesize(struct chatterbox_context* ctx, const ch
     chatterbox_tokens_free(speech_tokens);
 
     if (pcm && *out_n_samples > 0) {
-        const char* bench = std::getenv("CHATTERBOX_BENCH");
+        const char* bench = crispasr_env::get("CRISPASR_CHATTERBOX_BENCH");
         if (bench && bench[0]) {
             const auto& tp = ctx->last_perf;
             chatterbox_s3gen_perf sp{};

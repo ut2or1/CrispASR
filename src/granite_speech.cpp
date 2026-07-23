@@ -6,6 +6,7 @@
 //   3. 40-layer Granite 1B LLM (GQA 16/4, μP multipliers, RoPE)
 
 #include "granite_speech.h"
+#include "core/crispasr_env.h"
 #include <chrono>
 
 #ifndef M_PI
@@ -34,7 +35,7 @@
 static bool granite_force_scalar() {
     static int v = -1;
     if (v < 0)
-        v = (std::getenv("GRANITE_FORCE_SCALAR") != nullptr) ? 1 : 0;
+        v = (crispasr_env::get("CRISPASR_GRANITE_FORCE_SCALAR") != nullptr) ? 1 : 0;
     return v != 0;
 }
 
@@ -69,7 +70,7 @@ static bool granite_force_scalar() {
 static bool granite_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("GRANITE_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_GRANITE_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -1633,7 +1634,7 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
     // the final encoder output. Set GRANITE_DISABLE_ENCODER_GRAPH=1 to
     // fall back to the CPU loop (slower but kept around for debugging).
     bool use_graph = true;
-    if (const char* e = std::getenv("GRANITE_DISABLE_ENCODER_GRAPH"))
+    if (const char* e = crispasr_env::get("CRISPASR_GRANITE_DISABLE_ENCODER_GRAPH"))
         if (e[0] != '0' && e[0] != '\0')
             use_graph = false;
     if (use_graph) {

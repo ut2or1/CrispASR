@@ -27,6 +27,9 @@ public:
                CAP_WORD_TIMESTAMPS | CAP_PUNCTUATION_TOGGLE | CAP_FLASH_ATTN | CAP_DIARIZE;
     }
 
+    // Kyutai's Mimi codec operates at 24 kHz.
+    int input_sample_rate() const override { return 24000; }
+
     bool init(const whisper_params& params) override {
         kyutai_stt_context_params cp = kyutai_stt_context_default_params();
         cp.n_threads = params.n_threads;
@@ -34,6 +37,7 @@ public:
         cp.use_gpu = crispasr_backend_should_use_gpu(params);
         cp.temperature = params.temperature;
         cp.beam_size = params.beam_size > 0 ? params.beam_size : 1;
+        cp.input_sample_rate = 24000;
         ctx_ = kyutai_stt_init_from_file(params.model.c_str(), cp);
         return ctx_ != nullptr;
     }
@@ -56,11 +60,12 @@ public:
         // produces its own segment and the silence-tail flush from P6a
         // applies per-chunk so chunk boundaries close cleanly. Linear
         // wallclock + a predictable progress for callers.
-        constexpr int kChunkSamples = 30 * 16000;
+        const int sr = input_sample_rate();
+        const int kChunkSamples = 30 * sr;
         if (n_samples > kChunkSamples) {
             for (int start = 0; start < n_samples; start += kChunkSamples) {
                 const int this_n = std::min(kChunkSamples, n_samples - start);
-                const int64_t chunk_offset_cs = t_offset_cs + (int64_t)((double)start / 16000.0 * 100.0);
+                const int64_t chunk_offset_cs = t_offset_cs + (int64_t)((double)start / (double)sr * 100.0);
                 auto chunk_segs = transcribe_one(samples + start, this_n, chunk_offset_cs, params);
                 for (auto& s : chunk_segs)
                     out.push_back(std::move(s));
@@ -73,6 +78,7 @@ public:
     std::vector<crispasr_segment> transcribe_one(const float* samples, int n_samples, int64_t t_offset_cs,
                                                  const whisper_params& params) {
         std::vector<crispasr_segment> out;
+        const int sr = input_sample_rate();
 
         // PLAN #61c: use the _ex API to get per-token + word-level
         // timestamps. The kyutai LM emits one text token per Mimi frame
@@ -94,7 +100,7 @@ public:
         // Default 500 ms for models where the accessor isn't available yet;
         // stt-2.6b-en uses 2.5+1.0 = 3.5s → 56000 samples.
         const float lookahead_s = kyutai_stt_total_lookahead_seconds(ctx_);
-        const int kTailSilenceSamples = std::max(8000, (int)(lookahead_s * 16000.0f));
+        const int kTailSilenceSamples = std::max(sr / 2, (int)(lookahead_s * (float)sr));
         std::vector<float> padded;
         padded.reserve((size_t)n_samples + kTailSilenceSamples);
         padded.assign(samples, samples + n_samples);
@@ -146,7 +152,7 @@ public:
             seg.t1 = r->words[r->n_words - 1].t1;
         } else {
             seg.t0 = t_offset_cs;
-            seg.t1 = t_offset_cs + (int64_t)((double)n_samples / 16000.0 * 100.0);
+            seg.t1 = t_offset_cs + (int64_t)((double)n_samples / (double)sr * 100.0);
         }
 
         seg.tokens.reserve((size_t)r->n_tokens);

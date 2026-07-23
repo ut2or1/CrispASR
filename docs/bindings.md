@@ -78,12 +78,13 @@ backend doesn't expose that knob, but the call is safe to make.
 > (`bindings/javascript/emscripten.cpp`) via the `asr*` functions
 > (`asrOpen`/`asrTranscribe`/`asrSet…`).
 >
-> **⚠ `transcribe` does not auto-chunk long audio.** The session `transcribe`
-> is a low-level "transcribe this buffer" primitive: it runs one pass over the
-> whole PCM. For short-segment models (e.g. moonshine) that degrades and slows
-> badly past ~30 s. The CLI/server add dispatcher chunking on top; session
-> callers must chunk long audio themselves or use `transcribe_chunked`
-> (parakeet has bespoke internal long-audio handling, so it is the exception).
+> **Long audio auto-chunks.** `transcribe` slices audio longer than
+> ~30 s at energy minima and transcribes each piece (like the CLI/server),
+> collapsing any decode-loop repetition — so short-segment models (e.g.
+> moonshine) don't degrade or hang on a single long pass. Disable with
+> `CRISPASR_SESSION_AUTOCHUNK=0`; window via `CRISPASR_SESSION_CHUNK_SECONDS`.
+> `transcribe_chunked` remains the explicit, tunable long-form control (and
+> parakeet has its own internal long-audio handling either way).
 >
 > **Chunked long-form + progress (issue #208).** `transcribe_chunked` forces
 > the Parakeet backend through its bounded long-form path (inert on other
@@ -120,7 +121,7 @@ backend doesn't expose that knob, but the call is safe to make.
 ```python
 from crispasr import (
     Session, diarize_segments, detect_language_pcm,
-    align_words, cache_ensure_file, registry_lookup,
+    align_words, cache_ensure_file, registry_default_bundle,
     # Diarize pipeline primitives (#107):
     SpeakerEmbedder, PyannoteCache, agglomerative_cluster,
 )
@@ -136,9 +137,13 @@ lang = detect_language_pcm(pcm, model_path="ggml-tiny.bin")
 diarize_segments(my_segs, pcm, method=DiarizeMethod.VAD_TURNS)
 words = align_words("canary-ctc-aligner.gguf", "hello world", pcm)
 
-# Auto-download a canonical model
-entry = registry_lookup("parakeet")
-path  = cache_ensure_file(entry.filename, entry.url)
+# Inspect the canonical bundle used by `-m auto` (no quant suffix).
+# NOTE: this does not apply a preferred quant, so it does NOT reproduce
+# `-m auto:q8_0` — that rewrites both filename and URL. Use registry_lookup()
+# with a preferred quant for those.
+bundle = registry_default_bundle("omnivoice")
+assert not bundle.requires_acceptance  # prompt/attest before restricted downloads
+paths = [cache_ensure_file(a.filename, a.url) for a in bundle.artifacts]
 
 # Custom diarize pipeline: pluggable embedder + cosine clustering.
 # Same building blocks as `--diarize-embedder` in the CLI.
@@ -156,7 +161,7 @@ Install: `pip install crispasr` (or build locally from `python/`).
 use crispasr::{
     Session, DiarizeMethod, DiarizeOptions, DiarizeSegment,
     LidMethod, detect_language_pcm, align_words,
-    cache_ensure_file, registry_lookup,
+    cache_ensure_file, registry_default_bundle,
     // Diarize pipeline primitives (#107):
     SpeakerEmbedder, PyannoteCache, agglomerative_cluster,
 };
@@ -166,8 +171,11 @@ sess.set_max_new_tokens(256)?;
 sess.set_frequency_penalty(0.4)?;
 let segs = sess.transcribe_vad(&pcm, "silero-v6.2.0.bin", None)?;
 
-let entry = registry_lookup("canary")?.unwrap();
-let path  = cache_ensure_file(&entry.filename, &entry.url, false, None)?;
+let bundle = registry_default_bundle("canary")?.unwrap();
+assert!(!bundle.requires_acceptance); // obtain explicit acceptance when true
+for artifact in bundle.artifacts {
+    cache_ensure_file(&artifact.filename, &artifact.url, false, None)?;
+}
 
 // Custom diarize pipeline: pluggable embedder + cosine clustering.
 let emb = SpeakerEmbedder::new("auto", 4, None)?;     // "titanet"/"indextts"/.gguf
@@ -339,19 +347,114 @@ s.set_voice("ref.wav", ref_text="exact transcription of ref.wav")
 pcm = s.synthesize("Clone my voice.")
 ```
 
+## Voice conversion (SVC / RVC)
+
+**The session C ABI is the only surface — there is no CLI verb.** RVC's input is
+ContentVec features, which CrispASR does not produce (the caller owns the
+content encoder), so a command line has nothing to feed it.
+
+```c
+// content: n_frames * content_dim, frame-major. f0_hz: n_frames, 0.0 = unvoiced.
+// The coarse mel-quantised pitch is derived internally — those constants are
+// model-side and replicating them in the caller guarantees drift.
+int crispasr_session_convert(crispasr_session* s, const float* content, int n_frames,
+                             const float* f0_hz, int speaker_id,
+                             const float* noise_zp, const float* noise_sine);
+const float* crispasr_session_convert_audio(crispasr_session* s, int* out_n_samples);
+int crispasr_session_convert_content_dim(crispasr_session* s);   // 256 (v1) or 768 (v2)
+int crispasr_session_convert_n_speakers(crispasr_session* s);
+int crispasr_session_convert_sample_rate(crispasr_session* s);   // 32k/40k/48k
+```
+
+### Check `convert_content_dim()` before you call
+
+256 means v1 (ContentVec layer 9 + `final_proj`); 768 means v2 (final layer).
+Feeding a v2 encoder's features to a v1 checkpoint is **silent** — it produces
+audio that merely sounds poor. This accessor exists so the mismatch can be
+refused loudly, which the caller cannot detect on its own.
+
+### Conversion is STOCHASTIC — that is not a bug
+
+Two independent RNG sites (the latent sample and the sine source's additive
+noise) mean output varies run to run by design. Pass `NULL` for both noise
+buffers in production.
+
+Passing explicit buffers replays a specific draw and makes the call
+**bit-identical**. That is the only way to compare against another
+implementation: correlating waveforms against a reference run is invalid here,
+because the reference disagrees with itself.
+
+| buffer | size |
+|---|---|
+| `noise_zp` | `inter_channels * n_frames` (192 × N for every shipped config) |
+| `noise_sine` | `n_frames * (sample_rate / 100)` |
+
+Feature and F0 rate is **100 Hz** — derived as `sample_rate / prod(upsample_rates)`,
+not configured. See `docs/music-transcription/SVC_RECORD_SHAPES.md` for the full
+wire contract and `RVC_BLUEPRINT.md` for the ~15 implementation details the port
+reproduces.
+
+### Licence
+
+RVC's code is MIT, but **checkpoints are not uniformly so** — community voice
+models have unclear provenance and some forks add non-commercial terms. Each
+GGUF carries its own tag and the registry gate matches on it, exactly as for the
+BTC chord weights.
+
+## Chord recognition
+
+The `btc-chords` backend is a standalone task (CLI `--chords`) — audio in, a
+chord timeline out. It is exposed on the session C-ABI
+(`include/crispasr_session.h`) and, on top of that, in the WASM/JS binding:
+
+- `crispasr_session_chords(s, pcm, n_samples, sample_rate)` — returns the span
+  count, `-1` on error or on a backend with no chord arm. Input is mono
+  float32 at any rate; it is resampled internally to the model's 22050 Hz.
+- `crispasr_session_chords_n_spans(s)`
+- `crispasr_session_chords_spans(s, &n)` — flat, session-owned float view,
+  4 floats per span: `{start_ms, end_ms, label, confidence}`.
+- `crispasr_session_chords_span_name(s, idx)` — resolves `label` to a chord
+  name (`"C"`, `"Am"`, `"G:7"`, `"N"` for no-chord).
+- `crispasr_session_chords_vocab_size(s)` — `25` or `170`, `0` if the session
+  has no chord arm; usable as a capability probe.
+
+`CRISPASR_BTC_MAJ_MIN=1` collapses the 170-class output to the 25-class
+maj/min vocabulary (default off — full 170-class).
+
+```js
+// JavaScript / WASM (bindings/javascript/emscripten.cpp)
+const vocab = Module.sessionChordsVocabSize();   // 25 | 170 | 0 (no chord arm)
+const spans = Module.sessionChords(audio, sampleRate);
+// [{ startMs, endMs, chord, confidence }, ...]
+```
+
+The Go binding links `-lbtc-chords` (cgo LDFLAGS resynced) but adds no
+hand-written wrapper function; Python, Rust, Dart, Java and Ruby have no
+dedicated wrapper yet — the C ABI above is the surface for all of them.
+
+> **Weights are non-commercial.** The upstream BTC code is MIT and CrispASR
+> itself is MIT, but the shipped weights (`cstr/btc-chords-GGUF`) are
+> CC-BY-NC-SA — trained on Isophonics / Robbie Williams / UsPop2002 chord
+> annotations. The registry refuses to download them without
+> `--accept-license cc-by-nc-sa-4.0` (or the `CRISPASR_ACCEPT_LICENSE` env
+> var). A commercial product must supply its own weights.
+
 ## Speech-to-speech
 
-Backends with S2S capability (`lfm2-audio`, `mini-omni2`) support
+Backends with S2S capability (`lfm2-audio`, `mini-omni2`, `sidon`,
+`voxcpm2-vae`) support
 end-to-end audio-in → audio-out transformation through a single model
 pass. Available in Python, Go, Dart/Flutter, and the HTTP server
 (`POST /v1/audio/speech-to-speech`).
 
-- `speech_to_speech(pcm_16khz) -> (float32 PCM @ 24 kHz, transcript)`
+- `speech_to_speech(pcm) -> (float32 PCM, transcript)`
   (`crispasr_session_speech_to_speech`)
 
-Input is 16 kHz mono float32 PCM. Returns output audio at the backend's
-TTS sample rate (24 kHz) plus an optional intermediate ASR transcript.
-Output is automatically watermarked, same as TTS.
+Input defaults to 16 kHz mono float32 PCM. Python callers with another input
+rate call `set_pcm_sample_rate(rate)` before `speech_to_speech()`; Sidon and
+VoxCPM2 AudioVAE then resample internally to 16 kHz. Conversational S2S
+backends return 24 kHz; Sidon and VoxCPM2 AudioVAE return 48 kHz audio and an
+empty transcript.
 
 ```python
 # Python
@@ -361,6 +464,24 @@ audio, sr = sf.read("input.wav", dtype="float32")  # must be 16 kHz mono
 out_pcm, transcript = s.speech_to_speech(audio)
 print(f"Transcript: {transcript}")
 sf.write("output.wav", out_pcm, 24000)
+```
+
+```python
+# Sidon restoration from a 24 kHz source
+s = crispasr.Session("sidon-v0.1-f16.gguf")
+audio, sr = sf.read("input.wav", dtype="float32")
+s.set_pcm_sample_rate(sr)
+restored, _ = s.speech_to_speech(audio)
+sf.write("restored.wav", restored, 48000)
+```
+
+```python
+# VoxCPM2 AudioVAE upscaling
+s = crispasr.Session("voxcpm2-vae-f32.gguf")
+audio, sr = sf.read("input.wav", dtype="float32")
+s.set_pcm_sample_rate(sr)
+upscaled, _ = s.speech_to_speech(audio)
+sf.write("upscaled.wav", upscaled, 48000)
 ```
 
 ```go

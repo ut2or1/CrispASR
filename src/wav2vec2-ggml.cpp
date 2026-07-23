@@ -25,6 +25,7 @@
 #include "core/ctc.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include <unordered_map>
 
@@ -49,7 +50,7 @@
 static bool wav2vec2_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("WAV2VEC2_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_WAV2VEC2_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -1118,8 +1119,10 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
                                                         int n_threads) {
     const auto& hp = m.hparams;
     const int H = (int)hp.hidden_size;
-    const bool bench = (getenv("WAV2VEC2_BENCH") && getenv("WAV2VEC2_BENCH")[0]);
-    const bool verbose = (getenv("WAV2VEC2_VERBOSE") && getenv("WAV2VEC2_VERBOSE")[0]);
+    const bool bench =
+        (crispasr_env::get("CRISPASR_WAV2VEC2_BENCH") && crispasr_env::get("CRISPASR_WAV2VEC2_BENCH")[0]);
+    const bool verbose =
+        (crispasr_env::get("CRISPASR_WAV2VEC2_VERBOSE") && crispasr_env::get("CRISPASR_WAV2VEC2_VERBOSE")[0]);
     int64_t t_cnn = 0, t_proj = 0, t_pos = 0, t_enc = 0, t_lm = 0, t0;
 
     if (verbose) {
@@ -1323,7 +1326,7 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
 
     // Dump CNN output for reference comparison
     {
-        const char* dump = getenv("WAV2VEC2_DUMP_DIR");
+        const char* dump = crispasr_env::get("CRISPASR_WAV2VEC2_DUMP_DIR");
         if (dump && dump[0]) {
             char path[512];
             snprintf(path, sizeof(path), "%s/cnn_out.bin", dump);
@@ -1353,7 +1356,7 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
 
     // Dump feature projection output
     {
-        const char* dump = getenv("WAV2VEC2_DUMP_DIR");
+        const char* dump = crispasr_env::get("CRISPASR_WAV2VEC2_DUMP_DIR");
         if (dump && dump[0]) {
             char path[512];
             snprintf(path, sizeof(path), "%s/feat_proj.bin", dump);
@@ -1541,7 +1544,7 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
                     if (ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS) {
                         // Dump after_global_ln if available
                         {
-                            const char* dump = getenv("WAV2VEC2_DUMP_DIR");
+                            const char* dump = crispasr_env::get("CRISPASR_WAV2VEC2_DUMP_DIR");
                             ggml_tensor* gln = ggml_graph_get_tensor(gf, "after_global_ln");
                             if (dump && dump[0] && gln) {
                                 int ne = (int)ggml_nelements(gln);
@@ -1566,7 +1569,7 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
                             ggml_backend_tensor_get(out, logits_tv.data(), 0, logits_tv.size() * sizeof(float));
                             // Dump logits
                             {
-                                const char* dump = getenv("WAV2VEC2_DUMP_DIR");
+                                const char* dump = crispasr_env::get("CRISPASR_WAV2VEC2_DUMP_DIR");
                                 if (dump && dump[0]) {
                                     char path[512];
                                     snprintf(path, sizeof(path), "%s/logits.bin", dump);

@@ -13,6 +13,7 @@
 // See qwen3-asr-todo.md for the full plan.
 
 #include "qwen3_asr.h"
+#include "core/crispasr_env.h"
 #include "../crisp_audio/include/crisp_audio.h"
 #include "crispasr_imatrix.h"
 
@@ -52,7 +53,7 @@
 static bool qwen3_asr_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("QWEN3_ASR_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_QWEN3_ASR_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;

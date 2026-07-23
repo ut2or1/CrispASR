@@ -389,3 +389,115 @@ Lessons from the systematic head-to-head benchmark against
     `/kaggle/temp`. (And `onnxruntime-gpu`: pin the **CUDA-12** wheel `==1.19.2` on
     Kaggle P100 — the default now links libcudart.so.13 and ImportErrors on 12.8;
     import-guard the onnx phase so it can't crash the whole run.)
+
+## Multi-surface dispatch & long audio (issue #257 + improvements program)
+
+38. **A fix to a backend must land in THREE places, not one — the CLI adapter,
+    the HTTP server, AND the session C-ABI (`crispasr_c_api.cpp`).** The session
+    reimplements each backend's transcribe inline; it does NOT call the CLI
+    `CrispasrBackend` adapter (dev-guide HARD RULE #6). Issue #257's segmentation
+    fix had to be applied in all three; the JA-by-vocab-size misdetection was
+    patched in ~5 spots. The server is a fourth wrinkle: it uses the *adapter*
+    (`backend->transcribe`) but had its own slicing that ignored
+    `CAP_INTERNAL_CHUNKING`, so it per-slice-transcribed a full-attention encoder
+    until the CLI's `backend_self_chunks_on_explicit` gate was mirrored into it.
+    The durable fix for the class is to HOIST the orchestration into the library
+    (`parakeet_orchestrate.{h,cpp}`) so every surface calls one implementation —
+    the CLI adapter dropped 310 LOC becoming a thin wrapper. Before hoisting a
+    backend speculatively, AUDIT first: `tests/test-surface-parity.sh`
+    (`CRISPASR_PARITY_BACKEND=<be>`) proved only parakeet actually diverged
+    CLI-vs-session; qwen3/moonshine/nemotron already agreed, so their ~200-line
+    inline blocks did NOT need the (risky) refactor.
+
+39. **The parity harness must compare TOTAL concatenated content, not
+    per-segment, and be punctuation/case-insensitive.** Two traps: (a) the CLI
+    ran with `--no-punctuation` (which *strips* a model's native punctuation)
+    while the session API has no equivalent → punctuation-only "failures" that
+    are cosmetic, not dispatch bugs — normalize punctuation/case out. (b) On long
+    audio the CLI dispatcher and the session auto-chunker cut at DIFFERENT energy
+    minima, so segment COUNTS legitimately differ (CLI 2 vs session 3) while the
+    transcript is identical — compare the joined transcript with a word-overlap
+    threshold, not segment-by-segment. Only 16 kHz clips are safe to feed both
+    surfaces raw; for other rates resample ONCE to a shared 16 kHz WAV or the two
+    resamplers produce different mel and the comparison is meaningless.
+
+40. **The session `crispasr_session_transcribe` is a LOW-LEVEL "transcribe this
+    buffer" primitive — it does NOT auto-chunk long audio (parakeet is the lone
+    exception, with bespoke inline chunking).** So short-segment models (moonshine,
+    whisper) degrade and HANG on one long pass, while the CLI/server add
+    dispatcher chunking on top. Fix (`transcribe_autochunk`, gated
+    `CRISPASR_SESSION_AUTOCHUNK`, default on): slice long audio at energy minima,
+    transcribe each piece, shift timestamps to absolute. Verified moonshine/60 s:
+    1 seg / hung → 3 segs / completes. Gate off backends that self-chunk
+    (parakeet/reazonspeech), the `return_logits` path (per-slice CTC grids can't
+    merge), and explicit chunk requests.
+
+41. **Chunking a loop-prone greedy decoder EXPOSES the loop; fix it in two layers
+    — cleanup AND decode-time break.** A hard slice sends moonshine's greedy loop
+    into a short token cycle ("I'm sorry" ×15). Post-hoc `core_ngram::fix_loops`
+    (which cohere/granite/glm adapters already apply, moonshine did NOT) cleans the
+    output. But the decoder still BURNS every step generating the loop before it's
+    trimmed — a decode-time break (`core_repeat::tail_is_repetition`: a period-≤8
+    block repeated ≥4× stops generation) cut moonshine/60 s from 57 s → 11 s (5×),
+    identical output. Both are gated, default-on (a runaway loop is never wanted).
+
+42. **The O(T²) memory estimate for a heuristic gate can be validated against a
+    reported real allocation.** parakeet's single-pass rel-pos bias
+    (`parakeet_est_singlepass_peak_mb`, coeff 8.0) estimated **1931 MiB** at
+    T≈2812 / 8 heads — matching the reporter's measured **1911.98 MiB** cudaMalloc
+    almost exactly. So a proactive `CRISPASR_PARAKEET_VRAM_BUDGET_MB` policy can
+    pick streamed BEFORE allocating the bias it can't afford, layered over the
+    reactive OOM fallback. (CUDA no-OOM proof and the server worker-pool GPU
+    concurrency proof can't run on M1 — they ship as Kaggle kernels under
+    `tools/kaggle/{parakeet-mem-policy-cuda,server-workers-cuda}/`.)
+
+43. **Server request concurrency (`CRISPASR_SERVER_WORKERS=N`) is workload-bound,
+    not a free win — and unsafe unless the SHARED state is pooled too.** `model_mutex`
+    guards not just the backend but the non-re-entrant post-processing contexts
+    (punctuation, truecaser, LID model, aligner), so a pool must route only
+    "pure-ASR" requests (explicit language, no aligner, no post-processing) to
+    pooled workers and keep the rest serialized. And the throughput: on an M1 CPU
+    with a memory-bandwidth-bound model, 2 concurrent requests were *slower* than
+    serial (62 s vs ~32 s — the instances contend for bandwidth). It only helps
+    where a single request under-utilises the box (spare cores, an unsaturated
+    GPU, small models). Kept default-off; report the null honestly rather than
+    claim a speedup that isn't there.
+
+44. **A concurrent commit can add a NEW git submodule — a rebased worktree then
+    fails `cmake` config with "Cannot find source file" until you
+    `git submodule update --init --recursive <path>`.** Saw it when a `c2pa-audio`
+    submodule landed on main mid-session; the worktree's build.ninja regen failed
+    on the missing `third_party/c2pa-audio/src/*.cpp`. Also: heavy concurrent I/O
+    on the external SSD wedges *git itself* (2-min timeouts on `git status`), not
+    just model access — the tell it's the disk, not a hang.
+
+45. **A new path whose FIRST A/B regressed on one clip → keep it GATED (off), not
+    revert (F4).** Per-backend session chunk window: the hypothesis (short-segment
+    models want a sub-30 s slice, mirroring the CLI's `vad_slice_cap_seconds()`)
+    REGRESSED the one long clip measured — moonshine/60 s song CLI-vs-session
+    content overlap `15 s→0.58 | 20 s→0.56 | 30 s→0.75 | 40 s→0.75` (more slices =
+    more chunk-boundary artifacts on hard audio; 30 s is the plateau). The reflex
+    was to revert as "no measured benefit" (HARD RULE #4). Corrected: #4 forbids
+    shipping an unverified path AS DEFAULT — it does not mean delete it. A one-clip
+    regression is evidence to gate-OFF, not to erase; the path may win on other
+    clips/models and flipping the default is then a one-liner. Shipped opt-in
+    (`CRISPASR_SESSION_PERBACKEND_CHUNK=1`, default flat 30 s). Codified as
+    dev-guide A/B rule 3a. Implement the decision pure with the gate as a PARAMETER
+    (`session_default_chunk_seconds(backend, perbackend_enabled)`) so both modes
+    unit-test without env.
+
+46. **firered's greedy decoder runs away exactly like moonshine — but only greedy,
+    and the audit stops there (F1/F6).** Extended the `core_repeat` decode-time
+    break beyond moonshine, evidence-gated. On the loop-prone 60 s song, firered at
+    `--beam-size 1` SATURATES `max_len=150` with a period-1 cycle (`OOH ×35`),
+    burning ~350 s, and firered's CLI adapter has no `core_ngram::fix_loops` so the
+    garbage tail reaches the output — a speed AND quality bug. Wired
+    `core_repeat::tail_is_repetition` into the `beam_size==1` branch ONLY (beam=3,
+    the default, self-terminated at 59 tokens → not wired, Phase 1b), gated
+    `CRISPASR_FIRERED_NO_REPEAT_BREAK` default on. A/B on the SAME binary (token
+    count is the load-invariant proof, not wall-clock on a contended box): break
+    OFF → 150 tokens/`OOH ×35`, break ON → 59 tokens/`OOH ×4`, coherent content
+    byte-identical. Audit discipline held: the OTHER guard-less greedy backends
+    (glm-asr, cohere-transcribe) transcribed the same song CLEANLY (EOS-terminated,
+    no saturation) → NOT wired; kyutai_stt has no local model + a different
+    streaming-decoder shape → NOT wired. Only wire where the runaway is DEMONSTRATED.

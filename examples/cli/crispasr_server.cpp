@@ -16,6 +16,7 @@
 //   GET  /backends                    — list available backends
 //   GET  /v1/models                   — OpenAI-compatible model list
 //   GET  /v1/voices                   — list voices in --voice-dir (CAP_TTS only)
+//        /voices, /v1/audio/voices    — aliases for llama-swap compatibility (#264)
 //   POST /v1/voices                   — upload voice file (multipart, CAP_TTS only)
 //   DELETE /v1/voices/:name           — delete voice file (CAP_TTS only)
 //
@@ -23,6 +24,7 @@
 
 #include "crispasr_backend.h"
 #include "crispasr_diarize_cli.h"
+#include "tiron_link.h" // #295: tiron cross-window speaker linking (shared with the CLI)
 #include "crispasr_gap_fill.h"
 #include "crispasr_speaker_embedder.h"
 #include "crispasr_lid.h"
@@ -45,6 +47,7 @@
 #include "../server/ws_stream.h"       // real-time WebSocket ASR streaming (--ws-port)
 #include "../server/realtime_server.h" // vLLM Realtime API
 #include "wyoming.h"                   // Wyoming protocol for Home Assistant Assist (--wyoming-port)
+#include "core/audio_window.h"
 #include "core/crispasr_c2pa.h"
 #include "crispasr_tts_chunking.h"
 #include "crispasr_tts_disclaimer.h"
@@ -370,6 +373,9 @@ struct transcription_result {
     std::string language;
     double duration_s = 0.0;
     double elapsed_s = 0.0;
+    // #227: serialized VAD/chunk boundaries, when the request asked for them
+    // via `vad_export=true`. Empty otherwise.
+    std::string vad_segments_json;
 };
 
 static void append_ctc_logits(crispasr_ctc_logits& dst, const crispasr_ctc_logits* src) {
@@ -392,6 +398,21 @@ static std::string add_ctc_logits_to_json(const std::string& base, const crispas
     try {
         auto obj = nlohmann::json::parse(base);
         obj["ctc_logits"] = nlohmann::json::parse(crispasr_ctc_logits_to_json(logits));
+        return obj.dump();
+    } catch (...) {
+        return base;
+    }
+}
+
+// #227: splice the serialized VAD/chunk boundaries into a JSON response under
+// `vad_segments`, so a client can feed them back via `vad_import` on a later
+// request (e.g. same audio, different backend) and skip re-running VAD.
+static std::string add_vad_segments_to_json(const std::string& base, const std::string& vad_segments_json) {
+    if (vad_segments_json.empty())
+        return base;
+    try {
+        auto obj = nlohmann::json::parse(base);
+        obj["vad_segments"] = nlohmann::json::parse(vad_segments_json);
         return obj.dump();
     } catch (...) {
         return base;
@@ -450,6 +471,28 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
         return result;
     }
 
+    // #91: offset_t_ms / duration_ms request params — restrict processing to a
+    // time window of the upload (mirrors the CLI dispatcher crispasr_run.cpp,
+    // which the server path previously skipped). Applied to the decoded 16 kHz
+    // PCM before slicing so VAD/chunking/transcribe all operate on the window;
+    // reported segment timestamps are shifted back by the offset at the end so
+    // they stay in original-audio time. No backend adapter applies the offset
+    // itself (only the legacy whisper CLI path did), so this is the sole
+    // application — no double-shift.
+    {
+        const auto win = core_audio_window::compute((int64_t)pcmf32.size(), rp.offset_t_ms, rp.duration_ms, 16000);
+        if (win.active && win.past_end) {
+            // Window starts past end-of-audio: nothing to transcribe.
+            result.ok = true;
+            return result;
+        }
+        if (win.active) {
+            core_audio_window::trim(pcmf32, win);
+            for (auto& ch : pcmf32s)
+                core_audio_window::trim(ch, win);
+        }
+    }
+
     result.duration_s = (double)pcmf32.size() / 16000.0;
 
     const bool want_auto_lang = rp.detect_language || rp.language == "auto";
@@ -495,10 +538,83 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
     // breadcrumb it so a native-instruction fault (SIGILL) is attributed
     // correctly by the fatal-signal handler.
     std::vector<crispasr_audio_slice> slices;
-    {
+    if (!rp.vad_import_json.empty()) {
+        // #227: caller supplied boundaries from an earlier response's
+        // `vad_segments` — reuse them instead of running VAD again. Mirrors the
+        // CLI's --vad-import (crispasr_run.cpp); same wire format.
+        int imported_sr = 0;
+        float imported_chunk = 0.0f;
+        bool imported_raw = false;
+        if (!crispasr_parse_vad_slices(rp.vad_import_json, slices, &imported_sr, &imported_chunk, &imported_raw)) {
+            result.error = "malformed vad_import (expected the vad_segments object from a vad_export response)";
+            return result;
+        }
+        // #227: same gate as the CLI. The boundaries are CHUNK boundaries, so a
+        // payload exported under a different chunk length does not carry over --
+        // reusing it silently re-chunks the audio wrongly. Rejecting here keeps
+        // the server and CLI from disagreeing about what an import means.
+        // #227: same policy as the CLI -- WARN by default, refuse only when the
+        // caller opts in with vad_import_strict. Compare the REQUESTED chunk on
+        // both sides: the exporter runs before backend init and cannot know the
+        // effective value (see crispasr_run.cpp).
+        const float requested_chunk = rp.chunk_seconds > 0 ? (float)rp.chunk_seconds : 30.0f;
+        if (!imported_raw && crispasr_vad_chunk_mismatch(imported_chunk, requested_chunk)) {
+            if (rp.vad_import_strict) {
+                result.ok = false;
+                result.error = "vad_import was exported at chunk_seconds " + std::to_string(imported_chunk) +
+                               " but this request uses " + std::to_string(requested_chunk) +
+                               "; re-export, match the chunk length, or drop vad_import_strict";
+                return result;
+            }
+            fprintf(stderr,
+                    "crispasr-server: warning: vad_import exported at chunk_seconds %.2f, request uses %.2f — "
+                    "chunking will not match\n",
+                    imported_chunk, requested_chunk);
+        }
+        if (imported_sr > 0 && imported_sr != SR) {
+            for (auto& s : slices) {
+                s.start = (int)((int64_t)s.start * SR / imported_sr);
+                s.end = (int)((int64_t)s.end * SR / imported_sr);
+            }
+        }
+        // Clamp to this request's buffer and drop out-of-range slices, so a
+        // stale or hand-edited boundary set can't index out of bounds. Note the
+        // boundaries are interpreted in the buffer actually being processed —
+        // i.e. after any offset_t_ms/duration_ms window was applied above.
+        std::vector<crispasr_audio_slice> clean;
+        clean.reserve(slices.size());
+        for (auto& s : slices) {
+            if (s.start < 0)
+                s.start = 0;
+            if (s.end > n_samples)
+                s.end = n_samples;
+            if (s.end > s.start)
+                clean.push_back(s);
+        }
+        slices = std::move(clean);
+        // #227: a raw-segment payload carries no chunking; re-chunk it for THIS
+        // request exactly as a fresh VAD pass would, so it is reusable across
+        // requests with different chunk lengths (mirrors the CLI).
+        if (imported_raw && effective_chunk_seconds > 0)
+            slices = crispasr_rechunk_slices(slices, pcmf32.data(), n_samples, SR, effective_chunk_seconds);
+    } else {
+        // #261: Silero/MarbleNet VAD runs on the CPU ggml backend inside slicing —
+        // breadcrumb it so a native-instruction fault (SIGILL) is attributed
+        // correctly by the fatal-signal handler.
         stage_scope _stg(rp.vad ? "vad (silero/marblenet CPU inference)" : "audio slicing");
         slices = crispasr_compute_audio_slices(pcmf32.data(), n_samples, SR, effective_chunk_seconds, rp);
     }
+
+    // #227: hand the boundaries back when asked, so the next request (same
+    // audio, different backend) can skip VAD via `vad_import`.
+    if (rp.vad_export_inline) {
+        // A raw export makes the payload reusable across requests with different
+        // chunk lengths; the default (chunk boundaries) matches the older
+        // response shape, so this is additive.
+        const float exp_chunk = rp.vad_export_raw ? 0.0f : (rp.chunk_seconds > 0 ? (float)rp.chunk_seconds : 30.0f);
+        result.vad_segments_json = crispasr_serialize_vad_slices(slices, SR, exp_chunk, rp.vad_export_raw);
+    }
+
     if (slices.empty()) {
         result.ok = true;
         return result;
@@ -596,9 +712,42 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
             }
         }
 
+        // Tiron (#295): if the transcript carries <|speakerN|> markers, link them
+        // to global SPEAKER_NN with the library-shared linker (same as the CLI)
+        // and skip the generic diarizer. Opt-in via diarize / diarize_embedder.
+        bool tiron_handled = false;
+        if (!result.segs.empty()) {
+            std::vector<TironTranscriptSeg> ts(result.segs.size());
+            for (size_t i = 0; i < result.segs.size(); i++) {
+                ts[i].text = result.segs[i].text;
+                ts[i].t0_cs = result.segs[i].t0;
+                ts[i].t1_cs = result.segs[i].t1;
+                ts[i].chunk_id = result.segs[i].chunk_id;
+            }
+            const std::string spec =
+                !rp.diarize_embedder.empty() ? rp.diarize_embedder : (rp.diarize ? std::string("auto") : std::string());
+            const int n_spk = crispasr_tiron_link_transcript(ts, pcmf32.data(), n_samples, spec.c_str(), rp.n_threads,
+                                                             rp.cache_dir.c_str());
+            if (n_spk >= 0) {
+                tiron_handled = true;
+                std::vector<crispasr_segment> kept;
+                kept.reserve(result.segs.size());
+                for (size_t i = 0; i < result.segs.size(); i++) {
+                    if (ts[i].drop)
+                        continue;
+                    result.segs[i].text = ts[i].text;
+                    if (!ts[i].speaker.empty())
+                        result.segs[i].speaker = ts[i].speaker;
+                    kept.push_back(std::move(result.segs[i]));
+                }
+                if (n_spk > 0)
+                    result.segs = std::move(kept);
+            }
+        }
+
         // Diarization post-step (#143): assign speaker labels to segments.
         // Mirrors the CLI path in crispasr_run.cpp:732-743.
-        if (rp.diarize && !result.segs.empty()) {
+        if (!tiron_handled && rp.diarize && !result.segs.empty()) {
             // #261: diarization (pyannote-seg / sherpa / embedding) runs on the
             // CPU ggml backend. Breadcrumb the stage for the fatal-signal
             // handler, and wrap the whole step so a throwing failure (e.g.
@@ -716,6 +865,28 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
 
         auto t1 = std::chrono::steady_clock::now();
         result.elapsed_s = std::chrono::duration<double>(t1 - t0).count();
+    }
+
+    // #91: shift reported timestamps back into original-audio time when a
+    // --offset-t window trimmed the buffer above. Done here, after all
+    // slice-relative processing (diarize re-walk matches segments by the
+    // unshifted slice t0_cs).
+    if (rp.offset_t_ms > 0) {
+        const int64_t off_cs = (int64_t)rp.offset_t_ms / 10;
+        for (auto& seg : result.segs) {
+            seg.t0 += off_cs;
+            seg.t1 += off_cs;
+            for (auto& w : seg.words) {
+                w.t0 += off_cs;
+                w.t1 += off_cs;
+            }
+            for (auto& tok : seg.tokens) {
+                if (tok.t0 >= 0)
+                    tok.t0 += off_cs;
+                if (tok.t1 >= 0)
+                    tok.t1 += off_cs;
+            }
+        }
     }
 
     result.ok = true;
@@ -921,7 +1092,28 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     }
     // Honor the --no-watermark opt-out (equivalent to CRISPASR_NO_WATERMARK).
     // A server operator that disables it takes on the AI-content marking duty
-    // for every response the process serves.
+    // for every response the process serves — so, like the CLI, it requires the
+    // explicit --accept-marking-responsibility attestation. Refuse to start
+    // otherwise, rather than silently serving unmarked audio.
+    // --no-c2pa is the same class of opt-out as --no-watermark (disables the
+    // machine-readable C2PA manifest floor on every response), so it requires the
+    // same attestation.
+    if ((params.tts_no_watermark || params.tts_no_c2pa) && !params.tts_marking_responsibility_accepted) {
+        fprintf(stderr,
+                "crispasr: error: server launched with %s requires --accept-marking-responsibility "
+                "(the operator accepts AI-content marking responsibility for every response served). "
+                "Refusing to start.\n",
+                params.tts_no_watermark ? "--no-watermark" : "--no-c2pa");
+        return 1;
+    }
+    if (params.tts_no_watermark || params.tts_no_c2pa) {
+        std::time_t t = std::time(nullptr);
+        char ts[64];
+        std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
+        fprintf(stderr, "[MARKING] ts=%s scope=server no_watermark=%s no_c2pa=%s attestation=\"%s\"\n", ts,
+                params.tts_no_watermark ? "yes" : "no", params.tts_no_c2pa ? "yes" : "no",
+                params.tts_marking_attestation.c_str());
+    }
     crispasr_wm_dispatch::set_disabled(params.tts_no_watermark);
 
     std::vector<std::string> api_keys = split_api_keys(params.server_api_keys);
@@ -1158,7 +1350,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     // workers run without contending. Everything else stays on the primary
     // backend + model_mutex (serialized, unchanged). asr_pool is null unless
     // CRISPASR_SERVER_WORKERS>1.
-    auto dispatch_transcribe = [&](const httplib::MultipartFormData& audio_file, whisper_params rp,
+    auto dispatch_transcribe = [&](const httplib::MultipartFormData& audio_file, const whisper_params& rp,
                                    bool need_ts) -> transcription_result {
         const bool lang_explicit = !rp.language.empty() && rp.language != "auto";
         const bool no_post = !punc_ctx && !pcs_ctx && !tc_ctx && !tc_crf_ctx && !tc_lstm_ctx;
@@ -1241,6 +1433,13 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.split_on_punct = form_bool(req, "split_on_punct", rp.split_on_punct);
         rp.offset_t_ms = form_int(req, "offset_t_ms", rp.offset_t_ms);
         rp.duration_ms = form_int(req, "duration_ms", rp.duration_ms);
+        // #227: VAD boundary reuse. `vad_export=true` returns the computed
+        // boundaries under `vad_segments`; `vad_import=<that object>` reuses
+        // them and skips VAD entirely.
+        rp.vad_export_inline = form_bool(req, "vad_export", rp.vad_export_inline);
+        rp.vad_import_strict = form_bool(req, "vad_import_strict", rp.vad_import_strict);
+        rp.vad_export_raw = form_bool(req, "vad_export_raw", rp.vad_export_raw);
+        rp.vad_import_json = form_string(req, "vad_import", rp.vad_import_json);
         rp.max_context = form_int(req, "max_context", rp.max_context);
         rp.audio_ctx = form_int(req, "audio_ctx", rp.audio_ctx);
         rp.word_thold = form_float(req, "word_thold", rp.word_thold);
@@ -1285,6 +1484,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         std::string json = crispasr_segments_to_native_json(result.segs, backend_name, result.duration_s);
         if (rp.return_logits)
             json = add_ctc_logits_to_json(json, result.logits);
+        json = add_vad_segments_to_json(json, result.vad_segments_json);
         res.set_content(json, "application/json");
     });
 
@@ -1418,6 +1618,13 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.split_on_punct = form_bool(req, "split_on_punct", rp.split_on_punct);
         rp.offset_t_ms = form_int(req, "offset_t_ms", rp.offset_t_ms);
         rp.duration_ms = form_int(req, "duration_ms", rp.duration_ms);
+        // #227: VAD boundary reuse. `vad_export=true` returns the computed
+        // boundaries under `vad_segments`; `vad_import=<that object>` reuses
+        // them and skips VAD entirely.
+        rp.vad_export_inline = form_bool(req, "vad_export", rp.vad_export_inline);
+        rp.vad_import_strict = form_bool(req, "vad_import_strict", rp.vad_import_strict);
+        rp.vad_export_raw = form_bool(req, "vad_export_raw", rp.vad_export_raw);
+        rp.vad_import_json = form_string(req, "vad_import", rp.vad_import_json);
         rp.max_context = form_int(req, "max_context", rp.max_context);
         rp.audio_ctx = form_int(req, "audio_ctx", rp.audio_ctx);
         rp.word_thold = form_float(req, "word_thold", rp.word_thold);
@@ -1539,6 +1746,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                                                                         task, temperature);
             if (rp.return_logits)
                 json = add_ctc_logits_to_json(json, result.logits);
+            json = add_vad_segments_to_json(json, result.vad_segments_json);
             res.set_content(json, "application/json");
         } else if (response_format == "diarized_json") {
             std::string task = rp.translate ? "translate" : "transcribe";
@@ -1546,12 +1754,14 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                 crispasr_segments_to_diarized_json(result.segs, result.duration_s, result.language, task, temperature);
             if (rp.return_logits)
                 json = add_ctc_logits_to_json(json, result.logits);
+            json = add_vad_segments_to_json(json, result.vad_segments_json);
             res.set_content(json, "application/json");
         } else {
             // Default: json — {"text": "..."}
             std::string json = crispasr_segments_to_openai_json(result.segs);
             if (rp.return_logits)
                 json = add_ctc_logits_to_json(json, result.logits);
+            json = add_vad_segments_to_json(json, result.vad_segments_json);
             res.set_content(json, "application/json");
         }
     });
@@ -1826,6 +2036,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         std::string voice_name = body.value("voice", "");
         std::string consent_attestation = body.value("consent_attestation", "");
         std::string instructions = body.value("instructions", "");
+        // #201: transcript of a .wav clone reference (TADA on-the-fly cloning,
+        // gated by CRISPASR_TADA_WAV_CLONE). Passed through to the backend as
+        // tts_ref_text; a companion <name>.txt in --voice-dir is the fallback.
+        std::string ref_text = body.value("ref_text", "");
         // spoken_disclaimer defaults to true; set to false to skip the
         // audible AI-disclosure prefix (watermark + C2PA remain).
         const bool spoken_disclaimer = body.value("spoken_disclaimer", true);
@@ -1853,6 +2067,29 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                     log_sanitize(voice_name).c_str(), log_sanitize(consent_attestation).c_str(),
                     spoken_disclaimer ? "yes" : "no");
         }
+        // Marking-responsibility attestation (parallel to voice-clone consent):
+        // opting out of the spoken AI-disclaimer on a voice clone requires an
+        // explicit 'marking_attestation' field — the requester accepts the
+        // disclosure duty. Refused otherwise (hard-refuse policy).
+        std::string marking_attestation = body.value("marking_attestation", "");
+        if (is_voice_clone && !spoken_disclaimer && marking_attestation.empty()) {
+            json_error(res, 400,
+                       "disabling the spoken AI-disclaimer ('spoken_disclaimer': false) on a voice clone "
+                       "requires a 'marking_attestation' field affirming you accept the AI-content "
+                       "disclosure responsibility. "
+                       "Example: {\"marking_attestation\": \"I will disclose this is AI-generated\"}",
+                       "marking_attestation_required", "marking_attestation");
+            return;
+        }
+        if (is_voice_clone && !spoken_disclaimer) {
+            auto now = std::chrono::system_clock::now();
+            auto t = std::chrono::system_clock::to_time_t(now);
+            char ts[64];
+            std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
+            fprintf(stderr, "[MARKING] ts=%s scope=request no_spoken_disclaimer=yes attestation=\"%s\"\n", ts,
+                    log_sanitize(marking_attestation).c_str());
+        }
+
         std::string response_format = body.value("response_format", std::string("wav"));
         if (response_format != "wav" && response_format != "pcm" && response_format != "f32" &&
             response_format != "mp3" && response_format != "aac" && response_format != "opus") {
@@ -1897,6 +2134,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             }
             rp.tts_voice = voice_name;
         }
+        if (!ref_text.empty())
+            rp.tts_ref_text = ref_text;
         if (!instructions.empty())
             rp.tts_instruct = instructions;
         if (body.contains("seed") && body["seed"].is_number_integer())
@@ -2241,7 +2480,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             std::string wav = crispasr_make_wav_int16(pcm.data(), (int)pcm.size(), sr_out);
             // C2PA Content Credentials signing (when c2pa-c is available
             // and --c2pa-cert / --c2pa-key are configured)
-            crispasr_c2pa_sign_auto(wav, "audio/wav", params.c2pa_cert, params.c2pa_key, params.cache_dir);
+            if (!params.tts_no_c2pa) // --no-c2pa: attested opt-out of the manifest floor
+                crispasr_c2pa_sign_auto(wav, "audio/wav", params.c2pa_cert, params.c2pa_key, params.cache_dir);
             res.set_content(std::move(wav), "audio/wav");
         }
     });
@@ -2255,13 +2495,13 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     //   response_format: "wav"|"pcm"|"f32"               (optional, default "wav")
     //
     // Returns:
-    //   200 audio/wav — output audio at backend's TTS sample rate (24 kHz mono)
+    //   200 audio/wav — output audio at backend's native TTS/S2S sample rate
     //   Header X-Transcript: <URL-encoded intermediate ASR transcript>
     //   400 — backend lacks CAP_S2S, missing file
     //   500 — S2S returned empty audio
     //   503 — model still loading
     //
-    // Supported backends: lfm2-audio, mini-omni2
+    // Supported backends: lfm2-audio, mini-omni2, sidon, voxcpm2-vae
     // -----------------------------------------------------------------------
     svr.Post("/v1/audio/speech-to-speech", [&](const Request& req, Response& res) {
         if (!require_auth(req, res))
@@ -2274,7 +2514,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             json_error(res, 400,
                        "loaded backend '" + backend_name +
                            "' does not support speech-to-speech (no CAP_S2S); "
-                           "load lfm2-audio or mini-omni2 via POST /load");
+                           "load lfm2-audio, mini-omni2, sidon, or voxcpm2-vae via POST /load");
             return;
         }
 
@@ -2384,16 +2624,19 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             res.set_content(std::move(opus), ct);
         } else {
             std::string wav = crispasr_make_wav_int16(pcm.data(), (int)pcm.size(), sr_out);
-            crispasr_c2pa_sign_auto(wav, "audio/wav", params.c2pa_cert, params.c2pa_key, params.cache_dir);
+            if (!params.tts_no_c2pa) // --no-c2pa: attested opt-out of the manifest floor
+                crispasr_c2pa_sign_auto(wav, "audio/wav", params.c2pa_cert, params.c2pa_key, params.cache_dir);
             res.set_content(std::move(wav), "audio/wav");
         }
     });
 
     // -----------------------------------------------------------------------
     // GET /v1/voices — list voices in --voice-dir (CAP_TTS only)
+    // Also aliased on /voices and /v1/audio/voices for llama-swap and
+    // OpenAI-client compatibility (#264).
     // Returns: {"voices": [{"name": "<stem>", "format": "wav"|"gguf"}, ...]}
     // -----------------------------------------------------------------------
-    svr.Get("/v1/voices", [&](const Request& req, Response& res) {
+    auto handle_list_voices = [&](const Request& req, Response& res) {
         if (!require_auth(req, res))
             return;
         if (!(backend->capabilities() & CAP_TTS)) {
@@ -2428,7 +2671,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         }
         js << "]}";
         res.set_content(js.str(), "application/json");
-    });
+    };
+    svr.Get("/v1/voices", handle_list_voices);
+    svr.Get("/voices", handle_list_voices);
+    svr.Get("/v1/audio/voices", handle_list_voices);
 
     // -----------------------------------------------------------------------
     // POST /v1/voices — upload a voice file (multipart: "voice" file + optional "name" field)
@@ -2855,6 +3101,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     fprintf(stderr, "  GET  /v1/models                  — model info\n");
     if (tts) {
         fprintf(stderr, "  GET  /v1/voices                  — list voices in --voice-dir\n");
+        fprintf(stderr, "       /voices, /v1/audio/voices   — aliases (llama-swap compat)\n");
         fprintf(stderr, "  POST /v1/voices                  — upload voice file (multipart)\n");
         fprintf(stderr, "  DELETE /v1/voices/:name          — delete voice file\n");
         if (params.tts_voice_dir.empty()) {

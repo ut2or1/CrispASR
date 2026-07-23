@@ -25,9 +25,24 @@ public:
 
     const char* name() const override { return "canary-qwen"; }
 
+    // NO CAP_INTERNAL_CHUNKING (#290). The flag asserts that the backend slices
+    // long audio itself, and src/canary_qwen.cpp does not: it has no chunker at
+    // all, unlike src/parakeet.cpp and src/canary.cpp (which take a real
+    // chunk_seconds). Declaring it disabled BOTH dispatcher safety nets, so a
+    // long clip went through the encoder in a single pass:
+    //   - with --chunk-seconds: the #257 gate in crispasr_run.cpp handed the
+    //     whole clip over, trusting the internal chunker that isn't there;
+    //   - without it: should_auto_chunk_long() bailed at "backend handles its
+    //     own chunking", so the 30 s long-audio fallback never armed.
+    // canary-qwen also does not prefers_vad(), so the auto-VAD safeguard was out
+    // too — every net keyed off this one flag. Reported as no chunking, sparse
+    // output, and RSS growing 384 MiB -> 6.3 GiB -> 10.2 GiB with clip length
+    // (O(T^2) attention over an unchunked clip).
+    // Overlap-save context stays blocked separately via the kBlocked list in
+    // crispasr_chunk_context_gate.h (#218) — that gate is correct and unrelated.
     uint32_t capabilities() const override {
         return CAP_TOKEN_CONFIDENCE | CAP_FLASH_ATTN | CAP_TEMPERATURE | CAP_BEAM_SEARCH | CAP_AUTO_DOWNLOAD |
-               CAP_UNBOUNDED_INPUT | CAP_INTERNAL_CHUNKING;
+               CAP_UNBOUNDED_INPUT;
     }
 
     bool init(const whisper_params& p) override {
@@ -62,6 +77,8 @@ public:
 
         canary_qwen_set_temperature(ctx_, params.temperature, params.seed);
         canary_qwen_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
+        // #292: forward --max-new-tokens only when explicit; 0 keeps the backend default.
+        canary_qwen_set_max_new_tokens(ctx_, params.max_new_tokens_explicit ? params.max_new_tokens : 0);
 
         canary_qwen_result* r = canary_qwen_transcribe_ex(ctx_, samples, n_samples);
         if (!r)

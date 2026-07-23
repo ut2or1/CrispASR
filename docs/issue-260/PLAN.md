@@ -2,30 +2,36 @@
 
 ## NOW — active work
 
-### LATEST (2026-07-16): native C2PA signers — DONE, replacing c2pa-rs for WAV
-Branch `feat/c2pa-native-js` (3 commits ahead of the base; origin/main has since
-diverged with unrelated FASTCONV/parity work → **rebase needed before merge**).
+### DONE (2026-07-16): native C2PA across all audio formats — no c2pa-rs
 
-- **JS/WebCrypto signer** `bindings/javascript/c2pa.mjs` — pure WebCrypto ES256 +
-  hand-built CBOR/JUMBF/COSE/RIFF. Validates in the c2pa-rs reference reader
-  (only `signingCredential.untrusted`). Tests: 12 hermetic unit + 2 live parity
-  (`npm test`; ctests `test-c2pa-js-unit/-parity`). ✅
-- **C++ signer** `src/core/crispasr_c2pa_native.{h,cpp}` — same manifest, ES256 via
-  vendored BSD-2 micro-ecc (`third_party/uecc/`, RFC-6979 deterministic) + header
-  `crispasr_sha256.h`. Wired as the primary WAV path in `crispasr_c2pa_sign_pem`
-  (c2pa-rs now optional, MP3/M4A only). Built as its own C++17 static lib
-  `crispasr_c2pa_native` linked into crispasr-lib. Tests: 6 Catch2 unit +
-  `c2pa_native_parity.sh` live parity. ✅
-- **WASM win**: native C++ signer compiles under emscripten (verified), so
-  `c2paSign("audio/wav")` now works WITHOUT `--c2pa` / the ~10 MB c2pa-rs stack.
-- **WASM end-to-end VERIFIED (2026-07-16)**: built libwhisper with `third_party/c2pa`
-  hidden (configure: "C2PA signing disabled" → native-only). `Module.c2paSign(wav,
-  "audio/wav")` in Node signed 9644→11324 bytes; c2pa-python reader validated it
-  (only `signingCredential.untrusted`, gen CrispASR / c2pa.created /
-  trainedAlgorithmicMedia / Es256). Proves WAV Content Credentials in wasm with
-  ZERO c2pa-rs. (Local emscripten 6.0.2 needs `-DCMAKE_CXX_SCAN_FOR_MODULES=OFF` to
-  get past cohere.cpp's C++20 module scan — unrelated toolchain quirk.)
-- **Merged to origin/main** (rebased clean). All three signers (JS, C++, wasm) done.
+The whole C2PA layer was rebuilt from scratch (clean-room from the spec), extracted
+into a standalone library, and wired back in. **Every format CrispASR emits now
+carries a native C2PA manifest, interoperable with the c2pa-rs reference reader in
+both directions.**
+
+- **Standalone library `c2pa-audio`** — https://github.com/CrispStrobe/c2pa-audio
+  (MIT). Sign + verify in C/C++, pure-WebCrypto JS (no native), and Dart/Python/
+  Go/C# FFI bindings. Vendored back here as the submodule `third_party/c2pa-audio`
+  (crispasr_c2pa_native compiles its sources). Published to pub.dev as
+  `c2pa_audio` 0.1.0 (WAV+MP3; M4A landed after — republish pending, see below).
+- **Containers, all native + c2pa-rs-interoperable both ways:**
+  - WAV — RIFF `C2PA` chunk.
+  - MP3 — ID3v2.4 GEOB frame.
+  - **M4A/MP4 — ISO BMFF `uuid` box + `c2pa.hash.bmff.v3`.** BmffHash v3 was
+    reverse-engineered from the c2pa-rs source: `SHA-256(Σ BE64(box_offset) ++
+    box_bytes)` over non-excluded top-level boxes; sign inserts the uuid box and
+    fixes `stco`/`co64`. See `third_party/c2pa-audio/docs/M4A-BMFF.md`.
+  - **AAC + Opus** — no C2PA path in raw ADTS/Ogg (c2pa-rs refuses them too), so
+    `crispasr_mp4_writer.h` muxes glint's AAC-LC/Opus output into MP4 and signs
+    that. `.aac`→`.m4a`, `.opus`→`.mp4` when C2PA active; `CRISPASR_NO_C2PA_REMUX=1`
+    keeps raw (watermark-only). FLAC still needs c2pa-rs.
+- **crispasr_c2pa_sign_pem** routes audio/wav|mpeg|mp4 → native; c2pa-rs is now
+  optional (FLAC / edge formats only). WASM `c2paSign` works with no `--c2pa`.
+- Tests: JS 7 unit + 2 parity; C++ 11 Catch2 + live parity; all bindings green;
+  standalone muxer validated (ffmpeg decode + c2pa-rs reader). Pushed to origin/main.
+
+**Follow-ups (not blocking):** republish `c2pa_audio` 0.2.0 with M4A; optional
+GitHub-Actions OIDC auto-publish; C# has no local dotnet to test; native FLAC.
 
 - **Root cause FOUND & reproduced (model-free): the built-in spread-spectrum
   watermark, not the qwen3-tts port.** Every TTS output from the CLI is

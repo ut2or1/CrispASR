@@ -50,6 +50,10 @@ public:
         if (!ctx_)
             return {};
         moss_diarize_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
+        // #292: forward --max-new-tokens only when the user set it explicitly;
+        // 0 keeps the backend's 1024 default so the CLI's 512 default (too low
+        // for diarize) never shrinks it.
+        moss_diarize_set_max_new_tokens(ctx_, params.max_new_tokens_explicit ? params.max_new_tokens : 0);
         if (!params.hotwords.empty())
             moss_diarize_set_hotwords(ctx_, params.hotwords.c_str());
         // Language hint not injected by default — the model auto-detects language.

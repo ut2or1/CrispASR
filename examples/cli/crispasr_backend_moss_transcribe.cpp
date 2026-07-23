@@ -50,6 +50,8 @@ public:
         if (!ctx_)
             return {};
         moss_transcribe_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
+        // #292: forward --max-new-tokens only when explicit; 0 keeps the backend default.
+        moss_transcribe_set_max_new_tokens(ctx_, params.max_new_tokens_explicit ? params.max_new_tokens : 0);
 
         char* result = moss_transcribe_transcribe(ctx_, samples, n_samples);
         if (!result)
