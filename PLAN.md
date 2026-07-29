@@ -1,30 +1,359 @@
 # CrispASR — Pending work
 
-## NOW — active work (2026-07-23): canary-qwen q4_k NaN
+## 2026-07-29 — the unit tier found two real failures: one FIXED, one OPEN
 
-**Symptom:** canary-qwen emits all-`!` (token id 0) on jfk. **Root-caused** via
-Kaggle quant-diff (`tools/kaggle/cuda-canary-quant-diff`): **q8_0 (registry
-default) transcribes perfectly; only q4_k is NaN-corrupt.** Not a runtime bug
-(FUSED_QKV/PW_Q8 toggles ruled out). GGUF header shows tensor *types* are correct
-(token_embd/output F16, output_norm F32, encoder kept; only the 196 Qwen3-1.7B
-LLM projections Q4_K) → it is 4-bit *precision* on the small LLM, not a
-wrong-tensor policy bug.
+CI executed 1 of 162 unit tests until e17ce606/49e56eee. Turning the tier on
+surfaced two genuine failures. The whole tier costs 19.8 s for 1132 tests.
 
-**DONE + pushed:**
-- NaN-robust greedy argmax in `canary_qwen.cpp` (seed −inf, skip non-finite,
-  abort on all-non-finite) — a NaN no longer silently spews `!`.
-- Swept the same guard into 7 sibling backends sharing `best_val = logits[0]`
-  (lfm2_audio, m2m100, moonshine, moss_transcribe{,_diarize}, moss_audio,
-  t5_translate). All compile+link clean.
+**1. FIXED — VAD fed a transpose VIEW to a matmul (470df103).**
+whisper_vad_build_lstm_layer did `ggml_mul_mat(w, ggml_transpose(ctx0, cur))`.
+ggml_transpose swaps nb[0]/nb[1], so the row stride became sizeof(float) and
+llamafile_sgemm's `ldb` collapsed to 1 against k = lstm_hidden_size (128),
+tripping its `ldb >= k` precondition. Release defines NDEBUG, so the assert was
+compiled out and the matmul RAN ANYWAY with a violated precondition, producing
+plausible-looking segments — which is why nobody noticed. Fixed with ggml_cont
+(the idiom used five times in src/audioseal.cpp; the VAD was the outlier).
+A/B-verified on Kaggle before pushing, both compilers, 8/8: Debug rc 134 -> 0 and
+Release segments BYTE-IDENTICAL, so the precondition fix does not move output.
+Confirmed in CI afterwards: ubuntu-22-gcc (Debug) and gcc-arm64 (Debug) now pass.
 
-**IN FLIGHT:** Kaggle `chr1str/canary-qwen-requant` — re-quantize F16 →
-q4_k/q5_k/q6_k, validate each on jfk with the NaN-guarded binary, upload the
-smallest passing variant (q4_k overwrites broken in place; else atomic
-delete-broken + add smallest working k-quant). q8_0 default is safe throughout.
+**2. FIXED — ggml SVE used data from inactive lanes (fb7972ae).**
+ggml_vec_dot_f32's SVE tail did `sum1 = svmad_f32_m(pg, ax1, ay1, sum1)`.
+svmad_..._m computes a*b + c but MERGES ON THE FIRST OPERAND, so inactive lanes
+took ax1 — zeroed by the predicated load — wiping the lanes the preceding leftover
+loop had accumulated. Correct form merges on the accumulator:
 
-**NEXT:** on result, update model registry/docs if the fixed variant changes
-name; fold into the next release notes. The broken HF file:
-`cstr/canary-qwen-2.5b-GGUF/canary-qwen-2.5b-q4_k.gguf` sha256 `9cafd0f77e14…`.
+    sum1 = svmla_f32_m(pg, sum1, ax1, ay1);
+
+Bites only when n >= epr && n % epr != 0, so ordinary LLM dims (multiples of 32)
+never hit it; core_adaln's dim=6 does (epr=4 at VL=128: 4 lanes accumulated, tail
+zeroes 2).
+
+ALREADY FIXED UPSTREAM: 6aab1bcb "ggml-cpu: fix SVE leftover path in
+ggml_vec_dot_f32 (llama/24699)" (Tarek Dakhran, 2026-06-26), found there via 2D
+convolutions with kernel size 9. Our vendored snapshot predated it. Cherry-picked
+onto CrispStrobe/ggml crispstrobe-ops with authorship intact (bfe8ea22 ->
+392ac397) and the pin bumped. So for this one we were BEHIND upstream, not ahead —
+no PR to file, and nothing to add to tools/upstream-prs.
+
+Verified on real SVE2 hardware before and after, per stage:
+    before  native(+sve)  all six views 0.21-1.32, out 0.658/1.962
+    after   native(+sve)  every stage 0.000000
+    control no-sve / GGML_NATIVE=OFF   0.000000 both times
+
+The GGML_NATIVE=OFF mitigation added while this was unexplained has been REVERTED:
+with the root cause fixed it would only blind CI to the exact class of bug it just
+caught. Harness: .github/workflows/diag-arm-sve-adaln.yml (dispatch-only).
+
+**Why it took three wrong turns**, worth remembering: the job that failed is named
+`ubuntu-22-clang`, but its matrix `include:` entries do not key on `build:`, so
+GitHub merges them and the LAST wins — every "ubuntu-22-clang" job actually ran on
+ubuntu-22.04-arm. Chasing "clang" and then "AVX-512" on x86 was chasing a label.
+The cmake line (`-mcpu=native+dotprod+i8mm+sve+nosme`) was the tell.
+
+**BOTH FOLLOW-UPS NOW CLOSED (b4dcd8dd):**
+
+  * **F16 SVE accumulation** — cherry-picked upstream f69bdbb3 "ggml: fixed Arm SVE
+    usage bug in vec.h, vec.cpp (llama/22841)" (Martin Klacer + Milos Puzovic, Arm,
+    2026-05-28); pin 392ac397 -> 52165e4c. Upstream did NOT simply swap
+    svmad_f16_x for a merging variant: F16 accumulators became paired F32
+    (sum_lo/sum_hi) and every FMA goes through ggml_sve_f16_fma_widened(), which
+    widens F16->F32 before accumulating. The tail reuses that helper, so no
+    predicated FMA remains to get wrong — the zeroed lanes contribute 0*0. A
+    precision fix that removes the hazard structurally rather than patching it.
+
+    CHECKED AND DELIBERATELY NOT CHANGED: vec.h:396 / :513 still use svmad_f32_m /
+    svmad_f16_x, but each is immediately followed by a PREDICATED STORE
+    (svst1_*(pg, ...)), so inactive lanes are never written back. Upstream carries
+    them verbatim. Pattern-matching a bug is not the same as having one.
+
+  * **The ubuntu-22-clang matrix** — `arch` was two bare `include:` entries sharing
+    no key with `build:`, which GitHub merges into every combination, so the LAST
+    won and every such job ran on ubuntu-22.04-arm. clang-on-x86 had NEVER been
+    tested and the arm64 runs were labelled as x86 — which is precisely what sent
+    this investigation chasing "a clang bug" and then AVX-512 for three rounds.
+    `arch` is now a real matrix dimension (4 jobs, correctly labelled
+    "(Debug, amd64)" etc.); `include:` only maps arch -> runner.
+
+    Two of those four jobs are coverage that did not previously exist.
+
+**Also fixed:** the sanitized legs run in a container that had no python3, so
+test-release-workflow failed there with "/usr/bin/env: 'python3': No such file or
+directory" as soon as the tier began running. python3 added to its apt line.
+
+## RESOLVED 2026-07-28 — v0.8.24 shipped to all three registries
+
+GitHub, Docker, crates.io, pub.dev and PyPI are all on 0.8.24. Getting the last
+two there exposed real defects rather than configuration noise:
+
+**pub.dev (was stuck at 0.8.22, so 0.8.23 never shipped either).** Two causes:
+the admin-page tag pattern held pub.dev's monorepo default
+`{{package}}-v{{version}}` and rejected every `v*` tag (fixed on the pub.dev
+side), and a manual re-run must be dispatched with `--ref <tag>`, never
+`--ref main` — pub.dev authenticates the OIDC claim of the ref the RUN is on,
+not the one checked out, and otherwise fails with "only allowed from 'tag'
+refType". crates.io does not care, so the Rust half succeeds and only Dart fails.
+
+**PyPI — bundled wheels went 1/7 green to 7/7.** Four independent defects:
+  * Windows: `stage_libs` probed lib/src/. and the Windows bundle keeps DLLs in
+    `bin/`; `src/` holds non-loadable import libs. All three Windows wheels died
+    at staging. Worse, its smoke test was `smoke: false`, so once staging
+    succeeded the job would have gone green on a wheel containing no library.
+  * Windows again: `ctypes.CDLL(<path>)` does not search the DLL's own directory
+    for dependencies on Python 3.8+, so crispasr.dll could not find the ggml DLLs
+    beside it. `_find_lib` now calls `os.add_dll_directory`. Smoke test enabled
+    (and made portable — it hardcoded `bin/activate`, impossible on Windows).
+  * Linux: the bundle is relocatable but NOT self-contained (DT_NEEDED on
+    libopenblas / libespeak-ng / libfdk-aac / libasound). stage_libs now vendors
+    external deps with patchelf RUNPATH=$ORIGIN and FAILS on anything unresolved.
+  * GPU: "fail on unresolved" is wrong for libcuda.so.1 (the NVIDIA driver) and
+    the CUDA runtime — those are host-provided by definition. Classified
+    separately; this regressed the CUDA wheel for one run before being fixed.
+  * Every platform, all along: `crispasr.h` includes `ggml.h` from the bundle's
+    `ggml/include`, which was never on the include path, so `_helpers.c` failed
+    to compile on every wheel ever built and the legacy `CrispASR` class was
+    silently absent. The failure is deliberately non-fatal, so it was a warning
+    nobody read.
+
+**macOS bundle required macOS 26.0** — not a wheel bug. Measured on the shipped
+asset: `minos 26.0 / sdk 26.5` and a hard undefined
+`_OBJC_CLASS_$_MTLResidencySetDescriptor`, because the bundle job set no
+`CMAKE_OSX_DEPLOYMENT_TARGET` and so targeted the macos-latest runner. Anyone on
+an older macOS could not load the downloadable library at all, silently, because
+CI only ever loads it on the machine that built it. Rebuilt at 11.0: `minos 11.0`
+and the symbol is now **weak**, so old systems skip residency sets at runtime and
+macOS 26 still uses them.
+
+**New: `Release` takes an `only: <job>` dispatch input.** Rebuilding one broken
+asset used to mean re-running all 27 build jobs and rewriting every asset, which
+is why such fixes wait for the next version instead. Now a single job can be
+rebuilt and only its asset replaced; tag pushes are unaffected. Used immediately
+for the macOS bundle above.
+
+Verified as a consumer, not by reading a green check: `pip install crispasr==0.8.24`
+from PyPI, `_find_lib` resolves the in-wheel dylib, `ctypes.CDLL` loads it,
+`registry_lookup('kokoro')` returns `kokoro-82m-q8_0.gguf` through the ABI, and
+the legacy class imports.
+
+**Still open:** the `publish-summary` gate now reads job OUTPUTS rather than
+`needs.<job>.result` (which reports 'success' for a failed continue-on-error job
+— the first version of that gate was green while pub.dev failed). Worth auditing
+other workflows for the same `continue-on-error` + `result` combination.
+
+## LANDED 2026-07-27 — #300 vibevoice diarization + the #308 punctuation audit
+
+Merged to `main`; listed here because three follow-ups are still open (below).
+
+- **#300** (`88e31121`): vibevoice's model answers with a
+  `Start/End/Speaker/Content` JSON array that nobody parsed — the blob was one
+  segment's `text`, so `seg.speaker` was empty and the #300 streaming `"speaker"`
+  field could never fire for it. Now parsed into per-utterance segments across
+  CLI, `--stream`, `--stream-json`, server, and the session ABI (new
+  `crispasr_session_result_segment_speaker()` + all seven wrappers).
+  `CRISPASR_VIBEVOICE_RAW_TRANSCRIPT=1` keeps the old blob.
+- **#308 audit** (`762d9e27`): the capitalisation fix had been applied to
+  `src/fireredpunc.cpp` while `crisp_punc/src/fireredpunc.cpp` — the copy that
+  actually links — kept the bug. Fixed in both, plus a no-double-punctuation
+  guard, plus `tests/test-punc-copies-in-sync.cpp` so they cannot diverge again.
+  `moonshine-streaming` + `mimo-asr` gained `CAP_PUNCTUATION_NATIVE`.
+
+**OPEN follow-ups:**
+1. **C# and WASM bindings are source-only-verified.** No `dotnet` or emsdk on the
+   Mac, so the `IntPtr`/`PtrToUtf8` marshalling in
+   `bindings/csharp/CrispASR/NativeMethods.cs` and the two `emscripten.cpp` sites
+   were not compiled. `bindings-csharp.yml` is the real check — watch that job.
+2. **Three ASR backends still unaudited for `CAP_PUNCTUATION_NATIVE`**:
+   `lfm2-audio`, `fastconformer-ctc`, `wav2vec2` — no local GGUFs. The CTC pair
+   almost certainly needs the pass (unpunctuated by construction); `lfm2-audio`
+   is an LLM decoder and is the likely one to need the flag. Method:
+   `FIREREDPUNC_DEBUG=1 … | grep PUNCDBG` and read `in=` — do NOT use
+   `--no-punctuation`, it strips after the fact and inverts the answer.
+3. **`src/fireredpunc.cpp` vs `crisp_punc/` duplication is contained, not
+   removed.** The same shape exists for `crisp_lid/` and `crisp_truecase/`; only
+   the punc pair has a sync test. Extending the test (or deleting the fallbacks)
+   is unclaimed.
+
+## #316 DATA PROVENANCE — traced 2026-07-28, do NOT redistribute the lexicon
+
+misaki is Apache-2.0, but its README states nothing about where the English
+lexicon came from and there is no NOTICE file. Traced empirically instead, by
+comparing against espeak-ng 1.52 `en-us` output (alphabet-normalised, random
+120-word samples):
+
+    us_silver.json   87% byte-identical to espeak-ng
+    us_gold.json     48%
+    vs CMUdict       word sets largely DISJOINT (39% of CMUdict present;
+                     72% of misaki absent from it) — not a CMUdict derivative
+
+So silver is machine-generated by espeak-ng and gold is the hand-verified
+subset, which is exactly what the gold/silver naming conventionally means.
+
+**espeak-ng is GPL-3.0 and that covers its pronunciation dictionary.** A lexicon
+87% identical to its output is at least arguably derived from GPL data, which
+upstream may not have had the right to relicense as Apache-2.0. This is
+engineering judgement, not legal advice — but it means publishing the file to
+`cstr/g2p-dicts` needs upstream clarification FIRST, not a default.
+
+**RESOLVED 2026-07-28 by not redistributing at all:** the runtime now fetches
+misaki's JSON straight from raw.githubusercontent.com/hexgrad/misaki, pinned to
+commit fba12365. CrispASR hosts nothing, so the Apache-2.0/GPL question is
+upstream's to answer, not ours. `tools/convert-misaki-lexicon.py` remains for
+offline/air-gapped use.
+
+Nothing currently depends on resolving it: `tools/convert-misaki-lexicon.py`
+generates the file from the user's own `pip install misaki`, and
+`phonemize_misaki_en()` returns false when it is absent so kokoro falls back to
+the CMUdict path. If the question is ever forced, `--gold-only` emits just the
+hand-verified 89k entries and costs 0.58 points of parity (99.12% -> 98.54%).
+
+Practical note: since silver ~= espeak output, a user with espeak-ng installed
+already gets equivalent coverage for those words via CrispASR's existing espeak
+path. The lexicon's distinctive value is `gold`.
+
+## OPEN follow-ups from #316 (kokoro G2P, landed 2026-07-28)
+
+- **Numbers are expanded for ENGLISH only.** `core/num2words_en.h` is wired into
+  `g2p_en`, so kokoro/piper EN are fixed; `g2p_de` / `g2p_fr` / `g2p_es` still
+  phonemize `82` to the empty string and drop it. Each needs its own grammar
+  (German compounds: "zweiundachtzig"), so it is not a shared routine. Verify
+  the same way: `core_num2words_de::expand("82")` against a reference G2P.
+- **misaki's reduced vowels `ᵊ` / `ᵻ` are not modelled.** We emit plain `ə`/`ɪ`
+  where misaki reduces. Measured worth: exact whole-word phoneme match goes
+  58.3% → ~63% if handled. It is context-dependent (misaki uses both forms), so
+  it needs the rule, not a blanket substitution.
+- **The rest of the gap is dictionary-level**, not spelling: CMUdict stress
+  placement and unstressed-vowel choices vs misaki's lexicon (~190 stress
+  differences and ~130 ɪ/ə swaps over a 1508-word corpus). Closing it means
+  shipping misaki's lexicon, not more conversion rules.
+- Reproduce any of this with
+  `tools/` + `misaki` (pip): run both G2Ps over a word list and diff symbol
+  inventories — the invariant that matters is that we never emit a symbol
+  outside the model's vocab or outside the reference's inventory.
+
+## NOW — VAD + mel front-end parallelization campaign (#305 → fleet-wide)
+
+Started from #305 (reporter: whisper-vad-asmr + firered-vad slow / single-core).
+The recurring pattern: the model compute is fine (ggml threads / Accelerate BLAS),
+but the **audio FRONT-END (STFT/mel/fbank) is a scalar single-threaded per-frame
+loop** — and for long audio the mel can out-cost the encoder (measured in
+whisper-vad). Parallelizing over the independent frame axis (per-thread FFT
+scratch, reductions keep order) is **bit-identical** and a large win.
+
+**DONE (per-backend, std::thread, gated + bit-identical):**
+- whisper-vad-encdec — GPU move (3.3×) + parallel mel (~30% long-audio) + requant
+  (b5eb7556 / 9f867909 / 8324719e). `CRISPASR_VAD_ENCDEC_*`.
+- firered-vad — parallel DFSMN convs + fbank FFT, ~3.7× (8c1d6a10).
+  `CRISPASR_FIRERED_VAD_SERIAL=1`.
+- marblenet-vad — parallel mel front-end, ~1.6× (7b2f11bc).
+  `CRISPASR_MARBLENET_VAD_SERIAL=1`.
+- Audited silero (whisper.cpp native ggml, already threaded) + webrtc (subband
+  GMM, no FFT) — no change needed.
+
+**STATUS: the CPU front-end parallelization vein is MINED (2026-07-26).** Full sweep
+done. Nothing clean+validatable-locally remains — do NOT keep sprinkling std::thread:
+- `core/istft.h` (shared by outetts_wavtok/kokoro/cosyvoice3 +8 vocoders) is
+  single-threaded BUT it is **overlap-add** — adjacent output frames write
+  overlapping samples (data race, unlike the mel's disjoint writes), and n_fft is
+  tiny for most consumers (kokoro=20, cosyvoice3=16) so the per-frame IRFFT is
+  already cheap. Poor risk/reward — SKIP (would need per-thread out buffers + merge
+  or a stride-coloring scheme for a marginal win).
+- Own-mel backends NOT on core_mel (f5_tts, gemma4_e2b, titanet, chatterbox_s3gen,
+  outetts_wavtok, ecapa_lid): their FFT runs ONCE on the reference clip or on TTS
+  output where the DiT/decoder dominates — marginal fractions, not the
+  per-long-audio bottleneck the ASR/VAD mel was. Not worth the churn.
+- moonshine uses a shared mel helper (no local scalar loop of its own).
+The remaining lever is TIER 2 (GPU ports) only — see below + the handover prompt.
+
+**KEY FINDING that reframes the fleet rollout:** `core/mel.h::compute` (used by
+~28 ASR/TTS backends: parakeet, canary, canary_ctc, nemotron, qwen3_asr, cohere,
+glm_asr, granite_*, higgs_stt, ark_asr, voxtral/4b, moss_*, mini_omni2,
+lfm2_audio, qwen3_tts, cosyvoice3, chatterbox, indextts, mimo, piano_transcription
+…) ALREADY has a §176f parallel-STFT path — but it is **`#ifdef _OPENMP` only**,
+and this macOS/AppleClang build has **`OpenMP_CXX_FLAGS=NOTFOUND`** (no libomp), so
+it is **compiled out** on macOS (and any non-libomp build). That is why ZERO
+backends set `allow_parallel_stft=true` — the flag is a no-op on the dev box. The
+mel *projection* matmul in `compute()` is serial too (not even OpenMP-gated).
+
+**TIER 1 — port core_mel STFT to std::thread (PORTABLE) — DONE (528d672f).** One
+change to `src/core/mel.cpp`: portable std::thread STFT path (OpenMP kept when
+`_OPENMP`), DEFAULT parallel with `CRISPASR_MEL_SERIAL=1` opt-out, threshold T≥256.
+Bit-identical (disjoint power[] rows, same reduction order). The mel projection was
+already Accelerate/BLAS-threaded, so the STFT was the sole single-threaded piece.
+Validated parakeet-tdt-0.6b-ja (M1): STFT 1070-frame chunk 20.19→5.52 ms (~3.7×),
+transcript BIT-IDENTICAL serial vs parallel. Lifts all ~28 core_mel backends.
+Neutral for heavy-LLM-decoder ASR (mel is a tiny fraction); real win for
+encoder-bound ASR (parakeet/canary/nemotron) and long audio. `allow_parallel_stft`
+per-backend flag now redundant (kept for back-compat).
+
+**TIER 2 — CPU-hardcoded backends that could go GPU (per-model, MAJOR effort — NOT
+started; needs models + Kaggle validation).** `ggml_backend_cpu_init()` with no GPU
+path, conv-heavy enough to benefit: **mel_band_roformer** (source sep — STRONGEST,
+already promised as a GPU port under #296 below; but 1284 lines already
+BLAS-optimized, model not local, and #296 was Kaggle-validated → a full
+transformer+iSTFT ggml-graph port is a focused multi-hour project that must be
+diff-harness + Kaggle validated, NOT doable+trustworthy locally), piano_transcription
+(cblas=0 — not even BLAS yet; a cheaper first step is BLAS/threads before GPU),
+pyannote_seg (already uses threads), openvoice2, TTS codecs (miocodec has a scalar
+FFT — VAD-style parallelize; miotts/tada_encoder). Small classifiers (ecapa_lid,
+lid_fasttext, bert_encoder, marblenet) stay CPU (launch-bound). Each needs a
+ggml-graph port + Metal/Vulkan landmine handling + diff-harness validation. RECOMMEND
+as a dedicated session per model (get the model, port, validate on Kaggle), starting
+with mel_band_roformer (highest impact, already promised).
+
+**TIER 3 — mined.** §176 runtime-opt campaign is 18/20 DONE; the 2 open are
+<2% (measure-first). Do not chase.
+
+## #296 mel-band-roformer — follow-ups PROMISED on the issue (do not drop)
+
+`--separate` (mel-band-roformer) was ~24 min for 11 s on Linux/Windows (fast only
+on macOS/Accelerate). Root cause: CPU-only forward with an Apple-only BLAS gate +
+naive O(N²) iSTFT + scalar attention + redundant weight de-quant. FIXED on main to
+**24 min → 56 s (~26×), cos=1.0** via: portable OpenBLAS `linear()`, FFT iSTFT,
+attention→SGEMM + BLAS-thread-pin, per-layer weight hoist. Validated on Kaggle
+(cos + per-stage profile each round). Replied on the issue
+(`#296` comments 5062263388 / 5062697259).
+
+**Explicitly PROMISED on the issue — must follow through:**
+1. **OpenBLAS in the shipped binaries.** The speedup only reaches users if the
+   release binary links a real OpenBLAS. Status: Linux release jobs already
+   `apt-get install libopenblas-dev` (engages); **Linux tarball does not bundle
+   `libopenblas.so`** (self-containment) and **Windows CLI jobs set up NO BLAS**
+   (`build-windows-cpu*` in `.github/workflows/release.yml` — needs vcpkg
+   `openblas` + `-DCMAKE_TOOLCHAIN_FILE` + bundling `openblas.dll`). Until Windows
+   is wired, the #296 reporter (Windows) still gets the scalar fallback. Verify
+   each shipped artifact actually loads OpenBLAS (`-- mel-band-roformer: linking
+   OpenBLAS` at configure; `ldd`/`dumpbin /dependents` on the packaged binary).
+2. **GPU / ggml-graph port** (the real long-term fix, promised as "a GPU path is
+   tracked"). Rewrite the forward (transformer + iSTFT) as a ggml graph → SIMD +
+   threads + GPU everywhere, eliminating the scalar/BLAS/OpenMP scaffolding. Same
+   Apple-only-BLAS pattern also slows **htdemucs** (the other `--separate`
+   backend) on Linux/Windows — the ggml port is the template that fixes both.
+   Needed for full-song latency (56 s/11 s still extrapolates to ~15 min/song).
+   Validate with the mel-band-roformer diff harness (per-stage cos≥0.9995).
+
+## canary-qwen q4_k NaN — DONE (2026-07-23)
+
+canary-qwen emitted all-`!` (token id 0) on jfk: the published
+`cstr/canary-qwen-2.5b-GGUF/canary-qwen-2.5b-q4_k.gguf` was a **corrupt quant
+artifact** producing NaN logits (q8_0, the registry default, was always fine). The
+greedy argmax seeded `best_val = logits[0]`, so a NaN froze `best_id` at 0.
+**All shipped (v0.8.22):**
+- NaN-robust argmax in `canary_qwen.cpp` (+ swept into 7 siblings: lfm2_audio,
+  m2m100, moonshine, moss_transcribe{,_diarize}, moss_audio, t5_translate).
+- **Re-quantized q4_k, ASR-validated (4/4 on jfk), uploaded to HF replacing the
+  broken blob in place** — sha256 `9cafd0f77e14…` → `8f9e3a390b8a…` (verified).
+
+## RELEASE follow-up (open, 2026-07-25): v0.8.22 shipped with NO Windows CPU CLI
+
+`release.yml` for v0.8.22 **failed on `build-windows-cpu`**: the mel-band-roformer
+`openblas_set_num_threads` thread-pin used `__attribute__((weak))`, which **MSVC
+rejects** — and it only bit that job (the one Windows job my vcpkg step gives
+`HAVE_BLAS`). 26 assets shipped, but the #296 reporter's Windows CPU binary is
+missing. **Fixed on main** (`3f41a0a4`, gated on portable `CRISPASR_MBR_OPENBLAS`,
+no weak). **Still needs delivery** — v0.8.22 tag has the broken code, so a **v0.8.23**
+must ship it (+ the queued #298/#299 fixes; also realigns main with the 0.8.23
+PyPI wrapper). The MSVC fix is UNVALIDATED locally — watch `build-windows-cpu` on
+the v0.8.23 release run. LESSON: [[untested-release-workflow-broke-release]].
 
 ## #266 follow-up — hoist speaker orchestration into the library (PARKED, LOW)
 
@@ -1300,28 +1629,41 @@ Live registry state:
   `dart pub publish --force`, see `~/code/pupdev.md` handover 2026-07-15). No
   bootstrap needed for the package to exist; only the pub.dev-admin "automated
   publishing" toggle remains if tag-triggered republish is wanted.
-- **crates.io `crispasr` + `crispasr-sys` — NOT published** (both 404).
-- **PyPI `crispasr` — NOT published** (404).
+- **crates.io `crispasr` + `crispasr-sys` — DONE**, both **0.8.23** (manually
+  published 2026-07-27 with `CRISPASR_LIB_DIR` set so the verification build
+  takes build.rs path 1, no cmake). The account needed a one-time verified
+  email first. crates.io consumers must link a pre-built lib
+  (`CRISPASR_LIB_DIR`); the package does not vendor the C/C++ sources, so a
+  from-source build needs the git dependency (build.rs hardened to say so).
+- **PyPI `crispasr` — DONE**, latest **0.8.23** (also 0.8.22; both manually
+  uploaded 2026-07-24, verified 2026-07-27 — the published 0.8.23 wheel is
+  byte-identical to `python/crispasr/_binding.py`). Pure-Python `py3-none-any`
+  wheel; the native `libcrispasr` is still installed separately by the user.
 
-So only crates.io + PyPI still need the one-time creds bootstrap below before
-CI/OIDC can take over; the pub.dev bootstrap step (3) is already satisfied.
+So all three registries (crates.io, PyPI, pub.dev) are now bootstrapped; only
+the optional CI/OIDC auto-trigger remains (below).
 
 ### TO DO — bootstrap (one-time, needs repo admin creds)
 
-1. **crates.io:**
+1. **crates.io — ALREADY DONE** (both crates first-published 2026-07-27). The
+   recipe used (needs a *verified email* on the account + a prebuilt lib so the
+   verification build skips cmake):
    ```bash
-   cargo login   # token from https://crates.io/me
-   cargo publish --manifest-path crispasr-sys/Cargo.toml --allow-dirty
+   export CARGO_REGISTRY_TOKEN=...          # token from https://crates.io/me
+   CRISPASR_LIB_DIR=/usr/local/lib cargo publish --manifest-path crispasr-sys/Cargo.toml --allow-dirty
    sleep 30
-   cargo publish --manifest-path crispasr/Cargo.toml --allow-dirty
+   CRISPASR_LIB_DIR=/usr/local/lib cargo publish --manifest-path crispasr/Cargo.toml --allow-dirty
    ```
-   Then add `CARGO_REGISTRY_TOKEN` repo secret (Settings → Secrets → Actions).
+   For tag-triggered CI, add `CARGO_REGISTRY_TOKEN` repo secret (Settings →
+   Secrets → Actions) — CI build.rs will cmake from the checkout, so no
+   `CRISPASR_LIB_DIR` needed there.
 
-2. **PyPI (trusted publishing/OIDC):** at
-   https://pypi.org/manage/account/publishing/ create a pending publisher —
-   Owner `CrispStrobe`, Repository `CrispASR`, Workflow `release-wrappers.yml`,
-   Environment `pypi`. Push a `v*` tag; the OIDC handshake creates the package
-   (no manual twine upload).
+2. **PyPI — ALREADY DONE** (package first-published manually, `crispasr 0.8.22`
+   + `0.8.23`, 2026-07-24). Only optional remaining step for tag-triggered
+   republish: at https://pypi.org/manage/account/publishing/ create a pending
+   publisher — Owner `CrispStrobe`, Repository `CrispASR`, Workflow
+   `release-wrappers.yml`, Environment `pypi`. Manual `twine upload` of a bumped
+   version also works without it.
 
 3. **pub.dev (Dart) — ALREADY DONE** (first-published manually to `crispasr 0.8.11`).
    ~~`cd flutter/crispasr && dart pub get && dart pub publish`~~. Only remaining
@@ -1330,9 +1672,39 @@ CI/OIDC can take over; the pub.dev bootstrap step (3) is already satisfied.
    this only if you want tag-triggered republish (manual `dart pub publish` works
    without it).
 
-4. **After bootstrap:** re-enable the auto-trigger by un-commenting the `push:` /
-   `tags: ['v*']` lines in `release-wrappers.yml`. Next tag push should publish all
-   three wrappers cleanly (resilience guards already landed — see HISTORY).
+4. **Auto-trigger — DONE.** `release-wrappers.yml` now runs on `push: tags:
+   ['v*']` and publishes Rust (crates.io) + Dart (pub.dev). Python is handled
+   separately by **`release-python-wheels.yml`** (see below), so the PyPI job
+   was removed from `release-wrappers.yml` to avoid a double upload.
+
+### Python wheels — `release-python-wheels.yml`
+
+Ships the model I recommended: bundled **CPU wheels → PyPI**, **GPU wheels → a
+PEP 503 index on GitHub Pages** (`--extra-index-url .../whl/{cuda,vulkan}/`),
+plus a pure-Python **sdist** fallback. It runs on `workflow_run` after
+`release.yml` finishes and REUSES the `libcrispasr-<platform>[-cuda|-vulkan]`
+bundles that release.yml attaches to the GitHub Release — no native rebuild.
+`tools/stage_libs.py` copies the libs into the `crispasr` package,
+`_binding.py:_find_lib()` probes the package dir first, wheels are retagged per
+platform with `wheel tags`. CPU matrix: linux x86_64 + arm64, macOS arm64
+(Metal), windows x86_64. GPU: CUDA (linux + windows) + Vulkan (windows),
+carrying `+cuda`/`+vulkan` local versions. Verified end-to-end locally on
+macOS-arm64 (install → `_find_lib` picks the bundled dylib → `CDLL` loads).
+
+REGISTRY SECRETS (all set 2026-07-27 via `gh secret set`):
+- `PYPI_API_TOKEN` (pre-existing), `CARGO_REGISTRY_TOKEN` (added — crates.io CI
+  publish was otherwise skipped; `gh secret list` confirms both).
+
+GPU INDEX HOSTING: Pages already serves `main`/root (legacy Jekyll, the README
+landing). The GPU index is committed to `main` under `whl/` by the workflow
+(Jekyll serves it at `.../whl/{cuda,vulkan}/`), leaving the README landing
+untouched — no Pages reconfiguration. Index links point at Release-hosted
+wheels, so main only carries tiny `index.html` files, regenerated from all
+releases each run (`[skip ci]` commit, push-with-rebase-retry).
+
+Assumption to verify on the first tagged run: linux wheels are labelled
+`manylinux_2_28_*`; if a bundle needs newer glibc, bump the tag (`auditwheel
+show`).
 
 ## 67. Deferred follow-ups carry-over (mid-May 2026 session)
 
@@ -2793,3 +3165,36 @@ and Mel-Band RoFormer separation, piano_transcription (§250).
   far is M1/Metal only, and LEARNING 35 says Metal-correct is not CUDA-correct.
 - [ ] **File the upstream ggml PR** drafted at
   `tools/upstream-prs/24-conv-1d-batch-reshape.md`.
+
+## §252 — CosyVoice3 native-Vulkan: fp32-accumulation lever (LOW priority, likely dead end)
+
+Background (see LEARNINGS "Backend miscomputes my pipeline ≠ op X is broken" +
+`project_304_cosyvoice3_vulkan_native_lm_vs_flow`): CV3 is CPU-routed under Vulkan
+because native synthesis is noise. This was FULLY root-caused, on a real Tesla
+P100: it is **not** a broken ggml op (test-backend-ops passes every flow/HiFT op
+on Vulkan — IM2COL, NORM, MUL_MAT, ROPE, …) and **not** my gallocr dispatch
+(`FORCE_GALLOCR` on CPU is bit-identical to the scheduler). It is **aggregate
+precision sensitivity**: Vulkan's in-tolerance per-op accumulation deltas (fp16 vs
+CPU fp32) compound across the 22-layer DiT × 6 CFM Euler steps and are amplified
+by the log-mel HiFT vocoder → flow mel cosine(cpu,vk)=0.961 → garbage. The LM
+(shallow-per-token) is bit-correct on Vulkan (512/512 greedy tokens).
+
+- [ ] **Lever (low priority, low odds):** force **fp32 accumulation** in the
+  ggml-vulkan matmul/conv path for the flow + HiFT (e.g. `GGML_PREC_F32` /
+  coopmat-f32-accum, or a build/env knob) and re-measure the flow mel cosine and
+  the audio ASR round-trip on a real NVIDIA Vulkan device (Kaggle P100). If cosine
+  climbs to ≳0.999 and audio is intelligible, native Vulkan (or at least a
+  flow+HiFT-on-Vulkan hybrid) becomes viable. **Why it's likely a dead end:** every
+  op already passes test-backend-ops *within tolerance*, so fp32-accum may not
+  shrink the per-op delta enough to stop the CFM+vocoder amplification; and it is
+  deep upstream ggml-vulkan shader work. Do NOT invest unless someone independently
+  wants native-Vulkan CV3 speed badly enough to accept the shader effort.
+- Groundwork already committed (branch `fix/304-cosyvoice3-se`, gated, NOT merged):
+  LM single-backend gallocr (proves the LM runs native-Vulkan), hybrid
+  HiFT-on-CPU infra, and diagnostics `CRISPASR_COSYVOICE3_{GREEDY,DUMP_MEL,
+  DUMP_HIFT,FORCE_GALLOCR,HIFT_ON_GPU}`. Repro kernels:
+  `tools/kaggle/cv3-vulkan-{isolate,convtest}`. A real self-recursion crash in the
+  `cv3_sched_*` shims (CPU/Metal SIGSEGV) was fixed on that branch; the shipped
+  release was never affected (shims are branch-only).
+- Default stays the shipped all-CPU route under Vulkan — correct, and the right
+  answer unless the lever above ever pays off.

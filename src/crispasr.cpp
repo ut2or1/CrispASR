@@ -7,7 +7,8 @@
 #include "ggml-backend.h"
 #include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
-#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/gpu_backend_pref.h"       // crispasr_init_gpu_backend (#214)
+#include "core/whisper_special_tokens.h" // serialized-vs-legacy special ids (#322)
 
 #ifdef CRISPASR_USE_COREML
 #include "coreml/whisper-encoder.h"
@@ -2141,10 +2142,28 @@ static bool whisper_model_load(struct whisper_model_loader* loader, whisper_cont
             return false;
         };
 
-        const bool has_serialized_specials =
-            set_token_id(vocab.token_eot, "<|endoftext|>") && set_token_id(vocab.token_sot, "<|startoftranscript|>");
+        auto find_token = [&](const char* token) {
+            const auto it = vocab.token_to_id.find(token);
+            return it == vocab.token_to_id.end() ? core_whisper_specials::kAbsent : (int)it->second;
+        };
+
+        // Look the ids up, then DECIDE — the decision is a pure function over plain
+        // ints (core/whisper_special_tokens.h), so it has nothing to mutate. #322 was
+        // a probe that assigned its destination and then reported "not found", leaving
+        // token_eot resolved while the flag said legacy; the fixup below then
+        // incremented an already-correct id. Separating lookup from decision makes
+        // that class of bug unrepresentable rather than merely fixed.
+        core_whisper_specials::Serialized ser;
+        ser.eot = find_token("<|endoftext|>");
+        ser.sot = find_token("<|startoftranscript|>");
+        ser.beg = find_token("<|0.00|>");
+        const bool has_serialized_specials = core_whisper_specials::use_serialized(ser);
 
         if (has_serialized_specials) {
+            // Guaranteed present by use_serialized(), including <|0.00|> -> token_beg.
+            vocab.token_eot = ser.eot;
+            vocab.token_sot = ser.sot;
+            vocab.token_beg = ser.beg;
             set_token_id(vocab.token_translate, "<|translate|>");
             set_token_id(vocab.token_transcribe, "<|transcribe|>");
             set_token_id(vocab.token_solm, "<|startoflm|>");
@@ -2153,7 +2172,6 @@ static bool whisper_model_load(struct whisper_model_loader* loader, whisper_cont
                 set_token_id(vocab.token_nosp, "<|nocaptions|>");
             }
             set_token_id(vocab.token_not, "<|notimestamps|>");
-            set_token_id(vocab.token_beg, "<|0.00|>");
 
             // Tiron: detect a contiguous run of <|speaker1|>, <|speaker2|>, ...
             // starting above the timestamp block.
@@ -3692,6 +3710,7 @@ static bool log_mel_spectrogram(whisper_state& wstate, const float* samples, con
     const int64_t t_start_us = ggml_time_us();
 
     // Hann window
+    // cppcheck-suppress incorrectStringBooleanError
     CRISPASR_ASSERT(frame_size == CRISPASR_N_FFT && "Unsupported frame_size");
     const float* hann = global_cache.hann_window;
 
@@ -5078,7 +5097,15 @@ static ggml_tensor* whisper_vad_build_lstm_layer(ggml_context* ctx0, const whisp
     const whisper_vad_model& model = vctx.model;
     const int hdim = model.hparams.lstm_hidden_size;
 
-    struct ggml_tensor* x_t = ggml_transpose(ctx0, cur);
+    // ggml_transpose returns a NON-CONTIGUOUS view: it swaps nb[0]/nb[1], so the
+    // row stride of x_t becomes sizeof(float) and llamafile_sgemm's `ldb` collapses
+    // to 1 while k is lstm_hidden_size (128) — tripping its `ldb >= k` precondition
+    // (ggml-cpu/llamafile/sgemm.cpp). Release defines NDEBUG, so that assert is
+    // compiled out and the matmul RAN ANYWAY with a violated precondition; only a
+    // Debug build aborted, and the Debug leg had never run because CI executed 1 of
+    // 162 unit tests until 2026-07-29. ggml_cont materialises the transpose, which
+    // is the idiom the rest of this codebase already uses (src/audioseal.cpp, 5x).
+    struct ggml_tensor* x_t = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
 
     // Create operations using the input-to-hidden weights.
     struct ggml_tensor* inp_gate = ggml_mul_mat(ctx0, model.lstm_ih_weight, x_t);
@@ -9602,7 +9629,7 @@ static void whisper_exp_compute_token_level_timestamps(struct whisper_context& c
                         s0 = k;
                     }
                 } else {
-                    while (state.energy[k] < thold && k < s1) {
+                    while (k < s1 && state.energy[k] < thold) {
                         k++;
                     }
                     s0 = k;

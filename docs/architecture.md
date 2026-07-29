@@ -537,6 +537,31 @@ tok_emb shape (vocab_size + 3). Supports arbitrarily long audio input.
 σ-VAE ConvNeXt encoders + Qwen2.5-7B decoder. Dual-mode: ASR (with
 timestamps, diarization, hotwords) and TTS (DPM-Solver++ flow matching).
 
+**The ASR answer is JSON, and the adapter parses it.** The system prompt says
+"transcribes audio input into text output in JSON format" and the user turn asks
+for the keys `Start time, End time, Speaker ID, Content`, so the model replies
+with an array of utterances:
+
+```json
+[{"Start":0.0,"End":10.99,"Speaker":0,"Content":"…"},
+ {"Start":11.32,"End":15.65,"Speaker":1,"Content":"…"}]
+```
+
+`core_vibevoice::parse` (`src/core/vibevoice_transcript.h`) turns that into one
+`crispasr_segment` per utterance — timings from Start/End offset into the chunk,
+speaker as the structured `"(Speaker N) "` label — which is what makes the
+diarization reachable in file output, `--stream`, `--stream-json` and the
+bindings. Until v0.8.24 the whole blob was one segment's `text` (#300), so the
+labels were literal JSON and `seg.speaker` was never set.
+
+It is a deliberately tolerant scanner rather than a strict JSON reader: a decode
+that hits the token cap ends mid-array, and a strict parse would discard every
+complete utterance before the cut. Unparseable output falls back to the raw
+string, and `CRISPASR_VIBEVOICE_RAW_TRANSCRIPT=1` restores the pre-v0.8.24
+single-segment behaviour for callers that parse the blob themselves. Because the
+model punctuates and sentence-cases its own Content, the adapter declares
+`CAP_PUNCTUATION_NATIVE` so the CLI's FireRedPunc pass does not run over it.
+
 ### mimo-asr
 
 6L input_local_transformer (1024d) + 36L Qwen2 LM (4096d, 32Q/8KV);
@@ -1021,6 +1046,84 @@ runtime. **Two separate checkpoints**: `en-x` for English-source
 translation, `x-en` for English-target. Pick whichever matches your
 direction (`-sl`/`-tl`) — the auto-download path picks `en-x` by
 default; load `x-en` explicitly with `-m <path>` for X→English.
+
+### gigaam
+
+ai-sage/GigaAM-v3 — Russian ASR. A 16-layer **rotary** Conformer encoder
+(220 M params, `d_model=768`, 16 heads) with either a CTC or an RNN-T head.
+Four shipped revisions of one architecture:
+
+| revision | head | vocabulary | output |
+|---|---|---|---|
+| `ctc` | CTC | 33 Cyrillic chars | lowercase, unpunctuated |
+| `rnnt` | RNN-T | 33 Cyrillic chars | lowercase, unpunctuated |
+| `e2e_ctc` | CTC | SentencePiece 256 | punctuation + casing + ITN |
+| `e2e_rnnt` | RNN-T | SentencePiece 1024 | punctuation + casing + ITN (best WER) |
+
+One GGUF carries the head type and tokenizer kind, so a single runtime
+(`src/gigaam.cpp`) serves all four.
+
+```
+Audio → log-mel (64 bins, n_fft=win=320, hop=160, center=False, htk, power=2,
+                 ln(clamp(x, 1e-9)) — NO z-norm, NO pre-emphasis)
+      → conv1d striding subsample: 2 x [Conv1d(k=5, s=2, p=2) + ReLU]  (4x)
+      → 16 x Conformer block:
+            FFN1(x0.5) -> rotary MHA -> conv(dw k=5 + LayerNorm) -> FFN2(x0.5) -> LN
+      → CTC head (Conv1d k=1 + log_softmax + greedy collapse)
+        or RNN-T head (Embedding + 1-layer LSTM predictor, joint enc/pred
+        -> ReLU -> Linear, greedy with max 10 symbols per frame)
+```
+
+Three details are easy to get wrong and are worth stating explicitly — all
+three come from reading `modeling_gigaam.py`, not from Conformer convention:
+
+- **RoPE is applied to the block INPUT, before the Q/K/V projections.**
+  `RotaryPositionMultiHeadAttention.forward` receives `x, x, x`, rotates
+  `query`/`key` (which are still the raw hidden state, reshaped to
+  `(T, B, n_heads, head_dim)`), and only then calls `forward_qkv`. So
+  `Q = Wq·RoPE(x)`, `K = Wk·RoPE(x)`, and `V = Wv·x` — **V is projected
+  from the unrotated input.**
+- **The rotary base is 5000, not 10000.** `RotaryPositionalEmbedding` is
+  constructed as `(d_model // n_heads, pos_emb_max_len)` against
+  `PositionalEncoding.__init__(self, dim, base)`, so `pos_emb_max_len`
+  lands in the `base` slot. The converter writes it out as
+  `gigaam.rope_base` rather than letting the runtime re-derive it.
+- **`conv.batch_norm` is a LayerNorm.** `conv_norm_type='layer_norm'`
+  makes the conv module's `batch_norm` submodule an `nn.LayerNorm`, so
+  its weight/bias are LN affine parameters and there are no running
+  statistics to fold.
+
+`rtt_half` is the rotate-half (NEOX) pairing over `head_dim=48`, which maps
+onto `ggml_rope_ext(..., GGML_ROPE_TYPE_NEOX)` exactly. The FFN / conv /
+macaron halves are shape-identical to every other Conformer in the tree, so
+the weight container is `core_conformer::BlockWeights`; only the attention
+differs, which is why `gigaam.cpp` has its own block builder rather than
+calling the rel-pos `core_conformer::build_block`.
+
+Batch is always 1 in this runtime, and the blueprint only builds an
+attention mask when `batch > 1` — so full unmasked attention is correct and
+the conv module's `pad_mask` is a no-op.
+
+Preprocessing note: the Hann window and the mel filterbank are copied out of
+the checkpoint by `models/convert-gigaam-to-gguf.py` rather than rebuilt,
+which removes a whole class of window-convention and mel-normalization
+scale bugs. The mel is un-normalized log-mel in roughly `[-20.7, +5]`, so
+`encoder.pre.*` stays at F32 in every quant (the same reasoning as
+nemotron's pre-encode, #81), and the quantizer also keeps `joint.*`,
+`decoder.*` and `head.ctc.*` at source precision.
+
+The adapter declares `sole_language() == "ru"`, so `-l auto` resolves to
+Russian without downloading and running a whisper-tiny LID pass (#227), and
+`CAP_PUNCTUATION_NATIVE` for every revision — not only because the `e2e_*`
+ones already punctuate, but because the auto-enabled restorer (FireRedPunc)
+is a Chinese/English model that injects full-width CJK punctuation into
+Russian. An explicit `--punc-model` still applies.
+
+Env gates: `CRISPASR_GIGAAM_BENCH=1` (per-stage timings),
+`CRISPASR_GIGAAM_DEBUG=1`, `CRISPASR_GIGAAM_FLASH=1` (flash attention in
+the encoder — opt-in until it has its own A/B),
+`CRISPASR_GIGAAM_FORCE_SCALAR=1` (scalar LSTM/joint instead of cblas),
+`CRISPASR_GIGAAM_QUANT_ALL=1` (quantize the heads too).
 
 ### paraformer
 

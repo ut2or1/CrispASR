@@ -18,6 +18,22 @@ The default and recommended path is **session-scoped clustering**. The named
 path exists, is **off by default**, and should only be used deliberately and
 with the obligations in the last section understood.
 
+> **Streaming?** Both columns above are **recorded-file (offline)** features.
+> For live transcription, a backend that emits a structured per-segment speaker
+> label (`moss-diarize`; `vibevoice` from v0.8.24; `granite` in speaker-aware
+> `--diarize` mode) surfaces its own per-utterance `(Speaker N)` labels under
+> `--stream` — but the cross-recording clustering and named-voiceprint paths
+> here do not run in real time. See [`streaming.md`](streaming.md#speaker-diarization-while-streaming).
+
+> **From a binding?** The same native label is on the session ABI from v0.8.24 —
+> `crispasr_session_result_segment_speaker(result, i)` in C, `.speaker` on
+> Python's `SessionSegment`, `.Speaker` on Go's `TranscribeSegment`, `.speaker`
+> on Dart's `SessionSegment`. It is `""` when the backend does not diarize
+> natively, and its ordinals are **chunk-local** — `Speaker 1` from one
+> `transcribe()` call is not necessarily the same voice as `Speaker 1` from the
+> next, because no cross-chunk clustering runs there. Use the `diarize_*`
+> helpers in section 1 when you need labels stable across a whole recording.
+
 ---
 
 ## 1. Session-scoped speaker clustering (recommended)

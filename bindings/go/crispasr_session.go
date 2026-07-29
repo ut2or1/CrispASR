@@ -71,6 +71,7 @@ int              crispasr_session_set_speaker_id(CrispasrSession* s, int id);
 int              crispasr_session_n_speakers(CrispasrSession* s);
 const char*      crispasr_session_get_speaker_name(CrispasrSession* s, int i);
 int              crispasr_session_set_instruct(CrispasrSession* s, const char* instruct);
+int              crispasr_session_set_tts_phonemes(CrispasrSession* s, const char* phonemes);
 int              crispasr_session_is_custom_voice(CrispasrSession* s);
 int              crispasr_session_is_voice_design(CrispasrSession* s);
 float*           crispasr_session_synthesize(CrispasrSession* s, const char* text, int* out_n_samples);
@@ -109,6 +110,7 @@ long long    crispasr_session_result_word_t0(crispasr_session_result* r, int i_s
 long long    crispasr_session_result_word_t1(crispasr_session_result* r, int i_seg, int i_word);
 float        crispasr_session_result_word_p(crispasr_session_result* r, int i_seg, int i_word);
 float        crispasr_session_result_segment_no_speech_prob(crispasr_session_result* r, int i_seg);
+const char*  crispasr_session_result_segment_speaker(crispasr_session_result* r, int i);
 // Per-frame CTC logits (opted in via crispasr_session_set_return_logits) for
 // backends that produce a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,
 // canary-ctc). Frame-major: logits[t * n_logit_vocab + v]. Raw pre-softmax for
@@ -963,6 +965,25 @@ func (s *CrispasrSession) SetInstruct(instruct string) error {
 	}
 }
 
+// SetTTSPhonemes synthesizes the given phonemes verbatim instead of
+// phonemizing the text — the seam between text processing and the acoustic
+// model. Use it to reproduce another implementation's pronunciation exactly, or
+// to tell a G2P bug from a model bug (#316). Empty clears.
+// Honoured by kokoro and piper; other backends return a soft no-op error.
+func (s *CrispasrSession) SetTTSPhonemes(phonemes string) error {
+	cps := C.CString(phonemes)
+	defer C.free(unsafe.Pointer(cps))
+	rc := C.crispasr_session_set_tts_phonemes(s.handle, cps)
+	switch rc {
+	case 0:
+		return nil
+	case -2:
+		return errors.New("backend has no phonemes-in entry point; SetTTSPhonemes applies to kokoro and piper")
+	default:
+		return fmt.Errorf("SetTTSPhonemes failed (rc=%d)", int(rc))
+	}
+}
+
 // IsCustomVoice reports whether the loaded model is a qwen3-tts
 // CustomVoice variant (use SetSpeakerName for it).
 func (s *CrispasrSession) IsCustomVoice() bool {
@@ -1102,6 +1123,13 @@ type TranscribeSegment struct {
 	// <|nospeech|> posterior) in [0, 1]. Whisper-only; other backends leave
 	// the -1.0 "no data" sentinel.
 	NoSpeechProb float32
+	// Speaker is a native per-segment speaker label from a backend that
+	// diarizes on its own, in the "(Speaker N) " form the CLI prefixes into
+	// text/srt/vtt output, or "" when the backend produced none. Populated
+	// today by vibevoice, whose model answers with a Start/End/Speaker/Content
+	// array. The ordinals are CHUNK-LOCAL: "Speaker 1" in one transcribe call
+	// is not necessarily the same voice as "Speaker 1" in the next.
+	Speaker string
 }
 
 // TranscribeWord is one word with timing and confidence.
@@ -1241,6 +1269,7 @@ func extractResult(r *C.crispasr_session_result) *TranscribeResult {
 		seg.T0 = int64(C.crispasr_session_result_segment_t0(r, C.int(i)))
 		seg.T1 = int64(C.crispasr_session_result_segment_t1(r, C.int(i)))
 		seg.NoSpeechProb = float32(C.crispasr_session_result_segment_no_speech_prob(r, C.int(i)))
+		seg.Speaker = C.GoString(C.crispasr_session_result_segment_speaker(r, C.int(i)))
 		nWords := int(C.crispasr_session_result_n_words(r, C.int(i)))
 		seg.Words = make([]TranscribeWord, nWords)
 		for j := 0; j < nWords; j++ {

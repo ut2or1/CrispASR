@@ -315,6 +315,26 @@ catch_discover_tests(test-core-rvq
     PROPERTIES LABELS "unit"
 )
 
+# ─── test-pinyin-g2p — F5-TTS Chinese g2p parity vs pypinyin reference (#294) ──
+add_executable(test-pinyin-g2p
+    test-pinyin-g2p.cpp
+    ${PROJECT_SOURCE_DIR}/src/core/pinyin_g2p.cpp
+)
+target_include_directories(test-pinyin-g2p PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/src/core
+)
+target_compile_definitions(test-pinyin-g2p PRIVATE
+    PINYIN_PARITY_TSV="${CMAKE_CURRENT_SOURCE_DIR}/data/pinyin_parity.tsv"
+)
+target_link_libraries(test-pinyin-g2p PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-pinyin-g2p
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
 # ─── test-gguf-bounds — regression guard for the GGUF load_weights OOB fix ─────
 # Untrusted-input hardening: a truncated/crafted GGUF must be rejected by
 # core_gguf::load_weights, not SIGBUS the mmap loader. Needs crispasr-lib (the
@@ -623,6 +643,17 @@ if(CRISPASR_BUILD_EXAMPLES AND NOT WIN32)
     set_tests_properties(test-vad-export-live PROPERTIES
         LABELS "unit;vad;regression-227"
         TIMEOUT 120)
+
+    # #311: strict failure semantics for required VAD / aligner / punctuation.
+    # Model-free config-validation + help always run; the strict-vs-permissive
+    # A/B is gated on a loadable whisper model and SKIPs cleanly without one.
+    add_test(NAME test-strict-pipeline
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test_strict_pipeline.sh
+            $<TARGET_FILE:crispasr-cli>
+            ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test-strict-pipeline PROPERTIES
+        LABELS "unit;regression-311"
+        TIMEOUT 180)
 endif()
 
 if(CRISPASR_BUILD_EXAMPLES AND NOT WIN32)
@@ -812,6 +843,26 @@ target_link_libraries(test-paraformer PRIVATE
 )
 catch_discover_tests(test-paraformer
     TEST_SPEC "[paraformer]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-gigaam — live integration tests for the GigaAM-v3 backend
+add_executable(test-gigaam
+    test_gigaam_live.cpp
+)
+target_include_directories(test-gigaam PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-gigaam PRIVATE
+    Catch2::Catch2WithMain
+    gigaam
+)
+catch_discover_tests(test-gigaam
+    TEST_SPEC "[gigaam]"
     PROPERTIES
         LABELS live
         SKIP_RETURN_CODE 4
@@ -1404,6 +1455,13 @@ target_link_libraries(test-kokoro-params PRIVATE
     Catch2::Catch2WithMain
     kokoro
 )
+# #316: kokoro now compiles phonemizer.cpp with CRISPASR_BUILD, which enables the
+# G2P dictionary auto-download (previously dead code — the macro was defined
+# nowhere). That pulls in crispasr_cache::ensure_cached_file, which lives in
+# crispasr-lib. crispasr-lib links kokoro, so kokoro cannot link it back; every
+# real binary resolves the symbol because it links crispasr-lib. This test links
+# kokoro ALONE, so it compiles the one translation unit it needs directly.
+target_sources(test-kokoro-params PRIVATE ${PROJECT_SOURCE_DIR}/src/crispasr_cache.cpp)
 catch_discover_tests(test-kokoro-params
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;kokoro"
@@ -1535,6 +1593,23 @@ target_link_libraries(test-mimoasr-params PRIVATE
 catch_discover_tests(test-mimoasr-params
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;mimo_asr"
+)
+
+# ─── test-gigaam-params — Catch2 unit tests for gigaam_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+add_executable(test-gigaam-params
+    test-gigaam-params.cpp
+)
+target_include_directories(test-gigaam-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-gigaam-params PRIVATE
+    Catch2::Catch2WithMain
+    gigaam
+)
+catch_discover_tests(test-gigaam-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;gigaam"
 )
 
 # ─── test-nemotron-params — Catch2 unit tests for nemotron_context_params defaults
@@ -2648,6 +2723,101 @@ target_link_libraries(test_server_wav_writer PRIVATE
     Catch2::Catch2WithMain
 )
 catch_discover_tests(test_server_wav_writer
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-marking-policy — Catch2 unit tests for the spoken-AI-disclaimer
+# opt-out gate (#312). Header-only decision logic from
+# examples/cli/crispasr_marking_policy.h — no server, no socket, no models, so
+# the policy is guarded on a tier CI actually runs (the live server test that
+# covered it before went four days red without anyone noticing).
+add_executable(test-marking-policy test-marking-policy.cpp)
+target_include_directories(test-marking-policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-marking-policy PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-marking-policy
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-punc-copies-in-sync — the two fireredpunc implementations must not
+# drift. crisp_punc/src/fireredpunc.cpp is what normally links; src/fireredpunc.cpp
+# is the partial-checkout fallback. #308's capitalisation fix landed in the
+# fallback ONLY and was dead code for months (found while fixing #300). Pure file
+# comparison — no model, no linkage.
+add_executable(test-punc-copies-in-sync test-punc-copies-in-sync.cpp)
+target_compile_definitions(test-punc-copies-in-sync PRIVATE
+    CRISPASR_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+)
+target_link_libraries(test-punc-copies-in-sync PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-punc-copies-in-sync
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-kokoro-g2p-live — #316 end-to-end: a number must be audible, and
+# --tts-phonemes must drive the model instead of the text. The G2P defect was
+# invisible to every tensor-level check (crispasr-diff for kokoro is phoneme-IN),
+# so only a real synthesis + ASR round-trip proves it. SKIPs without models.
+add_test(NAME test-kokoro-g2p-live
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-kokoro-g2p-live.sh)
+set_tests_properties(test-kokoro-g2p-live PROPERTIES LABELS "live;tts;kokoro" TIMEOUT 900)
+
+# ─── test-whisper-special-tokens — serialized-vs-legacy special-token layout (#322).
+# Whisper had NO id-level coverage at all: it is absent from the regression manifest
+# and no test asserted a token id, so token_eot resolving to the wrong value was
+# invisible. Header-only predicate, no model.
+add_executable(test-whisper-special-tokens test-whisper-special-tokens.cpp)
+target_include_directories(test-whisper-special-tokens PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-whisper-special-tokens PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-whisper-special-tokens
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-tts-phonemes-policy — which backends --tts-phonemes may drive (#316).
+# The CLI guard began as a hardcoded backend-name check that wrongly excluded
+# piper. Header-only policy, no model.
+add_executable(test-tts-phonemes-policy test-tts-phonemes-policy.cpp)
+target_include_directories(test-tts-phonemes-policy PRIVATE ${PROJECT_SOURCE_DIR}/examples/cli)
+target_link_libraries(test-tts-phonemes-policy PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-tts-phonemes-policy TEST_SPEC "[unit]" PROPERTIES LABELS "unit")
+
+# ─── test-kokoro-g2p-316 — number expansion + Kokoro's phoneme alphabet (#316).
+# Kokoro dropped numbers and drifted British; both were G2P defects that
+# crispasr-diff cannot see (it is phoneme-IN, so it starts downstream of them).
+# Every expectation is misaki's own output. No model, no audio.
+add_executable(test-kokoro-g2p-316 test-kokoro-g2p-316.cpp)
+target_include_directories(test-kokoro-g2p-316 PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-kokoro-g2p-316 PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-kokoro-g2p-316
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-vibevoice-transcript — Catch2 unit tests for the VibeVoice-ASR
+# answer parser (#300). Header-only (examples/cli/vibevoice_transcript_parse.h):
+# Start/End/Speaker/Content -> utterances (+ assign_tokens, which splits the
+# per-token confidence list the same way), incl. a truncated decode and the
+# prompt's long key spellings. No model, no audio.
+add_executable(test-vibevoice-transcript test-vibevoice-transcript.cpp)
+target_include_directories(test-vibevoice-transcript PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-vibevoice-transcript PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-vibevoice-transcript
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit"
 )

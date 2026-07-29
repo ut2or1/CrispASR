@@ -1491,7 +1491,11 @@ static char* moss_diarize_impl(struct moss_diarize_context* ctx, const float* sa
             result += core_bpe::token_bytes_to_utf8(t);
     }
     if (ctx->params.verbosity >= 1)
-        fprintf(stderr, "moss_diarize: %zu tokens: \"%s\"\n", generated.size(), result.substr(0, 200).c_str());
+        // #318: print the FULL tagged transcript, not the first 200 chars — this
+        // `[t][Sxx] …[t]` line (speaker tags + per-phrase timings) is the only
+        // place the rich structure surfaces during streaming (the partial JSONs
+        // carry text only), and users rely on it. One line, printed once per call.
+        fprintf(stderr, "moss_diarize: %zu tokens: \"%s\"\n", generated.size(), result.c_str());
 
     // n-gram loop fix
     {

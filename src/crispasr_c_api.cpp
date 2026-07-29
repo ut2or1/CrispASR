@@ -68,6 +68,10 @@
 #include "nemotron.h"
 #define CA_HAVE_NEMOTRON 1
 #endif
+#if __has_include("gigaam.h")
+#include "gigaam.h"
+#define CA_HAVE_GIGAAM 1
+#endif
 #if __has_include("canary.h")
 #include "canary.h"
 #define CA_HAVE_CANARY 1
@@ -942,6 +946,7 @@ CA_EXPORT unsigned char* crispasr_pcm_to_wav(const float* pcm, int n_samples, in
 
 #include "core/crispasr_lcs.h"
 #include "core/crispasr_env.h"
+#include "core/vibevoice_transcript.h" // #300: shared with the CLI adapter
 
 CA_EXPORT int crispasr_lcs_dedup_prefix_count(const int32_t* prev_tail_tokens, int n_prev, const int32_t* curr_tokens,
                                               int n_curr, int min_lcs_length) {
@@ -1399,6 +1404,8 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "whisper";
     else if (strcmp(arch, "parakeet") == 0 || strcmp(arch, "parakeet-tdt") == 0)
         backend = "parakeet";
+    else if (strcmp(arch, "gigaam") == 0)
+        backend = "gigaam";
     else if (strcmp(arch, "canary") == 0)
         backend = "canary";
     else if (strcmp(arch, "canary_qwen") == 0 || strcmp(arch, "canary-qwen") == 0)
@@ -1581,6 +1588,14 @@ struct crispasr_session_seg {
     std::string text;
     int64_t t0 = 0; // centiseconds absolute
     int64_t t1 = 0;
+    // Native per-segment speaker label, "(Speaker N) " form, or empty when the
+    // backend produced none — the same field the CLI adapters populate
+    // (crispasr_segment::speaker) and the same string the CLI prefixes into
+    // text/srt/vtt output. Read via crispasr_session_result_segment_speaker().
+    // #300: added so a backend that natively diarizes can say so through the
+    // session ABI; before this the bindings had no way to express it, so
+    // vibevoice's speaker turns were only reachable as raw JSON inside `text`.
+    std::string speaker;
     // Whisper's per-segment probability that the segment is non-speech (the
     // <|nospeech|> token posterior). Only the whisper branch populates it;
     // every other backend leaves the -1.0 sentinel ("no signal", never a
@@ -1808,6 +1823,9 @@ struct crispasr_session {
 #ifdef CA_HAVE_NEMOTRON
     nemotron_context* nemotron_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_GIGAAM
+    gigaam_context* gigaam_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_CANARY
     canary_context* canary_ctx = nullptr;
 #endif
@@ -1976,6 +1994,12 @@ struct crispasr_session {
 #endif
 #ifdef CA_HAVE_KOKORO
     kokoro_context* kokoro_ctx = nullptr;
+
+    // #316: synthesize these phonemes verbatim instead of running the G2P over
+    // the text. The seam between text processing and the acoustic model — set
+    // it to reproduce another implementation's pronunciation exactly, or to
+    // tell a G2P bug from a model bug. Honoured by kokoro and piper.
+    std::string tts_phonemes;
 #endif
 #ifdef CA_HAVE_VOXTRAL_TTS
     voxtral_tts_context* voxtral_tts_ctx = nullptr;
@@ -2416,6 +2440,21 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         pp.use_flash = g_open_flash_attn_tls;
         s->parakeet_ctx = parakeet_init_from_file(model_path, pp);
         if (!s->parakeet_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_GIGAAM
+    if (s->backend == "gigaam") {
+        gigaam_context_params gp = gigaam_context_default_params();
+        gp.n_threads = s->n_threads;
+        gp.verbosity = g_open_verbosity_tls;
+        gp.use_gpu = g_open_use_gpu_tls;
+        gp.use_flash = g_open_flash_attn_tls;
+        s->gigaam_ctx = gigaam_init_from_file(model_path, gp);
+        if (!s->gigaam_ctx) {
             delete s;
             return nullptr;
         }
@@ -3901,6 +3940,10 @@ CA_EXPORT int crispasr_session_input_sample_rate(crispasr_session* s) {
     if (s->nemotron_ctx)
         return nemotron_sample_rate(s->nemotron_ctx);
 #endif
+#ifdef CA_HAVE_GIGAAM
+    if (s->gigaam_ctx)
+        return gigaam_sample_rate(s->gigaam_ctx);
+#endif
 #ifdef CA_HAVE_CTC
     if (s->ctc_ctx)
         return canary_ctc_sample_rate(s->ctc_ctx);
@@ -3969,6 +4012,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_NEMOTRON
     list += ",nemotron";
+#endif
+#ifdef CA_HAVE_GIGAAM
+    list += ",gigaam";
 #endif
 #ifdef CA_HAVE_CANARY
     list += ",canary";
@@ -5367,6 +5413,35 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         return r;
     }
 #endif
+#ifdef CA_HAVE_GIGAAM
+    if (s->backend == "gigaam" && s->gigaam_ctx) {
+        // GigaAM-v3 is Russian-only, so the sticky source_language is not a
+        // steering knob here; it is ignored on purpose.
+        gigaam_result* gr = gigaam_transcribe_ex(s->gigaam_ctx, pcm, n_samples, 0);
+        if (!gr) {
+            delete r;
+            return nullptr;
+        }
+        crispasr_session_seg seg;
+        seg.text = gr->text ? gr->text : "";
+        if (gr->n_words > 0) {
+            seg.t0 = gr->words[0].t0;
+            seg.t1 = gr->words[gr->n_words - 1].t1;
+            seg.words.reserve(gr->n_words);
+            for (int i = 0; i < gr->n_words; ++i) {
+                crispasr_session_seg::word w;
+                w.text = gr->words[i].text;
+                w.t0 = gr->words[i].t0;
+                w.t1 = gr->words[i].t1;
+                w.p = gr->words[i].p > 0.0f ? gr->words[i].p : 1.0f;
+                seg.words.push_back(std::move(w));
+            }
+        }
+        r->segments.push_back(std::move(seg));
+        gigaam_result_free(gr);
+        return r;
+    }
+#endif
 #ifdef CA_HAVE_NEMOTRON
     if (s->backend == "nemotron" && s->nemotron_ctx) {
         if (lang_set)
@@ -6200,14 +6275,75 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             tk.p = vr->token_probs[i];
             toks.push_back(std::move(tk));
         }
-        crispasr_session_seg seg;
-        seg.text = vr->text;
-        seg.t0 = 0;
-        seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
         _fire_token_callbacks(s, toks);
-        seg.words = emit_words_from_tokens(toks);
+        const std::string raw_text = vr->text;
+        const int64_t dur_cs = (int64_t)((double)n_samples * 100.0 / 16000.0);
+
+        // #300: same parse as the CLI adapter — the model answers with a
+        // Start/End/Speaker/Content array, so split it into one segment per
+        // utterance with the speaker in the structured field. Mirrored here
+        // because this ABI reimplements transcribe inline; a fix that landed
+        // only in crispasr_backend_vibevoice.cpp would leave every binding
+        // handing its callers the raw JSON blob.
+        // CRISPASR_VIBEVOICE_RAW_TRANSCRIPT=1 keeps the pre-#300 single segment.
+        bool parsed = false;
+        if (!crispasr_env::truthy("CRISPASR_VIBEVOICE_RAW_TRANSCRIPT")) {
+            const std::vector<core_vibevoice::Utterance> utts = core_vibevoice::parse(raw_text);
+            // Split the per-token confidence list the same way as the text, so
+            // segment i's words are segment i's tokens and none of the JSON
+            // scaffolding.
+            std::vector<std::string> tok_texts;
+            tok_texts.reserve(toks.size());
+            for (const auto& t : toks)
+                tok_texts.push_back(t.text);
+            const std::vector<std::vector<int>> tok_of = core_vibevoice::assign_tokens(utts, tok_texts);
+            for (size_t u = 0; u < utts.size(); u++) {
+                std::string t = utts[u].text;
+                while (!t.empty() && (unsigned char)t.front() <= ' ')
+                    t.erase(t.begin());
+                while (!t.empty() && (unsigned char)t.back() <= ' ')
+                    t.pop_back();
+                if (t.empty())
+                    continue;
+                crispasr_session_seg seg;
+                seg.text = std::move(t);
+                auto clamp_cs = [&](double sec, int64_t fallback) -> int64_t {
+                    if (sec < 0.0)
+                        return fallback;
+                    int64_t cs = (int64_t)(sec * 100.0 + 0.5);
+                    if (cs < 0)
+                        cs = 0;
+                    if (cs > dur_cs)
+                        cs = dur_cs;
+                    return cs;
+                };
+                seg.t0 = clamp_cs(utts[u].start_s, 0);
+                seg.t1 = clamp_cs(utts[u].end_s, dur_cs);
+                if (seg.t1 < seg.t0)
+                    seg.t1 = seg.t0;
+                if (utts[u].speaker >= 0) {
+                    char spk[32];
+                    snprintf(spk, sizeof(spk), "(Speaker %d) ", utts[u].speaker);
+                    seg.speaker = spk;
+                }
+                std::vector<ca_token_record> seg_toks;
+                seg_toks.reserve(tok_of[u].size());
+                for (int idx : tok_of[u])
+                    seg_toks.push_back(toks[(size_t)idx]);
+                seg.words = emit_words_from_tokens(seg_toks);
+                r->segments.push_back(std::move(seg));
+                parsed = true;
+            }
+        }
+        if (!parsed) {
+            crispasr_session_seg seg;
+            seg.text = raw_text;
+            seg.t0 = 0;
+            seg.t1 = dur_cs;
+            seg.words = emit_words_from_tokens(toks);
+            r->segments.push_back(std::move(seg));
+        }
         vibevoice_result_free(vr);
-        r->segments.push_back(std::move(seg));
         return r;
     }
 #endif
@@ -7301,6 +7437,9 @@ CA_EXPORT int64_t crispasr_session_result_segment_t0(crispasr_session_result* r,
 CA_EXPORT int64_t crispasr_session_result_segment_t1(crispasr_session_result* r, int i) {
     return (r && i >= 0 && i < (int)r->segments.size()) ? r->segments[i].t1 : 0;
 }
+CA_EXPORT const char* crispasr_session_result_segment_speaker(crispasr_session_result* r, int i) {
+    return (r && i >= 0 && i < (int)r->segments.size()) ? r->segments[i].speaker.c_str() : "";
+}
 CA_EXPORT int crispasr_session_result_n_words(crispasr_session_result* r, int i_seg) {
     if (!r || i_seg < 0 || i_seg >= (int)r->segments.size())
         return 0;
@@ -7876,6 +8015,19 @@ CA_EXPORT int crispasr_session_tada_set_makeref_models(crispasr_session* s, cons
 // Returns 0 on success, -1 if the session isn't valid, -2 if the name
 // is unknown for the active backend, -3 if the active backend has no
 // preset-speaker contract.
+// #316: drive the acoustic model with these phonemes, skipping the G2P.
+// Empty string clears it. Returns 0, -1 on a bad session, or -2 when the active
+// backend has no phonemes-in entry point (kokoro and piper do) — a soft no-op
+// like the other setters, so a caller can probe without special-casing.
+CA_EXPORT int crispasr_session_set_tts_phonemes(crispasr_session* s, const char* phonemes) {
+    if (!s)
+        return -1;
+    s->tts_phonemes = phonemes ? phonemes : "";
+    if (s->tts_phonemes.empty())
+        return 0;
+    return (s->backend == "kokoro" || s->backend == "piper") ? 0 : -2;
+}
+
 CA_EXPORT int crispasr_session_set_speaker_name(crispasr_session* s, const char* name) {
     if (!s || !name)
         return -1;
@@ -8201,7 +8353,9 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
         const std::string tts_lang = !s->target_language.empty() ? s->target_language : s->source_language;
         if (!tts_lang.empty() && tts_lang != "auto")
             kokoro_set_language(s->kokoro_ctx, tts_lang.c_str());
-        float* pcm = kokoro_synthesize(s->kokoro_ctx, text, out_n_samples);
+        float* pcm = s->tts_phonemes.empty()
+                         ? kokoro_synthesize(s->kokoro_ctx, text, out_n_samples)
+                         : kokoro_synthesize_phonemes(s->kokoro_ctx, s->tts_phonemes.c_str(), out_n_samples);
         if (!pcm && s->last_synth_error.empty()) {
             s->last_synth_error = "kokoro synthesis failed — "
                                   "this is usually because the built-in phonemizer could not "
@@ -9526,6 +9680,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
     if (s->nemotron_ctx)
         nemotron_free(s->nemotron_ctx);
 #endif
+#ifdef CA_HAVE_GIGAAM
+    if (s->gigaam_ctx)
+        gigaam_free(s->gigaam_ctx);
+#endif
 #ifdef CA_HAVE_CANARY
     if (s->canary_ctx)
         canary_free(s->canary_ctx);
@@ -10752,6 +10910,10 @@ CA_EXPORT int crispasr_session_set_max_new_tokens(crispasr_session* s, int n) {
 #ifdef CA_HAVE_COHERE
     if (s->cohere_ctx)
         cohere_set_max_new_tokens(s->cohere_ctx, s->max_new_tokens);
+#endif
+#ifdef CA_HAVE_VIBEVOICE
+    if (s->vibevoice_ctx)
+        vibevoice_set_max_new_tokens(s->vibevoice_ctx, s->max_new_tokens);
 #endif
     return 0;
 }

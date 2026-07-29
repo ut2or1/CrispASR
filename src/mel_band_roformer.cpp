@@ -34,10 +34,12 @@
 
 // #296: run_time/run_freq parallelise the band/time loops with OpenMP and each
 // block calls BLAS — a threaded BLAS would nest and oversubscribe cores. Pin BLAS
-// to one thread. Weak so it's a harmless no-op with reference cblas / MKL /
-// Accelerate (which aren't OpenBLAS).
-#if defined(HAVE_BLAS) && !defined(__APPLE__)
-extern "C" void openblas_set_num_threads(int) __attribute__((weak));
+// to one thread. Gated on CRISPASR_MBR_OPENBLAS (set by CMake ONLY when OpenBLAS
+// is the linked BLAS), so the symbol is guaranteed present — no __attribute__(
+// (weak)), which MSVC rejects. Reference cblas / MKL / Accelerate skip this
+// (single-threaded or self-managed).
+#if defined(CRISPASR_MBR_OPENBLAS)
+extern "C" void openblas_set_num_threads(int);
 #endif
 
 #include <algorithm>
@@ -861,11 +863,10 @@ bool run_forward(mel_band_roformer_context* ctx, const std::vector<std::vector<f
     const int n_freqs = ctx->n_freqs();
     const int T = stft_n_frames(T_samp, hp.hop);
 
-#if defined(HAVE_BLAS) && !defined(__APPLE__)
+#if defined(CRISPASR_MBR_OPENBLAS)
     // Coarse OpenMP parallelism (band/time loops) does the threading; keep each
-    // per-block BLAS call serial so they don't oversubscribe. No-op if not OpenBLAS.
-    if (openblas_set_num_threads)
-        openblas_set_num_threads(1);
+    // per-block OpenBLAS call serial so they don't oversubscribe cores.
+    openblas_set_num_threads(1);
 #endif
 
     // #296: per-stage profiling (CRISPASR_MBR_PROFILE=1) to localise where the

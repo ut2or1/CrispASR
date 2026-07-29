@@ -74,6 +74,14 @@ constexpr Entry k_registry[] = {
     // (predictor cos 0.998 vs the upstream F32; ASR round-trip identical). #283.
     {"sidon", "sidon-v0.1-q8_0.gguf",
      "https://huggingface.co/cstr/Sidon-GGUF/resolve/main/sidon-v0.1-q8_0.gguf", "~335 MB", nullptr, nullptr},
+    // GigaAM-v3 (ai-sage/GigaAM-v3) — Russian ASR. Default to the e2e_rnnt
+    // revision at Q8_0: lowest WER, emits punctuation + casing + ITN, and its
+    // transcript is byte-identical to the PyTorch reference. Q4_K is published
+    // too but drops a few capital letters on the SentencePiece variants, so it
+    // is not the auto-download default.
+    {"gigaam", "gigaam-v3-e2e-rnnt-q8_0.gguf",
+     "https://huggingface.co/cstr/gigaam-v3-GGUF/resolve/main/gigaam-v3-e2e-rnnt-q8_0.gguf", "~249 MB", nullptr,
+     nullptr},
     {"nemotron", "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
      "https://huggingface.co/cstr/nemotron-3.5-asr-streaming-0.6b-GGUF/resolve/main/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
      "~458 MB", nullptr, nullptr},
@@ -321,6 +329,9 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/data2vec-audio-960h-GGUF/resolve/main/data2vec-audio-base-960h-q4_k.gguf", "~60 MB", nullptr, nullptr},
     {"vibevoice", "vibevoice-asr-q4_k.gguf",
      "https://huggingface.co/cstr/vibevoice-asr-GGUF/resolve/main/vibevoice-asr-q4_k.gguf", "~4.5 GB", nullptr, nullptr},
+    {"vibevoice-bitnet", "vibevoice-asr-bitnet-tq2.gguf",
+     "https://huggingface.co/cstr/vibevoice-asr-bitnet-GGUF/resolve/main/vibevoice-asr-bitnet-tq2.gguf", "~1.6 GB",
+     nullptr, nullptr},
     {"vibevoice-1.5b", "vibevoice-1.5b-tts-q4_k.gguf",
      "https://huggingface.co/cstr/vibevoice-1.5b-GGUF/resolve/main/vibevoice-1.5b-tts-q4_k.gguf", "~1.6 GB", nullptr,
      nullptr},

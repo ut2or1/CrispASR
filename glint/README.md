@@ -69,4 +69,4 @@ and rewrites *only* the marker line below — the prose above is
 maintained here by hand and does not auto-update, so a codec added
 upstream will not be described until this file is edited.
 
-Synced at upstream commit: `39f1feb959806b04740ebfc43131e3e5d889fa32` (feat: add clean-room FLAC decoder).
+Synced at upstream commit: `946642033e489117fe12225783ff12e130451310` (docs: correct the wasm surface in README; note the downstream consumer).

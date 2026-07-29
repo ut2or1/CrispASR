@@ -55,6 +55,7 @@
 #include "granite_speech.h"
 #include "granite_nle.h"
 #include "parakeet.h"
+#include "gigaam.h"
 #include "canary.h"
 #include "canary_qwen.h"
 #include "cohere.h"
@@ -1153,7 +1154,7 @@ int main(int argc, char** argv) {
                 "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, omnivoice, tada-tts, "
                 "tada-encoder, kokoro, granite, "
                 "granite-4.1, "
-                "granite-nle, parakeet, chatterbox, voxcpm2-tts, "
+                "granite-nle, parakeet, gigaam, chatterbox, voxcpm2-tts, "
                 "canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, moonshine-streaming, "
                 "kyutai-stt, parler-tts, moss-audio\n"
                 "  model.gguf    crispasr-compatible model weights\n"
@@ -3686,6 +3687,181 @@ int main(int argc, char** argv) {
             n_fail++;
         }
         granite_nle_free(ctx);
+    } else if (backend_name == "gigaam") {
+        // GigaAM-v3: rotary Conformer + CTC or RNN-T head.
+        // Reference: tools/reference_backends/gigaam.py (the HF blueprint).
+        auto cp = gigaam_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        gigaam_context* ctx = gigaam_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load gigaam model\n");
+            return 4;
+        }
+
+        // ---- mel ----
+        // Our mel is row-major (n_mels, T_mel), so the GGUF ne is
+        // [T_mel, n_mels] — ne[0] is the fast axis.
+        {
+            int n_mels = 0, T_mel = 0;
+            float* mel = gigaam_compute_mel(ctx, samples.data(), (int)samples.size(), &n_mels, &T_mel);
+            if (mel) {
+                auto rep = ref.compare("mel_spectrogram", mel, (size_t)n_mels * T_mel);
+                print_row("mel_spectrogram", rep, COS_THRESHOLD);
+                record(rep);
+                free(mel);
+            } else {
+                printf("[ERR ] mel_spectrogram         gigaam_compute_mel returned null\n");
+                n_fail++;
+            }
+        }
+
+        // ---- encoder, from OUR mel (end-to-end) ----
+        {
+            int n_mels = 0, T_mel = 0;
+            float* mel = gigaam_compute_mel(ctx, samples.data(), (int)samples.size(), &n_mels, &T_mel);
+            if (mel) {
+                int T_enc = 0, d_model = 0;
+                float* enc = gigaam_run_encoder(ctx, mel, n_mels, T_mel, &T_enc, &d_model);
+                free(mel);
+                if (enc) {
+                    auto rep = ref.compare("encoder_output", enc, (size_t)T_enc * d_model);
+                    print_row("encoder_output", rep, COS_THRESHOLD);
+                    record(rep);
+                    free(enc);
+                } else {
+                    printf("[ERR ] encoder_output          gigaam_run_encoder returned null\n");
+                    n_fail++;
+                }
+            }
+        }
+
+        // ---- per-stage encoder diff, driven by the REFERENCE mel ----
+        // Separates encoder-internal divergence from mel bleed-through:
+        // the first stage that drops is the bug (HARD RULE #2).
+        std::vector<float> ref_enc; // reference encoder output, (T_enc, d_model)
+        int ref_T_enc = 0, ref_d = 0;
+        {
+            auto enc_pair = ref.get_f32("encoder_output");
+            auto enc_shp = ref.shape("encoder_output");
+            if (enc_pair.first && enc_shp.size() >= 2) {
+                ref_d = (int)enc_shp[0];
+                ref_T_enc = (int)enc_shp[1];
+                ref_enc.assign(enc_pair.first, enc_pair.first + (size_t)ref_T_enc * ref_d);
+            }
+        }
+        {
+            auto mel_pair = ref.get_f32("mel_spectrogram");
+            auto mel_shp = ref.shape("mel_spectrogram");
+            if (mel_pair.first && mel_shp.size() >= 2) {
+                const int T_mel = (int)mel_shp[0];
+                const int n_mels = (int)mel_shp[1];
+                const int n_layers = gigaam_n_layers(ctx);
+                const int d_model = gigaam_d_model(ctx);
+                const int T_enc_max = T_mel / 4 + 8;
+                std::vector<std::vector<float>> bufs((size_t)n_layers + 1,
+                                                     std::vector<float>((size_t)d_model * T_enc_max));
+                std::vector<float*> ptrs((size_t)n_layers + 1);
+                for (int i = 0; i <= n_layers; i++)
+                    ptrs[(size_t)i] = bufs[(size_t)i].data();
+                int T_enc = 0, d_out = 0;
+                int rc = gigaam_run_encoder_dump(ctx, mel_pair.first, n_mels, T_mel, ptrs.data(), (int)ptrs.size(),
+                                                 &T_enc, &d_out);
+                if (rc == 0 && T_enc > 0) {
+                    auto rep0 = ref.compare("pre_encode_output", ptrs[0], (size_t)T_enc * d_out);
+                    print_row("pre_encode_output", rep0, COS_THRESHOLD);
+                    record(rep0);
+                    for (int il = 0; il < n_layers; il++) {
+                        char nm[64];
+                        snprintf(nm, sizeof(nm), "encoder_layer_%d", il);
+                        auto rep = ref.compare(nm, ptrs[(size_t)il + 1], (size_t)T_enc * d_out);
+                        print_row(nm, rep, COS_THRESHOLD);
+                    }
+                } else {
+                    printf("[SKIP] encoder_layer_*         gigaam_run_encoder_dump rc=%d\n", rc);
+                }
+            } else {
+                printf("[SKIP] encoder_layer_*         reference mel_spectrogram not in archive\n");
+            }
+        }
+
+        // ---- head, driven by the REFERENCE encoder output ----
+        if (!ref_enc.empty()) {
+            if (!gigaam_is_rnnt(ctx)) {
+                int C = 0;
+                float* lp = gigaam_ctc_log_probs(ctx, ref_enc.data(), ref_T_enc, ref_d, &C);
+                if (lp) {
+                    auto rep = ref.compare("ctc_log_probs", lp, (size_t)ref_T_enc * C);
+                    print_row("ctc_log_probs", rep, COS_THRESHOLD);
+                    record(rep);
+                    auto rep2 = ref.compare_argmax("ctc_log_probs", lp, (size_t)ref_T_enc * C);
+                    print_row("ctc_log_probs_top1", rep2, COS_THRESHOLD);
+                    free(lp);
+                } else {
+                    printf("[ERR ] ctc_log_probs           gigaam_ctc_log_probs returned null\n");
+                    n_fail++;
+                }
+            } else {
+                int jh = 0;
+                float* proj = gigaam_joint_project_encoder(ctx, ref_enc.data(), ref_T_enc, ref_d, &jh);
+                if (proj) {
+                    auto rep = ref.compare("joint_enc_proj", proj, (size_t)ref_T_enc * jh);
+                    print_row("joint_enc_proj", rep, COS_THRESHOLD);
+                    record(rep);
+                } else {
+                    printf("[ERR ] joint_enc_proj          gigaam_joint_project_encoder returned null\n");
+                    n_fail++;
+                }
+                int ph = 0;
+                float* pred = gigaam_predictor_initial(ctx, &ph);
+                if (pred) {
+                    auto rep = ref.compare("pred_initial", pred, (size_t)ph);
+                    print_row("pred_initial", rep, COS_THRESHOLD);
+                    record(rep);
+                } else {
+                    printf("[ERR ] pred_initial            gigaam_predictor_initial returned null\n");
+                    n_fail++;
+                }
+                if (proj && pred) {
+                    int C = 0;
+                    float* lg = gigaam_joint_step(ctx, proj, pred, &C);
+                    if (lg) {
+                        auto rep = ref.compare("joint_logits_t0", lg, (size_t)C);
+                        print_row("joint_logits_t0", rep, COS_THRESHOLD);
+                        record(rep);
+                        free(lg);
+                    } else {
+                        printf("[ERR ] joint_logits_t0         gigaam_joint_step returned null\n");
+                        n_fail++;
+                    }
+                }
+                free(proj);
+                free(pred);
+            }
+        }
+
+        // ---- decoded transcript (HARD RULE #3: the acceptance gate) ----
+        {
+            const std::string ref_text = ref.meta("generated_text");
+            char* my_text = gigaam_transcribe(ctx, samples.data(), (int)samples.size());
+            if (my_text) {
+                if (ref_text.empty()) {
+                    printf("[INFO] transcribe              %s (no ref)\n", my_text);
+                } else if (ref_text == std::string(my_text)) {
+                    printf("[PASS] transcribe              %s\n", my_text);
+                } else {
+                    printf("[FAIL] transcribe              cpp: %s\n", my_text);
+                    printf("                               ref: %s\n", ref_text.c_str());
+                    n_fail++;
+                }
+                free(my_text);
+            } else {
+                printf("[ERR ] transcribe              gigaam_transcribe returned null\n");
+                n_fail++;
+            }
+        }
+
+        gigaam_free(ctx);
     } else if (backend_name == "parakeet") {
         auto cp = parakeet_context_default_params();
         cp.n_threads = 4;

@@ -1,6 +1,23 @@
 # F5-TTS performance — issue #294
 
-## NOW — active work
+## NOW — status
+
+**Quality follow-ups DONE (2026-07-25), audio-confirmed** — after the speed work
+the reporter hit two quality bugs; both fixed and TTS→ASR-roundtripped on M1 Metal
+(F16 GGUF + whisper-large-v3-turbo):
+- **Chinese g2p** (`9a2fd7dc` + `3167d014`): `convert_to_pinyin` was ASCII-only →
+  Chinese was silence. Added `src/core/pinyin_g2p.*` (jieba-min max-match +
+  pypinyin TONE3 + 不/一/third-tone sandhi, data embedded via
+  `tools/gen_pinyin_data.py`), parity 99.8% vs pypinyin (`tests/test-pinyin-g2p`).
+  Then the real audio fix: f5 was char-splitting each pinyin syllable — now maps
+  each token to its vocab id directly. ZH roundtrip exact.
+  ⚠ [[LEARNINGS: token-parity ≠ working audio]] — the g2p test was green while
+  audio was garbled; only the roundtrip caught the downstream char-split.
+- **English truncation** (`9a2fd7dc`): removed the CrispASR-only rate clamp
+  (`fixed_rate*2.5`, no upstream equivalent) that cut the tail of a slow ref;
+  now asymmetric (loose upper). `CRISPASR_F5_DURATION_CLAMP=0` = exact upstream.
+
+## Speed work (original #294)
 
 Branch `perf/f5-speedups` (worktree `CrispASR-f5perf`). Reporter: F5-TTS slow on
 RTX 5060 Ti (sm_120) + Ryzen 5 2600, F16 model, 32 ODE steps.

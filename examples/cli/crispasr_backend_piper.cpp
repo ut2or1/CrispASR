@@ -83,6 +83,21 @@ public:
         float* pcm = nullptr;
         int sr = 0;
 
+        // #316: --tts-phonemes drives the acoustic model directly. piper's
+        // runtime always had this call; the adapter previously reached it only
+        // by accident, as a fallback when phonemization failed and the text
+        // happened to be non-ASCII.
+        if (!p.tts_phonemes.empty()) {
+            int np = piper_tts_synthesize_phonemes(ctx_, p.tts_phonemes.c_str(), &pcm, &sr);
+            if (np <= 0 || !pcm) {
+                fprintf(stderr, "piper: phoneme synthesis failed for '%s'\n", p.tts_phonemes.c_str());
+                return {};
+            }
+            std::vector<float> out(pcm, pcm + np);
+            free(pcm);
+            return out;
+        }
+
         // Try full text→phoneme→synth (espeak-ng or built-in G2P).
         int n = piper_tts_synthesize(ctx_, text.c_str(), &pcm, &sr);
         if (n <= 0 || !pcm) {

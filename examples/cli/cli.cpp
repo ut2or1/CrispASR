@@ -626,6 +626,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.text_file = ARGV_NEXT;
     } else if (arg == "--instruct") {
         params.tts_instruct = ARGV_NEXT;
+    } else if (arg == "--tts-phonemes") {
+        params.tts_phonemes = ARGV_NEXT;
     } else if (arg == "--voice-dir") {
         params.tts_voice_dir = ARGV_NEXT;
     } else if (arg == "--tts-max-input-chars") {
@@ -728,6 +730,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.server_ws_port = std::stoi(ARGV_NEXT);
     } else if (arg == "--wyoming-port") {
         params.wyoming_port = std::stoi(ARGV_NEXT);
+    } else if (arg == "--server-workers") {
+        params.server_workers = std::max(1, std::stoi(ARGV_NEXT));
     } else if (arg == "--api-keys") {
         params.server_api_keys = ARGV_NEXT;
     } else if (arg == "--stream-step") {
@@ -814,6 +818,14 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.vad = true; // #227: import implies VAD
     } else if (arg == "--vad-import-strict") {
         params.vad_import_strict = true; // #227: refuse a chunk-length mismatch
+    } else if (arg == "--strict-pipeline") {
+        params.strict_pipeline = true; // #311: require every explicitly-requested aux stage to succeed
+    } else if (arg == "--require-vad") {
+        params.require_vad = true; // #311
+    } else if (arg == "--require-word-timestamps") {
+        params.require_word_timestamps = true; // #311
+    } else if (arg == "--require-punctuation") {
+        params.require_punctuation = true; // #311
     } else if (arg == "--vad-export-raw") {
         params.vad_export_file = ARGV_NEXT;
         params.vad_export_raw = true; // #227: export raw speech segments, not chunks
@@ -1192,6 +1204,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr, "  --host HOST                       [%-7s] server bind address\n", params.server_host.c_str());
     fprintf(stderr, "  --port PORT                       [%-7d] server port\n", params.server_port);
     fprintf(stderr,
+            "  --server-workers N                [%-7d] server: N>1 loads N model instances so pure-ASR "
+            "requests run concurrently (N× memory; see docs/concurrency.md)\n",
+            params.server_workers);
+    fprintf(stderr,
             "  --ws-port PORT                    [%-7d] server: real-time WebSocket ASR streaming port "
             "(-1 off, 0 = port+1)\n",
             params.server_ws_port);
@@ -1308,6 +1324,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.tts_ref_asr.empty() ? "whisper" : params.tts_ref_asr.c_str());
     fprintf(stderr, "             --instruct \"TEXT\"        natural-language voice/style description "
                     "(qwen3-tts: VoiceDesign = voice description; CustomVoice = style control)\n");
+    fprintf(stderr, "             --tts-phonemes \"IPA\"     synthesize these phonemes verbatim, skipping the "
+                    "G2P (kokoro; use to A/B a pronunciation against another implementation)\n");
     fprintf(
         stderr,
         "             --make-ref                create a TADA voice reference GGUF (with --voice <audio.wav>\n"
@@ -1419,6 +1437,16 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
         "import)\n",
         params.vad_import_file.empty() ? "none" : params.vad_import_file.c_str(),
         params.vad_import_strict ? "true" : "false", params.vad_export_raw ? "true" : "false");
+    fprintf(stderr,
+            "             --strict-pipeline            [%-7s] #311: non-zero exit if an explicitly-requested aux stage "
+            "(VAD/-vm, aligner/-am, --punc-model) fails to load or produce its output (a stage that ran and found no "
+            "speech is still success)\n"
+            "             --require-vad                [%-7s] force VAD-load-success requirement (needs --vad/-vm)\n"
+            "             --require-word-timestamps    [%-7s] fail if any non-empty segment lacks word timestamps\n"
+            "             --require-punctuation        [%-7s] force punctuation-model-load requirement (needs "
+            "--punc-model)\n",
+            params.strict_pipeline ? "true" : "false", params.require_vad ? "true" : "false",
+            params.require_word_timestamps ? "true" : "false", params.require_punctuation ? "true" : "false");
     fprintf(stderr,
             "             --separate                  [%-7s] source separation task; writes <input>_<stem>.wav "
             "(mel-band-roformer / htdemucs, arch auto-detected)\n",
@@ -2485,8 +2513,14 @@ int main(int argc, char** argv) {
         // /nonexistent.json` returned 0 and transcribed normally, so the whole
         // point of #227 (pay VAD once, reuse across models) was a no-op in the
         // most ordinary invocation. Route those runs through the dispatch.
+        // #311: any strict-pipeline requirement must route through the unified
+        // dispatch (crispasr_run.cpp), where the VAD/aligner/punc enforcement
+        // lives — the legacy whisper path below does not run it, so a strict
+        // flag there would be a silent no-op (exactly the trap #311 fixes).
+        const bool strict_requested = params.strict_pipeline || params.require_vad || params.require_word_timestamps ||
+                                      params.require_punctuation;
         if (explicit_backend || model_is_auto || auto_detected_non_whisper || params.stream ||
-            !params.tts_text.empty() || !params.vad_import_file.empty()) {
+            !params.tts_text.empty() || !params.vad_import_file.empty() || strict_requested) {
             const int rc = crispasr_run_backend(params);
 #if defined(_WIN32)
             // Bypass global C++ destructors (ggml Vulkan device teardown can

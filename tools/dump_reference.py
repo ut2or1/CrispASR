@@ -125,6 +125,11 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # audio arg is a real multi-speaker clip.
     "tiron":      "reference_backends.tiron",
     "parakeet":   "reference_backends.parakeet",
+    # GigaAM-v3 (ai-sage/GigaAM-v3): rotary Conformer + CTC or RNN-T head.
+    # model_dir is a LOCAL snapshot of one revision (ctc / rnnt / e2e_ctc /
+    # e2e_rnnt), or the repo id plus GIGAAM_REVISION=<rev>. Loaded with
+    # trust_remote_code — modeling_gigaam.py is the driving inference code.
+    "gigaam":     "reference_backends.gigaam",
     # Parakeet-TDT MAES beam decoding. Same model as "parakeet" but captures
     # transducer component intermediates (prediction net, joint net) plus
     # full MAES decode output. Config via MAES_BEAM_SIZE / MAES_NUM_STEPS /

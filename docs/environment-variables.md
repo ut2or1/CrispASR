@@ -137,6 +137,7 @@ These are not tied to a single backend.
 | `CRISPASR_G2P_DICT_SOURCE` / `_G2P_MODEL_PATH` | G2P dictionary source / neural G2P model path. |
 | `CRISPASR_ESPEAK_DATA_PATH` | eSpeak-NG data directory. |
 | `CRISPASR_KOKORO_G2P` | Kokoro G2P backend selection. |
+| `CRISPASR_KOKORO_MISAKI_IPA` | `0` disables the espeak-IPA → misaki-alphabet conversion Kokoro needs (#316), restoring the raw G2P spelling for A/B. On by default. |
 
 ### Watermark / provenance
 
@@ -201,7 +202,8 @@ scheme:
 
 - **`crisp_audio/`** — audio tower: `CRISP_AUDIO_DUMP_STAGES`, `CRISP_AUDIO_KEEP_PAD_FRAMES`, `CRISP_AUDIO_WINDOWED_ATTN`.
 - **`glint/`** — clean-room MP3/AAC codec: `GLINT_*`, `AACDBG`.
-- **`crisp_lid/` · `crisp_punc/` · `crisp_truecase/`** — standalone LID / punctuation / truecasing libraries (mirrored, not built by the main target); their runtime copies in `src/` follow each library's own naming (`LID_*`, `FIREREDPUNC_*`, `PCS_*`, `TRUECASER_*`).
+- **`crisp_lid/` · `crisp_punc/` · `crisp_truecase/`** — standalone LID / punctuation / truecasing libraries; they and their `src/` counterparts follow each library's own naming (`LID_*`, `FIREREDPUNC_*`, `PCS_*`, `TRUECASER_*`). `FIREREDPUNC_DEBUG=1` prints each restore pass as `[PUNCDBG] in=<…>` / `out=<…>`, which is the quickest way to see a backend's *true* model output — `--no-punctuation` is not, because it strips punctuation after the fact and so hides text the model punctuated itself.
+  > ⚠ **These libraries are built by the main target, and each has a second copy under `src/`.** `src/CMakeLists.txt` prefers `crisp_punc/` (etc.) and falls back to the `src/` copy only when the sibling directory is missing from a checkout — so the `crisp_punc/` copy is what normally links, and **a change must be applied to both**. #308's capitalisation fix went into `src/fireredpunc.cpp` alone and was dead code for months while the shipping copy kept the bug. `tests/test-punc-copies-in-sync.cpp` now fails if they diverge.
 
 ## Test fixtures
 

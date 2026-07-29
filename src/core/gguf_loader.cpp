@@ -541,6 +541,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
             char* tensor_base = (char*)mf.base + data_off;
             const size_t buf_size = mmap_size > data_off ? (mmap_size - data_off) : 0;
 
+            // cppcheck-suppress uninitvar
             auto* mctx = new mmap_buffer_ctx{};
             mctx->mmap_base = mf.base;
             mctx->mmap_size = mmap_size;

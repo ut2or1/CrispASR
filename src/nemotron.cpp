@@ -931,6 +931,7 @@ static ggml_tensor* nemotron_build_block_streaming(ggml_context* ctx0, ggml_tens
 static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, ggml_tensor* pos_enc, int T,
                                          const nemotron_enc_layer& e, const core_conformer::BlockParams& p,
                                          ggml_tensor* window_mask = nullptr) {
+    // cppcheck-suppress ctuuninitvar
     const int d = p.d;
     const int n_heads = p.n_heads;
     const int head_dim = p.head_dim;

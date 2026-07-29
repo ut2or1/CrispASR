@@ -92,11 +92,13 @@ crispasr --list-backends
 | `-l LANG`, `--language LANG` | ISO-639-1 code (default: `en`) |
 | `--tts "TEXT"` | Synthesize speech from text (requires `CAP_TTS` backend). Output via `--tts-output` |
 | `--tts-output FNAME` | Output path for TTS WAV (default: `tts_output.wav`) |
+| `--tts-phonemes "IPA"` | Synthesize these phonemes verbatim, skipping the G2P — the seam for telling a G2P bug from a model bug (#316). `kokoro` and `piper` only; any other backend exits 2 rather than silently synthesizing `--tts` instead. See [tts.md](tts.md#driving-the-phonemes-directly---tts-phonemes) |
 | `--tts-stream` | Stream s16le mono PCM to stdout per sentence (pipe to a player); logs stay on stderr. See [streaming.md](streaming.md#streaming-synthesized-audio-out) |
 | `--s2s` | Speech-to-speech mode: audio in → audio out (requires `CAP_S2S` backend, e.g. `lfm2-audio`, `mini-omni2`, `sidon`, `voxcpm2-vae`) |
 | `--s2s-output FNAME` | Output path for S2S WAV |
 | `--voice PATH` | Voice reference for TTS: GGUF voice pack or reference WAV for cloning (`--i-have-rights` required for WAV cloning) |
 | `--server` | Run as HTTP server with persistent model (see [`server.md`](server.md)) |
+| `--server-workers N` | Server: `N>1` loads N model instances so pure-ASR requests run concurrently (N× memory; env `CRISPASR_SERVER_WORKERS` overrides). See [`concurrency.md`](concurrency.md) |
 | `--ws-port N` | Server: real-time WebSocket ASR streaming port (`-1` off, `0` = HTTP port + 1) |
 | `--no-warmup` | Server: skip the startup warmup transcribe (workaround for GPU drivers that hang in warmup, #165) |
 | `--list-backends` | Print the capability matrix and exit |
@@ -251,6 +253,62 @@ crispasr -m whisper.gguf  -f talk.wav --vad-import talk.vad.json --chunk-seconds
 
 Files written before `"kind"` existed are read as `chunks` (the historical
 behaviour), so older exports keep working.
+
+### Strict pipeline — require aux stages to succeed (`--strict-pipeline`, #311)
+
+By default CrispASR **degrades gracefully**: a VAD, forced-aligner, or
+punctuation model that fails to load is skipped with a stderr warning and the
+command still exits `0`. That is convenient interactively but hides failures
+from automation — a zero exit and a valid `-ojf` do **not** prove the requested
+stages ran. For integrations that treat those stages as *required task
+properties*, opt into strict semantics:
+
+| Flag | Effect |
+|---|---|
+| `--strict-pipeline` | Require every stage **explicitly requested** on this command line: VAD if `--vad`/`-vm`, word timestamps if `-am`/`--force-aligner`, punctuation if `--punc-model`. |
+| `--require-vad` | Force the VAD requirement (needs `--vad`/`-vm`). |
+| `--require-word-timestamps` | Every non-empty output segment must carry word timestamps (native **or** aligned). |
+| `--require-punctuation` | Force the punctuation-model requirement (needs `--punc-model`). |
+
+Under strict semantics a required stage that **fails to load or produce its
+output** returns a **non-zero exit** (and the output file is not written), while
+a stage that **ran and legitimately found nothing** (VAD detected no speech)
+stays a success. Nothing depends on parsing stderr, and a direct local `-m`/
+`-vm`/`-am`/`--punc-model` path is used as-is — strict mode never falls back to
+auto-download.
+
+Distinct exit codes let a caller tell *which* stage failed:
+
+| Exit | Meaning |
+|---|---|
+| `2` | Config error — a `--require-*` whose stage was never requested |
+| `30` | Required VAD model failed to load |
+| `31` | Required word timestamps missing (aligner failed to load, or no native/aligned words on a non-empty segment) |
+| `32` | Required punctuation model failed to load |
+
+```bash
+# The integration's contract: rc 0 ⟺ every required stage succeeded.
+crispasr --backend parakeet -m asr.gguf -f in.wav -l zh \
+    --vad -vm vad.gguf -am aligner.gguf --force-aligner \
+    --punc-model punc.gguf --strict-pipeline -ojf -of result
+echo "rc=$?"   # 0 = VAD ran + words present + punctuation applied; 30/31/32 = that stage failed
+```
+
+Strict requirements route through the unified backend dispatch, so pass an
+explicit `--backend` (any backend, including `--backend whisper`) rather than
+relying on the legacy whisper-only path.
+
+**Across surfaces.** The CLI and the **HTTP server** both auto-run these stages
+and both honour strict semantics (the server via `strict_pipeline` /
+`require_*` form fields, returning HTTP 400 — see
+[`server.md`](server.md#strict-pipeline--fail-on-a-required-stages-failure-311)).
+The decision logic is shared (`crispasr_strict.h`) so they can't drift. The
+**session C-ABI** (`crispasr_session_*`, used by the language bindings) is a
+lower-level, caller-driven primitive — it does not auto-orchestrate VAD +
+alignment + punctuation, so there is no silent degradation to guard: a binding
+caller invokes each stage explicitly (`crispasr_session_transcribe_vad`, the
+aligner, the punc setter) and already sees each one's result directly. Strict
+mode is therefore a property of the two orchestrating front-ends (CLI, server).
 
 #### Transcribing a time window (`--offset-t` / `--duration`, #91)
 
