@@ -375,3 +375,32 @@ complying with their respective licenses.
     Building with -DCRISPASR_WITH_ESPEAK_NG=ON links espeak-ng at build
     time, making the resulting binary a GPL-3.0 derivative that cannot be
     distributed under MIT-only terms.
+
+────────────────────────────────────────────────────────────────────────────────
+WeSpeaker ResNet34-LM speaker embedding model — MODEL WEIGHTS
+(https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM)
+Creative Commons Attribution 4.0 International (CC-BY-4.0)
+────────────────────────────────────────────────────────────────────────────────
+
+CrispASR redistributes GGUF conversions of the WeSpeaker VoxCeleb ResNet34-LM
+speaker-embedding weights, used by the `--diarize-method foxnose` diarizer
+(issue #324).
+
+  Source model : Wespeaker/wespeaker-voxceleb-resnet34-LM
+  Upstream     : https://github.com/wenet-e2e/wespeaker
+  Licence      : CC-BY-4.0 — https://creativecommons.org/licenses/by/4.0/
+
+CC-BY-4.0 permits redistribution and modification, including commercially,
+PROVIDED attribution is given. This notice, and the `license: cc-by-4.0` tag
+plus credit on the converted model card, constitute that attribution.
+
+Note: some downstream projects describe these weights as Apache-2.0. That is
+incorrect — the wenet-e2e/wespeaker CODE is Apache-2.0, but the published
+WEIGHTS are CC-BY-4.0, which carries the attribution requirement above.
+
+No source code from wenet-e2e/wespeaker or from FoxNoseTech/diarize (both
+Apache-2.0) is incorporated into CrispASR. The GGUF converter, the ggml
+runtime and the clustering stack are independent implementations written from
+the published architecture and algorithms; the upstream packages are used only
+as measurement oracles by the reference dumper, never vendored or linked.
+

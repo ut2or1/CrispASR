@@ -82,6 +82,12 @@ constexpr Entry k_registry[] = {
     {"gigaam", "gigaam-v3-e2e-rnnt-q8_0.gguf",
      "https://huggingface.co/cstr/gigaam-v3-GGUF/resolve/main/gigaam-v3-e2e-rnnt-q8_0.gguf", "~249 MB", nullptr,
      nullptr},
+    // #324: speaker embedder for --diarize-method foxnose. NOT an ASR backend —
+    // registered so --diarize-embedder auto can fetch it. ⚠ CC-BY-4.0 weights:
+    // redistribution requires attribution (see THIRD_PARTY_NOTICES.txt).
+    {"wespeaker", "wespeaker-resnet34-lm.gguf",
+     "https://huggingface.co/cstr/wespeaker-resnet34-lm-GGUF/resolve/main/wespeaker-resnet34-lm.gguf", "~24 MB",
+     nullptr, nullptr},
     {"nemotron", "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
      "https://huggingface.co/cstr/nemotron-3.5-asr-streaming-0.6b-GGUF/resolve/main/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
      "~458 MB", nullptr, nullptr},

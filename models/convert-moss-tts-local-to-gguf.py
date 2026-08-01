@@ -297,10 +297,17 @@ def write_backbone_gguf(model_dir: Path, config: dict, out_path: Path, out_dtype
 #
 # We emit ONLY the tensors the decode path needs (see docs/moss-tts/STUDY-4B.md
 # "P3 codec" + PLAN NOW):
-#   - quantizer: output_proj (512->768) + the FIRST 12 LFQ quantizers
-#     (codebook[1024,8] + out_proj 8->512). Encoder + quantizers 12..31 skipped.
+#   - quantizer: input_proj/output_proj + the FIRST 12 LFQ quantizers
+#     (codebook[1024,8] + in_proj 512->8 + out_proj 8->512). Quantizers 12..31
+#     are skipped (the LM only predicts the top 12).
 #   - decoder: the 6 ProjectedTransformer stages (gguf idx 0,2,4,6,8,10). The 6
 #     PatchedPretransform upsamplers (odd idx) are weightless pure reshapes.
+#   - encoder (voice cloning): the mirrored 6 stages (gguf idx 1,3,5,7,9,11);
+#     the even indices are the weightless downsamplers. Layer counts mirror the
+#     decoder in reverse — enc.11 has 32 layers against dec.0's 32, the rest 12.
+#     Emitted only when the checkpoint carries them, and flagged in the KV as
+#     `encoder_present` so a decode-only GGUF still loads and simply reports
+#     cloning as unavailable.
 # WNConv1d weight-norm params are stored raw (wp0=original0, wp1=original1) and
 # reconstructed at load (w = wp0 * wp1 / ||wp1||) — mirrors the v1 codec runtime.
 #
@@ -309,6 +316,7 @@ def write_backbone_gguf(model_dir: Path, config: dict, out_path: Path, out_dtype
 
 CODEC_N_VQ_USED = 12          # the LM predicts the top 12 of 32 quantizers
 CODEC_DECODER_STAGES = [0, 2, 4, 6, 8, 10]  # ProjectedTransformer gguf indices
+CODEC_ENCODER_STAGES = [1, 3, 5, 7, 9, 11]  # mirrored analysis stages
 
 
 def _codec_add(writer, name, tensor, force_f32):
@@ -385,37 +393,64 @@ def write_codec_gguf(codec_dir: Path, out_path: Path):
                    f"codec.quant.q.{i}.oproj", writer)
         n_emit += 1
 
-    # --- Decoder: 6 ProjectedTransformer stages ---
-    for S in CODEC_DECODER_STAGES:
-        base = f"decoder.{S}."
-        gb = f"codec.dec.{S}."
-        # input_proj / output_proj ALWAYS present (bias=False linears).
-        _codec_add(writer, gb + "iproj.weight",
-                   handles[name_to_handle[base + "input_proj.weight"]].get_tensor(base + "input_proj.weight"),
-                   force_f32=False)
-        _codec_add(writer, gb + "oproj.weight",
-                   handles[name_to_handle[base + "output_proj.weight"]].get_tensor(base + "output_proj.weight"),
-                   force_f32=False)
-        # count layers present for this stage
-        li = 0
-        while (base + f"transformer.layers.{li}.norm1.weight") in name_to_handle:
-            lb = base + f"transformer.layers.{li}."
-            glb = gb + f"l.{li}."
-            for src, dst, f32 in [
-                ("norm1.weight", "norm1.weight", True), ("norm1.bias", "norm1.bias", True),
-                ("norm2.weight", "norm2.weight", True), ("norm2.bias", "norm2.bias", True),
-                ("self_attn.in_proj.weight", "attn_in.weight", False),
-                ("self_attn.out_proj.weight", "attn_out.weight", False),
-                ("ffn.0.weight", "ffn1.weight", False), ("ffn.2.weight", "ffn2.weight", False),
-                ("layer_scale_1.scale", "ls1.scale", True), ("layer_scale_2.scale", "ls2.scale", True),
-            ]:
-                key = lb + src
-                if key not in name_to_handle:
-                    raise RuntimeError(f"codec: missing {key}")
-                _codec_add(writer, glb + dst, handles[name_to_handle[key]].get_tensor(key), force_f32=f32)
-            li += 1
-        print(f"  dec.{S}: {li} layers")
+    # --- ProjectedTransformer stages (encoder and decoder share the layout) ---
+    def _emit_stages(hf_root, gguf_root, stages, label):
+        """Emit one side's ProjectedTransformer stages. Encoder and decoder have
+        identical per-stage structure — only the index set and the layer counts
+        differ (they mirror in reverse: enc.11 and dec.0 both carry 32)."""
+        emitted = 0
+        for S in stages:
+            base = f"{hf_root}.{S}."
+            gb = f"{gguf_root}.{S}."
+            # input_proj / output_proj ALWAYS present (bias=False linears).
+            _codec_add(writer, gb + "iproj.weight",
+                       handles[name_to_handle[base + "input_proj.weight"]].get_tensor(base + "input_proj.weight"),
+                       force_f32=False)
+            _codec_add(writer, gb + "oproj.weight",
+                       handles[name_to_handle[base + "output_proj.weight"]].get_tensor(base + "output_proj.weight"),
+                       force_f32=False)
+            # count layers present for this stage
+            li = 0
+            while (base + f"transformer.layers.{li}.norm1.weight") in name_to_handle:
+                lb = base + f"transformer.layers.{li}."
+                glb = gb + f"l.{li}."
+                for src, dst, f32 in [
+                    ("norm1.weight", "norm1.weight", True), ("norm1.bias", "norm1.bias", True),
+                    ("norm2.weight", "norm2.weight", True), ("norm2.bias", "norm2.bias", True),
+                    ("self_attn.in_proj.weight", "attn_in.weight", False),
+                    ("self_attn.out_proj.weight", "attn_out.weight", False),
+                    ("ffn.0.weight", "ffn1.weight", False), ("ffn.2.weight", "ffn2.weight", False),
+                    ("layer_scale_1.scale", "ls1.scale", True), ("layer_scale_2.scale", "ls2.scale", True),
+                ]:
+                    key = lb + src
+                    if key not in name_to_handle:
+                        raise RuntimeError(f"codec: missing {key}")
+                    _codec_add(writer, glb + dst, handles[name_to_handle[key]].get_tensor(key), force_f32=f32)
+                li += 1
+            print(f"  {label}.{S}: {li} layers")
+            emitted += 1
+        return emitted
+
+    n_emit += _emit_stages("decoder", "codec.dec", CODEC_DECODER_STAGES, "dec")
+
+    # --- Encoder (voice cloning): emitted only when the checkpoint has it ---
+    have_encoder = all(f"encoder.{S}.input_proj.weight" in name_to_handle
+                       for S in CODEC_ENCODER_STAGES)
+    if have_encoder:
+        # Analysis side of the quantizer: input_proj (768->512) and the per-
+        # quantizer in_proj (512->8). Without these the encoder output cannot be
+        # turned into codes, so they are part of the same all-or-nothing gate.
+        _wn_prefix(handles, name_to_handle, "quantizer.input_proj", "codec.quant.iproj", writer)
         n_emit += 1
+        for i in range(CODEC_N_VQ_USED):
+            _wn_prefix(handles, name_to_handle, f"quantizer.quantizers.{i}.in_proj",
+                       f"codec.quant.q.{i}.iproj", writer)
+            n_emit += 1
+        n_emit += _emit_stages("encoder", "codec.enc", CODEC_ENCODER_STAGES, "enc")
+        print("  encoder: present -> voice cloning available")
+    else:
+        print("  encoder: ABSENT in checkpoint -> decode-only GGUF (no voice cloning)")
+    writer.add_bool("moss-tts-local-codec.encoder_present", bool(have_encoder))
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()

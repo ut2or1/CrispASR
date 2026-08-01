@@ -161,6 +161,15 @@ struct crispasr_diarize_opts_abi {
     int         n_threads;
     long long   slice_t0_cs;
     const char* pyannote_model_path;
+    // #324 foxnose (method 4). This layout is hand-maintained and MUST match
+    // struct crispasr_diarize_opts_abi in src/crispasr_c_api.cpp exactly —
+    // Go allocates the struct, so a missing field here means the C side reads
+    // past the end of it.
+    const char* foxnose_embedder_path;
+    int         min_speakers;
+    int         max_speakers;
+    int         num_speakers;
+    int         _pad2;
 };
 int crispasr_diarize_segments_abi(const float* left_pcm, const float* right_pcm, int n_samples,
                                   int is_stereo, struct crispasr_diarize_seg_abi* segs, int n_segs,
@@ -1436,6 +1445,9 @@ const (
 	DiarizeXCorr    DiarizeMethod = 1 // stereo-only, cross-correlation
 	DiarizeVADTurns DiarizeMethod = 2 // mono-friendly, gap-based
 	DiarizePyannote DiarizeMethod = 3 // pyannote v3 segmentation model
+	// DiarizeMethodFoxNose: WeSpeaker embeddings + spectral clustering (#324).
+	// Requires FoxNoseOpts.EmbedderPath.
+	DiarizeMethodFoxNose DiarizeMethod = 4
 )
 
 // DiarizeSeg is one input/output segment for diarization.
@@ -1448,8 +1460,29 @@ type DiarizeSeg struct {
 // DiarizeSegments assigns speaker labels to pre-segmented audio.
 // leftPCM is the mono or left-channel audio; rightPCM is the right channel
 // (nil for mono). segs are modified in-place with Speaker fields filled.
+// FoxNoseOpts configures DiarizeMethodFoxNose (#324). Nil for other methods.
+type FoxNoseOpts struct {
+	EmbedderPath string // WeSpeaker GGUF; required
+	MinSpeakers  int    // 0 -> 1
+	MaxSpeakers  int    // 0 -> 8
+	NumSpeakers  int    // >0 pins the count and skips estimation
+}
+
+// DiarizeSegments keeps its original signature for source compatibility;
+// DiarizeSegmentsFoxNose adds the #324 options.
 func DiarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeSeg,
 	method DiarizeMethod, nThreads int, pyannoteModel string) error {
+	return diarizeSegments(leftPCM, rightPCM, isStereo, segs, method, nThreads, pyannoteModel, nil)
+}
+
+// DiarizeSegmentsFoxNose runs the WeSpeaker + spectral-clustering diarizer.
+func DiarizeSegmentsFoxNose(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeSeg,
+	nThreads int, fox *FoxNoseOpts) error {
+	return diarizeSegments(leftPCM, rightPCM, isStereo, segs, DiarizeMethodFoxNose, nThreads, "", fox)
+}
+
+func diarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeSeg,
+	method DiarizeMethod, nThreads int, pyannoteModel string, fox *FoxNoseOpts) error {
 	if len(segs) == 0 {
 		return nil
 	}
@@ -1475,6 +1508,18 @@ func DiarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeS
 		n_threads:           C.int(nThreads),
 		slice_t0_cs:         0,
 		pyannote_model_path: cPyannote,
+	}
+	if fox != nil {
+		// DiarizeMethodFoxNose (#324) consumes the embedder path and speaker
+		// bounds; every other method ignores them.
+		if fox.EmbedderPath != "" {
+			cEmb := C.CString(fox.EmbedderPath)
+			defer C.free(unsafe.Pointer(cEmb))
+			opts.foxnose_embedder_path = cEmb
+		}
+		opts.min_speakers = C.int(fox.MinSpeakers)
+		opts.max_speakers = C.int(fox.MaxSpeakers)
+		opts.num_speakers = C.int(fox.NumSpeakers)
 	}
 	stereo := C.int(0)
 	if isStereo {

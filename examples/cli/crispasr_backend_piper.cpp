@@ -44,6 +44,11 @@ public:
         pp.noise_scale = -1.0f; // use model defaults
         pp.length_scale = -1.0f;
         pp.noise_w = -1.0f;
+        // Piper is a stochastic VITS (SDP noise + latent sampling). Forward the
+        // seed so --seed makes synthesis reproducible; 0 keeps the historical
+        // std::random_device behaviour. Without this the WER regression gate
+        // resamples every run and flaps around its threshold.
+        pp.seed = (uint32_t)p.seed;
 
         ctx_ = piper_tts_init_from_file(model_path.c_str(), pp);
         if (!ctx_) {

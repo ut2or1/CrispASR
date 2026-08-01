@@ -1,5 +1,299 @@
 # CrispASR — Pending work
 
+## NOW — #326 diarization: accuracy first, then the ggml work
+
+Two things landed already (e517273d, 15aad6f8): pyannote now infers in parallel
+60 s chunks (2888 s file, M1 -t 8: 18.1 s vs 49.8–56.1 s), and `SPK_MASK` had
+powerset classes 3 and 4 swapped, worth 15 DER points. See
+`docs/diarization-speakers.md` "#326".
+
+Where the paths actually stand, measured end to end on 8 VoxConverse dev files
+with `tools/der_score.py` (whisper-tiny segments, 0.25 s collar):
+
+| path | mean DER |
+|---|---|
+| raw posteriors, no clustering (the chunking A/B harness only) | 33.37% |
+| `--diarize-method pyannote --diarize-embedder auto` | 15.74% |
+| `--diarize-method foxnose` (#324) | 7.32% |
+
+### 1. Over-clustering in the pyannote+embedder path (BIGGEST WIN, do first)
+
+`crispasr_remap_speakers_via_embeddings` clusters TitaNet embeddings with
+`crispasr_agglomerative_cluster` — **single-linkage, fixed 0.5 cosine
+threshold, hard `max_speakers` cap**. Single linkage chains, and a fixed
+threshold does not adapt, so the merge loop never gets below the cap and the
+cap decides the answer. It hit `--diarize-max-speakers 8` on 4 of 8 files:
+
+    esrit 8 hyp vs 5 real | mesob 8 vs 4 | nnqfq 8 vs 5 | fsaal 8 vs 7
+
+mesob is the worst file at 33.03% DER with 8 hypothesised speakers against 4.
+
+We already have a better clusterer in-tree and validated: `core_spectral::
+cluster_speakers` from #324 — PCA + full-covariance GMM/BIC to *estimate* the
+count, then Ng-Jordan-Weiss spectral clustering, then spherical refinement.
+That is what gets foxnose to 7.32% on the same files.
+
+PLAN: route the pyannote+embedder path through `core_spectral::cluster_speakers`
+instead of single-linkage. Keep `--diarize-cluster-threshold` meaningful for
+callers who set it explicitly, but stop letting the cap pick the speaker count.
+GATE: mean DER over the 8 files must beat 15.74%; per-file speaker counts should
+stop pinning to the cap. Watch tiams/jyirt, which currently do NOT hit the cap
+(4 hyp vs 5 and 4 vs 4) — they are the regression risk.
+
+### 2. Batch the pyannote chunks into one graph (the ggml work)
+
+After chunking, all 8 cores are busy (181.5 s CPU / 22.8 s wall on a 2888 s
+file), so there is no scheduling win left — only less work, or better work.
+Aggregate CPU by stage over 49 chunks: **LSTM 121.0 s (67%), SincNet 59.7 s
+(33%), classifier 0.8 s**.
+
+pyannote_seg is the least ggml-native runtime we ship. Not applied:
+
+  a. The LSTM recurrence is not ggml at all — a hand-written scalar loop over
+     timesteps. Only the input projection `W@x` is a `mul_mat` (~2/3 of the
+     LSTM FLOPs). The scalar third is what serialises.
+  b. Each chunk worker runs ggml with `n_threads = 1`. Chunking traded intra-op
+     threading for inter-chunk threading, so every conv and GEMM is now
+     single-threaded — wasteful whenever chunks < cores (short files).
+  c. No batching across chunks: 49 separate graphs instead of ONE graph with
+     chunks on a batch dimension. This is the parakeet/nemotron `ne[3]` trick
+     we already use elsewhere, and it fixes (a)-adjacent and (b) at once by
+     handing ggml 49×-taller GEMMs and the full thread pool.
+  d. No quantisation — all F32. The recurrence is a bandwidth-bound 512×128
+     matvec per timestep; F16 on `R` is a real candidate. ⚠ Do NOT assume the
+     wespeaker result transfers: F16 lost 2.2× there, but that was compute-bound
+     conv im2col, this is bandwidth-bound matvec. Measure it.
+  e. No GPU — the loader hard-forces `ggml_backend_cpu_init()` because the
+     recurrence dereferences `tensor->data`. Probably correct to leave alone:
+     see [[feedback_many_tiny_graphs_gpu_loses]].
+
+RESOLVED 2026-07-30. (b) is FIXED; (c) and (d) are measured NOT worth doing.
+
+  * (b) DONE — each chunk worker now gets `n_threads / n_workers` instead of 1.
+    Only bites when chunks < cores, which is every short file: an 85 s file
+    (2 chunks) on 8 cores went 1375 ms (-t 1) -> 788 ms (-t 4). Long files are
+    unaffected (49 chunks already saturate). Posteriors stay byte-identical
+    across -t 1/2/4/8, verified on a 2888 s file.
+
+  * (d) F16 `R` — TRIED AND REVERTED. 173.6 s of LSTM CPU against 146-162 s for
+    F32, interleaved. The motivating arithmetic ("512x128 restreamed 171k x 4
+    layers x 2 directions ~= 350 GB") was wrong in the way that matters: all of
+    R is 2 MB, so it is L2-resident and there was no DRAM bandwidth to reclaim,
+    while widening each element costs real cycles in the inner loop. Note this
+    is the SECOND F16 loss in this subsystem for a DIFFERENT reason than
+    wespeaker's (compute-bound conv im2col) — the shared lesson is only that
+    F16 must be measured, never assumed either way.
+
+  * (c) batched chunk graph — NOT DONE, and should not be without new evidence.
+    The case for it was that 49 single-threaded graphs waste ggml's thread pool
+    and GEMM shape. But after (b) there is no idle capacity to recover: on a
+    2888 s file the chunked path spends 181.5 s of CPU in 22.8 s of wall on 8
+    cores, i.e. every core is busy. Batching cannot add parallelism, only
+    per-op efficiency, and a -t 1 sweep of chunk size (30/60/90/120/240 s, the
+    setting that controls how many separate graphs there are) showed total work
+    varying no more than the round-to-round noise on a loaded box. The
+    restructure is also not free: uniform-length windows would be required for
+    a batch dimension, which changes what InstanceNorm normalises over.
+    Revisit only if a profile shows per-op overhead, not on the a-priori
+    argument.
+
+### 2b. DONE — the embedder, which is where the time actually is (#324)
+
+With segmentation fixed, the speaker embedder is the dominant diarization cost.
+Two fixes landed (fe0c0b3e, 6a5b0100):
+
+  * `wespeaker_context::n_threads` was STORED AND NEVER APPLIED —
+    `ggml_backend_cpu_set_n_threads` appears nowhere in wespeaker.cpp, so every
+    context ran at ggml's default whatever `-t` said. Confirmed before fixing:
+    -t 8 vs -t 1 gave 41.9/39.8, 41.0/42.7, 44.1/44.7 ms per window.
+  * core_foxnose now embeds windows CONCURRENTLY (Params::n_workers, EmbedFn
+    gains a worker index, results written into a preallocated array so row
+    order is untouched). Workers share weights through wespeaker_init_worker()
+    rather than reloading the GGUF each.
+
+    threads x workers, 85 s file, -t 8, interleaved, 3 rounds:
+      4x1 (old) 10.27 10.46 11.28 | 8x1 10.80 10.74 11.91 | 4x2 9.56 10.03 10.38
+      2x4 8.67 9.25 9.83          | 1x8 8.09 8.65 9.58  <- ships
+    215 s file: diarization 23.8 -> 19.2 s and 33.8 -> 25.6 s. DER unchanged
+    file-for-file (7.32%), labels identical across -t.
+
+⚠ METHODOLOGY, the expensive lesson of this series: a sequential -t 1/4/8 loop
+on a box whose load is ramping reads as a thread-scaling curve. It produced a
+confident, WRONG "threads make embedders 5x slower" diagnosis, which in turn
+justified forcing the pluggable embedder to 1 thread — a change that would have
+been a straight regression for the pyannote path, which has no cross-segment
+parallelism to fall back on. Interleave the arms; print the load next to every
+number; distrust any monotonic curve measured in loop order.
+
+### 2c. Shared-trunk window embedding — WRITTEN, GATED OFF, needs a quiet box
+
+`wespeaker_embed_windows()` + `core_foxnose::EmbedWindowsFn` land the 2x: one
+fbank and one trunk pass per 32-window span, each window a slice of the trunk
+output. Enable with `CRISPASR_DIARIZE_SPAN_EMBED=1` (07da3f45).
+
+⚠ 07da3f45 shipped this INERT and I did not notice. Only the signature change
+landed in core_foxnose::diarize; the loop body was applied with a Python
+str.replace whose target clang-format had already rewrapped, so it matched
+nothing and failed silently. `embed_windows` was accepted and ignored, and
+every "verification" of that commit therefore compared the per-window path
+with itself and found it identical for that reason. 856a6dd7 wires it for
+real — confirmed by counting bench stages: 134 `resnet` calls become 17
+`resnet_windows` calls on the same file.
+
+LESSON: str.replace/sed silently no-op on a miss. Use a tool that errors, and
+prove a new code path EXECUTES (count its invocations) before reporting any
+measurement taken through it. A "no difference" result is the expected shape of
+both "behaviour-preserving" and "never ran".
+
+### VERDICT: a real trade — 1.78x cheaper, +0.30 DER. Opt-in, default OFF.
+
+Measured against the wired path (856a6dd7), 8 VoxConverse dev files:
+
+    file    GT   per-window   shared-trunk
+    jyirt    4     7.24%(4)     11.05%(3)   <-- loses a speaker
+    mesob    4    15.61%(2)     14.19%(2)   <-- better
+    other 6            ==            ==
+    MEAN            7.32%         7.62%
+
+Speed, interleaved CPU time (user+sys, which survives a loaded box where wall
+clock does not), 85 s file, 1 worker: 70.2 s -> 41.2 s total, against a 4.2 s
+ASR-only baseline, so diarization CPU goes 66.0 s -> 37.0 s = **1.78x**. Trunk
+passes drop 135 -> 18.
+
+So it is not a dud and not free: a third less diarization CPU for a third of a
+DER point. Shipped as CRISPASR_DIARIZE_SPAN_EMBED=1, default OFF, because
+accuracy is the better default for a diarizer and the user who wants throughput
+can say so.
+
+⚠ Neither span size NOR the estimator is the lever. Both were investigated to
+the bottom; both are dead ends.
+
+Span size: jyirt scores exactly 11.05% with 3 speakers at N=2, 4, 8, 16 AND 32.
+At N=2 a span is 1.8 s against a 1.2 s window, so the CMN drift I assumed
+cannot be the mechanism. (An earlier revision of this plan said "17
+embeddings" — wrong, that was the pyannote path's ASR-segment count. foxnose
+gives this file n=134.) Since accuracy is flat in N, larger N is strictly
+faster — hence the default of 32. CRISPASR_DIARIZE_SPAN_WINDOWS overrides it.
+
+The actual mechanism, from the silhouette curve (CRISPASR_DIARIZE_DEBUG=1):
+
+    k   per-window sil / score     shared-trunk sil / score
+    3      0.3809 / 0.4248            0.4141 / 0.4581  <- wins
+    4      0.3777 / 0.4331 <- wins    0.3469 / 0.4023
+
+RAW SILHOUETTE PREFERS k=3 IN BOTH PATHS. Per-window only reaches the correct
+k=4 because the `kSilhouetteKBonus * log(k)` term flips a 0.8% gap.
+Shared-trunk prefers k=3 by 19% — it is MORE confident, and confidently wrong.
+Sharing a trunk pass means adjacent windows share convolutional context, so the
+embedding space smooths and a speaker with little airtime merges into a
+neighbour. That is intrinsic to the method, not a constant that wants tuning.
+
+So do NOT tune kSilhouetteKBonus to "fix" this. It would be overfitting to one
+file, and it would be tuning the very constant that is the only reason the
+baseline looks right here.
+
+WORTH KNOWING INDEPENDENTLY OF THIS FEATURE — and it is NOT what I first
+claimed. Full survey, all 8 files, default path (CRISPASR_DIARIZE_DEBUG=1;
+margin = winning score over the runner-up, relative):
+
+    file    GT   chosen   margin   verdict
+    esrit    5      5       8.7%   correct
+    fsaal    7      6       6.1%   WRONG
+    jyirt    4      4       1.9%   correct  <- the only tight call
+    mesob    4      2      14.1%   WRONG
+    nnqfq    5      5       3.6%   correct
+    rcxzg    4      4       7.2%   correct
+    tiams    5      3       9.6%   WRONG
+    willh    2      3      12.5%   WRONG
+
+    1 of 8 decided on a <3% margin.  4 of 8 pick the WRONG count.
+
+So the estimator is not FRAGILE, it is BIASED: it is confidently wrong half the
+time, by margins of 6-14%. Two things follow.
+
+  * Making the tie-break more robust buys nothing. Only one file is close, and
+    that one is already right. Do not tune kSilhouetteKBonus, and do not build
+    an eigengap tie-breaker: neither addresses a 14% margin in the wrong
+    direction.
+  * The silhouette criterion itself is the weak link. mesob merges 4 speakers
+    into 2 and prefers that by 14.1%; tiams merges 5 into 3 by 9.6%. Both are
+    UNDER-counts, as is fsaal (6 vs 7); willh is the lone over-count. A
+    criterion that systematically prefers too few clusters on real speech is a
+    modelling problem, not a threshold problem.
+
+⚠ Also corrects my own arithmetic: I repeatedly described jyirt's margin as
+"0.8%". 0.0083 absolute on a 0.4331 score is 1.9% relative. The conclusion it
+was used to support ("our DER is partly luck") was wrong twice over — wrong
+number, and wrong shape of problem.
+
+NOTE the counts being wrong does NOT scale linearly into DER: the shard still
+scores 7.32% mean, because a merged speaker costs only the frames of the
+speaker that got absorbed. willh picks 3 against a true 2 and still scores
+6.23%. So this is worth fixing for correctness of the reported speaker count,
+and only secondarily for DER.
+
+Span size is fixed at kWindowsPerSpan=32 deliberately: CMN over the span makes
+it part of the answer, so it must never depend on the worker count.
+
+### 4. RESOLVED — NME-SC LOSES. Default unchanged.
+
+The survey said the estimator is BIASED, not fragile: 4 of 8 files wrong, three
+of them under-counts by 6-14% margins. NME-SC is the candidate because it
+auto-tunes the affinity binarisation that estimate_speakers_eigengap currently
+hardcodes at 15% — and that parameter is what decides how many clusters the
+spectrum appears to have.
+
+  * Implemented, opt-in: CRISPASR_DIARIZE_COUNT=nme-sc (spectral_diarize.cpp).
+  * Corpus: VoxConverse dev, all 5 shards — 216 files, 20.3 h, 1-20 speakers,
+    101 tune / 115 holdout (tools/voxconverse_extract.py).
+  * Metric: speaker-COUNT accuracy first, DER second. DER cannot see this
+    failure — one file predicts 2 speakers against a true 5 and still scores
+    6.88% DER.
+  * Harness: tools/diarize_eval.py, --split tune so holdout is not computed
+    at all.
+  * Venue: Kaggle, chr1str/crispasr-diarize-count-eval. The local box sat
+    between load 13 and 197 for the whole session and killed the sweep three
+    times; the kernel pulls the HF parquet directly so there is no 20 GB
+    dataset upload.
+
+RESULT (Kaggle chr1str/crispasr-diarize-count-eval v4, 40-file tune subset,
+--diarize-max-speakers 8):
+
+                    count exact   within1   under   over     DER
+    BIC+silhouette   18/40 (45%)   34/40      15      7    33.06%
+    NME-SC           17/40 (42%)   31/40      11     12    39.26%
+
+    of 17 files where the counts differ: NME-SC closer on 6, worse on 10
+    mean |k - gt|: BIC 1.10, NME-SC 1.15
+
+The hypothesis was directionally right and still lost. NME-SC DOES cut
+under-counting (15 -> 11), which is exactly the failure it was chosen to
+address — but it converts those into over-counts (7 -> 12) and ends up worse on
+every aggregate. Auto-tuning the binarisation moves the error, it does not
+remove it.
+
+DECISION: default unchanged. NME-SC stays opt-in
+(CRISPASR_DIARIZE_COUNT=nme-sc). HOLDOUT WAS NOT COMPUTED and must stay
+unspent — it is worth more as an untouched set than as a second opinion on a
+hypothesis that already failed on tune.
+
+⚠ CALIBRATION — the 8-file shard used earlier in this series was EASY.
+Same code scores 7.32% DER there and 33.06% here. The 8 files top out at 7
+speakers; full dev reaches 20, and 20 of the 216 exceed the default cap of 8
+outright. Treat every "7.3%" in the #324/#326 history as a number from an
+unrepresentative subset, not as pipeline quality.
+
+STILL OPEN: speaker counting is the weak link — 45% exact on real data. NME-SC
+is not the answer; something that fixes over- and under-counting together is.
+Next candidate would have to be argued from the error structure above, not from
+a paper's abstract.
+
+### 3. Not worth doing, measured
+
+  * VAD-gating the segmenter the way foxnose does: VoxConverse is 96.9% speech,
+    so ~3% available. Would matter on sparse real-world audio, not here.
+  * GPU for the segmenter — see (e).
+
 ## 2026-07-29 — the unit tier found two real failures: one FIXED, one OPEN
 
 CI executed 1 of 162 unit tests until e17ce606/49e56eee. Turning the tier on

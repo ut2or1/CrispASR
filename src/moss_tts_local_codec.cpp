@@ -73,6 +73,53 @@ constexpr std::array<StageSpec, 6> DECODER_STAGES = {{
     {384, 768, 12, 3072, 12, 240, 240, 10, 400},
 }};
 
+// Encoder stack — the analysis mirror of the decoder, used for voice cloning.
+// Present only in codec GGUFs converted with encoder tensors (KV
+// `moss-tts-local-codec.encoder_present`); older decode-only files simply
+// report cloning as unavailable.
+//
+// Dimensions were read from the upstream tensor shapes rather than assumed from
+// symmetry, and the chain checks out end to end (Linear weight is [out, in]):
+//
+//   raw 96 kHz --patch 240--> 400 Hz, 240ch      (enc.1 input_dim 240)
+//   enc.1  iproj[768,240] oproj[384,768]  x2 ->  768  = enc.3  input_dim
+//   enc.3  iproj[768,768] oproj[384,768]  x2 ->  768  = enc.5  input_dim
+//   enc.5  iproj[768,768] oproj[384,768]  x2 ->  768  = enc.7  input_dim
+//   enc.7  iproj[768,768] oproj[384,768]  x2 ->  768  = enc.9  input_dim
+//   enc.9  iproj[768,768] oproj[640,768]  x2 -> 1280  = enc.11 input_dim
+//   enc.11 iproj[1280,1280] oproj[768,1280]  -> 768   = quantizer.input_proj in
+//
+// n_heads is d_model/64 (attn in_proj is [3*d_model, d_model]: 2304/768=3 heads
+// of 768 -> 12 heads; 3840/1280 -> 20). Layer counts mirror the decoder in
+// reverse: enc.11 carries 32 against dec.0's 32, every other stage 12.
+// Contexts are the decoder's reversed, since the rates mirror: enc.1 runs at
+// 400 Hz like dec.10 (context 400), enc.11 at 12.5 Hz like dec.0 (context 125).
+constexpr int CODEC_ENC_PRE_PATCH = 240; // 96 kHz -> 400 Hz before enc.1
+constexpr std::array<StageSpec, 6> ENCODER_STAGES = {{
+    {240, 768, 12, 3072, 12, 384, 2, 1, 400},
+    {768, 768, 12, 3072, 12, 384, 2, 3, 400},
+    {768, 768, 12, 3072, 12, 384, 2, 5, 400},
+    {768, 768, 12, 3072, 12, 384, 2, 7, 400},
+    {768, 768, 12, 3072, 12, 640, 2, 9, 250},
+    {1280, 1280, 20, 5120, 32, 768, 0, 11, 125},
+}};
+
+// The chain above is load-bearing — a wrong patch factor silently produces a
+// plausible-looking but misaligned latent. Assert it instead of trusting the
+// comment.
+static_assert(ENCODER_STAGES[0].input_dim == 240, "enc.1 consumes the 240ch pre-patch");
+static_assert(ENCODER_STAGES[0].output_dim * ENCODER_STAGES[0].patch_after == ENCODER_STAGES[1].input_dim,
+              "enc.1->enc.3");
+static_assert(ENCODER_STAGES[1].output_dim * ENCODER_STAGES[1].patch_after == ENCODER_STAGES[2].input_dim,
+              "enc.3->enc.5");
+static_assert(ENCODER_STAGES[2].output_dim * ENCODER_STAGES[2].patch_after == ENCODER_STAGES[3].input_dim,
+              "enc.5->enc.7");
+static_assert(ENCODER_STAGES[3].output_dim * ENCODER_STAGES[3].patch_after == ENCODER_STAGES[4].input_dim,
+              "enc.7->enc.9");
+static_assert(ENCODER_STAGES[4].output_dim * ENCODER_STAGES[4].patch_after == ENCODER_STAGES[5].input_dim,
+              "enc.9->enc.11");
+static_assert(ENCODER_STAGES[5].patch_after == 0, "enc.11 feeds the quantizer directly");
+
 } // namespace
 
 // ===========================================================================

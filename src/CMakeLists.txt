@@ -856,6 +856,15 @@ add_library(crispasr-core STATIC
             core/pinyin_g2p.cpp
             core/kaldi_fbank.h
             core/kaldi_fbank.cpp
+            # Speaker-count estimation + spectral clustering (#324). Lives in
+            # crispasr-core because both the diarizer and its unit tests use it
+            # and it depends on nothing but the standard library.
+            core/spectral_diarize.h
+            core/spectral_diarize.cpp
+            core/diarize_smooth.h
+            core/diarize_smooth.cpp
+            core/foxnose_pipeline.h
+            core/foxnose_pipeline.cpp
             core/audio_resample.h
             core/audio_resample.cpp
             # Importance-matrix (imatrix) activation-stats collector. Lives in
@@ -1091,6 +1100,29 @@ if(APPLE)
     endif()
     target_link_libraries(gigaam PUBLIC ${ACCELERATE_LIB})
     target_compile_definitions(gigaam PRIVATE HAVE_ACCELERATE ACCELERATE_NEW_LAPACK)
+endif()
+
+# ---------------------------------------------------------------------------
+# WeSpeaker ResNet34-LM — speaker embedding (#324 FoxNose diarization)
+# ---------------------------------------------------------------------------
+add_library(wespeaker STATIC
+            wespeaker.h
+            wespeaker.cpp
+            )
+target_include_directories(wespeaker PUBLIC . ../include)
+target_compile_features   (wespeaker PUBLIC cxx_std_17)
+set_target_properties(wespeaker PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (wespeaker PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+if(NOT MSVC)
+    target_compile_options(wespeaker PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(wespeaker PRIVATE GGML_USE_METAL)
+    target_link_libraries(wespeaker PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(wespeaker PRIVATE GGML_USE_CUDA)
+    target_link_libraries(wespeaker PUBLIC ggml-cuda)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -2654,6 +2686,9 @@ endif()
 if (TARGET gigaam)
     target_link_libraries(crispasr-lib PUBLIC gigaam)
 endif()
+if (TARGET wespeaker)
+    target_link_libraries(crispasr-lib PUBLIC wespeaker)
+endif()
 if (TARGET nemotron)
     target_link_libraries(crispasr-lib PUBLIC nemotron)
 endif()
@@ -2971,6 +3006,11 @@ endif()
 # so the native diarizer's symbols resolve at libcrispasr load time.
 if (TARGET pyannote-seg)
     target_link_libraries(crispasr-lib PUBLIC pyannote-seg)
+endif()
+# WeSpeaker is likewise not a backend — crispasr_diarize.cpp consumes it for
+# the "foxnose" method (#324).
+if (TARGET wespeaker)
+    target_link_libraries(crispasr-lib PUBLIC wespeaker)
 endif()
 # Silero LID engine used by crispasr_lid.cpp's native Silero path.
 if (TARGET silero-lid)

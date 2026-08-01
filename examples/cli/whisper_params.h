@@ -298,6 +298,32 @@ struct whisper_params {
     std::string diarize_embedder;           // model path or "auto"
     float diarize_cluster_threshold = 0.5f; // cosine merge threshold
     int diarize_max_speakers = 8;           // upper bound for cluster count
+    int diarize_num_speakers = 0;           // >0 pins the count (foxnose)
+    // Set when the user passed --diarize-max-speakers explicitly, so a
+    // per-method default never SHRINKS or GROWS a value they chose. Same
+    // contract as max_new_tokens_explicit (#292).
+    bool diarize_max_speakers_explicit = false;
+    // Set when the user passed --diarize-cluster-threshold explicitly. The
+    // embedder path otherwise estimates the speaker count with spectral
+    // clustering (#326) and the cosine threshold is not consulted at all;
+    // honouring it only when asked for keeps that knob working for anyone who
+    // tuned it, without letting its default decide the answer.
+    bool diarize_cluster_threshold_explicit = false;
+
+    // Set by the unified runner: foxnose diarization happens in one global
+    // pass after transcription, so the per-slice path must stand down.
+    bool diarize_foxnose_global = false;
+
+    // #324: `--diarize-method foxnose` consumes --diarize-embedder itself, as
+    // the WeSpeaker model for its own spectral clustering. The generic
+    // TitaNet remap must therefore NOT also try to load that path — it is a
+    // different architecture and fails with a confusing
+    // "block_repeats/kernels array size mismatch". There are three call sites
+    // (cli.cpp, crispasr_run.cpp, crispasr_server.cpp); they all ask here so a
+    // fourth cannot silently drift.
+    bool diarize_embedder_is_foxnose() const {
+        return diarize_method == "foxnose" || diarize_method == "foxnose-diarize";
+    }
     bool stream = false;
     bool mic = false;
     bool stream_continuous = false;

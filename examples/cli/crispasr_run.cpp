@@ -549,7 +549,13 @@ static void crispasr_apply_global_speaker_stages(std::vector<crispasr_segment>& 
     if (crispasr_apply_tiron_linking(all_segs, samples, params))
         return;
 
-    const bool want_cluster = params.diarize && !params.diarize_embedder.empty();
+    // #324: foxnose runs here, once, over the whole audio — this is what makes
+    // its speaker numbering consistent across slices.
+    if (crispasr_apply_foxnose_global(all_segs, samples, params))
+        return; // foxnose owns the labels; the TitaNet remap must not re-run
+
+    const bool want_cluster =
+        params.diarize && !params.diarize_embedder.empty() && !params.diarize_embedder_is_foxnose();
     const bool want_ident = !params.speaker_db.empty() && params.speaker_db_consent && !params.expect_speakers.empty();
     if ((!want_cluster && !want_ident) || all_segs.empty() || samples.empty())
         return;
@@ -1331,6 +1337,11 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             sherpa_cache = {};
         }
     }
+
+    // #324: foxnose diarizes in ONE global pass after transcription so speaker
+    // identities are consistent across slices; the per-slice path stands down.
+    if (params.diarize && params.diarize_embedder_is_foxnose())
+        const_cast<whisper_params&>(params).diarize_foxnose_global = true;
 
     CrispasrPyannoteCache pyannote_cache;
     if (params.diarize && params.diarize_method == "pyannote" && !samples.empty()) {

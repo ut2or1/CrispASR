@@ -638,7 +638,7 @@ static ggml_cgraph* gigaam_build_graph_encoder(gigaam_context* ctx, int T_mel, b
     ggml_set_name(pos, "pos");
     ggml_set_input(pos);
 
-    core_conformer::BlockParams bp;
+    core_conformer::BlockParams bp = {};
     bp.d = (int)hp.d_model;
     bp.n_heads = (int)hp.n_heads;
     bp.head_dim = (int)hp.head_dim;

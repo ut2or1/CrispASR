@@ -202,10 +202,16 @@ struct kv_snapshot_pool {
     void alloc_device(kv_snapshot* s) {
         const ggml_init_params ip = {ggml_tensor_overhead() * (live.size() + 1) + 256, nullptr, /*no_alloc=*/true};
         s->meta = ggml_init(ip);
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(live[0]->buffer);
+        // Size by the buffer type's alloc size, not ggml_nbytes: they differ on
+        // CUDA for quantized tensors (row padding for MMQ), and
+        // ggml_backend_tensor_alloc() asserts against the former. KV snapshots
+        // are F16/F32 today so the two agree, but sizing one way and allocating
+        // the other is the exact bug that made moonshine abort at load — no
+        // reason to leave the same shape here waiting for a quantized cache.
         size_t total = 0;
         for (ggml_tensor* t : live)
-            total += ggml_nbytes(t);
-        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(live[0]->buffer);
+            total += ggml_backend_buft_get_alloc_size(buft, t);
         s->buf = ggml_backend_buft_alloc_buffer(buft, total);
         char* base = (char*)ggml_backend_buffer_get_base(s->buf);
         size_t off = 0;
@@ -213,7 +219,7 @@ struct kv_snapshot_pool {
         for (size_t i = 0; i < live.size(); i++) {
             s->dev[i] = ggml_new_tensor(s->meta, live[i]->type, GGML_MAX_DIMS, live[i]->ne);
             ggml_backend_tensor_alloc(s->buf, s->dev[i], base + off);
-            off += ggml_nbytes(live[i]);
+            off += ggml_backend_buft_get_alloc_size(buft, live[i]);
         }
     }
 

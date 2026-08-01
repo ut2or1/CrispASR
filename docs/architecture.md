@@ -1047,6 +1047,81 @@ translation, `x-en` for English-target. Pick whichever matches your
 direction (`-sl`/`-tl`) — the auto-download path picks `en-x` by
 default; load `x-en` explicitly with `-m <path>` for X→English.
 
+### foxnose-diarize
+
+Speaker diarization via `--diarize-method foxnose` (#324), an alternative to
+the pyannote path. Ported from the recipe in
+[FoxNoseTech/diarize](https://github.com/FoxNoseTech/diarize); the algorithms
+are standard published methods and the implementation is independent, so the
+tree stays MIT (see below).
+
+```
+speech regions (the caller's segments — no separate VAD)
+  -> sliding windows: skip < 0.4 s, embed whole if <= 1.8 s, else 1.2 s / 0.6 s hop
+  -> WeSpeaker ResNet34-LM  ->  256-d embedding per window
+  -> speaker count: cosine-p10 veto -> PCA(8) -> full-covariance GMM BIC sweep
+                    -> silhouette refinement (score = sil + 0.04*log k)
+  -> spectral clustering on (cos+1)/2 affinity -> spherical centroid refinement
+  -> temporal smoothing: Viterbi (0.18 switch penalty) -> restore sustained runs
+                         -> collapse A-B-A islands <= 1.2 s
+  -> merge adjacent same-speaker turns closer than 0.7 s
+```
+
+Components: `src/wespeaker.{h,cpp}` (embedder),
+`src/core/spectral_diarize.{h,cpp}` (counting + clustering),
+`src/core/diarize_smooth.{h,cpp}` (temporal), `src/core/foxnose_pipeline.{h,cpp}`
+(orchestration), `src/core/der.h` (the metric).
+
+The pipeline takes its embedder as a function pointer rather than linking one
+in, which keeps `core/` model-free and — more usefully — makes the whole
+orchestration testable with a synthetic embedder whose speakers are known by
+construction. A model-driven test cannot separate "the pipeline is wrong" from
+"the embedder is weak".
+
+**Licensing.** The WeSpeaker *weights* are CC-BY-4.0 (not Apache-2.0 as some
+downstream projects state), so redistributing the GGUF requires attribution —
+see `THIRD_PARTY_NOTICES.txt`. The upstream *code* is Apache-2.0 and none of it
+is incorporated: `clustering.py` is a sequence of scikit-learn calls rather
+than implementations, so there was nothing to translate, and what was taken is
+the recipe and its tuned constants — parameters and facts, not copyrightable
+expression.
+
+**Parity.** Bit-exact agreement with scikit-learn is unachievable: its
+k-means++ seeding, GMM initialisation and ARPACK eigensolver all ride its own
+RNG stream. The gates are therefore known-answer unit tests (375 assertions
+over 57 hermetic cases) plus DER, not label equality. Output IS deterministic
+across runs — everything is explicitly seeded.
+
+**Speaker counting uses the upstream GMM/BIC + silhouette sweep by default.**
+`CRISPASR_DIARIZE_COUNT=eigengap` selects an eigengap-of-the-Laplacian
+estimator instead (with row-wise affinity thresholding, without which the
+dense cosine affinity puts the largest gap at k=1 and it reports one speaker
+for everything). Eigengap is better on well-separated synthetic data and
+cheaper, but it UNDER-counts on real speech and scores materially worse:
+pooled DER over 8 VoxConverse dev files against human labels is 5.3% for
+`bic` and 11.4% for `eigengap`, against upstream Python's 3.1%.
+
+**Benchmarked accuracy.** Over 8 VoxConverse dev files against human labels
+(0.25 s collar, optimal 1:1 mapping), with Silero VAD supplying speech regions
+to both sides: **this port 3.18 % DER, upstream Python 3.07 %** — 0.11 points
+apart, with our speaker confusion actually lower (26.5 s vs 29.0 s). Feeding
+whole files with no VAD instead costs 2 points of pure false alarm (5.27 %),
+which is a property of the benchmark driver, not of the diarizer: the real CLI
+path takes the caller's ASR/VAD segments. With the speaker count pinned equal
+on both sides the two agree with ZERO speaker confusion.
+
+Speaker identity is consistent across slices: on the unified `crispasr_run`
+path FoxNose runs in ONE global pass after transcription
+(`crispasr_apply_foxnose_global`), taking the final segment list as its speech
+regions, and segments spanning several speakers are then split at word-aligned
+turn boundaries. Diarizing per slice cannot work — each slice clusters
+independently and restarts numbering at 0 — which is the same problem the
+pyannote path solves with a pre-computed posterior cache (#107).
+
+Env gates: `CRISPASR_DIARIZE_BIC_WINDOW=1` (restrict silhouette to a window
+around the BIC anchor instead of the full speaker range, which is the default),
+`CRISPASR_WESPEAKER_BENCH=1`, `CRISPASR_WESPEAKER_DEBUG=1`.
+
 ### gigaam
 
 ai-sage/GigaAM-v3 — Russian ASR. A 16-layer **rotary** Conformer encoder

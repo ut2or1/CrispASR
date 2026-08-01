@@ -209,6 +209,7 @@ target_link_libraries(crispasr-diff PRIVATE
     common
     crispasr-lib
     parakeet
+    wespeaker
     gigaam
     canary
     cohere
@@ -326,6 +327,7 @@ target_link_libraries(${TARGET} PRIVATE
     common
     crispasr-lib
     parakeet
+    wespeaker
     gigaam
     canary
     cohere

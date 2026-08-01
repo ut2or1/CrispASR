@@ -259,6 +259,24 @@ catch_discover_tests(test-params
     PROPERTIES LABELS "unit"
 )
 
+# ─── test-lid-speech-prefix — keep request-level LID on speech, not silence ───
+add_executable(test-lid-speech-prefix
+    test-lid-speech-prefix.cpp
+)
+target_include_directories(test-lid-speech-prefix PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-lid-speech-prefix PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+catch_discover_tests(test-lid-speech-prefix
+    TEST_SPEC "[unit][lid]"
+    PROPERTIES LABELS "unit;lid"
+)
+
 # ─── test - cpu-ops-to-f32 — Catch2 unit tests for core_cpu::to_f32 ───────────────
 # The quantized-safe CPU weight reader. Verifies F32/F16/Q8_0/Q4_K round-trip so a
 # quantized weight is dequantized (not read as garbage / over-read). Header-only
@@ -476,6 +494,23 @@ catch_discover_tests(test-stream-partial-decode
 # internal helper with synthetic log-softmax posteriors; no model, no
 # audio. Links against libcrispasr so it tests the actually-shipped
 # logic rather than a fork of it.
+# The pyannote-seg powerset class layout (core/powerset.h). Header-only, so
+# this needs no library — but it guards the table whose two swapped entries
+# cost ~15 DER points in production.
+add_executable(test-powerset
+    test-powerset.cpp
+)
+target_include_directories(test-powerset PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-powerset PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-powerset
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;diarize"
+)
+
 add_executable(test-diarize-pyannote
     test-diarize-pyannote.cpp
 )
@@ -1610,6 +1645,92 @@ target_link_libraries(test-gigaam-params PRIVATE
 catch_discover_tests(test-gigaam-params
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;gigaam"
+)
+
+# ─── test-wespeaker — live integration tests for the WeSpeaker embedder
+add_executable(test-wespeaker
+    test_wespeaker_live.cpp
+)
+target_include_directories(test-wespeaker PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-wespeaker PRIVATE
+    Catch2::Catch2WithMain
+    wespeaker
+)
+catch_discover_tests(test-wespeaker
+    TEST_SPEC "[wespeaker]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-der — DER scorer + synthetic end-to-end pipeline test (#324)
+add_executable(test-der
+    test-der.cpp
+)
+target_include_directories(test-der PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-der PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-core
+)
+catch_discover_tests(test-der
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;der"
+)
+
+# ─── test-diarize-smooth — hermetic unit tests for temporal label smoothing
+add_executable(test-diarize-smooth
+    test-diarize-smooth.cpp
+)
+target_include_directories(test-diarize-smooth PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-diarize-smooth PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-core
+)
+catch_discover_tests(test-diarize-smooth
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;diarize_smooth"
+)
+
+# ─── test-spectral-diarize — hermetic unit tests for the speaker-clustering
+# numerics. No model, no audio (#324). ────────────────────────────────────────
+add_executable(test-spectral-diarize
+    test-spectral-diarize.cpp
+)
+target_include_directories(test-spectral-diarize PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-spectral-diarize PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-core
+)
+catch_discover_tests(test-spectral-diarize
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;spectral"
+)
+
+# ─── test-wespeaker-params — Catch2 unit tests for wespeaker_context_params
+# defaults and null-guard coverage. No GGUF required. ──────────────────────────
+add_executable(test-wespeaker-params
+    test-wespeaker-params.cpp
+)
+target_include_directories(test-wespeaker-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-wespeaker-params PRIVATE
+    Catch2::Catch2WithMain
+    wespeaker
+)
+catch_discover_tests(test-wespeaker-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;wespeaker"
 )
 
 # ─── test-nemotron-params — Catch2 unit tests for nemotron_context_params defaults

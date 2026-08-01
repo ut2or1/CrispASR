@@ -187,13 +187,19 @@ def run(cmd, timeout=600, stream_stderr=False):
 
 if os.path.isdir(CRISPASR_DIR):
     # Pull latest to pick up fixes pushed since initial clone
-    subprocess.run(f"cd {CRISPASR_DIR} && git fetch --depth 1 origin main && git reset --hard origin/main",
+    subprocess.run(f"cd {CRISPASR_DIR} && git fetch --depth 1 origin main "
+                   f"&& git reset --hard origin/main "
+                   f"&& git submodule update --init --recursive --depth 1",
                    shell=True, check=True, capture_output=True)
-    print("✓ CrispASR updated to latest")
+    print("✓ CrispASR updated to latest (submodules synced)")
 else:
-    subprocess.run(f"git clone --depth 1 https://github.com/CrispStrobe/CrispASR.git {CRISPASR_DIR}",
+    # --recurse-submodules is not optional: ggml is a submodule, and without it
+    # cmake stops at CMakeLists.txt:256 with "The bundled 'ggml' submodule is not
+    # initialized" (#298) before a single backend runs.
+    subprocess.run(f"git clone --depth 1 --recurse-submodules --shallow-submodules "
+                   f"https://github.com/CrispStrobe/CrispASR.git {CRISPASR_DIR}",
                    shell=True, check=True)
-    print("✓ CrispASR cloned")
+    print("✓ CrispASR cloned (with submodules)")
 
 # Shared Kaggle harness (lives in the cloned repo) — build streaming,
 # heartbeat+RSS, ccache/mold, CUDA arch auto-detect, 3-tier HF auth.
@@ -216,7 +222,11 @@ import io as _io
 # progress to), under a sweep-specific prefix so it doesn't collide with the
 # harness's runs/*.jsonl.
 SWEEP_REPO = os.environ.get("CRISPASR_SWEEP_REPO", "cstr/crispasr-kaggle-progress")
-RUN_TAG = os.environ.get("CRISPASR_SWEEP_RUN", "latest")
+# Bump this per campaign — results are keyed by tag and a matching tag makes the
+# kernel SKIP backends that already have a result file. "latest" currently holds
+# 60 finished backends from an earlier pin, so reusing it would skip nearly the
+# whole sweep and say nothing about the tree under test.
+RUN_TAG = os.environ.get("CRISPASR_SWEEP_RUN", "ggml-v0.17b")
 SWEEP_PREFIX = f"full-backend-sweep/{RUN_TAG}"
 # Optional subset filter: CRISPASR_SWEEP_ONLY="f5-tts,chatterbox,..." runs ONLY
 # those backends (skips all others) — for targeted re-tests of a fixed subset.

@@ -125,6 +125,11 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # audio arg is a real multi-speaker clip.
     "tiron":      "reference_backends.tiron",
     "parakeet":   "reference_backends.parakeet",
+    # WeSpeaker ResNet34-LM speaker embedder (#324). model_dir is a snapshot of
+    # Wespeaker/wespeaker-voxceleb-resnet34-LM (containing `avg_model`), or the
+    # checkpoint path itself. Needs the upstream package importable — either
+    # pip-installed or via WESPEAKER_REPO=<checkout>.
+    "wespeaker":  "reference_backends.wespeaker",
     # GigaAM-v3 (ai-sage/GigaAM-v3): rotary Conformer + CTC or RNN-T head.
     # model_dir is a LOCAL snapshot of one revision (ctc / rnnt / e2e_ctc /
     # e2e_rnnt), or the repo id plus GIGAAM_REVISION=<rev>. Loaded with

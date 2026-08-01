@@ -101,6 +101,9 @@ export CRISPASR_MODEL_ARK_ASR="${CRISPASR_MODEL_ARK_ASR:-$CRISPASR_MODELS_DIR/ar
 export CRISPASR_MODEL_MINI_OMNI2="${CRISPASR_MODEL_MINI_OMNI2:-$CRISPASR_MODELS_DIR/mini-omni2-q4_k.gguf}"
 export CRISPASR_MODEL_SNAC="${CRISPASR_MODEL_SNAC:-$CRISPASR_MODELS_DIR/snac-24khz.gguf}"
 
+# ── WeSpeaker ResNet34-LM (#324 foxnose diarization speaker embedder) ──
+export CRISPASR_MODEL_WESPEAKER="${CRISPASR_MODEL_WESPEAKER:-$CRISPASR_MODELS_DIR/wespeaker-resnet34-lm.gguf}"
+
 # ── GigaAM-v3 (ai-sage/GigaAM-v3, Russian ASR) ──
 # Default to the e2e_rnnt revision — best WER, and the only one that emits
 # punctuation + casing. The fixture is GigaAM's own example.wav:

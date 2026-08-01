@@ -5417,6 +5417,10 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
     if (s->backend == "gigaam" && s->gigaam_ctx) {
         // GigaAM-v3 is Russian-only, so the sticky source_language is not a
         // steering knob here; it is ignored on purpose.
+        // The transducer's per-frame symbol cap is this backend's only decode
+        // knob — forward it here too, not just in the CLI adapter (#292: a fix
+        // made in one surface never reaches bindings/server).
+        gigaam_set_max_symbols(s->gigaam_ctx, s->max_new_tokens);
         gigaam_result* gr = gigaam_transcribe_ex(s->gigaam_ctx, pcm, n_samples, 0);
         if (!gr) {
             delete r;
@@ -7031,10 +7035,18 @@ struct crispasr_diarize_seg_abi {
 };
 
 struct crispasr_diarize_opts_abi {
-    int32_t method; // 0..3 from crispasr_diarize_method_t
+    int32_t method; // 0..4 from crispasr_diarize_method_t
     int32_t n_threads;
     int64_t slice_t0_cs;
     const char* pyannote_model_path; // required for method 3, ignored otherwise
+    // #324 FoxNose (method 4). APPEND-ONLY: bindings lay this struct out by
+    // hand (bindings/go/crispasr_session.go's cgo preamble), so new fields go
+    // at the END and every hand-written layout is updated in the same commit.
+    const char* foxnose_embedder_path; // required for method 4
+    int32_t min_speakers;              // 0 -> 1
+    int32_t max_speakers;              // 0 -> 8
+    int32_t num_speakers;              // >0 pins the count
+    int32_t _pad2;
 };
 
 CA_EXPORT int crispasr_diarize_segments_abi(const float* left_pcm, const float* right_pcm, int32_t n_samples,
@@ -7042,7 +7054,7 @@ CA_EXPORT int crispasr_diarize_segments_abi(const float* left_pcm, const float* 
                                             const crispasr_diarize_opts_abi* opts) {
     if (!left_pcm || !segs || n_segs <= 0 || !opts)
         return -1;
-    if (opts->method < 0 || opts->method > 3)
+    if (opts->method < 0 || opts->method > 4)
         return -1;
 
     CrispasrDiarizeOptions lib_opts;
@@ -7051,6 +7063,11 @@ CA_EXPORT int crispasr_diarize_segments_abi(const float* left_pcm, const float* 
     lib_opts.slice_t0_cs = opts->slice_t0_cs;
     if (opts->pyannote_model_path)
         lib_opts.pyannote_model_path = opts->pyannote_model_path;
+    if (opts->foxnose_embedder_path)
+        lib_opts.foxnose_embedder_path = opts->foxnose_embedder_path;
+    lib_opts.min_speakers = opts->min_speakers > 0 ? opts->min_speakers : 1;
+    lib_opts.max_speakers = opts->max_speakers > 0 ? opts->max_speakers : 8;
+    lib_opts.num_speakers = opts->num_speakers;
 
     std::vector<CrispasrDiarizeSegment> lib_segs;
     lib_segs.reserve(n_segs);

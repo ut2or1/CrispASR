@@ -518,8 +518,14 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.speaker_db_consent = true;
     } else if (arg == "--diarize-cluster-threshold") {
         params.diarize_cluster_threshold = std::stof(ARGV_NEXT);
+        params.diarize_cluster_threshold_explicit = true;
     } else if (arg == "--diarize-max-speakers") {
         params.diarize_max_speakers = std::stoi(ARGV_NEXT);
+        params.diarize_max_speakers_explicit = true;
+    } else if (arg == "--diarize-num-speakers") {
+        // >0 pins the speaker count for --diarize-method foxnose, skipping
+        // automatic estimation entirely.
+        params.diarize_num_speakers = std::stoi(ARGV_NEXT);
     } else if (arg == "--cache-dir") {
         params.cache_dir = ARGV_NEXT;
     } else if (arg == "--alt") {
@@ -1103,7 +1109,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "Emits lang=<code>\\tconf=<x>\\tbackend=<n> to stderr.\n",
             params.lid_on_transcript.c_str());
     fprintf(stderr,
-            "  --diarize-method NAME             [%-7s] diarize method: energy|xcorr|vad-turns|sherpa|pyannote|ecapa\n",
+            "  --diarize-method NAME             [%-7s] diarize method: "
+            "energy|xcorr|vad-turns|sherpa|pyannote|ecapa|foxnose\n",
             params.diarize_method.c_str());
     fprintf(stderr,
             "                                             energy/xcorr: stereo channel split; vad-turns: gap-based "
@@ -2932,7 +2939,7 @@ int main(int argc, char** argv) {
                 // each segment's speaker label with its global cluster
                 // ID. Failure to build the embedder is a warning, not
                 // an error — the pyannote-local labels above survive.
-                if (!params.diarize_embedder.empty() && !pcmf32.empty()) {
+                if (!params.diarize_embedder.empty() && !pcmf32.empty() && !params.diarize_embedder_is_foxnose()) {
                     auto embedder =
                         crispasr_make_speaker_embedder(params.diarize_embedder, params.n_threads, params.cache_dir);
                     if (embedder) {

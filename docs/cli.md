@@ -936,10 +936,35 @@ the most languages (2102 ISO 639-3 + script). LID-176 is **CC-BY-SA-3.0
 
 ## Diarization
 
-Diarization assigns a speaker label to every transcribed segment. Two
-high-level paths, both work with every ASR backend:
+Diarization assigns a speaker label to every transcribed segment. Every method
+below works with every ASR backend.
+
+**Start with `foxnose`** unless you have a reason not to: it is the most
+accurate in-tree path, needs no Python and no external binary, and estimates
+the number of speakers instead of requiring you to know it.
+
+Measured on 8 VoxConverse dev files against human labels (whisper-tiny
+segments, 0.25 s collar, `tools/der_score.py`):
+
+| Method | Mean DER |
+|---|---|
+| `foxnose` + WeSpeaker | **7.3 %** |
+| `pyannote` + TitaNet | 7.8 % |
+
+Scored the way the upstream reference scores itself — on diarization turns
+rather than ASR segments — `foxnose` is at parity with it: 3.18 % against
+3.07 %.
 
 ```bash
+# Recommended: foxnose (auto-downloads the 24 MB WeSpeaker GGUF)
+crispasr -m auto --backend cohere -f podcast.wav \
+    --diarize --diarize-method foxnose --diarize-embedder auto -ojf
+
+# Pin the speaker count when you know it (skips estimation entirely)
+crispasr -m auto --backend cohere -f podcast.wav \
+    --diarize --diarize-method foxnose --diarize-embedder auto \
+    --diarize-num-speakers 2 -ojf
+
 # Native GGUF pyannote (no Python, no sherpa-onnx)
 crispasr -m auto --backend cohere -f podcast.wav \
     --diarize --diarize-method pyannote --sherpa-segment-model auto -ojf
@@ -958,6 +983,7 @@ crispasr -m auto --backend cohere -f podcast.wav \
 | `energy` | stereo | `|L|` vs `|R|` per segment; the louder channel wins (1.1× margin) |
 | `xcorr` | stereo | TDOA via cross-correlation, ±5 ms search window |
 | `vad-turns` | mono | Alternates 0/1 every >600 ms gap (mono-friendly proxy) |
+| `foxnose` | mono | **Recommended.** WeSpeaker ResNet34-LM embeddings over sliding windows -> PCA + full-covariance GMM/BIC speaker counting -> Ng-Jordan-Weiss spectral clustering -> Viterbi temporal smoothing. Estimates the speaker count; `--diarize-num-speakers N` pins it. Needs `--diarize-embedder auto` (or a WeSpeaker GGUF path). Weights are CC-BY-4.0 — see `THIRD_PARTY_NOTICES.txt` |
 | `pyannote` | mono | Native GGUF pyannote-seg-3.0; runs once globally over the full audio, splits ASR segments at speaker-turn boundaries when per-word timestamps exist. Auto-downloads the GGUF via `--sherpa-segment-model auto` |
 | `sherpa` / `ecapa` | mono | External `sherpa-onnx` subprocess with segmentation + speaker-embedding model. Since #110, runs once globally over the full audio (not per-slice), producing consistent speaker IDs across the whole file. Splits ASR segments at speaker-turn boundaries when per-word timestamps exist. Requires `--sherpa-bin`, `--sherpa-segment-model`, `--sherpa-embedding-model` |
 
@@ -970,6 +996,23 @@ input and `vad-turns` for mono — the historical behaviour.
 > speakers to each per-slice ASR segment, ensuring speaker IDs are
 > consistent across the entire file. Before #110, `sherpa`/`ecapa`
 > ran per-slice, producing local IDs that could reset between slices.
+
+#### Trading accuracy for throughput (`CRISPASR_DIARIZE_SPAN_EMBED=1`)
+
+`foxnose` slides a 1.2 s window at a 0.6 s hop, so every sample goes through the
+embedding network twice. Setting `CRISPASR_DIARIZE_SPAN_EMBED=1` runs one
+network pass per *span* of 32 windows and takes each window as a slice of it.
+
+Measured on the VoxConverse dev shard: **1.78x less diarization CPU** (66.0 s ->
+37.0 s on an 85 s file), for **+0.30 mean DER** (7.32% -> 7.62%). Six of eight
+files come out identical; one borderline file loses a speaker, because the
+slightly different embeddings flip the speaker-count estimate from 4 to 3.
+
+Off by default — accuracy is the better default for a diarizer. Turn it on when
+you are throughput-bound and can accept that. Span size
+(`CRISPASR_DIARIZE_SPAN_WINDOWS`, default 32) does **not** affect the accuracy
+cost — it is identical from N=2 to N=32 — so there is nothing to tune: larger is
+simply faster.
 
 ### `--diarize-embedder MODEL` — globally stable speaker IDs
 
@@ -987,9 +1030,20 @@ the whole audio.
 
 The interface is pluggable: add a new adapter by subclassing
 `CrispasrSpeakerEmbedder` in `src/crispasr_speaker_embedder.cpp` and
-extending the factory's dispatch. Tune clustering with
-`--diarize-cluster-threshold X` (default 0.5; higher = more clusters)
-and `--diarize-max-speakers N` (default 8 — hard cap).
+extending the factory's dispatch.
+
+`--diarize-max-speakers N` (default 8) bounds the search. `--diarize-num-speakers N`
+pins the count outright and skips estimation.
+
+> **`--diarize-cluster-threshold` only applies if you pass it (#326).** The
+> default path estimates the speaker count with the same spectral clusterer
+> `foxnose` uses, and a cosine merge threshold means nothing to it. It used to
+> be consulted always — single-linkage agglomerative at a fixed 0.5 — and
+> because single linkage chains, the merge loop never reached the threshold and
+> `--diarize-max-speakers` silently became the answer rather than a ceiling:
+> on 4 of 8 VoxConverse dev files it returned exactly 8 speakers against 4-7
+> real ones. Passing the flag explicitly still selects the old agglomerative
+> path for anyone who tuned it; leaving it alone gets the estimator.
 
 This clustering is **session-scoped**: embeddings are computed per
 recording and discarded, labels are anonymous `(speaker N)`, and nothing

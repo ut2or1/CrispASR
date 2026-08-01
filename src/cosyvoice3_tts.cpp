@@ -6010,7 +6010,13 @@ extern "C" float* cosyvoice3_tts_synth(struct cosyvoice3_tts_context* ctx, const
                         "tokenizer.ggml.tokens?)\n");
         return nullptr;
     }
-    std::string vname = voice_name ? voice_name : ctx->voices.voices.front().name;
+    // "default" / "auto" are the project-wide sentinels for "pick for me" — the
+    // same ones this file already honours for the flow GGUF path. Without this a
+    // caller passing --voice default got 'voice "default" not found (have 8)',
+    // even though a null voice_name already falls back to the first voice.
+    std::string vname = voice_name ? voice_name : std::string();
+    if (vname.empty() || vname == "default" || vname == "auto")
+        vname = ctx->voices.voices.front().name;
     const cv3_voice* voice = cv3_find_voice(ctx->voices, vname);
     if (!voice) {
         fprintf(stderr, "cosyvoice3_tts: synth: voice '%s' not found (have %zu)\n", vname.c_str(),

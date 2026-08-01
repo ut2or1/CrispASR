@@ -1100,7 +1100,7 @@ static ggml_cgraph* nemotron_build_graph_encoder(nemotron_context* ctx, int T_me
     }
 
     // ----- Conformer layers -----
-    core_conformer::BlockParams bp;
+    core_conformer::BlockParams bp = {};
     bp.d = (int)hp.d_model;
     bp.n_heads = (int)hp.n_heads;
     bp.head_dim = (int)hp.head_dim;
@@ -1250,7 +1250,7 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
     int n_chunks = (T_enc + chunk_size - 1) / chunk_size;
     enc_out.resize((size_t)T_enc * d);
 
-    core_conformer::BlockParams bp;
+    core_conformer::BlockParams bp = {};
     bp.d = d;
     bp.n_heads = (int)hp.n_heads;
     bp.head_dim = (int)hp.head_dim;
