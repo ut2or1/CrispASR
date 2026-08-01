@@ -10,6 +10,14 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <cerrno>
+#include <chrono>
+#include <csignal>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 namespace crispasr_cli_process {
@@ -156,7 +164,15 @@ inline RunResult run_capture_stdout(const std::vector<std::string>& args, int ti
     return result;
 }
 #else
-inline RunResult run_capture_stdout(const std::vector<std::string>& args, int /*timeout_sec*/,
+// fork/exec rather than popen, because popen gives no way to stop waiting.
+// The Windows branch above honours timeout_sec; a POSIX branch that ignored it
+// left the SAME unbounded hang reachable on Linux and macOS while the
+// signature advertised otherwise — verified by pointing --sherpa-bin at a
+// script that sleeps forever: the process ran until killed externally.
+//
+// execvp also removes the shell from the path entirely, so a model path
+// containing a space or a quote can no longer be re-split or re-interpreted.
+inline RunResult run_capture_stdout(const std::vector<std::string>& args, int timeout_sec,
                                     bool capture_stderr = false) {
     RunResult result;
     if (args.empty()) {
@@ -164,17 +180,88 @@ inline RunResult run_capture_stdout(const std::vector<std::string>& args, int /*
         return result;
     }
 
-    std::string cmd = join_cmdline(args) + (capture_stderr ? " 2>&1" : " 2>/dev/null");
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) {
+    int fds[2];
+    if (pipe(fds) != 0) {
         result.spawn_failed = true;
         return result;
     }
 
-    char linebuf[1024];
-    while (fgets(linebuf, sizeof(linebuf), pipe))
-        result.output += linebuf;
-    result.exit_code = pclose(pipe);
+    const pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        result.spawn_failed = true;
+        return result;
+    }
+
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        if (capture_stderr) {
+            dup2(fds[1], STDERR_FILENO);
+        } else {
+            const int nul = open("/dev/null", O_WRONLY);
+            if (nul >= 0) {
+                dup2(nul, STDERR_FILENO);
+                close(nul);
+            }
+        }
+        close(fds[1]);
+        std::vector<char*> argv;
+        argv.reserve(args.size() + 1);
+        for (const auto& a : args)
+            argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        execvp(argv[0], argv.data());
+        _exit(127); // exec failed; 127 is the shell's convention for not-found
+    }
+
+    close(fds[1]);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec > 0 ? timeout_sec : 0);
+    char buf[4096];
+    for (;;) {
+        int wait_ms = -1;
+        if (timeout_sec > 0) {
+            const auto left =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now())
+                    .count();
+            if (left <= 0) {
+                result.timed_out = true;
+                break;
+            }
+            wait_ms = (int)left;
+        }
+        struct pollfd pfd {
+            fds[0], POLLIN, 0
+        };
+        const int pr = poll(&pfd, 1, wait_ms);
+        if (pr == 0) {
+            result.timed_out = true;
+            break;
+        }
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        const ssize_t n = read(fds[0], buf, sizeof(buf));
+        if (n > 0)
+            result.output.append(buf, buf + n);
+        else if (n == 0)
+            break; // child closed stdout
+        else if (errno != EINTR)
+            break;
+    }
+    close(fds[0]);
+
+    if (result.timed_out) {
+        kill(pid, SIGKILL);
+        // Reap regardless, so a timed-out sherpa cannot become a zombie.
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     return result;
 }
 #endif

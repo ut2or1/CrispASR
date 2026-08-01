@@ -513,7 +513,10 @@ extern "C" {
         -> c_int;
     // #316: synthesize these phonemes verbatim, skipping the G2P. Empty clears.
     // -2 = the active backend has no phonemes-in call (kokoro and piper do).
-    pub fn crispasr_session_set_tts_phonemes(s: *mut CrispasrSession, phonemes: *const c_char) -> c_int;
+    pub fn crispasr_session_set_tts_phonemes(
+        s: *mut CrispasrSession,
+        phonemes: *const c_char,
+    ) -> c_int;
     // qwen3-tts variant detection (returns 0/1; 0 also covers "not qwen3-tts").
     pub fn crispasr_session_is_custom_voice(s: *mut CrispasrSession) -> c_int;
     pub fn crispasr_session_is_voice_design(s: *mut CrispasrSession) -> c_int;

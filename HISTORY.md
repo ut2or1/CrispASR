@@ -6,6 +6,41 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-08-01 — v0.8.25 release: two new backends, and a decode table that was wrong
+
+140 commits since v0.8.24. Headline additions are **GigaAM-v3** (Russian ASR,
+cosine 1.000000 at every stage on the first diff run) and **foxnose**
+diarization (WeSpeaker + spectral clustering, no external binary). But the
+theme that emerged while writing the notes was measurement being wrong:
+
+- **The pyannote powerset decode table had two entries transposed.** The head
+  emits a powerset over locally-active speakers; class 3 is spk2 ALONE and 4 is
+  the first PAIR, and we had them backwards — so every frame of a third speaker
+  was credited to the first two as simultaneous speech. 15 DER points. It
+  survived because every test used at most two speakers, where both tables
+  agree. Layout now lives once in `src/core/powerset.h`, derived not
+  transcribed, guarded by `tests/test-powerset.cpp`.
+- **`--diarize-max-speakers` was picking the count, not bounding it.**
+  Single-linkage clustering at a fixed 0.5 threshold never reached the
+  threshold, so the cap decided the answer — exactly 8 speakers on 4 of 8 files
+  with 4-7 real ones. 15.74% -> 7.81% DER.
+- **CI executed 1 unit test out of 162.** Turning the tier on surfaced two real
+  pre-existing failures, one of which (a transposed VAD matmul view violating
+  `llamafile_sgemm`'s `ldb >= k`) ran anyway in Release because NDEBUG compiled
+  the assert out.
+- **The DER numbers this project had been quoting came from an easy subset.**
+  Identical code scores 7.3% on the 8-file shard and 33.1% on a 40-file sample
+  of full VoxConverse dev. `tools/diarize_eval.py` + `tools/voxconverse_extract.py`
+  now provide a corpus and a two-metric (count accuracy AND DER) harness over a
+  tune/holdout split, because DER alone cannot see a count error — one file
+  predicts 2 speakers against a true 5 and still scores 6.88%.
+
+NME-SC speaker counting was implemented, measured on that harness, and **lost**
+(count exact 17/40 vs 18/40, DER 39.26% vs 33.06%). It cuts under-counting but
+converts it to over-counting. Left opt-in, default unchanged, holdout unspent.
+
+---
+
 ## 2026-07-28 — v0.8.24 release: fixes that had never run
 
 83 commits since v0.8.23. The theme that emerged from writing the notes was not

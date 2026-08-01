@@ -760,7 +760,20 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
 
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
     if (!out.buf) {
-        fprintf(stderr, "%s: failed to allocate backend buffer\n", tag);
+        // Almost always the weights simply don't fit in VRAM. The bare message
+        // sent people hunting for a ggml bug; say how much was wanted and what
+        // to do about it. (KugelAudio's F16 asks 17.3 GB — a hard stop on any
+        // 16 GB card, with nothing in the old message to suggest a smaller
+        // quant would work.)
+        size_t wanted = 0;
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+        for (ggml_tensor* t = ggml_get_first_tensor(out.ctx); t; t = ggml_get_next_tensor(out.ctx, t))
+            wanted += ggml_backend_buft_get_alloc_size(buft, t);
+        fprintf(stderr,
+                "%s: failed to allocate %.2f GB on '%s' for the model weights.\n"
+                "  If this is a GPU, the model does not fit in VRAM. Try a smaller quantization\n"
+                "  (--model-quant q4_k), or run on CPU with --no-gpu.\n",
+                tag, (double)wanted / 1e9, ggml_backend_name(backend));
         gguf_free(gctx);
         ggml_free(out.ctx);
         out.ctx = nullptr;

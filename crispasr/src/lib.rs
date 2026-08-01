@@ -968,7 +968,9 @@ impl Session {
         let c = CString::new(attestation).map_err(|e| e.to_string())?;
         // The C side records the attestation; the return is informational
         // (mirrors the Python/Dart bindings, which ignore it).
-        unsafe { crispasr_sys::crispasr_session_accept_marking_responsibility(self.handle, c.as_ptr()) };
+        unsafe {
+            crispasr_sys::crispasr_session_accept_marking_responsibility(self.handle, c.as_ptr())
+        };
         Ok(())
     }
 
@@ -980,7 +982,11 @@ impl Session {
         let ctext = CString::new(text).map_err(|e| e.to_string())?;
         let mut n: c_int = 0;
         let ptr = unsafe {
-            crispasr_sys::crispasr_session_synthesize_raw(self.handle, ctext.as_ptr(), &mut n as *mut c_int)
+            crispasr_sys::crispasr_session_synthesize_raw(
+                self.handle,
+                ctext.as_ptr(),
+                &mut n as *mut c_int,
+            )
         };
         if ptr.is_null() || n <= 0 {
             return Err(format!(
@@ -1474,7 +1480,8 @@ impl Session {
     /// Honoured by `kokoro` and `piper`; other backends soft no-op (`rc = -2`).
     pub fn set_tts_phonemes(&self, phonemes: &str) -> Result<(), String> {
         let c = CString::new(phonemes).map_err(|e| e.to_string())?;
-        let rc = unsafe { crispasr_sys::crispasr_session_set_tts_phonemes(self.handle, c.as_ptr()) };
+        let rc =
+            unsafe { crispasr_sys::crispasr_session_set_tts_phonemes(self.handle, c.as_ptr()) };
         if rc == -2 {
             return Err("backend has no phonemes-in entry point (kokoro and piper do)".to_string());
         }

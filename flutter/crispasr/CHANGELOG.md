@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.25
+
+* New ASR backend: GigaAM-v3 (Russian, CTC + RNN-T, punctuation-native `e2e` heads).
+* New diarization method `foxnose` — WeSpeaker embeddings + spectral clustering,
+  no external binary required.
+* Diarization correctness: the pyannote powerset decode table had two entries
+  swapped (48.21% -> 33.37% DER), and `--diarize-max-speakers` was picking the
+  speaker count instead of bounding it (15.74% -> 7.81% DER).
+* Diarization speed: pyannote segmentation now infers in parallel chunks
+  (2888 s file, 8 cores: ~50 s -> 18.1 s); speaker embedding parallelised.
+* Fixed sherpa diarization hanging indefinitely (#328) and the MSVC build
+  failure in glint (#327).
+* ggml synced to v0.17.0.
+
 ## 0.8.24
 
 - **`Session.setTtsPhonemes(String)`** — synthesize a phoneme string verbatim,
