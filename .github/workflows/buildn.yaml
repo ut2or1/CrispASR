@@ -151,7 +151,7 @@ jobs:
             -DCRISPASR_BUILD_TESTS=OFF ^
             -DCRISPASR_BUILD_EXAMPLES=OFF ^
             -DCRISPASR_BUILD_SERVER=ON ^
-            -DGGML_BACKEND_DL=OFF ^
+            -DGGML_BACKEND_DL=ON ^
             -DGGML_VULKAN=ON ^
             -DGGML_NATIVE=OFF ^
             -DGGML_CPU_ALL_VARIANTS=ON ^
