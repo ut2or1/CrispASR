@@ -148,6 +148,7 @@ jobs:
             -G "Ninja" ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DWHISPER_BUILD_TESTS=OFF ^
             -DGGML_BACKEND_DL=OFF ^
             -DGGML_VULKAN=ON ^
             -DGGML_NATIVE=OFF ^
