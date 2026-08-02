@@ -149,6 +149,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
             -DCRISPASR_BUILD_TESTS=OFF ^
+            -DCRISPASR_BUILD_EXAMPLES=OFF ^
             -DGGML_BACKEND_DL=OFF ^
             -DGGML_VULKAN=ON ^
             -DGGML_NATIVE=OFF ^
