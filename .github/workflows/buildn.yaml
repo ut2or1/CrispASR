@@ -150,10 +150,11 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
             -DCRISPASR_BUILD_TESTS=OFF ^
             -DCRISPASR_BUILD_EXAMPLES=OFF ^
+            -DCRISPASR_BUILD_SERVER=ON ^
             -DGGML_BACKEND_DL=OFF ^
             -DGGML_VULKAN=ON ^
             -DGGML_NATIVE=OFF ^
-            -DGGML_CPU_ALL_VARIANTS=OFF ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
             -DGGML_CPU=ON ^
             -DGGML_LTO=ON ^
             -DGGML_STATIC=ON ^
