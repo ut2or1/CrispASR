@@ -387,6 +387,32 @@ CRISPASR_SESSION_API float* crispasr_session_synthesize(crispasr_session* s, con
 // Attest acceptance of AI-content marking/disclosure duty (required for _raw); recorded for audit.
 CRISPASR_SESSION_API int crispasr_session_accept_marking_responsibility(crispasr_session* s, const char* attestation);
 
+// ─── Spoken AI-disclosure for voice clones (EU AI Act Art. 50(4)) ──────
+//
+// synthesize() watermarks every clip, which discharges the machine-readable
+// marking duty (Art. 50(2)). Art. 50(4) additionally requires a VISIBLE OR
+// AUDIBLE disclosure when the output is a deepfake — a watermark alone does not
+// satisfy it. The CLI and the HTTP server prepend a spoken disclaimer to cloned
+// output automatically; the ABI does not, because the neutral-voice synthesis
+// that requires cannot be done portably once a clone voice is applied to the
+// backend. On the ABI that duty is yours, and these two calls are the tools.
+//
+// Synthesizing with a clone voice set and no accept_marking_responsibility()
+// logs a one-time [MARKING] warning rather than refusing.
+
+// The canonical disclosure string, identical to the CLI's. Static; never NULL.
+// Use it for a visible label — Art. 50(5) requires disclosures to meet
+// accessibility requirements, and audio-only is not accessible to a deaf user.
+CRISPASR_SESSION_API const char* crispasr_session_disclaimer_text(void);
+
+// The disclosure synthesized in this session's NEUTRAL voice, for you to
+// prepend to cloned output. MUST be called BEFORE crispasr_session_set_voice()
+// installs a cloning voice — it returns NULL afterwards (see
+// crispasr_session_last_synth_error), because a disclaimer spoken in the cloned voice
+// would make the output more deceptive rather than less. Caller owns the
+// buffer; free with crispasr_pcm_free().
+CRISPASR_SESSION_API float* crispasr_session_get_disclaimer_pcm(crispasr_session* s, int* out_n_samples);
+
 // Streaming synthesis: fires `cb` once per sentence chunk with that chunk's
 // watermarked PCM (backend-native sample rate, same as synthesize) as it is
 // produced. The PCM is owned by the call and freed after `cb` returns — copy

@@ -66,7 +66,27 @@ def main() -> None:
     ap.add_argument("--voice", action="append", required=True, type=parse_voice,
                     help="name:wav_path:ref_text (repeatable, one per voice)")
     ap.add_argument("--output", required=True, help="Output GGUF path")
+    ap.add_argument("--i-have-rights", dest="i_have_rights", action="store_true",
+                    help="attest that you have the consent of the speaker(s) in the reference "
+                         "audio, or that it is your own voice. Required: baking clones a real "
+                         "person's voice into a reusable pack.")
+    ap.add_argument("--consent-attestation", default="",
+                    help="free-text attestation recorded in the pack metadata (audit trail; "
+                         "does not replace --i-have-rights at synthesis time)")
     args = ap.parse_args()
+
+    # Consent gate, mirroring the CLI's --i-have-rights. Baking IS the cloning
+    # step: everything downstream just replays the pack. The stamp is what lets
+    # the runtime's consent + Art. 50(4) disclosure gates recognise the .gguf as
+    # a clone, since they no longer guess from the file suffix.
+    if not args.i_have_rights:
+        raise SystemExit(
+            "baking a voice pack requires --i-have-rights.\n"
+            "\n"
+            "  By passing --i-have-rights you attest:\n"
+            '  "I have the consent of the speaker whose voice this clones,\n'
+            '   or it is my own voice."\n'
+        )
 
     # Lazy imports so --help works without the heavy stack
     try:
@@ -98,6 +118,10 @@ def main() -> None:
     w.add_description("Qwen3-TTS voice prompt pack (spk_embedding + ref_code per voice)")
     w.add_array("voicepack.names", [name for name, _, _ in voices])
     w.add_array("voicepack.ref_texts", [t for _, _, t in voices])
+    # Voice-clone provenance — see examples/cli/crispasr_voice_clone_policy.h.
+    w.add_bool("crispasr.voice.cloned_from_recording", True)
+    if args.consent_attestation:
+        w.add_string("crispasr.voice.consent_attestation", args.consent_attestation)
 
     for name, wav_path, ref_text in voices:
         print(f"\n--- voice '{name}' ---")

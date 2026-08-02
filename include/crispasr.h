@@ -628,6 +628,22 @@ CRISPASR_API float* crispasr_session_synthesize_raw(struct crispasr_session* s, 
 // (EU AI Act Art. 50). REQUIRED to use crispasr_session_synthesize_raw(); the
 // default marked paths do not need it. `attestation` is recorded for audit.
 CRISPASR_API int crispasr_session_accept_marking_responsibility(struct crispasr_session* s, const char* attestation);
+
+// Spoken AI-disclosure for voice clones (EU AI Act Art. 50(4)). The watermark
+// on synthesize() covers the machine-readable marking duty (Art. 50(2)), but a
+// deepfake additionally needs a VISIBLE OR AUDIBLE label, which a watermark is
+// not. The CLI and server prepend one automatically; the ABI cannot (neutral-
+// voice synthesis is not portable once a clone voice is applied), so it hands
+// you the pieces and logs a one-time [MARKING] warning instead of refusing.
+//
+// disclaimer_text() is a static string — use it for a visible label.
+// get_disclaimer_pcm() synthesizes it in the neutral voice and MUST be called
+// BEFORE crispasr_session_set_voice() installs a clone; afterwards it returns
+// nullptr, because a disclosure spoken in the cloned voice would make the
+// output more deceptive rather than less. Caller frees with crispasr_pcm_free().
+CRISPASR_API const char* crispasr_session_disclaimer_text(void);
+CRISPASR_API float* crispasr_session_get_disclaimer_pcm(struct crispasr_session* s, int* out_n_samples);
+
 CRISPASR_API void crispasr_pcm_free(float* pcm);
 
 // Speech-to-Speech — audio in → audio out via a single model pass.

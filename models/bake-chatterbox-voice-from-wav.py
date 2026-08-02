@@ -29,7 +29,13 @@ Usage:
     python models/bake-chatterbox-voice-from-wav.py \\
         --input /path/to/reference.wav \\
         --output my_voice.gguf \\
+        --i-have-rights \\
         [--exaggeration 0.5]
+
+``--i-have-rights`` attests speaker consent and is required: baking is the
+cloning step. The pack is stamped ``crispasr.voice.cloned_from_recording``
+so the runtime's consent and spoken-AI-disclosure gates recognise it as a
+clone at synthesis time.
 
 Requirements: the upstream ``chatterbox-tts`` package and ``gguf`` (ships
 with llama.cpp / ggml). Set ``RESEMBLE_CHATTERBOX_SRC`` if you have a
@@ -79,7 +85,28 @@ def main() -> None:
                         help="emotion-adv scalar baked into the voice (0.0-2.0, default 0.5)")
     parser.add_argument("--device", default="cpu",
                         help="device for the baking forward pass (default cpu)")
+    parser.add_argument("--i-have-rights", dest="i_have_rights", action="store_true",
+                        help="attest that you have the consent of the speaker in --input, "
+                             "or that it is your own voice. Required: baking clones a real "
+                             "person's voice into a reusable pack.")
+    parser.add_argument("--consent-attestation", default="",
+                        help="free-text attestation recorded in the pack's metadata "
+                             "(audit trail; does not replace --i-have-rights at synthesis time)")
     args = parser.parse_args()
+
+    # Consent gate, mirroring the CLI's --i-have-rights. Baking IS the cloning
+    # step: everything downstream just replays the pack. It also stamps the
+    # provenance the runtime gates read back — chatterbox has no .wav cloning
+    # path, so before that stamp existed a baked voice could never trip the
+    # consent gate or the Art. 50(4) spoken disclosure at synthesis time.
+    if not args.i_have_rights:
+        raise SystemExit(
+            "baking a voice pack requires --i-have-rights.\n"
+            "\n"
+            "  By passing --i-have-rights you attest:\n"
+            '  "I have the consent of the speaker whose voice this clones,\n'
+            '   or it is my own voice."\n'
+        )
 
     _find_chatterbox_src()
 
@@ -154,6 +181,13 @@ def main() -> None:
     writer.add_description("Chatterbox voice conditioning baked from " + str(args.input))
 
     writer.add_float32("chatterbox.conds.emotion_adv", float(args.exaggeration))
+    # Voice-clone provenance. The synthesis-time consent + Art. 50(4) disclosure
+    # gates classify by this stamp, not by the .gguf suffix — a pack baked from a
+    # recording is as much a deepfake as the recording. Key names mirror
+    # examples/cli/crispasr_voice_clone_policy.h; change both together.
+    writer.add_bool("crispasr.voice.cloned_from_recording", True)
+    if args.consent_attestation:
+        writer.add_string("crispasr.voice.consent_attestation", args.consent_attestation)
     writer.add_uint32("chatterbox.conds.gen_prompt_token_len", int(prompt_token.shape[0]))
 
     writer.add_tensor("conds.t3.speaker_emb",

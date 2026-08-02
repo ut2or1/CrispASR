@@ -36,6 +36,15 @@ on:
       - 'bindings/javascript/package.json'
       - 'crispasr/Cargo.toml'
       - 'crispasr-sys/Cargo.toml'
+      # kaggle_harness bundled-copy sync. Without these the job could only ever
+      # fire incidentally, on some unrelated .cpp push: editing the canonical
+      # harness did not trigger it (so drift went unnoticed — 6503430b sat
+      # broken), and neither did the re-copy that fixes it (so the job could not
+      # be observed going green again). A guard that cannot run on the commits
+      # it exists to guard is not a guard.
+      - 'tools/kaggle/**/kaggle_harness.py'
+      - 'tools/kaggle/kaggle_harness.py'
+      - 'tools/check-kaggle-harness-sync.py'
   pull_request:
     branches: [main, master]
     paths:

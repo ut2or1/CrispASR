@@ -662,8 +662,7 @@ bool crispasr_write_json(const std::string& path, const std::vector<crispasr_seg
             f << ",\n      \"language\":   \"" << json_escape(s.lang_id) << "\"";
         if (!s.audio_event.empty())
             f << ",\n      \"audio_event\":\"" << json_escape(s.audio_event) << "\"";
-        if (!s.emotion.empty())
-            f << ",\n      \"emotion\":    \"" << json_escape(s.emotion) << "\"";
+        // No "emotion" key by design — see crispasr_backend.h / docs/eu-ai-act.md.
         if (!s.itn_flag.empty())
             f << ",\n      \"itn_flag\":   \"" << json_escape(s.itn_flag) << "\"";
         // #292: chunk scope. Only present on multi-chunk runs (single-pass leaves

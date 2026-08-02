@@ -488,6 +488,15 @@ struct whisper_params {
     bool tts_voice_clone_consent = false;
     std::string tts_consent_attestation;
 
+    // Set when THIS run baked `tts_voice` from a user-supplied recording (the
+    // TADA inline-clone path bakes a .wav into a temp .gguf and rewrites
+    // tts_voice to point at it). Without this the rewrite erased the only
+    // evidence the voice was a clone, and the consent + spoken-disclosure gates
+    // — which classified by filename suffix — both scored the most explicit
+    // cloning command in the CLI as "not a clone".
+    // See crispasr_voice_clone_policy.h.
+    bool tts_voice_baked_from_wav = false;
+
     // Skip the spoken AI-disclosure prefix on voice-cloned output.
     // Machine-readable provenance (watermark + C2PA) is always retained.
     // CLI: --no-spoken-disclaimer   Server: "spoken_disclaimer": false

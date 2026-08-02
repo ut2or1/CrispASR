@@ -375,6 +375,16 @@ def install_build_toolchain() -> dict:
         ccache_dir.mkdir(parents=True, exist_ok=True)
         os.environ["CCACHE_DIR"] = str(ccache_dir)
         os.environ["CCACHE_MAXSIZE"] = "5G"
+        # Make the cache RELOCATABLE. ccache hashes the working directory by
+        # default, so a build tree at a different path misses every object even
+        # with a perfectly good cache — moving the sweep's build from
+        # /kaggle/working to /kaggle/temp turned a ~3 min warm build into a full
+        # 734-object cold one. NOHASHDIR drops the cwd from the hash; BASEDIR
+        # rewrites absolute paths beneath it to relative, so -I flags baked into
+        # the command line do not bust the hash either. Same pairing that makes
+        # the cache shared across local git worktrees.
+        os.environ["CCACHE_NOHASHDIR"] = "1"
+        os.environ["CCACHE_BASEDIR"] = str(_scratch)
         # Warm ccache from attached dataset (chr1s4/crispasr-ccache or
         # chr1str/crispasr-ccache). Shaves ~15 min off incremental builds.
         _warm_ccache_from_dataset(ccache_dir)

@@ -12,7 +12,7 @@ trade-off:
 | **`qwen3-tts`** | Highest fidelity / strongest cloning. Speech-LLM (talker + code predictor + 12 Hz codec). Default voice auto-downloaded with `-m auto`; or supply your own WAV + ref-text. | Optional (auto default voice; or WAV + ref-text or baked voice GGUF) | ~1.3 GB via `-m auto` |
 | **`miotts`** | MioTTS-0.6B (Qwen3 LLM + MioCodec-v2). EN/JA. Single GGUF, 44.1 kHz output. Codec-aware mixed quantization (LLM Q4_K + codec F16). | Yes — `--voice preset.emb.gguf` (preset speaker embeddings) | 502 MB Q4_K via `-m auto` |
 | **`moss-tts`** | MOSS-TTS-v1.5 (MossTTSDelay): Qwen3-8B backbone emitting 32 RVQ audio codebooks under a delay pattern, decoded by a 1.6B transformer codec. Needs the codec companion (`--codec-model`, or auto-downloaded/sibling). | Yes — `--voice ref.wav` (the codec encoder clones the reference speaker) | ~5 GB Q4_K backbone + ~3.5 GB F16 codec via `-m auto` |
-| **`moss-tts-local`** | MOSS-TTS-Local-Transformer-v1.5 (MossTTSLocal, 4B): Qwen3-4B backbone + a 1-layer local/depth transformer that autoregressively emits 12 RVQ codebooks per frame (RQ-Transformer; no delay pattern), decoded to 48 kHz stereo by MOSS-Audio-Tokenizer-v2 (downmixed to mono). Needs the codec companion (`--codec-model`, or auto-downloaded/sibling). | Not yet (the v2 codec encoder is a follow-up) | ~9.1 GB F16 backbone + ~2.1 GB codec via `-m auto` (F16 is the reliable target; Q4_K long-form runs away) |
+| **`moss-tts-local`** | MOSS-TTS-Local-Transformer-v1.5 (MossTTSLocal, 4B): Qwen3-4B backbone + a 1-layer local/depth transformer that autoregressively emits 12 RVQ codebooks per frame (RQ-Transformer; no delay pattern), decoded to 48 kHz stereo by MOSS-Audio-Tokenizer-v2 (downmixed to mono). Needs the codec companion (`--codec-model`, or auto-downloaded/sibling). | `--voice ref.wav --i-have-rights` (needs the encoder-carrying codec, `--codec-model moss-tts-local-v1.5-codec-enc.gguf`; the plain `-codec.gguf` is decode-only and falls back to the default voice) | ~9.1 GB F16 backbone + ~2.1 GB codec via `-m auto` (F16 is the reliable target; Q4_K long-form runs away) |
 | **`omnivoice`** | 600+ languages. Qwen3-0.6B backbone with masked iterative 8-codebook TTS (SoundStorm-style). Zero-shot voice cloning from reference audio. Supports finetunes (omnivoice-singing). | Yes (`--voice <wav> --ref-text "..."`) | ~1.2 GB F16 + ~400 MB tokenizer |
 | **`vibevoice-tts`** | Lowest-latency streaming TTS, designed for realtime. | Preset voice packs | ~636 MB via `-m auto` |
 | **`vibevoice-1.5b`** | Base VibeVoice TTS model with WAV cloning. | Yes (`CRISPASR_VIBEVOICE_VOICE_AUDIO=<wav>` or `--voice <wav>`) | ~1.6 GB via `-m auto` |
@@ -33,7 +33,7 @@ trade-off:
 | **`parler-tts`** | Parler TTS Mini v1.1 (~900M): T5 encoder + MusicGen decoder + DAC 44.1 kHz. Apache-2.0. Prompt-conditioned: describe the voice in natural language via `--instruct`. | No (prompt-conditioned) | ~900 MB via `-m auto` (Q8_0 GGUF) |
 | **`voxcpm2-tts`** | VoxCPM2: 2B Qwen2 backbone + flow matching + BigVGAN @ 48 kHz (decimated to 24 kHz). Zero-shot voice cloning via `--voice <ref.wav>`. | Yes | ~2.4 GB via `-m auto` |
 | **`pocket-tts`** | Kyutai Pocket TTS 100M: continuous-latent AR @ 12.5 Hz + one-step LSD flow head + Mimi VAE decoder → 24 kHz. MIT / CC-BY-4.0. Voice cloning via `--voice ref.wav`. | Yes (`--voice`) | ~220 MB via `-m auto` (F16 GGUF) |
-| **`kugelaudio`** | KugelAudio-0-Open: 7B Qwen2.5 backbone + 4-layer DiT diffusion head (20-step SDE-DPMSolver++) + acoustic VAE decoder → 24 kHz. 23 languages. MIT. | Pre-encoded voices (`--voice voice.gguf`) | ~5.3 GB Q4_K / ~16 GB F16 via `-m auto` |
+| **`kugelaudio`** | KugelAudio-0-Open: 7B Qwen2.5 backbone + 4-layer DiT diffusion head (20-step SDE-DPMSolver++) + acoustic VAE decoder → 24 kHz. 23 languages. MIT. | Pre-encoded voices (`--voice voice.gguf`) | ~17.3 GB F16 via `-m auto` — needs >16 GB VRAM, else `--no-gpu`. The ~5.7 GB Q4_K is **not** a usable substitute: it stutters and loops (WER 0.72 vs 0.056 for F16) |
 | **`tada-1b`** | HumeAI TADA 1B: Llama-3.2-1B backbone + per-token flow-matching diffusion head + TADA codec → 24 kHz. **English-only.** `-m auto` downloads model + default `tada-ref.gguf`. | Yes (`--voice <tada-ref.gguf>`, English voice refs only) | ~1.7 GB Q4_K + ~1 GB codec |
 | **`tada` / `tada-3b-ml`** | HumeAI TADA 3B Multilingual: same architecture, 3B params. Supports **ar, ch, de, es, fr, it, ja, pl, pt** in addition to English. `-l <lang>` auto-downloads `tada-ref-<lang>.gguf`. | Yes (`--voice <tada-ref.gguf>`) | ~4 GB Q4_K + ~1 GB codec |
 | **`lfm2-audio`** | LiquidAI LFM2.5-Audio 1.5B: FastConformer encoder + LFM2 hybrid conv+attention backbone + 6L depthformer (8-codebook Mimi) + ISTFT detokenizer → 24 kHz. Interleaved text+audio generation. Also does ASR and speech-to-speech. LFM Open License v1.0 ($10M revenue cap). | No | ~1.5 GB Q4_K (JP) / ~1.6 GB Q5_K (EN) + ~157 MB detokenizer companion |
@@ -143,11 +143,15 @@ next to your TADA model GGUF, then:
 
 ```bash
 # Step 1 — bake the ref GGUF (one-time per speaker):
+# --i-have-rights is required: baking IS the cloning step. The pack is
+# stamped as clone-derived so step 2 still gets the consent gate and the
+# spoken AI disclosure.
 crispasr --backend tada-3b-ml -m auto \
     --make-ref \
     --voice speaker_10s.wav \
     --ref-text "Exact words spoken in the audio." \
-    --make-ref-output tada-ref-custom.gguf
+    --make-ref-output tada-ref-custom.gguf \
+    --i-have-rights
 
 # Step 2 — synthesise with that voice:
 crispasr --backend tada-3b-ml -m auto \
@@ -846,8 +850,18 @@ experimental — it ships its own caveats (see "Known issues" later).
 # the VoiceEncoder + S3Tokenizer paths and 24 kHz for the prompt mel.
 python models/bake-chatterbox-voice-from-wav.py \
     --input samples/jfk.wav \
-    --output my_voice.gguf
+    --output my_voice.gguf \
+    --i-have-rights
 ```
+
+`--i-have-rights` is required — baking is the cloning step, and everything
+downstream just replays the pack. The baker stamps
+`crispasr.voice.cloned_from_recording` into the output so the runtime's
+consent gate and Art. 50(4) spoken disclosure recognise the `.gguf` as a
+clone at synthesis time. Chatterbox has **no `.wav` cloning path**, so
+before that stamp existed a baked voice could never trip either gate; see
+[`eu-ai-act.md`](eu-ai-act.md#62-art-504--deepfake-disclosure). A pack baked
+by an older CrispASR carries no stamp and reads as a preset — re-bake it.
 
 The baker runs upstream `ChatterboxTTS.prepare_conditionals(wav)` and
 writes five tensors plus two scalar metadata keys, using the same
@@ -863,7 +877,8 @@ size is ~150-200 KB regardless of reference WAV length.
 ./build/bin/crispasr --backend chatterbox -m auto \
     --voice my_voice.gguf \
     --tts "Cloned voice synthesising arbitrary text." \
-    --tts-output cloned.wav
+    --tts-output cloned.wav \
+    --i-have-rights
 ```
 
 `--voice` is per-call cached, so server callers (`--server` mode) can

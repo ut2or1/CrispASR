@@ -1235,8 +1235,12 @@ ChatML prompt template; audio embedded at `<|startofspeech|>` slot.
 FunAudioLLM SenseVoice-Small — encoder-only multi-task ASR. Same 70-block
 SANM encoder as funasr, but paired with a CTC head (25K SentencePiece
 vocab) instead of an LLM. One forward pass emits transcript + language
-ID + emotion + audio-event tags. Non-autoregressive, 15× faster than
+ID + audio-event tags. Non-autoregressive, 15× faster than
 Whisper-Large.
+
+Upstream also emits an emotion tag in the same annotation prefix. CrispASR
+parses it only to strip it from the transcript and then discards it — see
+[`eu-ai-act.md`](eu-ai-act.md#41-emotion-recognition--removed-not-gated).
 
 ### madlad
 

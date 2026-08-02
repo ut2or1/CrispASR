@@ -2,9 +2,10 @@
 """
 Can KugelAudio's Q4_K be the registry default? (sweep follow-up)
 
-KugelAudio is the only multi-GB registry entry that defaults to F16. That F16 is
-17.3 GB — over the VRAM of every 16 GB card — so `-m auto` hard-fails on Kaggle's
-P100/T4 and on most user GPUs. Q4_K (5.7 GB) is published alongside it and fits.
+KugelAudio was the only multi-GB registry entry defaulting to F16. That F16 is
+17.3 GB — over the VRAM of every 16 GB card — so `-m auto` hard-failed on Kaggle's
+P100/T4 and on most user GPUs. Q4_K (5.7 GB) is published alongside it and fits,
+and is now the default; this run checks the bare `-m auto` path gets it.
 
 The one thing that would justify keeping F16 as the default is Q4_K sounding
 worse. The only prior evidence is a commit that switched the DIFF HARNESS to F16
@@ -95,7 +96,14 @@ def synth(label, extra, timeout):
     return None
 
 
-# Q4_K on the GPU is the candidate default: this is the path a user gets.
+# Bare `-m auto` — the path a user actually gets. Since the registry default
+# moved to Q4_K this must resolve to the 5.7 GB file and fit; if it still pulls
+# the F16 it will OOM here, which is exactly the regression worth catching.
+kh.step("synth auto (gpu, registry default)")
+auto = synth("auto", "", 1800)
+
+# The same weights requested explicitly. Belt-and-braces: if `auto` failed but
+# this passes, the bug is the registry default, not the model.
 kh.step("synth q4_k (gpu)")
 q4 = synth("q4_k", "--model-quant q4_k", 1800)
 
@@ -125,7 +133,7 @@ def wer(ref, hyp):
     return d[len(r)][len(h)] / max(1, len(r))
 
 
-for label, path in (("q4_k", q4), ("f16", f16)):
+for label, path in (("auto", auto), ("q4_k", q4), ("f16", f16)):
     if not path:
         continue
     rc, out = sh(f"{cli} --backend parakeet -m auto --auto-download -f {path} --no-prints", timeout=3600)
@@ -138,9 +146,18 @@ for label, path in (("q4_k", q4), ("f16", f16)):
 # matching F16 exactly, which no 4-bit quant does. If F16 could not be produced
 # here the comparison is simply absent; that is reported, not papered over.
 res["q4k_usable"] = res.get("wer_q4_k", 1.0) <= 0.25
+res["auto_usable"] = res.get("wer_auto", 1.0) <= 0.25
+# Which file `-m auto` actually fetched. Succeeding on a 16 GB GPU already
+# implies it is not the 17.3 GB F16, but name the file so the record is explicit
+# rather than inferred.
+res["auto_downloaded"] = sorted(
+    f"{q.name} ({q.stat().st_size/1e9:.1f} GB)"
+    for q in Path.home().joinpath(".cache/crispasr").rglob("kugelaudio*.gguf")
+)
 res["f16_measured"] = f16 is not None
 if "wer_f16" in res and "wer_q4_k" in res:
     res["wer_delta_q4k_minus_f16"] = round(res["wer_q4_k"] - res["wer_f16"], 4)
 (WORK / "kugelaudio_quant.json").write_text(json.dumps(res, indent=2))
-kh.step("done", q4k_usable=res["q4k_usable"], wer_q4_k=res.get("wer_q4_k"), wer_f16=res.get("wer_f16"))
+kh.step("done", auto_usable=res["auto_usable"], q4k_usable=res["q4k_usable"],
+        wer_auto=res.get("wer_auto"), wer_q4_k=res.get("wer_q4_k"), wer_f16=res.get("wer_f16"))
 print(json.dumps(res, indent=2), flush=True)

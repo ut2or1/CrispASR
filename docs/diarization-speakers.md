@@ -236,6 +236,10 @@ path commercially.
 
 To stay clearly on the safe side, prefer **section 1** and rename manually.
 
+The full AI Act position — including why the constraints above keep this
+outside Annex III(1)(a), and what the Act requires of you as deployer — is in
+[`eu-ai-act.md`](eu-ai-act.md).
+
 ---
 
 ## Implementation notes

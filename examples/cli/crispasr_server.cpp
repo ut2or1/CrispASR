@@ -54,6 +54,8 @@
 #include "crispasr_marking_policy.h" // #312: who may skip the spoken AI-disclaimer
 #include "crispasr_tts_chunking.h"
 #include "crispasr_tts_disclaimer.h"
+#include "crispasr_voice_clone_policy.h"
+#include "crispasr_voice_provenance.h"
 #include "crispasr_watermark.h"
 #include "crispasr_watermark_dispatch.h"
 #include "core/crispasr_wav_writer.h"
@@ -2140,11 +2142,18 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         // is only honored when attested — see the marking gate below.
         const bool spoken_disclaimer = body.value("spoken_disclaimer", true);
 
-        // Voice-cloning consent gate: when the voice is a .wav reference
-        // (voice cloning), require an explicit consent_attestation field.
-        const bool is_voice_clone =
-            voice_name.size() >= 4 && (voice_name.compare(voice_name.size() - 4, 4, ".wav") == 0 ||
-                                       voice_name.compare(voice_name.size() - 4, 4, ".WAV") == 0);
+        // Voice-cloning consent gate: a clone requires an explicit
+        // consent_attestation field in the request body.
+        // A clone is a recording reference OR a pack that declares it was baked from a
+        // real recording — and the name is resolved against --voice-dir first,
+        // because {"voice": "victim"} reaches the same file as
+        // {"voice": "victim.wav"}. The old suffix test on the raw string missed
+        // both, so a bare name and every .gguf-only cloning backend (chatterbox
+        // has no .wav path at all) cleared this gate untouched.
+        // See crispasr_voice_clone_policy.h.
+        const crispasr_voice::CloneDecision clone_decision =
+            crispasr_voice::classify_voice(voice_name, params.tts_voice_dir, /*baked_from_wav_this_run=*/false);
+        const bool is_voice_clone = clone_decision.is_clone;
         if (is_voice_clone && consent_attestation.empty()) {
             json_error(res, 400,
                        "voice cloning requires a 'consent_attestation' field in the request body. "
@@ -2179,8 +2188,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
             // The audit line records what this response ACTUALLY carries, not
             // what was asked for — a denied opt-out reads spoken_disclaimer=yes.
-            fprintf(stderr, "[CONSENT] ts=%s voice=%s attestation=\"%s\" spoken_disclaimer=%s\n", ts,
-                    log_sanitize(voice_name).c_str(), log_sanitize(consent_attestation).c_str(),
+            fprintf(stderr, "[CONSENT] ts=%s voice=%s clone_reason=%s attestation=\"%s\" spoken_disclaimer=%s\n", ts,
+                    log_sanitize(voice_name).c_str(), clone_decision.reason, log_sanitize(consent_attestation).c_str(),
                     marking.apply_spoken_disclaimer ? "yes" : "no");
             if (marking.optout_denied) {
                 fprintf(stderr,
@@ -2430,7 +2439,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                     }
                     chunk = std::move(rs);
                 }
-                crispasr_wm_dispatch::embed(chunk.data(), (int)chunk.size(), sr_out);
+                // force: a raw PCM stream has no container, so no manifest can
+                // ride along and the watermark is the only mark available.
+                // Matches the CLI's --tts-stream floor.
+                crispasr_wm_dispatch::embed(chunk.data(), (int)chunk.size(), sr_out, /*force=*/true);
                 enqueue(crispasr_make_pcm_int16_le(chunk.data(), (int)chunk.size()));
             };
 
@@ -2582,7 +2594,16 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         // Embed spread-spectrum watermark marking audio as AI-generated.
         // Applied after speed resampling so the watermark is present in
         // the final signal regardless of speed setting.
-        crispasr_wm_dispatch::embed(pcm.data(), (int)pcm.size(), sr_out);
+        //
+        // Watertight floor, per response: when this container cannot carry a
+        // C2PA manifest the watermark is the only machine-readable mark there
+        // is, so --no-watermark must not strip it. The CLI has always forced it
+        // back on in that case; the server did not, so an attested
+        // --no-watermark plus response_format=mp3/aac/opus/pcm/f32 returned
+        // fully unmarked synthetic audio.
+        const crispasr_marking::ContainerMarking cmark =
+            crispasr_marking::container_marking_for_format(response_format);
+        crispasr_wm_dispatch::embed(pcm.data(), (int)pcm.size(), sr_out, /*force=*/!cmark.carries_c2pa);
 
         const double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
         const double audio_s = (double)pcm.size() / (double)sr_out;
@@ -2610,6 +2631,11 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                 json_error(res, 500, "MP3 encoding failed", "encoding_failed");
                 return;
             }
+            // MP3 carries a manifest (ID3v2.4 GEOB) and the native signer has
+            // handled it all along — signing was just hardcoded to the WAV
+            // branch, so every non-WAV response shipped without provenance.
+            if (!params.tts_no_c2pa)
+                crispasr_c2pa_sign_auto(mp3, cmark.c2pa_mime, params.c2pa_cert, params.c2pa_key, params.cache_dir);
             res.set_content(std::move(mp3), "audio/mpeg");
         } else if (response_format == "aac") {
             std::string aac = crispasr_make_aac(pcm.data(), (int)pcm.size(), sr_out);
@@ -2631,7 +2657,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             // C2PA Content Credentials signing (when c2pa-c is available
             // and --c2pa-cert / --c2pa-key are configured)
             if (!params.tts_no_c2pa) // --no-c2pa: attested opt-out of the manifest floor
-                crispasr_c2pa_sign_auto(wav, "audio/wav", params.c2pa_cert, params.c2pa_key, params.cache_dir);
+                crispasr_c2pa_sign_auto(wav, cmark.c2pa_mime, params.c2pa_cert, params.c2pa_key, params.cache_dir);
             res.set_content(std::move(wav), "audio/wav");
         }
     });
@@ -2724,8 +2750,12 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             return;
         }
 
-        // Watermark the output.
-        crispasr_wm_dispatch::embed(pcm.data(), (int)pcm.size(), sr_out);
+        // Watermark the output, with the same per-response watertight floor as
+        // /v1/audio/speech: force the mark on when the requested container
+        // cannot carry a C2PA manifest.
+        const crispasr_marking::ContainerMarking cmark =
+            crispasr_marking::container_marking_for_format(response_format);
+        crispasr_wm_dispatch::embed(pcm.data(), (int)pcm.size(), sr_out, /*force=*/!cmark.carries_c2pa);
 
         // Return intermediate transcript as a header.
         if (!transcript.empty()) {
@@ -2756,6 +2786,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                 json_error(res, 500, "MP3 encoding failed", "encoding_failed");
                 return;
             }
+            if (!params.tts_no_c2pa)
+                crispasr_c2pa_sign_auto(mp3, cmark.c2pa_mime, params.c2pa_cert, params.c2pa_key, params.cache_dir);
             res.set_content(std::move(mp3), "audio/mpeg");
         } else if (response_format == "aac") {
             std::string aac = crispasr_make_aac(pcm.data(), (int)pcm.size(), sr_out);
@@ -2775,7 +2807,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         } else {
             std::string wav = crispasr_make_wav_int16(pcm.data(), (int)pcm.size(), sr_out);
             if (!params.tts_no_c2pa) // --no-c2pa: attested opt-out of the manifest floor
-                crispasr_c2pa_sign_auto(wav, "audio/wav", params.c2pa_cert, params.c2pa_key, params.cache_dir);
+                crispasr_c2pa_sign_auto(wav, cmark.c2pa_mime, params.c2pa_cert, params.c2pa_key, params.cache_dir);
             res.set_content(std::move(wav), "audio/wav");
         }
     });

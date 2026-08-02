@@ -67,9 +67,11 @@ struct crispasr_segment {
     std::vector<crispasr_word> words;   // may be empty
     std::vector<crispasr_token> tokens; // may be empty
     // Multi-task ASR metadata (SenseVoice and similar). Empty when the
-    // backend doesn't emit them.
+    // backend doesn't emit them. There is deliberately no `emotion` field:
+    // inferring emotions from voice is an emotion recognition system under
+    // EU AI Act Art. 3(39) — prohibited in workplace/education (Art. 5(1)(f))
+    // and high-risk otherwise (Annex III(1)(c)). See docs/eu-ai-act.md.
     std::string lang_id;     // e.g. "en", "zh", "ja"
-    std::string emotion;     // e.g. "HAPPY", "NEUTRAL"
     std::string audio_event; // e.g. "Speech", "Music"
     std::string itn_flag;    // "withitn" or "woitn"
 };

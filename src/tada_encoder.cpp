@@ -1186,7 +1186,7 @@ float* tada_encoder_extract_stage(tada_encoder_context* ctx, const float* audio_
 // ──────────── GGUF writer for voice reference ─────────────────────
 
 int tada_encoder_write_ref_gguf(const char* path, const tada_encoder_result& result, const char* transcript,
-                                const char* language) {
+                                const char* language, bool cloned_from_recording, const char* consent_attestation) {
     if (result.n_tokens <= 0 || result.token_values.empty())
         return -1;
 
@@ -1204,6 +1204,16 @@ int tada_encoder_write_ref_gguf(const char* path, const tada_encoder_result& res
         gguf_set_val_str(gw, "crispasr.ref.tada_tts_prompt_text", transcript);
     if (language && language[0])
         gguf_set_val_str(gw, "crispasr.ref.tada_tts_language", language);
+    // Voice-clone provenance. A pack baked from a person's recording is exactly
+    // as much a deepfake as the recording; stamping it is what lets the consent
+    // and Art. 50(4) disclosure gates see that, since they can no longer tell
+    // from the .gguf suffix alone. Key names are mirrored in
+    // examples/cli/crispasr_voice_clone_policy.h — change both together.
+    if (cloned_from_recording) {
+        gguf_set_val_bool(gw, "crispasr.voice.cloned_from_recording", true);
+        if (consent_attestation && consent_attestation[0])
+            gguf_set_val_str(gw, "crispasr.voice.consent_attestation", consent_attestation);
+    }
 
     // prompt_token_values: (n_tokens, embed_dim) F32
     {

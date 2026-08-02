@@ -351,7 +351,7 @@ curl http://localhost:8080/v1/audio/speech \
 | `noise_temp` | backend default | tada flow-matching noise temperature (Python `noise_temp`, default 0.9). Per request. |
 | `speed` | `1.0` | Tempo multiplier `0.25 .. 4.0` (OpenAI range). Applied as a post-synth linear resampler. Out-of-range returns 400 with `code=invalid_speed`. |
 | `response_format` | `"wav"` | `wav` (16-bit PCM RIFF, 24 kHz mono — default), `pcm` (OpenAI spec: 24 kHz signed 16-bit LE raw, no header), `f32` (crispasr-specific raw float32 for downstream DSP), or the compressed containers `mp3` / `aac` / `opus` — all encoded in-tree by [glint](https://github.com/CrispStrobe/glint), no build deps. `opus` returns a standard **Ogg Opus** file (`audio/ogg`); set `CRISPASR_OPUS_ENCODER=libopus` (build with libopus) to fall back to the legacy raw-packet framing (`audio/opus`) instead. |
-| `consent_attestation` | empty | Required when `voice` ends in `.wav` (voice cloning). A free-text statement attesting speaker consent, e.g. `"I have the speaker's consent"`. Logged for audit. |
+| `consent_attestation` | empty | Required when `voice` is a **clone**: a `.wav` reference, or a `.gguf` pack stamped `crispasr.voice.cloned_from_recording` by the baker that derived it from a real recording. The name is resolved against `--voice-dir` first, so a bare `"victim"` is treated exactly like `"victim.wav"`. A free-text statement attesting speaker consent, e.g. `"I have the speaker's consent"`. Logged for audit, with the reason the voice was classified a clone. Preset packs (kokoro, vibevoice, `tada-ref-<lang>`, …) carry no stamp and need no attestation — see [`eu-ai-act.md` §6.2](eu-ai-act.md#62-art-504--deepfake-disclosure). |
 | `ref_text` | empty | Transcript of the `.wav` clone reference, used by TADA on-the-fly cloning (#201). A companion `<name>.txt` in `--voice-dir` is used when omitted. Ignored by backends that clone from audio alone. |
 | `spoken_disclaimer` | `true` | Set to `false` to skip the audible AI-disclosure prefix on voice-cloned output. Machine-readable provenance (watermark + C2PA) is always applied. When `false`, the caller assumes responsibility for providing appropriate AI-disclosure to end users — which is why the opt-out is only honoured when attested (see `marking_attestation`). |
 | `marking_attestation` | empty | Required (since v0.8.22) to **honour** `"spoken_disclaimer": false` on a voice clone — a free-text affirmation that you accept the AI-content disclosure duty, e.g. `"I will disclose this is AI-generated"`. Logged for audit. A server launched with `--accept-marking-responsibility` has already accepted that duty for every response it serves and satisfies this per-request field. **Without it the opt-out is denied, not the request** (since v0.8.24): the response is still `200`, but it carries the spoken disclaimer and the headers below say so. Earlier v0.8.22/v0.8.23 servers returned `400 marking_attestation_required` instead. |
@@ -362,6 +362,15 @@ curl http://localhost:8080/v1/audio/speech \
 > which turns it off for **all** responses and logs a one-time warning that the
 > AI-content marking responsibility then rests with the operator. See
 > [`tts.md`](tts.md#disabling-the-watermark-operator-opt-out).
+>
+> **The floor that opt-out cannot cross.** A response may lose the watermark
+> only if a C2PA manifest still marks it. `response_format` decides that, so the
+> floor is applied per response: `wav` and `mp3` carry a manifest, and
+> `pcm` / `f32` / `aac` / `opus` and the streaming path do not — for those the
+> watermark is forced on even under `--no-watermark`. Before v0.8.26 the server
+> had no floor at all and signed only `wav`, so `--no-watermark` plus
+> `"response_format": "mp3"` returned entirely unmarked synthetic audio while
+> the CLI in the same configuration forced the mark back on.
 
 **Returns:**
 

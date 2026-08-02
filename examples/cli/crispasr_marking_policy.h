@@ -77,4 +77,54 @@ inline Decision decide(bool is_voice_clone, bool requested_spoken_disclaimer, co
     return d;
 }
 
+// ---------------------------------------------------------------------------
+// Which marks a given output container can actually carry.
+//
+// The watertight floor rests on this: an audio watermark may be dropped only
+// when a C2PA manifest still marks the output. If the container can carry
+// neither, the output would be fully unmarked AI audio, so the watermark opt-out
+// must not be honored for it.
+//
+// The CLI enforces that per process (crispasr_enforce_cli_watermark_floor(),
+// keyed on the output file extension). The SERVER picks its container per
+// request and had no floor at all: `--no-watermark --accept-marking-
+// responsibility` plus {"response_format": "mp3"} returned audio with no
+// watermark and — because signing was hardcoded to the WAV branch — no manifest
+// either, while the CLI in the same configuration forced the watermark back on.
+// Same operator, same attestation, two different floors.
+// ---------------------------------------------------------------------------
+
+struct ContainerMarking {
+    // A C2PA manifest can be embedded in this container.
+    bool carries_c2pa = false;
+    // MIME to hand crispasr_c2pa_sign_auto(); empty when carries_c2pa is false.
+    const char* c2pa_mime = "";
+};
+
+// `response_format` as accepted by /v1/audio/speech and
+// /v1/audio/speech-to-speech. Unknown values fall back to WAV, mirroring the
+// handlers' own trailing `else` branch — the fallback must stay in step with
+// them or the floor would be computed for a container that is never produced.
+inline ContainerMarking container_marking_for_format(const std::string& response_format) {
+    ContainerMarking m;
+    if (response_format == "pcm" || response_format == "f32") {
+        // Raw samples, no container ⇒ nowhere to put a manifest.
+        return m;
+    }
+    if (response_format == "aac" || response_format == "opus") {
+        // Raw ADTS / Ogg carry no manifest. The CLI remuxes these to MP4 when
+        // C2PA is active; the server encodes what was asked for, so here the
+        // watermark is the only mark available.
+        return m;
+    }
+    if (response_format == "mp3") {
+        m.carries_c2pa = true;
+        m.c2pa_mime = "audio/mpeg"; // ID3v2.4 GEOB — native signer handles it
+        return m;
+    }
+    m.carries_c2pa = true;
+    m.c2pa_mime = "audio/wav"; // RIFF C2PA chunk; also the unknown-format default
+    return m;
+}
+
 } // namespace crispasr_marking

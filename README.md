@@ -49,6 +49,7 @@ live transcription + TTS + language detection, auto-deployed from `hf-space/`.
 - [Architecture](docs/architecture.md) — layered layout, `src/core/` primitives, regression discipline
 - [Contributing — adding a new backend](docs/contributing.md) — 5-file recipe, ground-truth diff workflow
 - [Regression matrix](docs/regression-matrix.md) — `tools/test-all-backends.py` capability tiers
+- [**EU AI Act**](docs/eu-ai-act.md) — synthetic-audio marking (watermark + C2PA + spoken disclaimer), what counts as a voice clone, the speaker-biometrics boundary, why there is no emotion recognition, and what stays your duty as deployer
 - [Quantize models](docs/quantize.md) — `crispasr-quantize` for all backends
 - [GPU backend selection](#gpu-backend-selection)
 - [Debugging & profiling](#debugging--profiling)
@@ -130,7 +131,7 @@ from the GGUF metadata. Jump to the [TTS table](#text-to-speech-models) for the 
 | **paraformer** | [`funasr/paraformer-zh`](https://huggingface.co/cstr/paraformer-zh-GGUF) | 50-block SANM encoder + CIF predictor + 16-block NAR decoder (single-pass, non-autoregressive); character-level vocab (8404); 220M params | zh, en | FunASR Model License (commercial OK w/ attribution) |
 | **foxnose** *(speaker diarization)* | [`Wespeaker/wespeaker-voxceleb-resnet34-LM`](https://huggingface.co/cstr/wespeaker-resnet34-lm-GGUF) | Speaker diarization via `--diarize-method foxnose`: WeSpeaker ResNet34-LM 256-d embeddings + GMM/BIC speaker counting + spectral clustering + Viterbi temporal smoothing ([more](docs/architecture.md#foxnose-diarize)). 3.18 % DER on VoxConverse dev vs the upstream reference implementation's 3.07 % | any | weights CC-BY-4.0 |
 | **gigaam** | [`ai-sage/GigaAM-v3`](https://huggingface.co/cstr/gigaam-v3-GGUF) (base [`ai-sage/GigaAM-v3`](https://huggingface.co/ai-sage/GigaAM-v3)) | 16-layer rotary Conformer (220M) + CTC or RNN-T head; four revisions — `e2e_rnnt` / `e2e_ctc` emit punctuation + casing + ITN from a SentencePiece vocab, `rnnt` / `ctc` emit bare lowercase Cyrillic ([more](docs/architecture.md#gigaam)) | en ru | MIT |
-| **sensevoice** | [`FunAudioLLM/SenseVoiceSmall`](https://huggingface.co/cstr/sensevoice-small-GGUF) | 70-block SANM encoder + CTC head; emits transcript + language ID + emotion + audio-event in one forward pass (non-AR, 15× faster than Whisper-Large); structured C ABI + `-oj` JSON expose the four tags as separate fields | 50+ langs; native LID + emotion + audio-event tags | FunASR Model License v1.1 |
+| **sensevoice** | [`FunAudioLLM/SenseVoiceSmall`](https://huggingface.co/cstr/sensevoice-small-GGUF) | 70-block SANM encoder + CTC head; emits transcript + language ID + audio-event in one forward pass (non-AR, 15× faster than Whisper-Large); structured C ABI + `-oj` JSON expose the tags as separate fields. Upstream's emotion classifier is **not exposed** — see [EU AI Act](docs/eu-ai-act.md#41-emotion-recognition--removed-not-gated) | 50+ langs; native LID + audio-event tags | FunASR Model License v1.1 |
 
 ### Speech-to-speech audio upscaling and restoration
 
@@ -437,7 +438,7 @@ crispasr --backend parakeet -m parakeet.gguf --vad --flush-after 1 -osrt -f long
 | **Russian** | **gigaam** (`e2e_rnnt` — 8.4 % avg WER, punctuation + ITN), **whisper**, **qwen3** |
 | **Mandarin + Chinese dialects** | **firered-asr**, **qwen3**, **glm-asr**, **funasr**, **paraformer**, **sensevoice** |
 | **Multilingual (31 langs) speech-LLM** | **fun-asr-mlt-nano**, **qwen3**, **omniasr-llm**, **gemma4-e2b** |
-| **Multilingual (50+ langs) + LID + emotion + audio-event in one pass** | **sensevoice** (encoder-only CTC, non-AR, 15× faster than Whisper-Large) |
+| **Multilingual (50+ langs) + LID + audio-event in one pass** | **sensevoice** (encoder-only CTC, non-AR, 15× faster than Whisper-Large) |
 
 ### CPU performance tips
 

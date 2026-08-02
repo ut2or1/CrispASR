@@ -347,9 +347,17 @@ constexpr Entry k_registry[] = {
      "vibevoice-voice-emma.gguf",
      "https://huggingface.co/cstr/vibevoice-realtime-0.5b-GGUF/resolve/main/vibevoice-voice-emma.gguf",
      "~3 MB"},
-    // 17.3 GB, not the "~14 GB" this entry used to claim — which is over the
-    // VRAM of every 16 GB card, so `-m auto` hard-fails there. Q4_K (5.7 GB) is
-    // published alongside it via --model-quant q4_k.
+    // F16 (17.3 GB, not the "~14 GB" this once claimed), and it stays F16 because
+    // the published Q4_K is BROKEN, not merely lossy: measured on Kaggle it
+    // stutters and loops — "The quick brown fast The quick brown the quick brown
+    // fox jobs over the lazy job ..." (WER 0.72, 13.7 s of audio for a 7.5 s
+    // sentence) where F16 gives WER 0.056. Defaulting to it would trade a loud
+    // OOM for silently broken speech.
+    // The real cost: 17.3 GB does not fit a 16 GB card, so `-m auto` downloads
+    // 17 GB and then fails to allocate. The fix is a quant that fits AND holds up
+    // (Q6_K/Q8_0, likely keeping the DiT head + VAE decoder in F16 — the usual
+    // shape for this family), not the Q4_K we have. Until then the loader at
+    // least says what happened and that --no-gpu exists.
     {"kugelaudio", "kugelaudio-0-open-f16.gguf",
      "https://huggingface.co/cstr/kugelaudio-0-open-GGUF/resolve/main/kugelaudio-0-open-f16.gguf", "~17.3 GB", nullptr,
      nullptr},

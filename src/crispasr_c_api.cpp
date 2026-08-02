@@ -832,6 +832,8 @@ CA_EXPORT void crispasr_vad_free(float* spans) {
 // crispasr_watermark_load_model(), otherwise falls back to the built-in
 // spread-spectrum watermark.
 
+#include "../examples/cli/crispasr_voice_clone_policy.h"
+#include "../examples/cli/crispasr_voice_provenance.h"
 #include "../examples/cli/crispasr_watermark.h"
 #include "audioseal.h"
 
@@ -1646,6 +1648,29 @@ struct crispasr_session {
     // the provider/deployer). Mirrors the CLI --accept-marking-responsibility gate.
     bool marking_responsibility_accepted = false;
     std::string marking_attestation;
+
+    // True once crispasr_session_set_voice() has been given a reference WAV,
+    // i.e. this session clones a real person's voice. The CLI and server both
+    // treat that as the trigger for the spoken AI-disclosure (EU AI Act
+    // Art. 50(4), which the Commission's guidance says needs a visible or
+    // AUDIBLE label — a machine-readable watermark alone does not satisfy it).
+    // The ABI cannot prepend that disclosure safely for the caller (see
+    // crispasr_session_get_disclaimer_pcm), so instead it records the fact,
+    // warns once, and hands the caller the disclaimer to prepend themselves.
+    bool voice_is_clone = false;
+    std::string voice_path;
+    // Cached disclosure PCM. The disclaimer is a fixed sentence in the session's
+    // neutral voice, so it is identical for every clip — but the documented
+    // recipe (fetch -> set_voice -> synthesize -> prepend) is per-clip, which
+    // without this would charge a full TTS forward pass per clip for
+    // byte-identical audio. The CLI caches it via std::call_once for the same
+    // reason. Invalidated by set_voice(), since a different preset voice would
+    // change what "neutral" means.
+    std::vector<float> disclaimer_pcm;
+    // One-shot latches for the two audit lines, so a long-running session
+    // logs each condition once rather than per synthesis call.
+    bool warned_clone_unmarked = false;
+    bool logged_clone_consent = false;
 
     // Sticky session-level state (PLAN #59 partial unblock — the
     // capabilities matrix items that were previously CLI-only). Per-call
@@ -7711,6 +7736,50 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
         return (tail[0] == '.' && (tail[1] == 'w' || tail[1] == 'W') && (tail[2] == 'a' || tail[2] == 'A') &&
                 (tail[3] == 'v' || tail[3] == 'V'));
     };
+
+    // Record whether this is a voice CLONE (reference WAV) as opposed to a
+    // preset/bank voice name. Every backend arm below reaches the same
+    // conclusion from the same test, so it is done once here — the arms then
+    // only have to apply the voice, not re-derive its legal character.
+    //
+    // Unlike the CLI (--i-have-rights) and the server (consent_attestation),
+    // the ABI does NOT refuse an unattested clone. That is deliberate: consent
+    // to clone a voice is a personality-rights/GDPR matter rather than an AI
+    // Act duty, the caller here is an integrator who has read this header, and
+    // #312 is the standing lesson on what a hard refusal does to a surface with
+    // many downstream clients (a 400 on unattested requests took out voice
+    // cloning for every Subtitle Edit build up to v5.1.0-rc16, for four days).
+    // What the ABI does instead is leave an audit trail.
+    //
+    // That trail only exists if the clone is RECOGNISED. `ends_with_wav` alone
+    // missed every .gguf voice pack baked from a real recording — chatterbox
+    // clones only that way and has no .wav path at all — so its [CONSENT] line
+    // and the Art. 50(4) [MARKING] warning below silently never fired for the
+    // pack-based clone paths. Classify by provenance instead: the shared
+    // predicate reads the baker's crispasr.voice.cloned_from_recording stamp.
+    // (`ends_with_wav` is still used by the arms below for backend routing —
+    // that is a file-format question, not a legal one.)
+    s->voice_is_clone =
+        crispasr_voice::classify_voice(path, /*voice_dir=*/std::string(), /*baked_from_wav_this_run=*/false).is_clone;
+    s->voice_path = path;
+    // Any voice change invalidates the cached neutral-voice disclosure.
+    s->disclaimer_pcm.clear();
+    s->disclaimer_pcm.shrink_to_fit();
+    if (s->voice_is_clone && !s->logged_clone_consent) {
+        s->logged_clone_consent = true;
+        std::time_t t = std::time(nullptr);
+        char ts[64];
+        std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
+        // Strip newlines so a crafted path can't forge extra audit lines.
+        std::string safe = path;
+        for (char& c : safe)
+            if (c == '\n' || c == '\r')
+                c = ' ';
+        fprintf(stderr,
+                "[CONSENT] ts=%s scope=abi voice=\"%s\" attestation=(none — the ABI does not gate cloning; "
+                "the integrator affirms they have the speaker's consent)\n",
+                ts, safe.c_str());
+    }
 #ifdef CA_HAVE_VOXTRAL_TTS
     if (s->voxtral_tts_ctx) {
         // `path` is a preset voice name (e.g. "fr_female"); applied at synthesize.
@@ -8680,6 +8749,31 @@ CA_EXPORT int crispasr_session_accept_marking_responsibility(crispasr_session* s
     return 0;
 }
 
+// Warn once per session when synthesizing with a cloning voice and no marking
+// attestation. The output IS watermarked (Art. 50(2) is discharged on every ABI
+// path), but Art. 50(4) additionally requires a visible or audible disclosure
+// for deepfakes, and the ABI cannot prepend one for the caller. The CLI and the
+// server both do prepend it, so the same operation has a different disclosure
+// posture depending on which surface you call — this line is what stops that
+// asymmetry from being silent. Not a refusal, and not repeated per call.
+static void crispasr_session_warn_unmarked_clone(crispasr_session* s) {
+    if (!s || !s->voice_is_clone || s->marking_responsibility_accepted || s->warned_clone_unmarked)
+        return;
+    s->warned_clone_unmarked = true;
+    std::time_t t = std::time(nullptr);
+    char ts[64];
+    std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
+    fprintf(stderr,
+            "[MARKING] ts=%s scope=abi voice_clone=yes watermark=yes spoken_disclaimer=no\n"
+            "  crispasr: warning: cloned-voice output is watermarked, but the ABI does not prepend the\n"
+            "  spoken AI-disclosure that the CLI and server add. If you publish this audio you owe an\n"
+            "  audible or visible \"AI-generated\" label yourself. Use\n"
+            "  crispasr_session_get_disclaimer_pcm() (before set_voice) or\n"
+            "  crispasr_session_disclaimer_text(); call\n"
+            "  crispasr_session_accept_marking_responsibility() to silence this.\n",
+            ts);
+}
+
 // Synthesize WITHOUT the watermark — an explicit provenance opt-out for callers
 // that must DSP (speed change, mixing, concatenation) before embedding the mark
 // themselves via crispasr_watermark_embed(). Because it yields unmarked PCM it is
@@ -8711,11 +8805,74 @@ CA_EXPORT float* crispasr_session_synthesize_raw(crispasr_session* s, const char
 // DETECTABLE yet inaudible — the faint 0.005 it used before was too weak to
 // detect on real speech. Use synthesize_raw() to post-process PCM before marking.
 CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* text, int* out_n_samples) {
+    crispasr_session_warn_unmarked_clone(s);
     float* pcm = crispasr_session_synthesize_raw_impl(s, text, out_n_samples);
     if (pcm && out_n_samples && *out_n_samples > 0) {
         crispasr_watermark_embed(pcm, *out_n_samples, -1.0f);
     }
     return pcm;
+}
+
+// The canonical spoken AI-disclosure text, identical to the one the CLI and
+// server prepend (examples/cli/crispasr_tts_disclaimer.h). Exposed so an
+// integrator can render it as a VISIBLE label instead of, or as well as, an
+// audible one — Art. 50(5) requires disclosures to meet accessibility
+// requirements, and an audio-only disclosure is not accessible to a deaf user.
+// Returns a static string; never NULL, never needs freeing.
+CA_EXPORT const char* crispasr_session_disclaimer_text(void) {
+    return "This audio was generated by artificial intelligence.";
+}
+
+// Synthesize the spoken AI-disclosure in this session's NEUTRAL voice, for the
+// caller to prepend to cloned output (Art. 50(4)).
+//
+// REFUSES (returns NULL) if a clone voice is already set. That restriction is
+// the whole point of the function rather than a limitation of it: the CLI
+// produces a neutral disclaimer by clearing tts_voice per call, and several
+// backends need adapter-specific handling to honour that (see the voice-clearing
+// comments in crispasr_backend_{dots_tts,irodori_tts,voxcpm2_tts}.cpp). On the
+// ABI the voice has already been applied to the backend context by set_voice,
+// and there is no uniform way to un-apply it. Synthesizing here anyway would
+// risk speaking the disclosure IN THE CLONED VOICE — which makes the fake more
+// convincing rather than less, and is worse than no disclaimer at all.
+//
+// So the supported order is: open session -> get_disclaimer_pcm() -> set_voice()
+// -> synthesize() -> prepend. Caller owns the buffer; free with
+// crispasr_pcm_free(). Sample rate is the backend-native one, same as
+// crispasr_session_synthesize().
+CA_EXPORT float* crispasr_session_get_disclaimer_pcm(crispasr_session* s, int* out_n_samples) {
+    if (out_n_samples)
+        *out_n_samples = 0;
+    if (!s)
+        return nullptr;
+    if (s->voice_is_clone) {
+        s->last_synth_error = "crispasr_session_get_disclaimer_pcm must be called BEFORE crispasr_session_set_voice() "
+                              "installs a cloning voice: once the clone is applied there is no portable way to "
+                              "synthesize in the neutral voice, and a disclaimer spoken in the cloned voice would "
+                              "make the output more deceptive, not less. Open the session, fetch the disclaimer, "
+                              "then set the voice.";
+        return nullptr;
+    }
+    // Synthesize once per session, then hand out copies. The caller owns and
+    // frees each buffer, so the cache holds the samples rather than the pointer.
+    if (s->disclaimer_pcm.empty()) {
+        int n = 0;
+        float* fresh = crispasr_session_synthesize_raw_impl(s, crispasr_session_disclaimer_text(), &n);
+        if (!fresh || n <= 0) {
+            free(fresh);
+            return nullptr;
+        }
+        s->disclaimer_pcm.assign(fresh, fresh + n);
+        free(fresh);
+    }
+    const size_t n = s->disclaimer_pcm.size();
+    float* out = (float*)malloc(n * sizeof(float));
+    if (!out)
+        return nullptr;
+    std::memcpy(out, s->disclaimer_pcm.data(), n * sizeof(float));
+    if (out_n_samples)
+        *out_n_samples = (int)n;
+    return out;
 }
 
 CA_EXPORT void crispasr_pcm_free(float* pcm) {
@@ -8880,6 +9037,7 @@ static float* crispasr_session_speech_to_speech_impl(crispasr_session* s, const 
 // should synthesize/convert via the raw+attested path instead.
 CA_EXPORT float* crispasr_session_speech_to_speech(crispasr_session* s, const float* in_samples, int n_in_samples,
                                                    char** out_text, int* out_n_samples) {
+    crispasr_session_warn_unmarked_clone(s);
     float* pcm = crispasr_session_speech_to_speech_impl(s, in_samples, n_in_samples, out_text, out_n_samples);
     if (pcm && out_n_samples && *out_n_samples > 0)
         crispasr_watermark_embed(pcm, *out_n_samples, -1.0f);

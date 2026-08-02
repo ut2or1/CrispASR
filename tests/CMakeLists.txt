@@ -2865,6 +2865,62 @@ catch_discover_tests(test-marking-policy
     PROPERTIES LABELS "unit"
 )
 
+# ─── test-voice-clone-policy — what counts as a voice CLONE (the predicate the
+# speaker-consent gate and the Art. 50(4) audible-disclosure gate both hang off),
+# plus which containers can carry a C2PA manifest (the watertight marking floor).
+# Both are pure predicates in examples/cli/crispasr_voice_clone_policy.h and
+# crispasr_marking_policy.h — no models, no voice files, no server — so the
+# gates are guarded on the tier CI actually runs.
+add_executable(test-voice-clone-policy test-voice-clone-policy.cpp)
+target_include_directories(test-voice-clone-policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-voice-clone-policy PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-voice-clone-policy
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-no-emotion-recognition — CrispASR ships no voice-based emotion
+# inference on any surface. SenseVoice-Small is upstream an emotion classifier
+# too; we parse its `<|HAPPY|>` marker only to strip it. Shipping the capability
+# would make CrispASR an Annex III(1)(c) high-risk system (and Art. 5(1)(f)
+# prohibited in workplace/education), which Art. 2(12)'s open-source exemption
+# does not cover. Source-level guard — the behavioural version needs the
+# SenseVoice GGUF and would only run in the live tier CI doesn't run.
+add_executable(test-no-emotion-recognition test-no-emotion-recognition.cpp)
+target_compile_definitions(test-no-emotion-recognition PRIVATE
+    CRISPASR_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+)
+target_link_libraries(test-no-emotion-recognition PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-no-emotion-recognition
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-abi-clone-disclosure — the ABI watermarks cloned output (Art. 50(2))
+# but does not prepend the spoken disclosure the CLI/server add (Art. 50(4)),
+# because neutral-voice synthesis isn't portable once a clone voice is applied
+# to the backend. Pins what makes a voice a clone, that the warning fires once
+# and is silenced by attesting, that get_disclaimer_pcm fails closed after
+# set_voice, and that the ABI/CLI disclosure strings don't drift. Weight-free —
+# a session needs a TTS model, which would strand this in the live tier.
+add_executable(test-abi-clone-disclosure test-abi-clone-disclosure.cpp)
+target_compile_definitions(test-abi-clone-disclosure PRIVATE
+    CRISPASR_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+)
+target_link_libraries(test-abi-clone-disclosure PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-abi-clone-disclosure
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
 # ─── test-punc-copies-in-sync — the two fireredpunc implementations must not
 # drift. crisp_punc/src/fireredpunc.cpp is what normally links; src/fireredpunc.cpp
 # is the partial-checkout fallback. #308's capitalisation fix landed in the

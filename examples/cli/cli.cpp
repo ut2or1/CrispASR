@@ -1303,7 +1303,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.tts_voice.c_str());
     fprintf(
         stderr,
-        "             --i-have-rights                    required for voice cloning (.wav); attests consent\n"
+        "             --i-have-rights                    required for voice cloning and for --make-ref; attests "
+        "consent\n"
         "             --accept-license TAG                accept a restricted model licence (SPDX tag, or 'all');\n"
         "                                                required before downloading cc-by-nc-*/gemma/llama* weights\n"
         "                                                 of the cloned speaker or that it is your own voice\n"
@@ -1983,12 +1984,13 @@ static void output_json(const std::vector<crispasr_segment>& segs, std::ofstream
 
         // Multi-task ASR metadata (SenseVoice and similar). Emit any
         // non-empty fields right after `text`. Each one is a flat string
-        // sibling: language / emotion / audio_event / itn_flag.
+        // sibling: language / audio_event / itn_flag. No `emotion` key —
+        // CrispASR does not surface voice-based emotion inference at all
+        // (EU AI Act Art. 5(1)(f) / Annex III(1)(c); docs/eu-ai-act.md).
         const bool has_lang = !segs[i].lang_id.empty();
-        const bool has_emo = !segs[i].emotion.empty();
         const bool has_evt = !segs[i].audio_event.empty();
         const bool has_itn = !segs[i].itn_flag.empty();
-        const bool has_meta = has_lang || has_emo || has_evt || has_itn;
+        const bool has_meta = has_lang || has_evt || has_itn;
 
         start_obj(nullptr);
         times_o(t0, t1, false);
@@ -1996,7 +1998,7 @@ static void output_json(const std::vector<crispasr_segment>& segs, std::ofstream
 
         if (has_meta) {
             const bool meta_is_last = !full && !params.diarize && !params.tinydiarize;
-            int remaining = (int)has_lang + (int)has_emo + (int)has_evt + (int)has_itn;
+            int remaining = (int)has_lang + (int)has_evt + (int)has_itn;
             auto emit = [&](const char* name, const std::string& v, bool present) {
                 if (!present)
                     return;
@@ -2005,7 +2007,6 @@ static void output_json(const std::vector<crispasr_segment>& segs, std::ofstream
             };
             emit("language", segs[i].lang_id, has_lang);
             emit("audio_event", segs[i].audio_event, has_evt);
-            emit("emotion", segs[i].emotion, has_emo);
             emit("itn_flag", segs[i].itn_flag, has_itn);
         }
 
