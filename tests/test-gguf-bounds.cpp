@@ -24,7 +24,7 @@
 
 #include <cstdio>
 #include <string>
-#include <unistd.h> // truncate
+//#include <unistd.h> // truncate
 
 namespace {
 
