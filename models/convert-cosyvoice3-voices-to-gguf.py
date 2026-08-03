@@ -295,7 +295,32 @@ def main():
     ap.add_argument("--onnx-cache", default=os.path.expanduser("~/.cache/crispasr/cosyvoice3-onnx"),
                     help="Where to stash campplus.onnx + speech_tokenizer_v3.onnx if not on disk")
     ap.add_argument("--output", required=True, help="Output voices.gguf path")
+    ap.add_argument("--i-have-rights", dest="i_have_rights", action="store_true",
+                    help="attest that you have the consent of the speaker(s) in the reference "
+                         "audio, or that it is your own voice. Required: every entry in this "
+                         "bundle is a real person's voice baked into a reusable clone.")
+    ap.add_argument("--consent-attestation", default="",
+                    help="free-text attestation recorded in the bundle metadata (audit trail; "
+                         "does not replace --i-have-rights at synthesis time)")
     args = ap.parse_args()
+
+    # Consent gate, mirroring the CLI's --i-have-rights and the other bakers.
+    # Baking IS the cloning step: CAMPPlus turns the WAV into a speaker embedding
+    # and the tokenizer into a reusable prompt, and everything downstream just
+    # replays them. This applies to the built-in default manifest too — it bakes
+    # upstream's asset/zero_shot_prompt.wav, which is a recording of a real
+    # speaker being cloned zero-shot, not a synthetic preset.
+    if not args.i_have_rights:
+        raise SystemExit(
+            "baking a CosyVoice3 voice bundle requires --i-have-rights.\n"
+            "\n"
+            "  By passing --i-have-rights you attest:\n"
+            '  "I have the consent of the speaker(s) whose voice(s) this clones,\n'
+            '   or they are my own."\n'
+            "\n"
+            "  This applies to the built-in default manifest as well: it bakes\n"
+            "  upstream's asset/zero_shot_prompt.wav, a real speaker's recording.\n"
+        )
 
     if args.manifest:
         with open(args.manifest, encoding="utf-8") as f:
@@ -313,6 +338,23 @@ def main():
     writer.add_name("Fun-CosyVoice3-0.5B-2512-voices")
     names = [v["name"] for v in manifest]
     writer.add_array("voice.names", names)
+
+    # Voice-clone provenance — see examples/cli/crispasr_voice_clone_policy.h.
+    #
+    # This is a BANK: --voice selects an entry by name, so the runtime gate never
+    # sees a file it can inspect and has to read the answer out of this bundle.
+    # The sentinel says "this bundle stamps its entries", which is what lets an
+    # absent per-voice key mean "preset" instead of "baked before the stamp
+    # existed" — without it the gate falls back to the producer architecture and
+    # treats every entry as a clone.
+    writer.add_bool("crispasr.voice.bank_stamped", True)
+    # Every entry here is baked from a WAV, so every entry is a clone. Stamped
+    # per voice anyway: a later bundle may legitimately mix a synthetic preset
+    # in, and a bank-wide flag would have to gate it or free the clones.
+    for name in names:
+        writer.add_bool(f"crispasr.voice.{name}.cloned_from_recording", True)
+    if args.consent_attestation:
+        writer.add_string("crispasr.voice.consent_attestation", args.consent_attestation)
 
     for v in manifest:
         name = v["name"]

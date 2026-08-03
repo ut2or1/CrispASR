@@ -1270,7 +1270,10 @@ static bool mtl_generate_grid(moss_tts_local_context* ctx, const char* text, con
             fprintf(stderr, "moss_tts_local[dbg] frame %d: stop_head continue=%.4f stop=%.4f -> %s\n", f, tl[0], tl[1],
                     stop_idx == 1 ? "STOP" : "cont");
         free(tl);
-        if (stop_idx == 1 && forced.empty()) { // audio_end -> stop (ignored under teacher-forcing)
+        // audio_end -> stop (ignored under teacher-forcing). min_audio_frames
+        // overrides the stop head: keep generating until the floor is reached —
+        // paired with max_audio_frames it yields exact-duration synthesis.
+        if (stop_idx == 1 && forced.empty() && (int)frames.size() >= sp.min_audio_frames) {
             free(lh);
             if (dbg)
                 fprintf(stderr, "moss_tts_local[dbg] stop head fired at frame %d\n", f);

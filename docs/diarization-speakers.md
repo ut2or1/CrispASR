@@ -314,15 +314,27 @@ Two properties worth relying on:
   | path | mean DER |
   |---|---|
   | raw posteriors, no clustering (the A/B harness above) | 33.37% |
-  | `--diarize-method pyannote --diarize-embedder auto` | **15.74%** |
+  | `--diarize-method pyannote --diarize-embedder auto` | **7.81%** |
   | `--diarize-method foxnose` (#324) | **7.32%** |
 
-  foxnose is the one to reach for. The pyannote+TitaNet path over-clusters: it
-  hit the `--diarize-max-speakers 8` cap on 4 of the 8 files (esrit 8 vs 5 real,
-  mesob 8 vs 4, nnqfq 8 vs 5), which is where most of its remaining DER lives.
+  The two shipped paths are now within half a point of each other. The
+  pyannote+TitaNet figure was **15.74%** until `a719c89d`: it over-clustered,
+  pinning to the `--diarize-max-speakers 8` cap on 4 of the 8 files (esrit 8 vs
+  5 real, mesob 8 vs 4, nnqfq 8 vs 5, fsaal 8 vs 7), because single-linkage at a
+  fixed 0.5 threshold never reached the threshold and the cap became the answer.
+  Routing it through the same `core_spectral::cluster_speakers` that foxnose
+  uses — which ESTIMATES the count — closed most of the gap.
   (The 7.32% here is foxnose labelling whisper-tiny's ASR segments; #324's
   3.18% scored foxnose's own turns directly, without ASR segmentation as a
   ceiling. Different measurement, not a regression.)
+
+  Both rows are reproducible from a clean corpus extraction with
+  `tools/der_voxconverse.py` (`--prepare` pulls the 8 dev files and their human
+  labels straight out of the HuggingFace parquet shards). Re-measured that way
+  on 2026-08-03: mean 7.81%, per-file counts 5/6/3/4/5/4/3/3 against ground
+  truth 5/7/4/4/5/4/5/2 — the counts no longer pin to the cap, but the
+  estimator now UNDER-counts on 3 of 8. That is the remaining accuracy item
+  (root `PLAN.md` NOW §2).
 
 This also moves toward pyannote's own design rather than away from it:
 upstream infers on a sliding 10 s window, and one continuous 48-minute scan

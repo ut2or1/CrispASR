@@ -97,6 +97,17 @@ jobs:
           cp build/bin/crispasr release/crispasr-linux-x86_64/
           cp build/bin/crispasr-quantize release/crispasr-linux-x86_64/
           bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64 || true
+          # #296: the binary carries `NEEDED libopenblas.so.0` (apt ships a
+          # dynamic OpenBLAS), so without this the tarball does not START on a
+          # machine that lacks it. RUNPATH is $ORIGIN, so a copy beside the
+          # binary resolves. Verified against the published v0.8.25 artifact.
+          bash scripts/bundle-openblas.sh release/crispasr-linux-x86_64 || true
+          # Assert the SHIPPED artifact, not the configure log: a silent scalar
+          # fallback used to be indistinguishable from a green run.
+          if objdump -p release/crispasr-linux-x86_64/crispasr | grep -q 'NEEDED.*libopenblas'; then
+            test -f release/crispasr-linux-x86_64/libopenblas.so.0 || {
+              echo "::error::crispasr needs libopenblas.so.0 but it is not bundled — the tarball will not run without OpenBLAS installed"; exit 1; }
+          fi
           cd release && tar czf crispasr-linux-x86_64.tar.gz crispasr-linux-x86_64/
 
       - uses: actions/upload-artifact@v4
@@ -574,6 +585,13 @@ jobs:
           cp build/bin/crispasr release/crispasr-linux-arm64/
           cp build/bin/crispasr-quantize release/crispasr-linux-arm64/
           bash scripts/bundle-c2pa.sh release/crispasr-linux-arm64 || true
+          # #296, same as the x86_64 tarball: apt's OpenBLAS is dynamic, so
+          # without this the arm64 tarball will not start on a host that lacks it.
+          bash scripts/bundle-openblas.sh release/crispasr-linux-arm64 || true
+          if objdump -p release/crispasr-linux-arm64/crispasr | grep -q 'NEEDED.*libopenblas'; then
+            test -f release/crispasr-linux-arm64/libopenblas.so.0 || {
+              echo "::error::crispasr needs libopenblas.so.0 but it is not bundled — the tarball will not run without OpenBLAS installed"; exit 1; }
+          fi
           cd release && tar czf crispasr-linux-arm64.tar.gz crispasr-linux-arm64/
 
       - uses: actions/upload-artifact@v4
@@ -1610,6 +1628,13 @@ jobs:
             Copy-Item -Destination release\crispasr-windows-x86_64-cpu\
           Copy-Item LICENSE release\crispasr-windows-x86_64-cpu\
           Copy-Item THIRD_PARTY_NOTICES.txt release\crispasr-windows-x86_64-cpu\
+          # #296: the vcpkg step is continue-on-error, so a failure there would
+          # otherwise ship a silently-scalar binary on a green run — which is
+          # exactly what the reporter is waiting on. Fail loudly instead.
+          if (-not (Test-Path release\crispasr-windows-x86_64-cpu\openblas.dll)) {
+            Write-Output "::error::openblas.dll missing from the Windows CPU package - the vcpkg install step failed and --separate would fall back to the scalar path (#296)"
+            exit 1
+          }
           Compress-Archive -Path release\crispasr-windows-x86_64-cpu -DestinationPath release\crispasr-windows-x86_64-cpu.zip -CompressionLevel Optimal
 
       - uses: actions/upload-artifact@v4

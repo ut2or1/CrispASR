@@ -44,7 +44,15 @@ from pathlib import Path
 
 import numpy as np
 
+# EU AI Act Art. 50(4): whose voice this checkpoint's preset speakers are.
+# Shared with every other converter so the metadata key cannot drift — a drift
+# fails OPEN (the stamp is simply never found) and nothing errors.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _speaker_identity_arg import add_speaker_identity_arg, stamp_speaker_identity
+
+
 try:
+    import gguf
     from gguf import GGUFWriter, GGMLQuantizationType
 except ImportError:
     sys.exit("pip install gguf")
@@ -654,6 +662,7 @@ def main():
                         help="Weight storage type")
     parser.add_argument("--use-nemo-api", action="store_true",
                         help="Use NeMo model API instead of direct .nemo loading")
+    add_speaker_identity_arg(parser)
     args = parser.parse_args()
 
     # ── Load FastPitch ──
@@ -728,6 +737,7 @@ def main():
     # ── Write GGUF ──
     print(f"\nWriting GGUF: {args.output}")
     writer = GGUFWriter(str(args.output), arch="fastpitch")
+    stamp_speaker_identity(writer, args)
 
     # KV metadata
     writer.add_uint32("fastpitch.n_mel_channels",
@@ -813,17 +823,28 @@ def main():
     if "n_symbols" in hparams:
         writer.add_uint32("fastpitch.n_symbols", hparams["n_symbols"])
 
-    # Pitch statistics (for denormalization; from training config)
-    if "pitch_mean" in pitch_stats:
-        writer.add_float32("fastpitch.pitch_mean", pitch_stats["pitch_mean"])
-    if "pitch_std" in pitch_stats:
-        writer.add_float32("fastpitch.pitch_std", pitch_stats["pitch_std"])
-    # Also store pitch stats from training config if available
+    # Pitch statistics, for denormalisation. TWO possible sources: scalars in
+    # the state dict, and the training config's dataset block.
+    #
+    # These used to be written independently, so a checkpoint carrying BOTH —
+    # nvidia/tts_en_fastpitch does — hit gguf-py's "Duplicated key name
+    # 'fastpitch.pitch_mean'" and the conversion died after loading every
+    # weight. Resolve to ONE value first, then write once.
+    #
+    # The state dict wins where both exist: it travels with the weights, while
+    # the config describes the training run that produced them. They should
+    # agree; if they ever do not, the tensors are the thing being shipped.
     train_ds = fp_cfg.get("train_ds", {}) if fp_cfg else {}
     ds = train_ds.get("dataset", {}) if isinstance(train_ds, dict) else {}
-    if ds.get("pitch_mean") and ds["pitch_mean"] != 0:
-        writer.add_float32("fastpitch.pitch_mean", float(ds["pitch_mean"]))
-        writer.add_float32("fastpitch.pitch_std", float(ds["pitch_std"]))
+    pitch_mean = pitch_stats.get("pitch_mean")
+    pitch_std = pitch_stats.get("pitch_std")
+    if pitch_mean is None and ds.get("pitch_mean") and ds["pitch_mean"] != 0:
+        pitch_mean = float(ds["pitch_mean"])
+        pitch_std = float(ds.get("pitch_std", 0.0))
+    if pitch_mean is not None:
+        writer.add_float32("fastpitch.pitch_mean", float(pitch_mean))
+    if pitch_std is not None:
+        writer.add_float32("fastpitch.pitch_std", float(pitch_std))
 
     # Tokenizer vocabulary (ARPABET phonemes for English)
     # Stored as semicolon-separated string for compact metadata
@@ -858,6 +879,46 @@ def main():
         # 1D biases and norms always F32
         if arr.ndim <= 1 or "norm" in name or name.endswith(".bias"):
             qt = GGMLQuantizationType.F32
+
+        # ...and so are the sinusoidal position tables.
+        #
+        # ggml's Metal binary ops assert `src[1]->type == GGML_TYPE_F32`
+        # (ggml-metal-ops.cpp, ggml_metal_op_bin). enc.pos_emb / dec.pos_emb are
+        # 2-D, so the `ndim >= 2` rule above turned them F16, and they are added
+        # to the hidden state (`ggml_add(x, pos_slice)` in fastpitch_tts.cpp) —
+        # which aborted the whole run. A matmul WEIGHT may be F16; a tensor that
+        # is an ADDEND may not.
+        #
+        # This is why --ftype f16 was believed impossible for fastpitch. It is
+        # not: it was two tensors.
+        if name.endswith("pos_emb") or ".pos_emb" in name:
+            qt = GGMLQuantizationType.F32
+
+        # CONVERT TO THE DECLARED TYPE BEFORE WRITING.
+        #
+        # `arr` is float32 (torch .float().numpy() above). add_tensor() with an
+        # explicit raw_dtype does NOT convert anything — it takes the array's
+        # bytes and labels them with the type you named. Passing an f32 array as
+        # F16 therefore wrote f32 bytes tagged F16, and a reader took the first
+        # half of them and reinterpreted each 4-byte float as two 2-byte ones.
+        #
+        # That is what shipped in cstr/fastpitch-en-GGUF's f16 build: HALF the
+        # weights missing and the survivors garbage — 943,872 NaNs across 138
+        # decoder tensors, values to 6.5e4 where the real range is +-0.33. It
+        # went unnoticed because the model card recommends q8_0.
+        #
+        # Q8_0 HAS THE SAME BUG and it is easy to conclude otherwise: the
+        # published q8_0/q4_k files are fine, because they were made by
+        # crispasr-quantize from a good source, NOT by this path. Verified
+        # directly — add_tensor(f32_array, raw_dtype=Q8_0) writes the right
+        # BYTE COUNT from the wrong bytes, and dequantizes to noise (max error
+        # 1978 on weights that live in +-0.3). It needs an explicit quantize.
+        if qt == GGMLQuantizationType.F16:
+            arr = arr.astype(np.float16)
+        elif qt == GGMLQuantizationType.F32:
+            arr = arr.astype(np.float32)
+        elif qt == GGMLQuantizationType.Q8_0:
+            arr = gguf.quants.quantize(arr.astype(np.float32), qt)
 
         writer.add_tensor(name, arr, raw_dtype=qt)
         n_tensors += 1

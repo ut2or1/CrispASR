@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include "core/num2words_fr.h" // #316: spell digits out before phonemizing
+
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -566,7 +568,11 @@ inline std::string word_to_ipa(const context& ctx, const std::string& word) {
 }
 
 inline std::string text_to_ipa(const context& ctx, const std::string& text) {
-    auto words = tokenize(text);
+    // #316: spell numbers out FIRST. Digits are in no pronunciation dictionary
+    // and no letter-to-sound rule, so a numeric token phonemized to the EMPTY
+    // string and vanished from the audio. Must run before tokenize(), which
+    // splits on ',' and '.' — the decimal mark and thousands separator.
+    auto words = tokenize(core_num2words_fr::expand(text));
     std::string ipa;
     for (const auto& w : words) {
         if (w.size() == 1 && strchr(",.!?;:-'", w[0]))

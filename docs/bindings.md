@@ -363,6 +363,39 @@ concatenation) before watermarking, use `synthesize_raw()` +
 the C API level (see
 [`tts.md`](tts.md#spoken-disclaimer-voice-clones-only)).
 
+### Whose voice is a preset voice? (`set_speaker_identity`)
+
+`synthesize()` marks every clip (Art. 50(2)), and the voice-clone gate handles
+cloning. Neither covers the third case: a **preset** voice shipped inside a
+model can be an identifiable individual — a named donor, or a corpus speaker
+such as VCTK's `p225` — and Art. 3(60) attaches to the audio resembling that
+person, not to which pipeline produced it. CrispASR resolves this automatically
+where it has researched the model, and warns once per model where it has not.
+
+When you know the answer and CrispASR does not, say so:
+
+| Binding | Call |
+|---|---|
+| Python | `session.set_speaker_identity("real_person")` |
+| Rust | `session.set_speaker_identity("real_person")?` |
+| Go | `session.SetSpeakerIdentity("real_person")` |
+| Java | `session.setSpeakerIdentity("real_person")` |
+| C# | `session.SetSpeakerIdentity("real_person")` |
+| Dart | `session.setSpeakerIdentity('real_person')` |
+| Ruby | `CrispASR::Session.set_speaker_identity(handle, "real_person")` |
+| WASM | `Module.ttsSetSpeakerIdentity("real_person")` |
+
+Values are `real_person`, `synthetic` and `unknown`. An unrecognised value
+**raises** rather than silently becoming `unknown` — a typo must not quietly
+remove a duty you meant to declare.
+
+`real_person` makes the Art. 50(4) reminder fire for a non-cloned voice. It
+does **not** require a consent attestation: whether the donor agreed to the
+model being trained is a licensing matter settled upstream, which you cannot
+attest to. Do not reach for `synthetic` to quiet a warning you have not
+checked — of every model whose provenance this project has resolved, the large
+majority turned out to be real people.
+
 > **The CLI `--no-watermark` flag and the `CRISPASR_NO_WATERMARK` env var do
 > NOT affect the bindings.** They are wired into the `crispasr` CLI and server
 > only; `synthesize()` and `crispasr_watermark_embed()` watermark

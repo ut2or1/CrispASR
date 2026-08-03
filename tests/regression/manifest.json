@@ -987,7 +987,7 @@
       "gguf": {
         "repo": "cstr/parler-tts-mini-v1.1-GGUF",
         "revision": "534c5b0f8ad18fa4d927e1fe81047175836544c5",
-        "file": "parler-mini-v1.1-q8_0.gguf",
+        "file": "parler-tts-mini-v1.1-q8_0.gguf",
         "approx_size_mb": 1000
       },
       "tts_phrase": "The quick brown fox jumps over the lazy dog",

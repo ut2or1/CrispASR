@@ -106,6 +106,10 @@ namespace CrispASR
             IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string lang);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_set_tts_reference_language(
+            IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string lang);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_set_punctuation(IntPtr s, int enable);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -209,6 +213,12 @@ namespace CrispASR
             out int outNSamples);
 
         // Attest acceptance of AI-content marking/disclosure duty (EU AI Act Art. 50).
+        // Whose voice a PRESET voice is (EU AI Act Art. 50(4)). 0 ok, -1 bad
+        // session, -2 unrecognised value.
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_set_speaker_identity(
+            IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string identity);
+
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_accept_marking_responsibility(
             IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string attestation);
@@ -230,6 +240,14 @@ namespace CrispASR
         // Whisper-family backends, 0 on error).
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_input_sample_rate(IntPtr s);
+
+        // AI-content marking (EU AI Act Art. 50(2)) — the other half of
+        // synthesize_raw. alpha <= 0 selects the reliably detectable default.
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void crispasr_watermark_embed(float[] pcm, int nSamples, float alpha);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern float crispasr_watermark_detect(float[] pcm, int nSamples);
 
         // ---- ASR transcription ----
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]

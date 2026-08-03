@@ -28,6 +28,7 @@ void             crispasr_session_close(CrispasrSession* s);
 int              crispasr_session_set_codec_path(CrispasrSession* s, const char* path);
 int              crispasr_session_set_source_language(CrispasrSession* s, const char* lang);
 int              crispasr_session_set_target_language(CrispasrSession* s, const char* lang);
+int              crispasr_session_set_tts_reference_language(CrispasrSession* s, const char* lang);
 int              crispasr_session_set_punctuation(CrispasrSession* s, int enable);
 int              crispasr_session_set_punc_model(CrispasrSession* s, const char* punc_model);
 int              crispasr_session_set_hotwords(CrispasrSession* s, const char* hotwords, float boost);
@@ -77,6 +78,7 @@ int              crispasr_session_is_voice_design(CrispasrSession* s);
 float*           crispasr_session_synthesize(CrispasrSession* s, const char* text, int* out_n_samples);
 float*           crispasr_session_synthesize_raw(CrispasrSession* s, const char* text, int* out_n_samples);
 int              crispasr_session_accept_marking_responsibility(CrispasrSession* s, const char* attestation);
+int              crispasr_session_set_speaker_identity(CrispasrSession* s, const char* identity);
 float*           crispasr_session_speech_to_speech(CrispasrSession* s, const float* in_samples, int n_in_samples,
                                                     char** out_text, int* out_n_samples);
 void             crispasr_session_translate_text_free(char* text);
@@ -414,6 +416,26 @@ func (s *CrispasrSession) SetTargetLanguage(lang string) error {
 	rc := C.crispasr_session_set_target_language(s.handle, cl)
 	if rc != 0 {
 		return errors.New("crispasr_session_set_target_language failed")
+	}
+	return nil
+}
+
+// SetTTSReferenceLanguage declares the language a voice-cloning REFERENCE clip
+// is spoken in (issue #329). Cross-lingual TTS backends (cosyvoice3) compare it
+// to the requested output language — SetTargetLanguage, falling back to
+// SetSourceLanguage — and drop the reference transcript when they differ, so the
+// clone speaks the target language instead of carrying the reference's accent.
+//
+// Optional: the backend otherwise infers it from the voice bank or the reference
+// transcript, and that inference declines rather than guesses on a short
+// transcript. When it declines, the requested target language has no effect —
+// set this to make it explicit. Empty string clears.
+func (s *CrispasrSession) SetTTSReferenceLanguage(lang string) error {
+	cl := C.CString(lang)
+	defer C.free(unsafe.Pointer(cl))
+	rc := C.crispasr_session_set_tts_reference_language(s.handle, cl)
+	if rc != 0 {
+		return errors.New("crispasr_session_set_tts_reference_language failed")
 	}
 	return nil
 }
@@ -1034,6 +1056,37 @@ func (s *CrispasrSession) Synthesize(text string) ([]float32, error) {
 	src := unsafe.Slice((*float32)(unsafe.Pointer(ptr)), int(n))
 	copy(samples, src)
 	return samples, nil
+}
+
+// SetSpeakerIdentity declares whose voice a PRESET voice is: "real_person",
+// "synthetic" or "unknown".
+//
+// Cloning is not the only way to produce a deep fake. A preset voice shipped
+// inside a model can be an identifiable individual — a named donor, a corpus
+// speaker — and EU AI Act Art. 3(60) attaches to the audio resembling that
+// person, not to which pipeline made it. Setting real_person makes the
+// Art. 50(4) reminder fire for a non-cloned voice.
+//
+// It does NOT require a consent attestation: whether that donor agreed to the
+// model being trained is a licensing matter settled upstream that you cannot
+// attest to.
+//
+// Returns an error on an unrecognised value rather than silently downgrading
+// it to "unknown".
+func (s *CrispasrSession) SetSpeakerIdentity(identity string) error {
+	if s == nil || s.handle == nil {
+		return errors.New("session is closed")
+	}
+	cid := C.CString(identity)
+	defer C.free(unsafe.Pointer(cid))
+	switch rc := C.crispasr_session_set_speaker_identity(s.handle, cid); rc {
+	case 0:
+		return nil
+	case -2:
+		return fmt.Errorf("unrecognised speaker_identity %q (expected real_person, synthetic or unknown)", identity)
+	default:
+		return fmt.Errorf("crispasr_session_set_speaker_identity failed (rc=%d)", int(rc))
+	}
 }
 
 // AcceptMarkingResponsibility attests that the caller accepts AI-content
@@ -2401,11 +2454,18 @@ func WatermarkLoadModel(ggufPath string) error {
 
 // WatermarkEmbed embeds an AI-generated watermark into PCM audio in-place.
 // Uses AudioSeal if a model was loaded, otherwise spread-spectrum.
+//
+// Passes alpha <= 0, which selects the band-limited default strength that makes
+// the mark reliably DETECTABLE — the property EU AI Act Art. 50(2) requires, and
+// the reason this is the call SynthesizeRaw users need to discharge marking
+// themselves. It used to hardcode 0.005, the strength the C ABI documents as
+// too faint to reliably detect on real speech: an explicit positive alpha is
+// used verbatim and bypasses the robust default.
 func WatermarkEmbed(pcm []float32) {
 	if len(pcm) == 0 {
 		return
 	}
-	C.crispasr_watermark_embed((*C.float)(unsafe.Pointer(&pcm[0])), C.int(len(pcm)), 0.005)
+	C.crispasr_watermark_embed((*C.float)(unsafe.Pointer(&pcm[0])), C.int(len(pcm)), -1.0)
 }
 
 // WatermarkDetect returns a confidence score [0, 1] indicating whether

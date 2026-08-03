@@ -51,14 +51,20 @@ public final class CrispasrSession implements AutoCloseable {
         // UNMARKED synthesis — refused unless crispasr_session_accept_marking_responsibility() was called first.
         Pointer crispasr_session_synthesize_raw(Pointer session, String text, IntByReference outNSamples);
         int     crispasr_session_accept_marking_responsibility(Pointer session, String attestation);
+        // Whose voice a PRESET voice is (EU AI Act Art. 50(4)); -2 on a bad value.
+        int     crispasr_session_set_speaker_identity(Pointer session, String identity);
         // Speech-to-speech (lfm2-audio, mini-omni2, sidon, voxcpm2-vae). outText receives the intermediate transcript.
         Pointer crispasr_session_speech_to_speech(Pointer session, float[] inSamples, int nInSamples,
                                                   PointerByReference outText, IntByReference outNSamples);
         int     crispasr_session_input_sample_rate(Pointer session);
         void    crispasr_pcm_free(Pointer pcm);
+        // AI-content marking (EU AI Act Art. 50(2)) — the other half of synthesize_raw.
+        void    crispasr_watermark_embed(float[] pcm, int nSamples, float alpha);
+        float   crispasr_watermark_detect(float[] pcm, int nSamples);
         int     crispasr_session_kokoro_clear_phoneme_cache(Pointer session);
         int     crispasr_session_set_source_language(Pointer session, String lang);
         int     crispasr_session_set_target_language(Pointer session, String lang);
+        int     crispasr_session_set_tts_reference_language(Pointer session, String lang);
         int     crispasr_session_set_punctuation(Pointer session, int enable);
         int     crispasr_session_set_translate(Pointer session, int enable);
         int     crispasr_session_set_temperature(Pointer session, float temperature, long seed);
@@ -394,6 +400,18 @@ public final class CrispasrSession implements AutoCloseable {
     public void setTargetLanguage(String lang) {
         int rc = Lib.INSTANCE.crispasr_session_set_target_language(handle, lang == null ? "" : lang);
         if (rc != 0) throw new IllegalStateException("set_target_language failed (rc=" + rc + ")");
+    }
+
+    /**
+     * Language a voice-cloning REFERENCE clip is spoken in (#329). Cross-lingual TTS backends
+     * (cosyvoice3) drop the reference transcript when it differs from the requested output
+     * language, so the clone speaks that language rather than carrying the reference's accent.
+     * Optional — otherwise inferred from the voice bank or the reference transcript, and that
+     * inference declines rather than guesses on a short transcript.
+     */
+    public void setTtsReferenceLanguage(String lang) {
+        int rc = Lib.INSTANCE.crispasr_session_set_tts_reference_language(handle, lang == null ? "" : lang);
+        if (rc != 0) throw new IllegalStateException("set_tts_reference_language failed (rc=" + rc + ")");
     }
 
     /** Toggle punctuation + capitalisation. Default true. */
@@ -751,6 +769,71 @@ public final class CrispasrSession implements AutoCloseable {
             throw new IllegalStateException(
                     "accept_marking_responsibility failed (rc=" + rc + ")");
         }
+    }
+
+    /**
+     * Declare whose voice a PRESET voice is: {@code "real_person"},
+     * {@code "synthetic"} or {@code "unknown"}.
+     *
+     * <p>Cloning is not the only way to produce a deep fake: a preset voice
+     * shipped inside a model can be an identifiable individual — a named donor,
+     * or a corpus speaker such as VCTK's {@code p225} — and EU AI Act
+     * Art. 3(60) attaches to the audio resembling that person, not to which
+     * pipeline produced it. Setting {@code real_person} makes the Art. 50(4)
+     * reminder fire for a non-cloned voice.
+     *
+     * <p>It does <b>not</b> require a consent attestation: whether that donor
+     * agreed to the model being trained is a licensing matter settled upstream
+     * that you cannot attest to.
+     *
+     * @throws IllegalArgumentException on an unrecognised value, rather than
+     *         silently downgrading it to {@code unknown}.
+     */
+    public void setSpeakerIdentity(String identity) {
+        int rc = Lib.INSTANCE.crispasr_session_set_speaker_identity(
+                handle, identity == null ? "" : identity);
+        if (rc == -2) {
+            throw new IllegalArgumentException(
+                    "unrecognised speaker_identity '" + identity
+                            + "' (expected real_person, synthetic or unknown)");
+        }
+        if (rc != 0) {
+            throw new IllegalStateException("set_speaker_identity failed (rc=" + rc + ")");
+        }
+    }
+
+    /**
+     * Embed the AI-content watermark into mono float32 PCM, in place.
+     *
+     * <p>The other half of {@link #synthesizeRaw(String)}: opting out of
+     * automatic marking makes marking the result the integrator's duty under
+     * EU AI Act Art. 50(2), and this is what discharges it. Do the
+     * post-processing you opted out for — resample, mix, concatenate — then
+     * mark the finished buffer.
+     *
+     * <p>Uses the robust, reliably detectable default strength; AudioSeal
+     * instead when a model has been loaded. Static because marking is a
+     * property of the samples, not of the session that produced them.
+     */
+    public static void watermarkEmbed(float[] pcm) {
+        if (pcm == null || pcm.length == 0) {
+            return;
+        }
+        Lib.INSTANCE.crispasr_watermark_embed(pcm, pcm.length, -1.0f);
+    }
+
+    /**
+     * Confidence in [0, 1] that {@code pcm} carries the watermark.
+     *
+     * <p>A weak diagnostic, not proof: the spread-spectrum detector's null mean
+     * is 0.5, not 0, and a negative result on a short clip is mostly evidence
+     * that the clip was short. See {@code docs/eu-ai-act.md} §6.7.
+     */
+    public static float watermarkDetect(float[] pcm) {
+        if (pcm == null || pcm.length == 0) {
+            return 0.0f;
+        }
+        return Lib.INSTANCE.crispasr_watermark_detect(pcm, pcm.length);
     }
 
     /** Result of {@link #speechToSpeech(float[])}: output PCM plus the intermediate transcript. */

@@ -671,24 +671,68 @@ if(CRISPASR_BUILD_EXAMPLES AND NOT WIN32)
     # wire format and the chunk-gate rule; only this catches a flag reaching a
     # code path that ignores it (--vad-import was silently a no-op without
     # --backend). SKIPs cleanly when no whisper model is available.
+    # Split into two tiers (2026-08-02). One entry labelled `unit` ran the whole
+    # script: in CI, which has no whisper model, it SKIPPED everything below
+    # Test 4 and reported green for coverage it never ran; on a developer
+    # machine where a model was findable it made 14 model-loading CLI runs and
+    # blew the 120s timeout. Green where it tested nothing, red where it tested
+    # everything. The model-free half stays in `unit` because it is the half
+    # that caught #227's actual bug; the transcribing half moves to `live`.
+    add_test(NAME test-vad-export
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test_vad_export_live.sh
+            $<TARGET_FILE:crispasr-cli>
+            ${PROJECT_SOURCE_DIR}
+            unit)
+    # 300s: model-free, but still a CLI-surface test that runs the binary four
+    # times with Silero VAD, not a Catch2 microtest. ~6s of CPU; the wall clock
+    # is entirely down to what else the machine is doing. Measured 32s at load
+    # 32, and it blew a 120s budget at load 51 — so the first number was a
+    # measurement of one moment, not a bound.
+    #
+    # This is a BACKSTOP against a hang, not an assertion about speed (Test 4
+    # inside the script makes exactly that mistake and was fixed for it). Set it
+    # generously: a timeout that fires on a busy laptop teaches people to re-run
+    # the suite rather than read it.
+    set_tests_properties(test-vad-export PROPERTIES
+        LABELS "unit;vad;regression-227"
+        TIMEOUT 300)
+
     add_test(NAME test-vad-export-live
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test_vad_export_live.sh
             $<TARGET_FILE:crispasr-cli>
-            ${PROJECT_SOURCE_DIR})
+            ${PROJECT_SOURCE_DIR}
+            live)
+    # 600s, not 120s: 14 runs that each load a model off whatever storage the
+    # developer keeps it on. Measured 45s wall for ONE run on an external
+    # volume under load (1.9s of that was CPU) — the cost here is I/O and
+    # scheduling, not VAD.
     set_tests_properties(test-vad-export-live PROPERTIES
-        LABELS "unit;vad;regression-227"
-        TIMEOUT 120)
+        LABELS "live;vad;regression-227"
+        TIMEOUT 600)
 
     # #311: strict failure semantics for required VAD / aligner / punctuation.
     # Model-free config-validation + help always run; the strict-vs-permissive
     # A/B is gated on a loadable whisper model and SKIPs cleanly without one.
+    # Split for the same reason as test-vad-export above: as one `unit` entry
+    # this reported green in CI while skipping the model-gated A/B, which is
+    # the half that actually exercises --strict-pipeline against a real run.
     add_test(NAME test-strict-pipeline
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test_strict_pipeline.sh
             $<TARGET_FILE:crispasr-cli>
-            ${PROJECT_SOURCE_DIR})
+            ${PROJECT_SOURCE_DIR}
+            unit)
     set_tests_properties(test-strict-pipeline PROPERTIES
         LABELS "unit;regression-311"
-        TIMEOUT 180)
+        TIMEOUT 60)
+
+    add_test(NAME test-strict-pipeline-live
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test_strict_pipeline.sh
+            $<TARGET_FILE:crispasr-cli>
+            ${PROJECT_SOURCE_DIR}
+            live)
+    set_tests_properties(test-strict-pipeline-live PROPERTIES
+        LABELS "live;regression-311"
+        TIMEOUT 600)
 endif()
 
 if(CRISPASR_BUILD_EXAMPLES AND NOT WIN32)
@@ -839,6 +883,33 @@ target_link_libraries(test-diarize-align-order PRIVATE
 catch_discover_tests(test-diarize-align-order
     TEST_SPEC "[issue267]"
     PROPERTIES LABELS "unit;diarize;issue267"
+)
+
+# ─── test-diarize-slice-rewalk — issue #324: the server diarizes the MERGED
+# segment list by re-walking the slices, and the turn splitter GROWS each
+# slice's sub-range. Guards that the re-walk never drops a sub-segment.
+# Compiles crispasr_diarize_cli.cpp directly, like test-diarize-align-order.
+add_executable(test-diarize-slice-rewalk
+    test-diarize-slice-rewalk.cpp
+    ${PROJECT_SOURCE_DIR}/examples/cli/crispasr_diarize_cli.cpp
+)
+target_include_directories(test-diarize-slice-rewalk PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-diarize-slice-rewalk PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+    common
+    pyannote-seg
+    titanet
+)
+catch_discover_tests(test-diarize-slice-rewalk
+    TEST_SPEC "[issue324]"
+    PROPERTIES LABELS "unit;diarize;issue324"
 )
 
 # ─── test-miotts-live — live integration tests for MioTTS backend
@@ -2874,6 +2945,8 @@ catch_discover_tests(test-marking-policy
 add_executable(test-voice-clone-policy test-voice-clone-policy.cpp)
 target_include_directories(test-voice-clone-policy PRIVATE
     ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/third_party/c2pa-audio/src
 )
 target_link_libraries(test-voice-clone-policy PRIVATE
     Catch2::Catch2WithMain
@@ -2882,6 +2955,32 @@ catch_discover_tests(test-voice-clone-policy
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit"
 )
+
+# ─── test-speech-window — PR #330's min/max speech-token window arithmetic.
+# Pure policy (examples/cli/crispasr_speech_window.h): no model, no audio, so
+# the "can this window actually be delivered" reasoning is guarded on the tier
+# CI runs. The decode loop itself is covered by the moss live tests.
+add_executable(test-speech-window test-speech-window.cpp)
+target_include_directories(test-speech-window PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-speech-window PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-speech-window
+    TEST_SPEC "[pr330]"
+    PROPERTIES LABELS "unit;pr330"
+)
+
+# ─── watermark-detect-ab — measurement harness, NOT a ctest test.
+# Produces the FP/TP table that decides which detection statistic ships as the
+# default. Deliberately not registered with catch_discover_tests: it needs a
+# corpus of real unmarked speech that the repo does not carry, and a harness
+# whose verdict depends on which wavs are lying around must never gate CI.
+# Usage: build/bin/watermark-detect-ab <wav>...  (see the file header for the
+# two corpus rules — no already-marked audio, no upsampled clips).
+add_executable(watermark-detect-ab ${PROJECT_SOURCE_DIR}/tools/watermark_detect_ab.cpp)
+target_include_directories(watermark-detect-ab PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 # ─── test-no-emotion-recognition — CrispASR ships no voice-based emotion
 # inference on any surface. SenseVoice-Small is upstream an emotion classifier
@@ -2898,6 +2997,66 @@ target_link_libraries(test-no-emotion-recognition PRIVATE
     Catch2::Catch2WithMain
 )
 catch_discover_tests(test-no-emotion-recognition
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-speaker-identity — whose voice a PRESET voice is, and which duty that
+# triggers. `is_clone == false` was answering two questions at once: correctly
+# "no consent attestation owed by this operator", and incorrectly "nothing to
+# disclose". A preset shipped inside a model can be an identifiable individual,
+# and Art. 3(60) attaches to the audio resembling that person rather than to the
+# pipeline that made it. Pure predicate, guarded on the tier CI actually runs.
+add_executable(test-speaker-identity test-speaker-identity.cpp)
+target_include_directories(test-speaker-identity PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-speaker-identity PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-speaker-identity
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-speaker-identity-gguf — the speaker-identity stamp survives a real
+# GGUF round trip. test-speaker-identity is pure and cannot notice a read path
+# that is never reached; this writes an actual metadata-only GGUF, hands it to
+# the reader the CLI and server call, and checks the value comes back. #324 is
+# the standing reason: a fix landed inert and every test stayed green.
+add_executable(test-speaker-identity-gguf test-speaker-identity-gguf.cpp)
+target_include_directories(test-speaker-identity-gguf PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-speaker-identity-gguf PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+    ggml
+)
+catch_discover_tests(test-speaker-identity-gguf
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-compliance-wiring — the EU AI Act gates are WIRED UP on every surface
+# that can reach them. The pure predicates live in test-voice-clone-policy and
+# test-marking-policy, and both stayed green through every failure this guards:
+# Wyoming marking nothing for four releases, --make-ref demanding no
+# attestation, cosyvoice3 voice BANKS bypassing the clone gate on all four
+# surfaces. None of those were predicate bugs — they were missing call sites,
+# unstamped bakers and ungated endpoints. Source-level on purpose: the
+# behavioural version needs models and sockets, i.e. the live tier CI does not
+# run, and a gate CI can't run is a gate that ships wrong (#312).
+add_executable(test-compliance-wiring test-compliance-wiring.cpp)
+target_compile_definitions(test-compliance-wiring PRIVATE
+    CRISPASR_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+)
+target_link_libraries(test-compliance-wiring PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-compliance-wiring
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit"
 )
@@ -2921,19 +3080,19 @@ catch_discover_tests(test-abi-clone-disclosure
     PROPERTIES LABELS "unit"
 )
 
-# ─── test-punc-copies-in-sync — the two fireredpunc implementations must not
+# ─── test-copies-in-sync — the two fireredpunc implementations must not
 # drift. crisp_punc/src/fireredpunc.cpp is what normally links; src/fireredpunc.cpp
 # is the partial-checkout fallback. #308's capitalisation fix landed in the
 # fallback ONLY and was dead code for months (found while fixing #300). Pure file
 # comparison — no model, no linkage.
-add_executable(test-punc-copies-in-sync test-punc-copies-in-sync.cpp)
-target_compile_definitions(test-punc-copies-in-sync PRIVATE
+add_executable(test-copies-in-sync test-copies-in-sync.cpp)
+target_compile_definitions(test-copies-in-sync PRIVATE
     CRISPASR_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
 )
-target_link_libraries(test-punc-copies-in-sync PRIVATE
+target_link_libraries(test-copies-in-sync PRIVATE
     Catch2::Catch2WithMain
 )
-catch_discover_tests(test-punc-copies-in-sync
+catch_discover_tests(test-copies-in-sync
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit"
 )
@@ -3005,6 +3164,7 @@ catch_discover_tests(test-vibevoice-transcript
 add_executable(test_watermark test_watermark.cpp)
 target_include_directories(test_watermark PRIVATE
     ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src   # core/crispasr_watermark.h
 )
 target_link_libraries(test_watermark PRIVATE
     Catch2::Catch2WithMain
@@ -3497,9 +3657,19 @@ if(APPLE AND TARGET ggml-metal)
     foreach(T 33 65 66 67 97 129 130 131 132 257)
         add_test(NAME metal_norm_T${T}
             COMMAND test_metal_norm_repro ${T} 512)
+        # 120s, not 30s. Measured on an IDLE box: 0.85s per test warm, 3.5s for
+        # the first (cold Metal pipeline cache) — so 30s looked like ~8x
+        # headroom. It is not: these are GPU tests, they contend with each
+        # other and with anything else using the GPU, and on a loaded machine
+        # (load 32-51 here) the whole set times out while passing in isolation.
+        #
+        # A ctest TIMEOUT is a backstop against a hang, not an assertion about
+        # speed — the same distinction test-vad-export's Test 4 got wrong one
+        # level down. Size it for the worst machine that will run it, not the
+        # median one.
         set_tests_properties(metal_norm_T${T} PROPERTIES
             LABELS "unit;metal"
-            TIMEOUT 30)
+            TIMEOUT 120)
     endforeach()
 endif()
 
@@ -3799,6 +3969,19 @@ set_tests_properties(test-server-wyoming PROPERTIES
     LABELS "live;server;wyoming"
     TIMEOUT 300)
 
+# ─── test-wyoming-marking — live: EU AI Act Art. 50 on the Wyoming surface.
+# The policy lives in crispasr_marking::decide_raw_surface() and is unit-tested
+# in test-marking-policy; this pins what a unit test cannot reach — that the
+# synthesize handler actually CALLS it. The original bug was a missing call
+# site, which a green policy test would never have caught. Needs a kokoro GGUF;
+# SKIPs otherwise.
+add_test(NAME test-wyoming-marking
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-wyoming-marking.py
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-wyoming-marking PROPERTIES
+    LABELS "live;server;wyoming;marking"
+    TIMEOUT 900)
+
 # ─── test-server-tts — live: /v1/audio/speech + /v1/voices smoke, incl. the
 # PR #177 streaming path (stream=true per-chunk PCM, mp3 rejection, log marker).
 # Needs a qwen3-tts CustomVoice GGUF + tokenizer (set CRISPASR_MODELS); SKIPs
@@ -3953,6 +4136,39 @@ target_include_directories(test-btc-vocab PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(test-btc-vocab PRIVATE Catch2::Catch2WithMain)
 catch_discover_tests(test-btc-vocab
     TEST_SPEC "[btc]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-num2words-fr-es — French + Spanish number expansion (hermetic, unit)
+add_executable(test-num2words-fr-es test-num2words-fr-es.cpp)
+target_include_directories(test-num2words-fr-es PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-num2words-fr-es PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-num2words-fr-es
+    TEST_SPEC "[num2words-fr],[num2words-es]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-num2words-de — German number expansion for the built-in G2P (hermetic, unit)
+add_executable(test-num2words-de test-num2words-de.cpp)
+target_include_directories(test-num2words-de PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-num2words-de PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-num2words-de
+    TEST_SPEC "[num2words-de]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-tts-lang — cross-lingual language tags + reference LID (hermetic, unit)
+add_executable(test-tts-lang test-tts-lang.cpp)
+target_include_directories(test-tts-lang PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-tts-lang PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-tts-lang
+    TEST_SPEC "[tts-lang]"
     PROPERTIES
         LABELS unit
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"

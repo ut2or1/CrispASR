@@ -53,6 +53,14 @@ _TRANSLATE_BACKENDS = {
 }
 
 _SRC_TGT_BACKENDS = {
+    # TTS side (#304/#329): for these two the pair means the synthesis
+    # languages — `-tl` is what to SPEAK, `-sl` is what the cloning reference is
+    # spoken in. The bit is what stops crispasr_run's warn_unsupported() from
+    # printing "--target-lang ignored by this backend" and discarding the flag,
+    # which is how #329 came to read as "this engine has no language option".
+    "cosyvoice3-tts",
+    "qwen3-tts",
+    "qwen3-tts-1.7b-base",
     "canary",
     "granite",
     "granite-4.1",

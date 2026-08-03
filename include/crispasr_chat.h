@@ -20,6 +20,31 @@
 //
 // Strings out of this ABI come from malloc — free with
 // `crispasr_chat_string_free`.
+//
+// EU AI Act — read this before shipping a product on top of it
+// ------------------------------------------------------------
+// Everything else in CrispASR either records what a human said (ASR) or
+// generates AUDIO, which the runtime marks for you: every synthesis path
+// watermarks by default and cloned voices get an audible AI disclosure. This
+// header is the exception. It is open-ended synthetic TEXT generation, and
+// there are two duties on it that CrispASR does NOT discharge:
+//
+//   Art. 50(2) — synthetic text must be marked as artificially generated, in a
+//     machine-readable form. There is no watermark-equivalent for short-form
+//     text that survives a copy-paste, so nothing here marks the output. The
+//     practical option is metadata travelling with the response (the server
+//     sends X-Crispasr-Ai-Generated on /v1/chat/completions; do the same).
+//
+//   Art. 50(1) — a system that interacts directly with natural persons must
+//     tell them they are talking to an AI, unless that is obvious to a
+//     reasonably well-informed person. A terminal you launched with a `-m
+//     model.gguf` flag is obvious. A chat bubble in your app is not.
+//     `crispasr_chat_ai_disclosure_text()` is the canonical wording; show it
+//     at or before the first turn, and make it visible, not audio-only
+//     (Art. 50(5) accessibility).
+//
+// Neither duty transfers with the model: whichever GGUF you point this at, you
+// are the deployer of the system built on it. See docs/eu-ai-act.md §6.6.
 
 #ifndef CRISPASR_CHAT_H
 #define CRISPASR_CHAT_H
@@ -184,6 +209,22 @@ CRISPASR_CHAT_API size_t crispasr_chat_memory_estimate(const char* model_path, c
 
 // Free a malloc'd string returned by `crispasr_chat_generate`.
 CRISPASR_CHAT_API void crispasr_chat_string_free(char* s);
+
+// ---------------------------------------------------------------------------
+// AI disclosure (EU AI Act Art. 50(1))
+// ---------------------------------------------------------------------------
+// The canonical wording for "you are talking to an AI", the text counterpart of
+// crispasr_session_disclaimer_text() on the audio side. Show it at or before
+// the first turn of any conversational product built on this ABI, and show it
+// VISIBLY — Art. 50(5) requires disclosures to meet accessibility requirements.
+//
+// This is a string, not a gate: the ABI cannot know whether your product faces
+// a natural person or is a batch summarizer where no disclosure is owed. What
+// it can do is stop every downstream integrator inventing their own wording,
+// and stop the duty going unnoticed because it lives only in a doc.
+//
+// Returns a static string; never NULL, never needs freeing.
+CRISPASR_CHAT_API const char* crispasr_chat_ai_disclosure_text(void);
 
 #ifdef __cplusplus
 } // extern "C"

@@ -58,9 +58,10 @@
 #include "core/crispasr_c2pa.h"
 #include "crispasr_tts_chunking.h"
 #include "crispasr_tts_disclaimer.h"
+#include "crispasr_consent_record.h"
 #include "crispasr_voice_clone_policy.h"
 #include "crispasr_voice_provenance.h"
-#include "crispasr_watermark.h"
+#include "core/crispasr_watermark.h"
 #include "crispasr_watermark_dispatch.h"
 #include "crispasr_watermark_stats.h"
 #include "core/crispasr_wav_writer.h"
@@ -2109,6 +2110,49 @@ int crispasr_run_backend(const whisper_params& params_in) {
         }
     }
 
+    // ── --print-speaker-identity: whose voice does this file produce? ─────
+    // Standalone verb, resolved with the SAME code the disclosure gate uses:
+    // the stamp inside the file first, then the researched legacy table. Runs
+    // before any backend/model resolution — it inspects a file, not a session.
+    //
+    // Exists so a script never has to restate a verdict. Anything that needs to
+    // know (the stamping driver, a packaging step, an operator asking "will
+    // this disclose?") asks the binary and gets the answer the runtime will
+    // actually act on, instead of keeping a third copy of the table that drifts.
+    //
+    // Prints one of real_person / synthetic / unknown on stdout. Exit 0 when
+    // the answer is established, 3 when it is unknown — so a shell driver can
+    // skip unknowns with `if crispasr --print-speaker-identity f; then ...`.
+    if (!params.print_speaker_identity_file.empty()) {
+        const std::string& path = params.print_speaker_identity_file;
+        // The stamp is authoritative wherever it exists; the tables are the
+        // legacy fallback for files published before it. Same strongest-duty
+        // combination the synthesis path applies, so this cannot report an
+        // answer weaker than the one that will be enforced.
+        const crispasr_voice::SpeakerIdentity stamped = crispasr_voice::read_model_speaker_identity(path);
+        const crispasr_voice::PackProvenance pack = crispasr_voice::read_pack_provenance(path);
+        // Both tables: this file may be a voice PACK or a MODEL, and the verb
+        // has no session to ask which. The model table keys on a backend name,
+        // so derive it from what the file declares about itself.
+        crispasr_voice::SpeakerIdentity table = crispasr_voice::identity_for_voice_pack(path);
+        if (table == crispasr_voice::SpeakerIdentity::Unknown) {
+            const std::string arch = crispasr_voice::read_gguf_architecture(path);
+            if (!arch.empty())
+                table = crispasr_voice::identity_for_model(crispasr_voice::backend_for_architecture(arch), path);
+        }
+        const crispasr_voice::SpeakerIdentity id = crispasr_voice::resolve_speaker_identity(
+            /*override=*/crispasr_voice::parse_speaker_identity(params.tts_speaker_identity),
+            /*pack=*/pack.identity == crispasr_voice::SpeakerIdentity::Unknown ? table : pack.identity,
+            /*backend=*/crispasr_voice::SpeakerIdentity::Unknown, stamped);
+        printf("%s\n", crispasr_voice::to_string(id));
+        if (!params.no_prints) {
+            fprintf(stderr, "crispasr: '%s' -> speaker_identity=%s (stamp=%s, table=%s)\n", path.c_str(),
+                    crispasr_voice::to_string(id), crispasr_voice::to_string(stamped),
+                    crispasr_voice::to_string(table));
+        }
+        return id == crispasr_voice::SpeakerIdentity::Unknown ? 3 : 0;
+    }
+
     // ── --detect-watermark: standalone watermark detection verb ───────────
     // Reads a WAV file, runs watermark detection, prints the result, exits.
     // This is handled before any backend/model resolution so no GGUF is
@@ -2183,17 +2227,34 @@ int crispasr_run_backend(const whisper_params& params_in) {
             // probability of reaching this score by chance instead of a bare
             // threshold: the old `> 0.65` bar is p = 0.055, i.e. it called roughly
             // one in eighteen clean files watermarked, in the past tense.
-            const double p = crispasr_wm_stats::p_value(confidence, CRISPASR_WATERMARK_NBINS);
-            const auto verdict = crispasr_wm_stats::classify(confidence, CRISPASR_WATERMARK_NBINS);
-            fprintf(stdout, "Chance of this score without a watermark: %.2g\n", p);
-            fprintf(stdout, "Result: %s\n", crispasr_wm_stats::verdict_line(verdict));
-            if (verdict != crispasr_wm_stats::Verdict::Detected && dur_s < 10.0) {
-                fprintf(stdout,
-                        "Note: %.1f s is short for this detector — it averages spectra across frames, so\n"
-                        "      confidence grows with duration (measured: 78%% of 1 s clips vs 100%% of 10 s\n"
-                        "      clips clear the old bar). Use --watermark-model auto (AudioSeal) for a\n"
-                        "      sensitive check, and treat a negative here as inconclusive, not as proof.\n",
-                        dur_s);
+            if (crispasr_watermark_detect_uses_frames()) {
+                // Per-frame t + decoy specificity. The score is a calibrated
+                // confidence, not a bin count, so the binomial null does not
+                // apply and no p-value is printed — quoting one would invent an
+                // n that was never scored.
+                const auto verdict = crispasr_wm_stats::classify_frames(confidence);
+                fprintf(stdout, "Statistic: per-frame t + decoy specificity\n");
+                fprintf(stdout, "Result: %s\n", crispasr_wm_stats::verdict_line(verdict));
+                if (verdict != crispasr_wm_stats::Verdict::Detected && dur_s < 1.0) {
+                    fprintf(stdout,
+                            "Note: %.2f s is below the %d-frame minimum this statistic needs; it returns 0\n"
+                            "      rather than guess. A negative is not evidence the audio is human-made.\n",
+                            dur_s, crispasr_wm::kDetectMinFrames);
+                }
+            } else {
+                const double p = crispasr_wm_stats::p_value(confidence, CRISPASR_WATERMARK_NBINS);
+                const auto verdict = crispasr_wm_stats::classify(confidence, CRISPASR_WATERMARK_NBINS);
+                fprintf(stdout, "Statistic: bin-sign agreement (legacy)\n");
+                fprintf(stdout, "Chance of this score without a watermark: %.2g\n", p);
+                fprintf(stdout, "Result: %s\n", crispasr_wm_stats::verdict_line(verdict));
+                if (verdict != crispasr_wm_stats::Verdict::Detected && dur_s < 10.0) {
+                    fprintf(stdout,
+                            "Note: %.1f s is short for this detector — it averages spectra across frames, so\n"
+                            "      confidence grows with duration (measured: 69%% of 1 s clips vs 100%% of 10 s\n"
+                            "      clips clear the 0.65 bar). Unset CRISPASR_WATERMARK_DETECT to use the\n"
+                            "      per-frame statistic, which reads 97%% at 1 s with fewer false positives.\n",
+                            dur_s);
+                }
             }
         }
 
@@ -2790,6 +2851,10 @@ int crispasr_run_backend(const whisper_params& params_in) {
             if (!params.no_prints)
                 fprintf(stderr, "crispasr[tada-clone]: baked voice ref (%d tokens) → %s\n", result.n_tokens,
                         tmp.c_str());
+            // Remember the recording BEFORE the rewrite: consent was given for
+            // that file, so it is what the audit record hashes. The baked pack
+            // is derived and not byte-stable across runs.
+            params.tts_voice_source_recording = params.tts_voice;
             params.tts_voice = tmp; // backend init() now sees a .gguf reference
             // The rewrite above erases the ONLY evidence this voice is a clone:
             // the consent + spoken-disclosure gates below classify by suffix, so
@@ -3037,13 +3102,17 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // Honor the --no-watermark opt-out (equivalent to CRISPASR_NO_WATERMARK).
         crispasr_wm_dispatch::set_disabled(params.tts_no_watermark);
 
+        // Consent-record sink: --consent-log set this at parse time; the env
+        // var covers wrappers that cannot add a flag. Explicit flag wins.
+        crispasr_consent::init_log_path_from_env();
+
         // Voice-cloning consent gate. A clone is a .wav reference, a voice baked
         // from one during this run, or a pack that declares it was derived from a
         // real recording — NOT merely "the path ends in .wav", which missed the
         // inline-bake rewrite above and every .gguf-only cloning backend
         // (chatterbox has no .wav path at all). See crispasr_voice_clone_policy.h.
-        const crispasr_voice::CloneDecision clone_decision =
-            crispasr_voice::classify_voice(params.tts_voice, params.tts_voice_dir, params.tts_voice_baked_from_wav);
+        const crispasr_voice::CloneDecision clone_decision = crispasr_voice::classify_voice(
+            params.tts_voice, params.tts_voice_dir, params.tts_voice_baked_from_wav, backend->voice_bank_path());
         const bool is_voice_clone = clone_decision.is_clone;
         if (is_voice_clone && !params.tts_voice_clone_consent) {
             fprintf(stderr,
@@ -3059,13 +3128,59 @@ int crispasr_run_backend(const whisper_params& params_in) {
             return 17;
         }
         if (is_voice_clone) {
-            // Log consent attestation with timestamp for audit trail
+            // Log consent attestation with timestamp for audit trail.
+            // `ref_sha256` binds the record to the BYTES that were cloned, not
+            // just the name they were cloned under — a name is not evidence,
+            // because the file can be swapped afterwards and the line still
+            // reads true. Hash whatever the backend will actually open (the
+            // --voice-dir resolution), so a bare name records the same thing a
+            // full path would. See crispasr_consent_record.h.
             auto now = std::chrono::system_clock::now();
             auto t = std::chrono::system_clock::to_time_t(now);
             char ts[64];
             std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
-            fprintf(stderr, "[CONSENT] ts=%s voice=%s clone_reason=%s attestation=\"%s\"\n", ts,
-                    params.tts_voice.c_str(), clone_decision.reason, params.tts_consent_attestation.c_str());
+            // For an inline bake, hash the ORIGINAL recording rather than the
+            // temp pack it was baked into — that is the file consent covers.
+            const std::string ref_target =
+                !params.tts_voice_source_recording.empty()
+                    ? params.tts_voice_source_recording
+                    : crispasr_voice::resolve_voice_path(params.tts_voice, params.tts_voice_dir);
+            std::string ref = crispasr_consent::file_sha256(ref_target);
+            crispasr_consent::emit(
+                "CONSENT", ts,
+                {{"voice", params.tts_voice},
+                 {"clone_reason", clone_decision.reason},
+                 {"attestation", params.tts_consent_attestation, /*quoted=*/true},
+                 {"ref_sha256", ref.empty() ? "none" : ref},
+                 {"ref_is", params.tts_voice_source_recording.empty() ? "resolved-voice" : "source-recording"}});
+        }
+
+        // Art. 50(4) applies to a PRESET voice too when that voice is an
+        // identifiable person: the audience cannot tell which pipeline made the
+        // audio, and Art. 3(60) does not ask them to. Resolve whose voice this
+        // is — operator override, then the pack's declaration, then the
+        // backend's — and disclose on either ground. Notably this does NOT feed
+        // the consent gate above; see crispasr_speaker_identity.h.
+        bool identity_recognised = true;
+        const crispasr_voice::SpeakerIdentity identity_override =
+            crispasr_voice::parse_speaker_identity(params.tts_speaker_identity, &identity_recognised);
+        if (!identity_recognised) {
+            // Report the typo rather than silently treating it as Unknown: the
+            // operator meant to answer this question, and "real-person" landing
+            // as "unknown" would drop the disclosure they asked for.
+            fprintf(stderr,
+                    "crispasr: warning: unrecognised --speaker-identity '%s'; treating as 'unknown'. "
+                    "Expected real_person, synthetic or unknown.\n",
+                    params.tts_speaker_identity.c_str());
+        }
+        const crispasr_voice::SpeakerIdentity speaker_identity = crispasr_voice::resolve_speaker_identity(
+            identity_override, clone_decision.pack_identity, backend->declared_speaker_identity(params.model),
+            crispasr_voice::read_model_speaker_identity(params.model));
+        const bool needs_spoken_disclosure =
+            crispasr_voice::requires_spoken_disclosure(is_voice_clone, speaker_identity);
+        if (crispasr_voice::should_warn_unknown_identity(is_voice_clone, speaker_identity) &&
+            crispasr_voice::claim_unknown_identity_warning(backend_name)) {
+            fprintf(stderr, "%s\n", crispasr_voice::unknown_identity_warning(backend_name).c_str());
         }
 
         // Sample rate of the synthesized PCM — backend-declared. Most TTS
@@ -3105,7 +3220,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 fwrite(s16.data(), sizeof(int16_t), s16.size(), stdout);
                 fflush(stdout);
             };
-            if (is_voice_clone && !params.tts_no_spoken_disclaimer) {
+            if (needs_spoken_disclosure && !params.tts_no_spoken_disclaimer) {
                 const auto& disc = crispasr_tts_get_disclaimer(backend.get(), params);
                 if (!disc.empty()) {
                     std::vector<float> d(disc.begin(), disc.end());
@@ -3160,12 +3275,13 @@ int crispasr_run_backend(const whisper_params& params_in) {
             return 15;
         }
 
-        // Prepend spoken AI-disclosure for voice-cloned output. The
-        // disclaimer is synthesized with the neutral/default voice (not
-        // the cloned voice) and cached. 300ms silence gap.
-        // Skipped when --no-spoken-disclaimer is set; watermark + C2PA
-        // provenance remain regardless.
-        if (is_voice_clone && !params.tts_no_spoken_disclaimer) {
+        // Prepend the spoken AI-disclosure — for a voice clone, and for a preset
+        // voice that belongs to an identifiable person (Art. 50(4) attaches to
+        // the audio, not to the pipeline). The disclaimer is synthesized with
+        // the neutral/default voice (not the cloned voice) and cached. 300ms
+        // silence gap. Skipped when --no-spoken-disclaimer is set; watermark +
+        // C2PA provenance remain regardless.
+        if (needs_spoken_disclosure && !params.tts_no_spoken_disclaimer) {
             crispasr_tts_prepend_disclaimer(audio, backend.get(), params);
         }
 
@@ -3223,14 +3339,47 @@ int crispasr_run_backend(const whisper_params& params_in) {
         if (!crispasr_wm_dispatch::is_disabled() && crispasr_wm_dispatch::get_ctx() == nullptr) {
             const double dur_s = sr_in > 0 ? (double)audio.size() / (double)sr_in : 0.0;
             const float conf = crispasr_wm_dispatch::detect(audio.data(), (int)audio.size(), sr_in);
-            const auto verdict = crispasr_wm_stats::classify(conf, CRISPASR_WATERMARK_NBINS);
-            if (dur_s >= 5.0 && verdict == crispasr_wm_stats::Verdict::NotDetected) {
-                fprintf(stderr,
-                        "crispasr: warning: watermark self-check did not find the mark it just embedded "
-                        "(score=%.3f over %.1fs, p=%.2g). The file is still marked if C2PA signing "
-                        "succeeded; re-run --detect-watermark to confirm.\n",
-                        conf, dur_s, crispasr_wm_stats::p_value(conf, CRISPASR_WATERMARK_NBINS));
+            const bool frames = crispasr_watermark_detect_uses_frames();
+            const auto verdict = frames ? crispasr_wm_stats::classify_frames(conf)
+                                        : crispasr_wm_stats::classify(conf, CRISPASR_WATERMARK_NBINS);
+            // The per-frame statistic finds a fresh embed on ~100% of clips at
+            // 2.5 s and up, so the 5 s guard it needed is only about the legacy
+            // path. Keep it there; the self-check is a diagnostic either way and
+            // must never be read as the marking gate (embedding is unconditional).
+            const double min_dur = frames ? 2.5 : 5.0;
+            if (dur_s >= min_dur && verdict == crispasr_wm_stats::Verdict::NotDetected) {
+                if (frames) {
+                    fprintf(stderr,
+                            "crispasr: warning: watermark self-check did not find the mark it just embedded "
+                            "(score=%.3f over %.1fs). The file is still marked if C2PA signing succeeded; "
+                            "re-run --detect-watermark to confirm.\n",
+                            conf, dur_s);
+                } else {
+                    fprintf(stderr,
+                            "crispasr: warning: watermark self-check did not find the mark it just embedded "
+                            "(score=%.3f over %.1fs, p=%.2g). The file is still marked if C2PA signing "
+                            "succeeded; re-run --detect-watermark to confirm.\n",
+                            conf, dur_s, crispasr_wm_stats::p_value(conf, CRISPASR_WATERMARK_NBINS));
+                }
             }
+        }
+
+        // Close the loop on the consent record: the same run_id appears on the
+        // [CONSENT] line above, so a disputed clip can be walked back to the
+        // attestation that authorised it. Emitted for CLONES only — a preset
+        // needs no attestation, so there would be nothing to correlate to.
+        // out_sha256 is of the file as WRITTEN (watermarked, C2PA-signed), which
+        // is the artefact that leaves the machine.
+        if (is_voice_clone) {
+            auto now = std::chrono::system_clock::now();
+            auto t = std::chrono::system_clock::to_time_t(now);
+            char ts[64];
+            std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
+            std::string out_hash = crispasr_consent::file_sha256(out_path);
+            crispasr_consent::emit("CONSENT-OUTPUT", ts,
+                                   {{"output", out_path},
+                                    {"out_sha256", out_hash.empty() ? "none" : out_hash},
+                                    {"seconds", std::to_string((double)audio.size() / (double)sr_in)}});
         }
 
         if (!params.no_prints)

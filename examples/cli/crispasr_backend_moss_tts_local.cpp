@@ -10,6 +10,7 @@
 // plain TTS there with a warning.
 
 #include "crispasr_backend.h"
+#include "crispasr_speech_window.h"
 #include "crispasr_backend_utils.h"
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
@@ -185,6 +186,20 @@ public:
             sp.max_new_frames = params.max_new_tokens;
         if (params.tts_max_speech_tokens >= 0)
             sp.max_audio_frames = params.tts_max_speech_tokens;
+        if (params.tts_min_speech_tokens >= 0) {
+            sp.min_audio_frames = params.tts_min_speech_tokens;
+            // #330: the floor is not the only bound — the decode loop stops at
+            // max_new_frames regardless, so an unreachable floor silently
+            // yields SHORTER audio than asked for. For a feature whose whole
+            // point is exact duration, say so rather than let it pass.
+            crispasr_speech_window::Window win;
+            win.min_frames = sp.min_audio_frames;
+            win.max_frames = sp.max_audio_frames > 0 ? sp.max_audio_frames : -1;
+            win.frame_cap = sp.max_new_frames > 0 ? sp.max_new_frames : crispasr_speech_window::kDefaultFrameCap;
+            const std::string warn = crispasr_speech_window::diagnose(win);
+            if (!warn.empty())
+                fprintf(stderr, "crispasr[moss-tts-local]: warning: %s\n", warn.c_str());
+        }
         if (params.tts_top_p >= 0.0f)
             sp.audio_top_p = params.tts_top_p;
         if (params.tts_top_k >= 0)

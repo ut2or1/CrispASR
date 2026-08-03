@@ -8,9 +8,55 @@ of numerics.
 ## NOW — active work
 
 Embedder, clustering, smoothing, pipeline, DER harness, CLI wiring and
-word-aligned segment splitting all landed. **Automatic speaker counting is the open problem** (below). Not yet
-done: WeSpeaker GGUF upload + CC-BY attribution, THIRD_PARTY_NOTICES entry,
-docs/architecture.md section, session ABI, real-audio DER.
+word-aligned segment splitting all landed. **Automatic speaker counting is the
+open problem** (below).
+
+The old "not yet done" list here was stale — re-verified 2026-08-03, all five
+had in fact landed:
+
+| claimed missing | actual state |
+|---|---|
+| WeSpeaker GGUF upload + CC-BY attribution | uploaded; `api.model_info("cstr/wespeaker-resnet34-lm-GGUF").cardData["license"]` returns `cc-by-4.0` |
+| THIRD_PARTY_NOTICES entry | present (7 WeSpeaker mentions) |
+| docs/architecture.md section | present (6 foxnose mentions) |
+| session ABI | `foxnose_embedder_path` in `crispasr_c_api.cpp` (`crispasr_diarize_opts_abi`) |
+| registry auto-download | `{"wespeaker", "wespeaker-resnet34-lm.gguf", …}` in `crispasr_model_registry.cpp` |
+
+Only **real-audio DER** was genuinely open, and it is now the root `PLAN.md`
+NOW item (§1: route the pyannote+embedder path through the same
+`core_spectral::cluster_speakers` that gets foxnose to 7.32%).
+
+### Post-release server fixes (reporter follow-up on v0.8.25)
+
+The reporter hit two SERVER-only defects — neither reachable from the CLI,
+both instances of the multi-surface dispatch trap (the server re-implements
+the runner's diarize orchestration instead of calling it).
+
+1. **Transcript loss around every speaker change.** The CLI diarizes inside
+   its per-slice loop, handing the slice its own segment vector; the server
+   transcribes all slices first and then re-walks the merged list, giving each
+   slice a copied sub-range. `crispasr_apply_diarize` **grows** that sub-range
+   whenever it splits a segment at a speaker turn (pyannote, foxnose and
+   sherpa all do word-range splitting), and the copy-back wrote back only the
+   element count it started with — so every sub-segment past the first was
+   dropped. One segment split three ways lost two thirds of its text. With VAD
+   the slices are short and often hold a single segment, so the loss is
+   "large portions"; without VAD a 30 s chunk holds many segments and only the
+   ones straddling a turn are lost, which is why the reporter saw *"almost"
+   full transcription, some parts where there are overlapping speakers /
+   laughter didn't get transcribed* — those parts ARE the split ones.
+   Fixed by hoisting the re-walk into `crispasr_diarize_merged_by_slice`
+   (`crispasr_diarize_cli.{h,cpp}`), which rebuilds the list instead of
+   copying a fixed count back. Guarded by `tests/test-diarize-slice-rewalk.cpp`
+   (`[issue324]`), whose last case drives the REAL splitter via a hand-built
+   global-sherpa cache so the guard is anchored to production behaviour.
+2. **Foxnose ran per slice on the server.** `diarize_foxnose_global` was never
+   set there and `crispasr_apply_foxnose_global` was never called, so each VAD
+   slice clustered independently — numbering restarted at 0 every few seconds
+   and the WeSpeaker embedder was re-resolved per slice. The server now
+   mirrors `crispasr_apply_global_speaker_stages`: stand the per-slice path
+   down, run one global pass, and skip the TitaNet remap when it owns the
+   labels.
 
 ## What was reused vs. built
 

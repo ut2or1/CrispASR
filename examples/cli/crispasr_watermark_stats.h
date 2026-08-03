@@ -110,6 +110,42 @@ inline Verdict classify(float score, int n_bins) {
     return Verdict::NotDetected;
 }
 
+// ── Per-frame statistic (crispasr_watermark_detect_frames_impl) ────────────
+//
+// Everything above is about a BIN COUNT: score = k/n, null = Binomial(n, 1/2),
+// so a p-value is available exactly. The per-frame detector returns something
+// different — a calibrated confidence squashed from the binding of two
+// standardised statistics (consistency across frames, and specificity against
+// 15 decoy sign patterns). There is no k, and running p_value() over it would
+// invent a bin count that was never scored. Hence a separate band set rather
+// than an overload that silently reuses the wrong null.
+//
+// The squash is built so the decision point — both bars exactly met — lands on
+// kFramesDetected, which is the same 0.65 the CLI and docs already speak in.
+//
+// Measured on 1265 one-second clips of genuinely unmarked human speech
+// (VoxConverse dev + JFK, native 16 kHz, see tools/watermark_detect_ab.cpp),
+// scored against the same clips after the UNCHANGED embedder marked them:
+//
+//   clip    sign FP/TP @0.65      frames FP/TP @0.65
+//   1.0 s      5.2% / 68.6%          0.9% / 96.8%
+//   2.5 s      5.1% / 79.8%          1.2% / 99.6%
+//   5.0 s      4.0% / 88.0%          1.6% / 99.6%
+//  10.0 s      4.9% / 100.0%         3.3% / 100.0%
+//
+// Better on BOTH error rates at every clip length, which is why this is the
+// default and the sign test is the fallback rather than the other way round.
+inline constexpr float kFramesDetected = 0.65f;
+inline constexpr float kFramesInconclusive = 0.5f;
+
+inline Verdict classify_frames(float score) {
+    if (score > kFramesDetected)
+        return Verdict::Detected;
+    if (score > kFramesInconclusive)
+        return Verdict::Inconclusive;
+    return Verdict::NotDetected;
+}
+
 inline const char* verdict_line(Verdict v) {
     switch (v) {
     case Verdict::Detected:

@@ -54,9 +54,10 @@
 #include "crispasr_marking_policy.h" // #312: who may skip the spoken AI-disclaimer
 #include "crispasr_tts_chunking.h"
 #include "crispasr_tts_disclaimer.h"
+#include "crispasr_consent_record.h"
 #include "crispasr_voice_clone_policy.h"
 #include "crispasr_voice_provenance.h"
-#include "crispasr_watermark.h"
+#include "core/crispasr_watermark.h"
 #include "crispasr_watermark_dispatch.h"
 #include "core/crispasr_wav_writer.h"
 #include "core/worker_pool.h"     // improvements Phase 4b: concurrent ASR worker pool
@@ -804,6 +805,15 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
             try {
                 const bool have_stereo = pcmf32s.size() == 2 && !pcmf32s[0].empty() && !pcmf32s[1].empty();
 
+                // #324: foxnose diarizes in one global pass after transcription
+                // (below) so speaker identities are consistent across slices —
+                // the per-slice path must stand down. Mirrors crispasr_run.cpp.
+                // Without this the server clustered each VAD slice on its own,
+                // restarting the numbering every few seconds and reloading the
+                // WeSpeaker embedder once per slice.
+                if (rp.diarize_embedder_is_foxnose())
+                    rp.diarize_foxnose_global = true;
+
                 // Pre-compute global caches for cross-slice consistency.
                 CrispasrPyannoteCache pyannote_cache;
                 if (rp.diarize_method == "pyannote" && !pcmf32.empty()) {
@@ -818,24 +828,17 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
                 const CrispasrPyannoteCache* pya_ptr = pyannote_cache.valid() ? &pyannote_cache : nullptr;
                 const CrispasrSherpaCache* shp_ptr = sherpa_cache.valid() ? &sherpa_cache : nullptr;
 
-                // Apply diarize per-slice. We re-walk the slices and apply
-                // diarize to the corresponding range of result.segs.
-                size_t seg_offset = 0;
-                for (size_t i = 0; i < slices.size(); ++i) {
-                    const auto& sl = slices[i];
-                    // Count how many segments belong to this slice (by timestamp range).
-                    size_t seg_count = 0;
-                    for (size_t j = seg_offset; j < result.segs.size(); ++j) {
-                        // Segments from the next slice will have t0 >= next slice's t0_cs.
-                        if (i + 1 < slices.size() && result.segs[j].t0 >= slices[i + 1].t0_cs)
-                            break;
-                        seg_count++;
-                    }
-
-                    if (seg_count > 0) {
-                        std::vector<crispasr_segment> slice_segs(result.segs.begin() + (ptrdiff_t)seg_offset,
-                                                                 result.segs.begin() +
-                                                                     (ptrdiff_t)(seg_offset + seg_count));
+                // Apply diarize per-slice. The CLI does this inside its slice
+                // loop, where the slice owns its segment vector; the server
+                // transcribes first, so it re-walks the merged list and hands
+                // each slice its own sub-range. #324: the turn splitter GROWS
+                // that sub-range, so the shared helper rebuilds the list
+                // instead of copying a fixed count back in place — writing back
+                // only the original count dropped every sub-segment past it,
+                // i.e. exactly the text around each speaker change.
+                crispasr_diarize_merged_by_slice(
+                    result.segs, slices,
+                    [&](const crispasr_audio_slice& sl, std::vector<crispasr_segment>& slice_segs) {
                         if (have_stereo) {
                             std::vector<float> sl_l(pcmf32s[0].begin() + sl.start, pcmf32s[0].begin() + sl.end);
                             std::vector<float> sl_r(pcmf32s[1].begin() + sl.start, pcmf32s[1].begin() + sl.end);
@@ -846,15 +849,20 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
                             crispasr_apply_diarize(mono_slice, mono_slice,
                                                    /*is_stereo=*/false, sl.t0_cs, slice_segs, rp, pya_ptr, shp_ptr);
                         }
-                        // Copy back the diarized segments.
-                        for (size_t j = 0; j < seg_count; ++j)
-                            result.segs[seg_offset + j] = std::move(slice_segs[j]);
-                    }
-                    seg_offset += seg_count;
-                }
+                    });
+
+                // #324: foxnose diarizes in ONE global pass over the whole
+                // audio (the per-slice call above stood down via
+                // diarize_foxnose_global), so its speaker numbering is
+                // consistent across slices instead of restarting at 0 in every
+                // VAD slice. Mirrors crispasr_apply_global_speaker_stages in
+                // the CLI runner; foxnose owns the labels, so the TitaNet remap
+                // below must not re-run.
+                const bool foxnose_global_ran = crispasr_apply_foxnose_global(result.segs, pcmf32, rp);
 
                 // Global embedding-based re-clustering (issue #107 P3).
-                if (!rp.diarize_embedder.empty() && !pcmf32.empty() && !rp.diarize_embedder_is_foxnose()) {
+                if (!foxnose_global_ran && !rp.diarize_embedder.empty() && !pcmf32.empty() &&
+                    !rp.diarize_embedder_is_foxnose()) {
                     auto embedder = crispasr_make_speaker_embedder(rp.diarize_embedder, rp.n_threads, rp.cache_dir);
                     if (embedder) {
                         crispasr_remap_speakers_via_embeddings(result.segs, pcmf32.data(), n_samples, embedder.get(),
@@ -1143,6 +1151,17 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     using namespace httplib;
 
     crispasr_install_fatal_signal_handlers();
+
+    // Consent-record sink. --consent-log already set this during arg parsing;
+    // the env var is the route for a container where adding a flag to the
+    // entrypoint is awkward. Explicit flag wins.
+    if (!params.consent_log.empty())
+        crispasr_consent::set_log_path(params.consent_log);
+    crispasr_consent::init_log_path_from_env();
+    if (!crispasr_consent::log_path().empty())
+        fprintf(stderr,
+                "crispasr-server: consent records -> %s (JSON Lines; append-only storage is yours to provide)\n",
+                crispasr_consent::log_path().c_str());
 
     // #261: compare the build's CPU instruction-set baseline against this host.
     // If they mismatch, the CPU-only paths (VAD / diarization) would raise
@@ -2042,6 +2061,15 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     //     "consent_attestation":  "<text>",              (REQUIRED when `voice` is a .wav clone)
     //     "spoken_disclaimer":    true|false,            (optional, default true)
     //     "phonemes":        "<IPA>",              (optional; kokoro/piper — skips the G2P)
+    //     "language":        "de",                       (optional; the language to SPEAK.
+    //                                                     `target_lang` is an alias. cosyvoice3,
+    //                                                     qwen3-tts and moss-tts act on it;
+    //                                                     language-agnostic backends ignore it)
+    //     "source_lang":     "en",                       (optional; the language the CLONING
+    //                                                     REFERENCE is spoken in. `ref_lang` is an
+    //                                                     alias. Only needed when it cannot be
+    //                                                     inferred from the reference transcript —
+    //                                                     see #329)
     //     "marking_attestation":  "<text>",              (required to HONOR spoken_disclaimer:false
     //                                                     on a clone; without it the opt-out is
     //                                                     denied, not the request — see below)
@@ -2085,6 +2113,11 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     // --voice / --instruct.
     // -----------------------------------------------------------------------
     svr.Post("/v1/audio/speech", [&](const Request& req, Response& res) {
+        // Mint the per-request correlation id first, so every audit record this
+        // handler emits carries it. Without it a [CONSENT] line and the response
+        // it authorised are unlinkable on a server serving many requests.
+        crispasr_consent::new_request_id();
+        res.set_header("X-Crispasr-Request-Id", crispasr_consent::request_correlation_id());
         if (!require_auth(req, res))
             return;
         if (!ready.load()) {
@@ -2126,6 +2159,15 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         std::string requested_model = body.value("model", "");
 
         std::string voice_name = body.value("voice", "");
+        // Before anything logs, resolves or opens this name. A control character
+        // in it forges log records at every downstream site that echoes it —
+        // the GGUF loader, the kokoro adapter, ggml — none of which know the
+        // string came off a socket. See crispasr_voice_clone_policy.h; the
+        // path-traversal guard further down is a separate concern.
+        if (crispasr_voice::voice_name_has_control_chars(voice_name)) {
+            json_error(res, 400, "'voice' must not contain control characters", "invalid_voice", "voice");
+            return;
+        }
         std::string consent_attestation = body.value("consent_attestation", "");
         std::string instructions = body.value("instructions", "");
         // #316: drive the acoustic model with these phonemes, skipping the G2P.
@@ -2151,8 +2193,11 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         // both, so a bare name and every .gguf-only cloning backend (chatterbox
         // has no .wav path at all) cleared this gate untouched.
         // See crispasr_voice_clone_policy.h.
-        const crispasr_voice::CloneDecision clone_decision =
-            crispasr_voice::classify_voice(voice_name, params.tts_voice_dir, /*baked_from_wav_this_run=*/false);
+        // ... and a name that resolves to no file at all may still be an entry
+        // inside the backend's multi-voice bank, which is where cosyvoice3 keeps
+        // every one of its voice clones.
+        const crispasr_voice::CloneDecision clone_decision = crispasr_voice::classify_voice(
+            voice_name, params.tts_voice_dir, /*baked_from_wav_this_run=*/false, backend->voice_bank_path());
         const bool is_voice_clone = clone_decision.is_clone;
         if (is_voice_clone && consent_attestation.empty()) {
             json_error(res, 400,
@@ -2178,8 +2223,32 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         // the reasoning behind it, live in crispasr_marking_policy.h so they can
         // be unit-tested (tests/test-marking-policy.cpp) rather than only through
         // a live server with a model loaded.
+        // Whose voice is this? A PRESET voice that belongs to an identifiable
+        // person needs the same audible disclosure a clone does — and does NOT
+        // need consent_attestation, which is why this is resolved after the gate
+        // above rather than folded into it. Per-request override, then the
+        // pack/bank declaration, then the backend's.
+        // See crispasr_speaker_identity.h.
+        bool identity_recognised = true;
+        const crispasr_voice::SpeakerIdentity identity_override =
+            crispasr_voice::parse_speaker_identity(body.value("speaker_identity", std::string()), &identity_recognised);
+        if (!identity_recognised) {
+            json_error(res, 400, "unrecognised 'speaker_identity'. Expected one of: real_person, synthetic, unknown.",
+                       "invalid_speaker_identity", "speaker_identity");
+            return;
+        }
+        const crispasr_voice::SpeakerIdentity speaker_identity = crispasr_voice::resolve_speaker_identity(
+            identity_override, clone_decision.pack_identity, backend->declared_speaker_identity(params.model),
+            crispasr_voice::read_model_speaker_identity(params.model));
+        const bool needs_spoken_disclosure =
+            crispasr_voice::requires_spoken_disclosure(is_voice_clone, speaker_identity);
+        if (crispasr_voice::should_warn_unknown_identity(is_voice_clone, speaker_identity) &&
+            crispasr_voice::claim_unknown_identity_warning(backend_name)) {
+            fprintf(stderr, "%s\n", crispasr_voice::unknown_identity_warning(backend_name).c_str());
+        }
+
         const crispasr_marking::Decision marking =
-            crispasr_marking::decide(is_voice_clone, spoken_disclaimer, body.value("marking_attestation", ""),
+            crispasr_marking::decide(needs_spoken_disclosure, spoken_disclaimer, body.value("marking_attestation", ""),
                                      params.tts_marking_responsibility_accepted, params.tts_marking_attestation);
         if (is_voice_clone) {
             auto now = std::chrono::system_clock::now();
@@ -2188,9 +2257,19 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
             // The audit line records what this response ACTUALLY carries, not
             // what was asked for — a denied opt-out reads spoken_disclaimer=yes.
-            fprintf(stderr, "[CONSENT] ts=%s voice=%s clone_reason=%s attestation=\"%s\" spoken_disclaimer=%s\n", ts,
-                    log_sanitize(voice_name).c_str(), clone_decision.reason, log_sanitize(consent_attestation).c_str(),
-                    marking.apply_spoken_disclaimer ? "yes" : "no");
+            // ref_sha256 binds it to the bytes cloned (see
+            // crispasr_consent_record.h); req is the per-request correlation id,
+            // without which a consent line and the response it authorised are
+            // unlinkable on a server serving many.
+            const std::string resolved_ref = crispasr_voice::resolve_voice_path(voice_name, params.tts_voice_dir);
+            std::string ref_hash = crispasr_consent::file_sha256(resolved_ref);
+            crispasr_consent::emit("CONSENT", ts,
+                                   {{"voice", log_sanitize(voice_name)},
+                                    {"clone_reason", clone_decision.reason},
+                                    {"attestation", log_sanitize(consent_attestation), /*quoted=*/true},
+                                    {"spoken_disclaimer", marking.apply_spoken_disclaimer ? "yes" : "no"},
+                                    {"ref_sha256", ref_hash.empty() ? "none" : ref_hash},
+                                    {"req", crispasr_consent::request_correlation_id()}});
             if (marking.optout_denied) {
                 fprintf(stderr,
                         "[MARKING] ts=%s scope=request no_spoken_disclaimer=DENIED "
@@ -2201,13 +2280,27 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                 fprintf(stderr, "[MARKING] ts=%s scope=%s no_spoken_disclaimer=yes attestation=\"%s\"\n", ts,
                         marking.scope.c_str(), log_sanitize(marking.attestation).c_str());
             }
+        } else if (needs_spoken_disclosure) {
+            // A real-person PRESET: disclosed, not gated, so there is no
+            // [CONSENT] line above to carry the record. Without this the only
+            // trace of an Art. 50(4) disclosure on a non-clone would be the
+            // audio itself.
+            char ts[64];
+            auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
+            fprintf(stderr,
+                    "[MARKING] ts=%s scope=request voice=%s speaker_identity=real_person spoken_disclaimer=%s\n", ts,
+                    log_sanitize(voice_name).c_str(), marking.apply_spoken_disclaimer ? "yes" : "no");
         }
         const bool apply_spoken_disclaimer = marking.apply_spoken_disclaimer;
         // Tell the client what it got. Called once the response is committed to
         // being a 200 (buffered: after synthesis; streaming: before the first
         // chunk), so an error response never claims a disclaimer it never made.
-        auto set_marking_headers = [&marking, is_voice_clone](Response& r) {
-            if (!is_voice_clone)
+        // Keyed on whether a disclosure was OWED, not on cloning: a real-person
+        // preset gets one, and a client that reads these headers to decide
+        // whether to show a visual label needs to hear about it.
+        auto set_marking_headers = [&marking, needs_spoken_disclosure](Response& r) {
+            if (!needs_spoken_disclosure)
                 return;
             r.set_header("X-Crispasr-Spoken-Disclaimer", marking.apply_spoken_disclaimer ? "applied" : "skipped");
             if (marking.optout_denied)
@@ -2284,6 +2377,15 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             const std::string tts_lang = body.value("language", body.value("target_lang", std::string()));
             if (!tts_lang.empty())
                 rp.language = tts_lang;
+            // #329: and the language the REFERENCE clip is spoken in. Without it
+            // CosyVoice3 has to infer that from the reference transcript, which
+            // only ever answered for non-Latin scripts — so an English reference
+            // plus "language": "de" silently stayed zero-shot and came back with
+            // the English accent the caller was trying to get rid of.
+            // `ref_lang` is an alias.
+            const std::string ref_lang = body.value("source_lang", body.value("ref_lang", std::string()));
+            if (!ref_lang.empty())
+                rp.source_lang = ref_lang;
         }
         if (body.contains("seed") && body["seed"].is_number_integer())
             rp.seed = body["seed"].get<uint64_t>();
@@ -2324,6 +2426,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             rp.tts_speaker_id = body["speaker_id"].get<int>();
         if (body.contains("max_speech_tokens") && body["max_speech_tokens"].is_number_integer())
             rp.tts_max_speech_tokens = body["max_speech_tokens"].get<int>();
+        if (body.contains("min_speech_tokens") && body["min_speech_tokens"].is_number_integer())
+            rp.tts_min_speech_tokens = body["min_speech_tokens"].get<int>();
 
         // Wire speed into params so backends with native duration control
         // (e.g. melotts length_scale, piper noise_w) can use it directly.
@@ -2611,8 +2715,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                 "crispasr-server: synthesized %.1fs audio in %.2fs (RTF=%.2f) "
                 "voice='%s' speed=%.2f format=%s model='%s' chunks=%zu sr=%dHz\n",
                 audio_s, elapsed_s, elapsed_s > 0 ? elapsed_s / audio_s : 0.0,
-                voice_name.empty() ? "<startup>" : voice_name.c_str(), speed, response_format.c_str(),
-                requested_model.empty() ? "<unset>" : requested_model.c_str(), chunks.size(), sr_out);
+                voice_name.empty() ? "<startup>" : log_sanitize(voice_name).c_str(), speed, response_format.c_str(),
+                requested_model.empty() ? "<unset>" : log_sanitize(requested_model).c_str(), chunks.size(), sr_out);
 
         if (response_format == "f32") {
             std::string buf((const char*)pcm.data(), pcm.size() * sizeof(float));
@@ -2859,10 +2963,30 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     svr.Get("/v1/audio/voices", handle_list_voices);
 
     // -----------------------------------------------------------------------
-    // POST /v1/voices — upload a voice file (multipart: "voice" file + optional "name" field)
+    // POST /v1/voices — upload a voice file (multipart: "voice" file +
+    // "consent_attestation" + optional "name" field)
     // Returns 201 on success: {"name": "...", "format": "wav", "size_bytes": N}
+    //
+    // This is the network equivalent of --make-ref: it takes a recording of a
+    // real person and stores it as a reusable voiceprint the server will clone
+    // from. The project's rule is that baking IS the cloning step, which is why
+    // --make-ref and all three Python voice bakers demand --i-have-rights — so
+    // the attestation is taken HERE, where the recording enters the system, not
+    // only at /v1/audio/speech where it is replayed.
+    //
+    // It shipped without one: an upload was accepted from anyone who could
+    // reach the endpoint, and the only trace it left was a byte count. The
+    // synthesis gate did catch the resulting clone (a bare name resolves to
+    // <voice-dir>/<name>.wav and scores as a recording-reference), so this was
+    // never unmarked output — but consent for a third party's voice was never
+    // asked for, and no [CONSENT] line existed to show it had been.
     // -----------------------------------------------------------------------
     svr.Post("/v1/voices", [&](const Request& req, Response& res) {
+        // Mint the per-request correlation id first, so every audit record this
+        // handler emits carries it. Without it a [CONSENT] line and the response
+        // it authorised are unlinkable on a server serving many requests.
+        crispasr_consent::new_request_id();
+        res.set_header("X-Crispasr-Request-Id", crispasr_consent::request_correlation_id());
         if (!require_auth(req, res))
             return;
         // CAP_TTS gate (documented CAP_TTS-only; matches the GET /v1/voices guard).
@@ -2883,6 +3007,24 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         const auto& voice_file = req.get_file_value("voice");
         if (voice_file.content.size() < 44) {
             json_error(res, 400, "uploaded file is too small to be a valid audio file");
+            return;
+        }
+
+        // Speaker-consent gate. Hard refusal, matching /v1/audio/speech rather
+        // than #312's deny-the-opt-out rule: #312 is about a MARKING opt-out,
+        // where serving the stronger default is always available. There is no
+        // safe default for "may I keep a recording of this person's voice" —
+        // either the attestation exists or the upload must not happen.
+        const std::string upload_consent =
+            req.has_file("consent_attestation") ? req.get_file_value("consent_attestation").content : std::string();
+        if (upload_consent.empty()) {
+            json_error(res, 400,
+                       "uploading a voice reference requires a 'consent_attestation' form field. "
+                       "Storing a recording as a reusable voiceprint is the cloning step itself. "
+                       "This field should contain a statement attesting that you have the consent "
+                       "of the speaker whose voice this is, or that it is your own voice. "
+                       "Example: consent_attestation=\"I have the speaker's consent\"",
+                       "consent_required", "consent_attestation");
             return;
         }
 
@@ -2937,6 +3079,27 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         resp["size_bytes"] = voice_file.content.size();
         res.status = 201;
         res.set_content(resp.dump(), "application/json");
+        // Audit trail for the enrollment itself, in the same [CONSENT] format
+        // the CLI and /v1/audio/speech emit — so "when was this voiceprint
+        // created and on whose attestation" is answerable from the log, not
+        // just "what was synthesized with it afterwards".
+        {
+            char ts[64];
+            auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
+            // Hash the UPLOADED BYTES, not the file that was written: this is
+            // the recording the attestation is about, and hashing it here binds
+            // the two before anything on disk can be swapped.
+            crispasr_consent::emit(
+                "CONSENT", ts,
+                {{"scope", "voice-upload"},
+                 {"voice", log_sanitize(voice_name)},
+                 {"clone_reason", "recording-reference"},
+                 {"bytes", std::to_string(voice_file.content.size())},
+                 {"attestation", log_sanitize(upload_consent), /*quoted=*/true},
+                 {"ref_sha256", crispasr_consent::bytes_sha256(voice_file.content.data(), voice_file.content.size())},
+                 {"req", crispasr_consent::request_correlation_id()}});
+        }
         fprintf(stderr, "crispasr-server: uploaded voice '%s' (%zu bytes)\n", voice_name.c_str(),
                 voice_file.content.size());
     });
@@ -3153,6 +3316,19 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             json_error(res, 500, std::string("chat reset failed: ") + rerr.message, "chat_reset_failed");
             return;
         }
+
+        // EU AI Act Art. 50(2) marking for synthetic TEXT. There is no
+        // watermark-equivalent that survives a copy-paste of a sentence, so the
+        // Commission's own guidance points at metadata travelling with the
+        // response — which for an HTTP API means headers. Set on both the
+        // buffered and the SSE branch, before either writes a body.
+        //
+        // This is weaker than the audio case and the docs say so (§6.6): a
+        // client that drops the headers publishes unmarked text, and marking
+        // what you then do with it stays the deployer's duty. Weak marking that
+        // travels is still strictly better than none, and it costs two headers.
+        res.set_header("X-Crispasr-Ai-Generated", "true");
+        res.set_header("X-Crispasr-Ai-Disclosure", crispasr_chat_ai_disclosure_text());
 
         const auto now_unix = []() -> int64_t {
             return (int64_t)std::chrono::duration_cast<std::chrono::seconds>(

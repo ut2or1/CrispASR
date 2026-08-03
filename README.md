@@ -218,6 +218,14 @@ quick-start commands and engine selection guidance.
 
 \* CustomVoice variant only; Base uses baked speakers via `--voice <name>`.
 
+**Output language.** `-tl <lang>` (or `-l`) selects the language to speak;
+`cosyvoice3-tts`, `qwen3-tts` and `moss-tts` act on it natively. For
+cross-lingual **cloning** — an English reference clip speaking German, the
+subtitle-dubbing case — also pass `-sl <lang>` for the language the reference is
+spoken in, so cosyvoice3 drops the reference transcript instead of carrying its
+accent. Over HTTP: `"language"` + `"source_lang"` on `POST /v1/audio/speech`.
+See [`docs/tts.md`](docs/tts.md#output-language-and-cross-lingual-cloning--tl---sl).
+
 </details>
 
 ### Translation

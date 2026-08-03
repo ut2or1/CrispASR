@@ -9,7 +9,7 @@
 #pragma once
 
 #include "audioseal.h"
-#include "crispasr_watermark.h"
+#include "core/crispasr_watermark.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -206,8 +206,9 @@ inline float detect(const float* pcm, int n_samples, int sample_rate = 24000) {
         if (probs)
             std::free(probs);
     }
-    // Fallback: spread-spectrum
-    return crispasr_watermark_detect_impl(pcm, n_samples);
+    // Fallback: spread-spectrum. Goes through the selector so this surface and
+    // the session C-ABI cannot end up on different statistics.
+    return crispasr_watermark_detect_select(pcm, n_samples);
 }
 
 } // namespace crispasr_wm_dispatch

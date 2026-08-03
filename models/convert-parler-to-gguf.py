@@ -58,10 +58,18 @@ import argparse
 import json
 import re
 import struct
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
+
+# EU AI Act Art. 50(4): whose voice this checkpoint's preset speakers are.
+# Shared with every other converter so the metadata key cannot drift — a drift
+# fails OPEN (the stamp is simply never found) and nothing errors.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _speaker_identity_arg import add_speaker_identity_arg, stamp_speaker_identity
+
 
 try:
     import gguf
@@ -589,6 +597,7 @@ def main():
                         help="Output GGUF file path")
     parser.add_argument("--use-f32", action="store_true",
                         help="Store weights as F32 instead of F16")
+    add_speaker_identity_arg(parser)
     args = parser.parse_args()
 
     model_dir = load_model_dir(args.input)
@@ -624,6 +633,7 @@ def main():
     dac_cfg = config["audio_encoder"]
 
     writer.add_name("Parler TTS")
+    stamp_speaker_identity(writer, args)
     writer.add_description(f"Parler TTS ({args.input})")
 
     # Decoder config

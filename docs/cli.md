@@ -1128,6 +1128,13 @@ flags. Pick by what you have for input and what you need out:
 | `-sl LANG`, `--source-lang LANG` | Source language (canary AST source; explicit pin overrides LID) |
 | `-tl LANG`, `--target-lang LANG` | Target language (canary AST; set different from `-sl` for X→Y translation) |
 | `-tr`, `--translate` | Translate to English (whisper, canary) — boolean toggle, no string arg |
+
+On a **TTS** backend the same two flags mean the synthesis languages: `-tl` is
+the language to SPEAK (overriding `-l`), and `-sl` is the language the
+`--voice` cloning reference is spoken in, which cosyvoice3 uses to decide
+whether to switch to cross-lingual synthesis. See
+[`docs/tts.md`](tts.md#output-language-and-cross-lingual-cloning--tl---sl).
+
 | `--no-punctuation` | Disable punctuation in the output. Native for cohere/canary, post-processed for everyone else |
 
 ### Text-to-text translate (m2m100, WMT21, MADLAD-400)
@@ -1788,6 +1795,8 @@ the neural watermark, C2PA signing, voice-cloning consent, and the opt-out:
 | `--no-watermark` | Disable the AI-content watermark on TTS output. Equivalent to the `CRISPASR_NO_WATERMARK` env var; both emit a one-time stderr warning and shift the AI-content marking responsibility onto the operator (see below) |
 | `--detect-watermark PATH` | Read a WAV file, run watermark detection, print confidence + verdict (`>0.65` = AI-GENERATED, `0.4–0.65` = UNCERTAIN, `<0.4` = none), then exit |
 | `--i-have-rights` | Required for voice cloning (`--voice <file.wav>`); attests speaker consent |
+| `--print-speaker-identity FILE` | Standalone verb: print whose voice a model or voice pack produces (`real_person` / `synthetic` / `unknown`) and exit. Uses the same resolution the Art. 50(4) disclosure gate uses — stamp inside the file first, then the researched table — so a script never has to restate a verdict. Exits 3 when the answer is unknown |
+| `--speaker-identity VALUE` | Whose voice a **preset** voice is: `real_person`, `synthetic` or `unknown` (default). `real_person` adds the audible AI disclosure to non-cloned output — a stock voice can be an identifiable individual, which makes the output a deep fake under Art. 3(60) without any cloning. It does **not** require `--i-have-rights`. Backends default to `unknown` and warn once per model until someone answers; don't silence that with `synthetic` unless you've read the model card. See [`eu-ai-act.md` §6.2a](eu-ai-act.md#62a-whose-voice-is-a-preset-voice-speaker_identity) |
 | `--no-spoken-disclaimer` | Skip the audible AI-disclosure prefix on voice-cloned output (watermark + C2PA still applied; caller assumes disclosure responsibility) |
 | `--g2p-dict SOURCE` | G2P pronunciation dictionary: `olaph` (MIT, default), `open-dict` (CC-BY-SA), or path to a custom dict file. Auto-downloads on first use. See [`tts.md`](tts.md) for details. |
 | `--c2pa-cert PATH` | X.509 certificate for C2PA Content Credentials signing |

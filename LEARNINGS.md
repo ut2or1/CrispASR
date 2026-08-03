@@ -10,6 +10,50 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## A gate that ANDs "both sides known" is only as alive as its weakest detector (#329, 2026-08-03)
+
+CosyVoice3's cross-lingual synthesis is gated on
+
+```cpp
+cross_lingual = !target.empty() && !reference.empty() && target != reference;
+```
+
+which reads as obviously correct: only switch modes when you know both languages
+and they differ. The `reference` side came from a script detector that answered
+for Hangul, Kana, Han and Cyrillic — **and returned "" for Latin script**. So
+every Latin-script pair (en↔de, en↔fr, es↔it, i.e. all of subtitle dubbing)
+could never satisfy the AND. `-tl de` on an English reference did nothing, said
+nothing, and the feature was 100% dead for its majority use case while every
+component of it worked exactly as written.
+
+Nothing catches this. The detector is right about what it claims. The gate is
+right about what it claims. The unit tests of each pass. It is only wrong in the
+*join*, and only for inputs nobody wrote a test for — which is the same shape as
+the voice-bank clone-gate bypass (#13e40ed2, "guard the JOINS not the
+predicate").
+
+So: **when a feature is gated on a detector answering, measure what fraction of
+real inputs that detector actually answers for, not just its accuracy on the
+ones it does answer.** A detector with 100% precision and 20% coverage silently
+turns an AND-gated feature off for the other 80%. Two habits fall out:
+
+- **Let the caller override the inference.** Detection that declines is correct
+  behaviour; having no way to say "it's German, I recorded it" is the defect.
+  `-sl` / `"source_lang"` / `set_tts_reference_language()` now outrank it.
+- **Say when a request could not be acted on.** The mode never engaged and
+  nothing was printed, so the reporter's conclusion — "this engine has no
+  language option" — was the only one available. A request you cannot honour
+  should announce itself and name the flag that fixes it, the same way an
+  unattested marking opt-out is *denied, not silently ignored* (#312).
+
+The predicate now lives in `src/core/tts_lang.h` (weight-free, hermetic test),
+because it sits downstream of every tensor: get it wrong and `crispasr-diff`
+still reads cos 1.000000 while the user hears an accented clone. Live A/B on
+real weights, en reference → German output: the pre-fix path emitted **2.1× the
+speech tokens for the same sentence** (262 vs 122, 10.48 s vs 4.88 s of
+continuously-voiced audio) — the reference-transcript leak the cross-lingual
+path exists to remove.
+
 ## The diff harness starts where its INPUT starts — check what it is fed before trusting parity (#316, 2026-07-28)
 
 Kokoro was dropping numbers and speaking with the wrong accent, and

@@ -49,13 +49,18 @@ extern int crispasr_session_is_voice_design(struct CrispasrSession* s);
 extern float* crispasr_session_synthesize(struct CrispasrSession* s, const char* text, int* out_n_samples);
 extern float* crispasr_session_synthesize_raw(struct CrispasrSession* s, const char* text, int* out_n_samples);
 extern int crispasr_session_accept_marking_responsibility(struct CrispasrSession* s, const char* attestation);
+extern int crispasr_session_set_speaker_identity(struct CrispasrSession* s, const char* identity);
 extern float* crispasr_session_speech_to_speech(struct CrispasrSession* s, const float* in_samples, int n_in_samples,
                                                 char** out_text, int* out_n_samples);
 extern int crispasr_session_input_sample_rate(struct CrispasrSession* s);
 extern void crispasr_pcm_free(float* pcm);
+/* AI-content marking (EU AI Act Art. 50(2)) — the other half of synthesize_raw. */
+extern void crispasr_watermark_embed(float* pcm, int n_samples, float alpha);
+extern float crispasr_watermark_detect(const float* pcm, int n_samples);
 extern int crispasr_session_kokoro_clear_phoneme_cache(struct CrispasrSession* s);
 extern int crispasr_session_set_source_language(struct CrispasrSession* s, const char* lang);
 extern int crispasr_session_set_target_language(struct CrispasrSession* s, const char* lang);
+extern int crispasr_session_set_tts_reference_language(struct CrispasrSession* s, const char* lang);
 extern int crispasr_session_set_punctuation(struct CrispasrSession* s, int enable);
 extern int crispasr_session_set_translate(struct CrispasrSession* s, int enable);
 extern int crispasr_session_set_temperature(struct CrispasrSession* s, float temperature, unsigned long long seed);
@@ -386,6 +391,19 @@ static VALUE rb_session_set_target_language(VALUE self, VALUE handle, VALUE lang
     int rc = crispasr_session_set_target_language(s, NIL_P(lang) ? "" : StringValueCStr(lang));
     if (rc != 0)
         rb_raise(rb_eRuntimeError, "set_target_language failed (rc=%d)", rc);
+    return Qnil;
+}
+
+/* #329: the language a voice-cloning REFERENCE clip is spoken in. Cross-lingual
+ * TTS backends (cosyvoice3) drop the reference transcript when it differs from
+ * the requested output language, so the clone speaks that language instead of
+ * carrying the reference's accent. Optional — otherwise inferred from the voice
+ * bank or the reference transcript. */
+static VALUE rb_session_set_tts_reference_language(VALUE self, VALUE handle, VALUE lang) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_tts_reference_language(s, NIL_P(lang) ? "" : StringValueCStr(lang));
+    if (rc != 0)
+        rb_raise(rb_eRuntimeError, "set_tts_reference_language failed (rc=%d)", rc);
     return Qnil;
 }
 
@@ -777,6 +795,71 @@ static VALUE rb_session_accept_marking_responsibility(VALUE self, VALUE handle, 
     struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
     int rc = crispasr_session_accept_marking_responsibility(s, NIL_P(attestation) ? "" : StringValueCStr(attestation));
     return INT2NUM(rc);
+}
+
+// CrispASR::Session.set_speaker_identity(handle, identity) -> Integer rc
+//   Declare whose voice a PRESET voice is: "real_person", "synthetic" or
+//   "unknown". A preset shipped inside a model can be an identifiable
+//   individual, which makes its output a deep fake under EU AI Act Art. 3(60)
+//   even though nothing was cloned. Setting real_person makes the Art. 50(4)
+//   reminder fire for a non-cloned voice; it does NOT require a consent
+//   attestation. Raises ArgumentError on an unrecognised value rather than
+//   silently downgrading it to "unknown".
+static VALUE rb_session_set_speaker_identity(VALUE self, VALUE handle, VALUE identity) {
+    (void)self;
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_speaker_identity(s, NIL_P(identity) ? "" : StringValueCStr(identity));
+    if (rc == -2)
+        rb_raise(rb_eArgError,
+                 "unrecognised speaker_identity (expected real_person, synthetic or unknown)");
+    return INT2NUM(rc);
+}
+
+// CrispASR::Session.watermark_embed(pcm_array) -> Array<Float>
+//   The other half of synthesize_raw. Opting out of automatic marking makes
+//   marking the result the caller's duty under EU AI Act Art. 50(2), and this
+//   is what discharges it: post-process the unmarked PCM, then mark the
+//   finished buffer. Uses the robust, reliably detectable default strength
+//   (alpha <= 0); AudioSeal instead when a model is loaded.
+//   Returns a new marked array — Ruby Floats are boxed, so in-place would mean
+//   mutating boxed objects the caller may share.
+static VALUE rb_watermark_embed(VALUE self, VALUE pcm_arr) {
+    (void)self;
+    Check_Type(pcm_arr, T_ARRAY);
+    long n = RARRAY_LEN(pcm_arr);
+    if (n <= 0)
+        return rb_ary_new_capa(0);
+    float* buf = (float*)malloc(sizeof(float) * (size_t)n);
+    if (!buf)
+        rb_raise(rb_eNoMemError, "alloc failed");
+    for (long i = 0; i < n; i++)
+        buf[i] = (float)NUM2DBL(rb_ary_entry(pcm_arr, i));
+    crispasr_watermark_embed(buf, (int)n, -1.0f);
+    VALUE out = rb_ary_new_capa(n);
+    for (long i = 0; i < n; i++)
+        rb_ary_push(out, DBL2NUM((double)buf[i]));
+    free(buf);
+    return out;
+}
+
+// CrispASR::Session.watermark_detect(pcm_array) -> Float in [0, 1]
+//   A weak diagnostic, not proof: the spread-spectrum null mean is 0.5, not 0,
+//   and a negative result on a short clip is mostly evidence the clip was
+//   short. See docs/eu-ai-act.md §6.7 before reading anything into the number.
+static VALUE rb_watermark_detect(VALUE self, VALUE pcm_arr) {
+    (void)self;
+    Check_Type(pcm_arr, T_ARRAY);
+    long n = RARRAY_LEN(pcm_arr);
+    if (n <= 0)
+        return DBL2NUM(0.0);
+    float* buf = (float*)malloc(sizeof(float) * (size_t)n);
+    if (!buf)
+        rb_raise(rb_eNoMemError, "alloc failed");
+    for (long i = 0; i < n; i++)
+        buf[i] = (float)NUM2DBL(rb_ary_entry(pcm_arr, i));
+    float score = crispasr_watermark_detect(buf, (int)n);
+    free(buf);
+    return DBL2NUM((double)score);
 }
 
 // CrispASR::Session.speech_to_speech(handle, pcm_array)
@@ -1765,6 +1848,7 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "clear_phoneme_cache", rb_session_clear_phoneme_cache, 1);
     rb_define_singleton_method(mSession, "set_source_language", rb_session_set_source_language, 2);
     rb_define_singleton_method(mSession, "set_target_language", rb_session_set_target_language, 2);
+    rb_define_singleton_method(mSession, "set_tts_reference_language", rb_session_set_tts_reference_language, 2);
     rb_define_singleton_method(mSession, "set_punctuation", rb_session_set_punctuation, 2);
     rb_define_singleton_method(mSession, "set_translate", rb_session_set_translate, 2);
     rb_define_singleton_method(mSession, "set_temperature", rb_session_set_temperature, 3);
@@ -1837,6 +1921,9 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "speaker_db_count", rb_speaker_db_count, 1);
     rb_define_singleton_method(mSession, "speaker_db_match", rb_speaker_db_match, 3);
     rb_define_singleton_method(mSession, "speaker_db_enroll", rb_speaker_db_enroll, 4);
+    rb_define_singleton_method(mSession, "set_speaker_identity", rb_session_set_speaker_identity, 2);
+    rb_define_singleton_method(mSession, "watermark_embed", rb_watermark_embed, 1);
+    rb_define_singleton_method(mSession, "watermark_detect", rb_watermark_detect, 1);
 
     // Mic (PLAN #62d) — CrispASR::Mic.{open(rate, channels) { |pcm| ... }, start, stop, close, default_device_name}.
     mMic = rb_define_module_under(mCrispASR, "Mic");

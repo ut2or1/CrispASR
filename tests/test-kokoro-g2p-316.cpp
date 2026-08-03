@@ -74,6 +74,15 @@ TEST_CASE("decimals, separators, ordinals, signs and units", "[unit][kokoro][g2p
     REQUIRE(expand("50%") == "fifty percent");
     REQUIRE(expand("$20") == "twenty dollars");
     REQUIRE(expand("$1") == "one dollar");
+    // #316 follow-up: the unit used to survive only for a LEADING '$'. A
+    // currency symbol is in no dictionary and no letter-to-sound rule, so every
+    // other form lost it silently — "€50" was spoken "fifty".
+    REQUIRE(expand("\u20ac50") == "fifty euros");
+    REQUIRE(expand("\u00a350") == "fifty pounds");
+    REQUIRE(expand("\u20ac1") == "one euro");
+    // …and the postfix form every European locale writes.
+    REQUIRE(expand("50\u20ac") == "fifty euros");
+    REQUIRE(expand("50 \u20ac") == "fifty euros");
 }
 
 TEST_CASE("alphanumeric tokens are left for the existing rules", "[unit][kokoro][g2p]") {

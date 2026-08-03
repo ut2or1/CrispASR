@@ -2021,6 +2021,29 @@ class Session:
         if rc != 0:
             raise RuntimeError(f"set_target_language failed (rc={rc})")
 
+    def set_tts_reference_language(self, lang: str) -> None:
+        """Language a voice-cloning reference clip is spoken in (issue #329).
+
+        Cross-lingual TTS backends (cosyvoice3) compare it to the requested
+        output language — :meth:`set_target_language`, falling back to
+        :meth:`set_source_language` — and drop the reference transcript when
+        they differ, so the clone speaks the target language rather than
+        carrying the reference's accent.
+
+        Optional: the backend otherwise infers the reference language from the
+        voice-bank entry or the reference transcript. That inference cannot
+        answer for a short transcript, and when it cannot, the requested target
+        language has no effect — set this to make it explicit. Empty string
+        clears.
+        """
+        if not hasattr(self._lib, "crispasr_session_set_tts_reference_language"):
+            raise RuntimeError("session-state API not present in this libcrispasr build")
+        self._lib.crispasr_session_set_tts_reference_language.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        self._lib.crispasr_session_set_tts_reference_language.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_tts_reference_language(self._handle, lang.encode("utf-8"))
+        if rc != 0:
+            raise RuntimeError(f"set_tts_reference_language failed (rc={rc})")
+
     def set_punctuation(self, enable: bool) -> None:
         """Toggle punctuation + capitalisation in the output (canary/cohere
         natively; LLM backends via post-process strip). Default True."""
@@ -2679,6 +2702,33 @@ class Session:
         ]
         self._lib.crispasr_session_accept_marking_responsibility.restype = ctypes.c_int
         self._lib.crispasr_session_accept_marking_responsibility(self._handle, attestation.encode("utf-8"))
+
+    def set_speaker_identity(self, identity: str) -> None:
+        """Declare whose voice a PRESET voice is: "real_person", "synthetic" or
+        "unknown". A preset shipped inside a model can be an identifiable
+        individual, which makes its output a deep fake under EU AI Act
+        Art. 3(60) even though nothing was cloned — so "not a clone" is not
+        the same as "nothing to disclose". Setting real_person makes the
+        Art. 50(4) reminder fire for a non-cloned voice; it does NOT require a
+        consent attestation, because the donor's agreement to the training is
+        settled upstream and you cannot attest to it.
+
+        Raises :class:`ValueError` on an unrecognised value rather than
+        silently downgrading it to "unknown" — a typo must not quietly remove
+        a duty you meant to declare.
+        """
+        if not hasattr(self._lib, "crispasr_session_set_speaker_identity"):
+            raise RuntimeError("speaker-identity API not present in this libcrispasr build")
+        self._lib.crispasr_session_set_speaker_identity.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        self._lib.crispasr_session_set_speaker_identity.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_speaker_identity(self._handle, identity.encode("utf-8"))
+        if rc == -2:
+            raise ValueError(
+                f"unrecognised speaker_identity {identity!r}; "
+                "expected 'real_person', 'synthetic' or 'unknown'"
+            )
+        if rc != 0:
+            raise RuntimeError(f"set_speaker_identity failed (rc={rc})")
 
     def synthesize_raw(self, text: str) -> "np.ndarray":
         """UNMARKED synthesis (no watermark), for callers that post-process
@@ -3636,8 +3686,21 @@ def watermark_load_model(gguf_path: str) -> None:
         raise RuntimeError(f"crispasr_watermark_load_model failed (rc={rc})")
 
 
-def watermark_embed(pcm: "numpy.ndarray", alpha: float = 0.005) -> None:
-    """Embed an AI-generated watermark into float32 PCM in-place."""
+def watermark_embed(pcm: "numpy.ndarray", alpha: float = -1.0) -> None:
+    """Embed an AI-generated watermark into float32 PCM in-place.
+
+    ``alpha`` controls spread-spectrum strength; ignored when AudioSeal is
+    loaded. The default (``<= 0``) selects the band-limited strength that makes
+    the mark reliably *detectable*, which is the property EU AI Act Art. 50(2)
+    requires — this is the call :func:`Session.synthesize_raw` callers use to
+    discharge marking themselves, so it has to produce a findable mark.
+
+    This defaulted to ``0.005`` — the strength the C ABI documents as "too
+    faint to reliably detect on real speech". An explicit positive alpha is
+    passed through verbatim and bypasses the robust default, so every caller
+    that relied on the default was emitting audio it could not detect a
+    watermark in. Only pass a literal alpha to A/B watermark strength.
+    """
     import numpy as np
     if pcm.dtype != np.float32:
         raise TypeError("pcm must be float32")

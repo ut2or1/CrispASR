@@ -10,8 +10,10 @@
 #include "text_lid_dispatch.h"
 
 #include "core/gguf_loader.h"
+#ifdef CRISPASR_BUILD
 #include "crispasr_cache.h"
 #include "crispasr_model_registry.h"
+#endif
 #include "lid_cld3.h"
 #include "lid_fasttext.h"
 
@@ -179,6 +181,7 @@ extern "C" const char* text_lid_backend(const struct text_lid_context* ctx) {
 // Path resolution + auto-download (C++-only helper, see header).
 // ===========================================================================
 
+#ifdef CRISPASR_BUILD
 namespace {
 
 bool path_exists(const std::string& p) {
@@ -204,7 +207,9 @@ const char* auto_variant_to_backend(const std::string& arg) {
 }
 
 } // namespace
+#endif // CRISPASR_BUILD
 
+#ifdef CRISPASR_BUILD
 std::string text_lid_resolve_path(const std::string& arg, const std::string& cache_dir_override, bool quiet) {
     if (arg.empty()) {
         fprintf(stderr, "text_lid: empty model path\n");
@@ -250,3 +255,4 @@ std::string text_lid_resolve_path(const std::string& arg, const std::string& cac
             arg.c_str());
     return "";
 }
+#endif // CRISPASR_BUILD

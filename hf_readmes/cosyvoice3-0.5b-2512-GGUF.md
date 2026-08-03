@@ -140,13 +140,25 @@ the converter in the CrispASR tree:
 python models/convert-cosyvoice3-voices-to-gguf.py \
     --manifest my-voices.json \
     --upstream-base /path/to/CosyVoice-clone \
-    --output my-voices.gguf
+    --output my-voices.gguf \
+    --i-have-rights
 ```
 
 Each manifest entry is `{name, wav, prompt_text}`. The script needs
 `campplus.onnx` (CV2/CV3 speaker encoder) and
 `speech_tokenizer_v3.onnx` (CV3 token extractor); both auto-download
 from HF on first run.
+
+`--i-have-rights` is required: baking turns a real speaker's recording
+into a reusable voice clone, and by passing it you attest that you have
+that speaker's consent or that the voice is your own. The converter
+stamps each entry as recording-derived, which is what makes CrispASR
+demand `--i-have-rights` / `consent_attestation` at synthesis time and
+prepend the spoken AI disclosure to the output (EU AI Act Art. 50(4)).
+
+A bundle baked before that stamp existed still gates — every entry falls
+back to the producer architecture — but re-bake it for per-entry
+accuracy.
 
 ### Arbitrary-WAV cloning (native, no Python pre-bake)
 

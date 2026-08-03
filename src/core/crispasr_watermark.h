@@ -25,6 +25,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -44,6 +45,16 @@
 // balance for 1024-sample frames at 24 kHz.
 #ifndef CRISPASR_WATERMARK_NBINS
 #define CRISPASR_WATERMARK_NBINS 32
+#endif
+
+// Which detection statistic is the DEFAULT when CRISPASR_WATERMARK_DETECT is
+// unset. 1 = the per-frame t + decoy statistic, which beat the sign test on
+// BOTH false positives and true positives at every clip length measured
+// (tools/watermark_detect_ab.cpp; table in crispasr_watermark_stats.h). The
+// sign test stays reachable with CRISPASR_WATERMARK_DETECT=sign — it is the
+// regression-bisection path, not dead code.
+#ifndef CRISPASR_WATERMARK_DETECT_FRAMES_DEFAULT
+#define CRISPASR_WATERMARK_DETECT_FRAMES_DEFAULT 1
 #endif
 
 namespace crispasr_wm {
@@ -391,4 +402,246 @@ inline float crispasr_watermark_detect_impl(const float* pcm, int n_samples) {
     if (score > 1.0)
         score = 1.0;
     return (float)score;
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame detector (ported from CrispTTS Phase 28)
+// ---------------------------------------------------------------------------
+//
+// The detector above collapses the whole file to ONE averaged spectrum and then
+// scores 32 bins by the SIGN of their excess, discarding the size. Under the
+// null that is a coin flip per bin: mean 0.5, sd sqrt(32)/(2*32) = 0.088, so
+// the 0.65 threshold sits 1.7 sigma above chance. crispasr_watermark_stats.h
+// answers that honestly with an exact binomial p-value — but a p-value can only
+// TRADE the two error rates, and docs/eu-ai-act.md 6.7 prices the trade: at
+// p < 0.01 the true-positive rate on 1 s clips is 18%.
+//
+// CrispTTS replaced the STATISTIC instead and measured FP 1.9% / TP 99.4%
+// against 8.6% / 97.0% — better in both directions at once, because it fixes
+// the two things that made the old one weak:
+//
+//   1. It keeps the MAGNITUDE of each bin's excess, not just its sign.
+//   2. Its sample count is the number of FRAMES (hundreds to thousands), not
+//      32. The null barely moves as clips lengthen while a real mark grows with
+//      the evidence available.
+//
+// Two questions, and a mark must answer BOTH:
+//
+//   t  — is the comb's excess consistent across frames at all?
+//   z  — is that specific to OUR pattern, or would any pattern score as well on
+//        this audio? Measured against 15 decoy sign patterns over the SAME bins,
+//        from keys we never embed with, standardised by their median and MAD.
+//
+// Neither alone works. On a stationary tone a raw t of 11.4 means nothing
+// because every decoy scores just as extremely — only z separates them. But z
+// alone rejects real marks at 44.1 kHz, where the comb sits in a low-energy
+// region and the decoy spread grows.
+//
+// THE EMBED IS UNTOUCHED. That is deliberate and load-bearing: audio marked by
+// any CrispASR, CrispTTS or Susurrus release still verifies through this, and
+// the three projects can read each other's marks. Do not "improve" the embed to
+// suit the detector.
+//
+// Selected by CRISPASR_WATERMARK_DETECT=frames|sign (see detect_uses_frames()).
+namespace crispasr_wm {
+
+inline constexpr int kDetectDecoys = 15;
+inline constexpr int kDetectMinFrames = 20;
+inline constexpr double kDetectMinScale = 0.75; // floor on the decoy MAD scale
+inline constexpr double kDetectTMin = 3.0;      // consistency bar
+inline constexpr double kDetectZMin = 1.0;      // specificity bar
+// The real pattern must also out-score the single STRONGEST decoy, not merely
+// the decoy median — the condition that removes the stationary-tone false
+// positive the median comparison lets through. CrispTTS measured FP
+// 1.89% -> 0.00% with TP unchanged at 99.37%, i.e. no true positive pays for
+// it. 0.70 is the midpoint of the observed gap (tone 0.59, weakest real mark
+// 0.84), so neither margin is thin.
+// Overridable so the term can be A/B'd without editing the header. ⚠ Setting it
+// near zero makes it non-binding only while `t_true` is POSITIVE: the ratio
+// carries t_true's sign, so a tiny divisor amplifies a negative into a large
+// negative and the term binds harder, not less. That never flips a verdict
+// (both readings sit far below the bar), but do not read a near-zero override
+// as "disabled" — it is "disabled for marks, exaggerated for non-marks".
+#ifndef CRISPASR_WM_MAX_DECOY_RATIO
+#define CRISPASR_WM_MAX_DECOY_RATIO 0.70
+#endif
+inline constexpr double kDetectMaxDecoyRatio = CRISPASR_WM_MAX_DECOY_RATIO;
+// Squash so the decision point (a ratio of 1.0 on the binding constraint) lands
+// exactly on the 0.65 score threshold the docs and CLI already speak in.
+inline constexpr double kTScale = 0.35;
+inline constexpr double kTCentre = 1.0 - kTScale * 0.6190392; // ln(0.65/0.35)
+
+inline double t_to_confidence(double t_stat) {
+    const double z = (t_stat - kTCentre) / kTScale;
+    if (z > 60.0)
+        return 1.0;
+    if (z < -60.0)
+        return 0.0;
+    return 1.0 / (1.0 + std::exp(-z));
+}
+
+} // namespace crispasr_wm
+
+// Per-frame t + decoy-specificity detector. Returns a confidence in [0, 1]
+// calibrated so > 0.65 means present, matching the existing threshold.
+inline float crispasr_watermark_detect_frames_impl(const float* pcm, int n_samples) {
+    const int n_fft = 1024;
+    const int hop = n_fft / 2;
+    if (n_samples < n_fft)
+        return 0.0f;
+
+    int lo_bin, hi_bin;
+    float alpha_unused;
+    crispasr_wm::wm_params(n_fft, lo_bin, hi_bin, alpha_unused);
+    const auto bins =
+        crispasr_wm::generate_bin_pattern(CRISPASR_WATERMARK_KEY, n_fft, CRISPASR_WATERMARK_NBINS, lo_bin, hi_bin);
+    if (bins.empty())
+        return 0.0f;
+
+    const int n_fft_half = n_fft / 2;
+    std::vector<int> idx;
+    std::vector<double> sgn;
+    idx.reserve(bins.size());
+    sgn.reserve(bins.size());
+    for (const auto& b : bins) {
+        if (b.index < n_fft_half) {
+            idx.push_back(b.index);
+            sgn.push_back((double)b.sign);
+        }
+    }
+    const int nb = (int)idx.size();
+    if (nb == 0)
+        return 0.0f;
+
+    int n_frames = 0;
+    for (int start = 0; start + n_fft <= n_samples; start += hop)
+        n_frames++;
+    if (n_frames < crispasr_wm::kDetectMinFrames)
+        return 0.0f;
+
+    // Decoy sign patterns over the SAME bins, from keys never embedded with.
+    // Mirrors CrispTTS: key ^ (0x9E3779B97F4A7C15 * (k + 1)).
+    const int n_pat = 1 + crispasr_wm::kDetectDecoys;
+    std::vector<double> pats((size_t)n_pat * nb);
+    for (int j = 0; j < nb; j++)
+        pats[j] = sgn[j];
+    for (int k = 0; k < crispasr_wm::kDetectDecoys; k++) {
+        const uint64_t dk = (uint64_t)CRISPASR_WATERMARK_KEY ^ (0x9E3779B97F4A7C15ULL * (uint64_t)(k + 1));
+        crispasr_wm::prng rng(dk);
+        for (int j = 0; j < nb; j++)
+            pats[(size_t)(k + 1) * nb + j] = (rng.next() & 1) ? 1.0 : -1.0;
+    }
+
+    std::vector<float> window(n_fft);
+    for (int i = 0; i < n_fft; i++)
+        window[i] = 0.5f * (1.0f - std::cos(2.0f * 3.14159265358979323846f * (float)i / (float)(n_fft - 1)));
+
+    // Per-frame correlation of the local-excess vector with each pattern.
+    std::vector<double> sum((size_t)n_pat, 0.0), sumsq((size_t)n_pat, 0.0);
+    std::vector<float> re(n_fft), im(n_fft);
+    std::vector<double> mags(n_fft_half), excess(nb);
+
+    for (int start = 0, f = 0; start + n_fft <= n_samples; start += hop, f++) {
+        for (int i = 0; i < n_fft; i++) {
+            re[i] = pcm[start + i] * window[i];
+            im[i] = 0.0f;
+        }
+        crispasr_wm::fft_radix2(re.data(), im.data(), n_fft, false);
+        for (int b = 0; b < n_fft_half; b++)
+            mags[b] = std::sqrt((double)re[b] * re[b] + (double)im[b] * im[b]);
+
+        // Local baseline: the same +-2 neighbours the sign test uses. NOT
+        // excluding other comb bins from it — CrispTTS measured that worse
+        // (separation +0.031 -> +0.017), because the comb's signs are random so
+        // an opposite-signed neighbour raises the contrast rather than muddying
+        // it. Widening to +-4 or +-6 was worse still.
+        for (int j = 0; j < nb; j++) {
+            double local = 0.0;
+            int count = 0;
+            for (int d = -2; d <= 2; d++) {
+                if (d == 0)
+                    continue;
+                const int b = idx[j] + d;
+                if (b >= 1 && b < n_fft_half) {
+                    local += mags[b];
+                    count++;
+                }
+            }
+            local = count ? local / (double)count : 0.0;
+            const double ref = std::max(local, 1e-12);
+            excess[j] = (mags[idx[j]] - local) / ref;
+        }
+
+        for (int p = 0; p < n_pat; p++) {
+            double c = 0.0;
+            const double* pv = &pats[(size_t)p * nb];
+            for (int j = 0; j < nb; j++)
+                c += excess[j] * pv[j];
+            c /= (double)nb;
+            sum[p] += c;
+            sumsq[p] += c * c;
+        }
+    }
+
+    // One-sample t across frames, for the true pattern and every decoy.
+    std::vector<double> t_all((size_t)n_pat, 0.0);
+    const double nf = (double)n_frames;
+    for (int p = 0; p < n_pat; p++) {
+        const double mean = sum[p] / nf;
+        double var = (sumsq[p] - nf * mean * mean) / (nf - 1.0);
+        if (!(var > 0.0))
+            var = 0.0;
+        const double sd = std::max(std::sqrt(var), 1e-12);
+        t_all[p] = mean / (sd / std::sqrt(nf));
+    }
+
+    std::vector<double> dec(t_all.begin() + 1, t_all.end());
+    std::sort(dec.begin(), dec.end());
+    const size_t m = dec.size();
+    const double centre = (m % 2) ? dec[m / 2] : 0.5 * (dec[m / 2 - 1] + dec[m / 2]);
+    std::vector<double> absdev(m);
+    for (size_t i = 0; i < m; i++)
+        absdev[i] = std::fabs(dec[i] - centre);
+    std::sort(absdev.begin(), absdev.end());
+    const double mad = (m % 2) ? absdev[m / 2] : 0.5 * (absdev[m / 2 - 1] + absdev[m / 2]);
+    const double scale = std::max(1.4826 * mad, crispasr_wm::kDetectMinScale);
+    const double z = (t_all[0] - centre) / scale;
+
+    // Third condition: beat the STRONGEST decoy, not just the typical one. On a
+    // stationary tone the real pattern scores high and so does every decoy — a
+    // median comparison cannot see that, a maximum comparison can. The tone
+    // scores 0.59 on this ratio (t_true 11.44 against a decoy maximum of 19.44:
+    // every absent pattern beats the real one, which is the tell), while the
+    // weakest genuine mark scores 0.84, so 0.70 sits mid-gap.
+    double strongest_decoy = 0.0;
+    for (size_t i = 1; i < t_all.size(); i++)
+        strongest_decoy = std::max(strongest_decoy, std::fabs(t_all[i]));
+    const double decoy_ratio = t_all[0] / std::max(strongest_decoy, 1e-9);
+
+    // The BINDING constraint decides — a mark must clear all three bars.
+    const double ratio = std::min({t_all[0] / crispasr_wm::kDetectTMin, z / crispasr_wm::kDetectZMin,
+                                   decoy_ratio / crispasr_wm::kDetectMaxDecoyRatio});
+    return (float)crispasr_wm::t_to_confidence(ratio);
+}
+
+// Which statistic `--detect-watermark` uses. The old sign test stays reachable
+// for A/B and for re-reading a score the way an older release reported it:
+//   CRISPASR_WATERMARK_DETECT=sign    -> averaged-spectrum sign agreement
+//   CRISPASR_WATERMARK_DETECT=frames  -> per-frame t + decoy specificity
+inline bool crispasr_watermark_detect_uses_frames() {
+    const char* e = std::getenv("CRISPASR_WATERMARK_DETECT");
+    if (!e || !*e)
+        return CRISPASR_WATERMARK_DETECT_FRAMES_DEFAULT;
+    return !(std::strcmp(e, "sign") == 0 || std::strcmp(e, "0") == 0);
+}
+
+// The ONE entry point every surface must call. There are two spread-spectrum
+// call sites (the CLI dispatch and the session C-ABI) and they have to agree on
+// which statistic ran, or the same file reads differently depending on which
+// binding asked — the multi-surface trap this repo keeps re-learning. Selecting
+// inside a shared function is what makes that structural instead of a
+// convention two files have to remember.
+inline float crispasr_watermark_detect_select(const float* pcm, int n_samples) {
+    return crispasr_watermark_detect_uses_frames() ? crispasr_watermark_detect_frames_impl(pcm, n_samples)
+                                                   : crispasr_watermark_detect_impl(pcm, n_samples);
 }

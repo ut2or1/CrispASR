@@ -37,6 +37,13 @@ from pathlib import Path
 
 import numpy as np
 
+# EU AI Act Art. 50(4): whose voice this checkpoint's preset speakers are.
+# Shared with every other converter so the metadata key cannot drift — a drift
+# fails OPEN (the stamp is simply never found) and nothing errors.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _speaker_identity_arg import add_speaker_identity_arg, stamp_speaker_identity
+
+
 try:
     from gguf import GGUFWriter, GGMLQuantizationType
 except ImportError:
@@ -289,6 +296,7 @@ def main():
     parser.add_argument("--ftype", default="f16",
                         choices=["f16", "f32"],
                         help="Weight storage type")
+    add_speaker_identity_arg(parser)
     args = parser.parse_args()
 
     # ── Resolve model files ──
@@ -375,6 +383,7 @@ def main():
 
     print(f"\nWriting GGUF: {args.output}")
     writer = GGUFWriter(str(args.output), arch="bananamind_tts")
+    stamp_speaker_identity(writer, args)
 
     # ── KV metadata ──
 
@@ -491,6 +500,20 @@ def main():
                 or "_bn" in name or ".bn_" in name or ".mean" in name \
                 or ".var" in name:
             qt = GGMLQuantizationType.F32
+
+        # add_tensor() with an explicit raw_dtype does NOT convert — it labels
+        # the array's bytes with the type you name. Passing an f32 array as F16
+        # writes f32 bytes tagged F16, and a reader takes the first half of them
+        # and reinterprets each 4-byte float as two 2-byte ones. See
+        # tests/test_gguf_dtype_cast.py; this shipped for real in
+        # cstr/fastpitch-en-GGUF's f16 build (943,872 NaNs).
+        #
+        # Latent here rather than shipped: every published bananamind file is
+        # f32 or q8_0, so --ftype f16 was never exercised.
+        if qt == GGMLQuantizationType.F16:
+            arr = arr.astype(np.float16)
+        elif qt == GGMLQuantizationType.F32:
+            arr = arr.astype(np.float32)
 
         writer.add_tensor(name, arr, raw_dtype=qt)
         n_tensors += 1

@@ -83,10 +83,24 @@ def load_voice_pt(pt_path: str):
 
 def write_voice_gguf(output_path: str, acoustic_mean: np.ndarray,
                      scaling: float = 0.0, bias: float = 0.0,
-                     acoustic_std: float = 0.5, voice_name: str = "custom"):
+                     acoustic_std: float = 0.5, voice_name: str = "custom",
+                     cloned_from_recording: bool = False,
+                     consent_attestation: str = ""):
     """Write voice embeddings to a GGUF file."""
     writer = gguf.GGUFWriter(output_path, "kugelaudio-voice")
     writer.add_name(f"kugelaudio-voice-{voice_name}")
+
+    # Voice-clone provenance — see examples/cli/crispasr_voice_clone_policy.h.
+    #
+    # Stamped per pack rather than declared for the whole `kugelaudio-voice`
+    # architecture, because this script has two modes: --audio bakes a real
+    # person's recording (a clone), --voice-pt converts an upstream pre-encoded
+    # voice (a preset). Listing the architecture as recording-derived would gate
+    # the presets too; the stamp is the only predicate that can tell them apart.
+    if cloned_from_recording:
+        writer.add_bool("crispasr.voice.cloned_from_recording", True)
+        if consent_attestation:
+            writer.add_string("crispasr.voice.consent_attestation", consent_attestation)
 
     # Voice metadata
     writer.add_string("kugelaudio.voice.name", voice_name)
@@ -129,19 +143,46 @@ def main():
     parser.add_argument("--output", required=True, help="Output GGUF path")
     parser.add_argument("--name", default="custom", help="Voice name")
     parser.add_argument("--device", default="cuda", help="Device for encoding")
+    parser.add_argument("--i-have-rights", dest="i_have_rights", action="store_true",
+                        help="attest that you have the consent of the speaker in --audio, or "
+                             "that it is your own voice. Required with --audio: encoding a "
+                             "recording bakes a real person's voice into a reusable clone. "
+                             "Not needed for --voice-pt, which converts an upstream preset.")
+    parser.add_argument("--consent-attestation", default="",
+                        help="free-text attestation recorded in the pack metadata (audit trail; "
+                             "does not replace --i-have-rights at synthesis time)")
     args = parser.parse_args()
 
     if args.voice_pt:
+        # Upstream pre-encoded voice: no recording of a natural person enters
+        # here, so no attestation and no clone stamp. Same reasoning that keeps
+        # kokoro and vibevoice packs ungated.
         acoustic_mean, acoustic_std = load_voice_pt(args.voice_pt)
         write_voice_gguf(args.output, acoustic_mean,
                          acoustic_std=acoustic_std or 0.5,
                          voice_name=args.name)
     elif args.audio:
+        # Consent gate, mirroring the CLI's --i-have-rights and the other
+        # bakers. Baking IS the cloning step: the acoustic encoder turns the
+        # recording into a reusable speaker identity, and everything downstream
+        # just replays it.
+        if not args.i_have_rights:
+            raise SystemExit(
+                "encoding a voice from --audio requires --i-have-rights.\n"
+                "\n"
+                "  By passing --i-have-rights you attest:\n"
+                '  "I have the consent of the speaker whose voice this clones,\n'
+                '   or it is my own voice."\n'
+                "\n"
+                "  --voice-pt converts an upstream preset instead and needs no attestation.\n"
+            )
         acoustic_mean, scaling, bias = encode_voice_from_audio(
             args.model, args.audio, args.device)
         write_voice_gguf(args.output, acoustic_mean,
                          scaling=scaling, bias=bias,
-                         voice_name=args.name)
+                         voice_name=args.name,
+                         cloned_from_recording=True,
+                         consent_attestation=args.consent_attestation)
     else:
         parser.error("either --audio or --voice-pt is required")
 

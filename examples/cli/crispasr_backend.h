@@ -13,6 +13,8 @@
 
 #pragma once
 
+#include "crispasr_speaker_identity_models.h" // declared_speaker_identity() — the researched verdicts
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -216,6 +218,44 @@ public:
         if (!v.empty())
             cb(v.data(), (int)v.size(), true);
     }
+
+    // Whose voice this backend's BUILT-IN preset voices belong to.
+    //
+    // The default is a lookup in crispasr_speaker_identity_models.h, keyed on
+    // (backend name, checkpoint) — because one backend serves many checkpoints
+    // with different answers (`orpheus` runs both Canopy's base model and
+    // Kartoffel's German fine-tune), and because these are research results
+    // that belong in one reviewable table rather than scattered across 50
+    // adapters. A backend only overrides this if it can do better from its own
+    // loaded metadata.
+    //
+    // Unresearched models resolve to Unknown, and that claims nothing: it means
+    // nobody has read the provider's card yet, not that the voice is synthetic.
+    // Guessing Synthetic is the costly direction — it silently removes an
+    // Art. 50(4) disclosure.
+    //
+    // A RealPerson preset is disclosed but NOT consent-gated; see
+    // crispasr_speaker_identity.h for why those are different duties.
+    //
+    // A pack or bank entry that declares its own crispasr.voice.speaker_identity
+    // outranks this, and --speaker-identity outranks both.
+    virtual crispasr_voice::SpeakerIdentity declared_speaker_identity(const std::string& model_path) const {
+        return crispasr_voice::identity_for_model(name(), model_path);
+    }
+
+    // Path to the multi-voice BANK this backend selects `--voice` entries from,
+    // or empty when `--voice` names a file directly (the usual case).
+    //
+    // This exists for the voice-clone gate, not for synthesis. cosyvoice3 keeps
+    // every voice inside one bundle discovered as a sibling of the model, so
+    // `--voice fleurs-en` names no file on disk; the gate read no metadata and
+    // classified a zero-shot voice clone as a preset, on every surface. The
+    // backend is the only thing that knows which bundle it resolved, so it has
+    // to hand the path over. See crispasr_voice_provenance.h.
+    //
+    // Any future backend that selects voices by name from a container MUST
+    // override this, or its clones ship unattested and undisclosed.
+    virtual std::string voice_bank_path() const { return {}; }
 
     // Sample rate of `synthesize()` output PCM. Defaults to 24 kHz since most
     // TTS backends (kokoro, qwen3-tts, vibevoice, chatterbox, orpheus, indextts)

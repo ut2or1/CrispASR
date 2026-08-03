@@ -340,6 +340,8 @@ curl http://localhost:8080/v1/audio/speech \
 | `seed` | `0` | RNG seed for sampling. `0` = non-deterministic. Same-seed + same-text produces bit-identical audio on all sampling-capable TTS backends (qwen3-tts, chatterbox, vibevoice, orpheus). |
 | `temperature` | server's `--temperature` | Sampling temperature for AR TTS backends. `0` = greedy; backends apply their own default (e.g. 0.8 for qwen3-tts) when the global default of 0.0 is unchanged. |
 | `max_new_tokens` | server's `--max-new-tokens` | AR token generation cap. `<= 0` clears the override and uses the backend default. |
+| `max_speech_tokens` | backend default | MOSS-TTS / moss-tts-local hard cap on generated audio frames (~12.5 frames/sec). The decode loop is forced to end once this many frames are produced, so it bounds the worst-case synthesis length even when the model never emits its end token. Per request. |
+| `min_speech_tokens` | backend default | MOSS-TTS / moss-tts-local minimum number of generated audio frames (~12.5 frames/sec). The decode loop is forbidden from ending until this many frames are produced. **Setting `min_speech_tokens == max_speech_tokens` yields exact-duration synthesis** — the model generates precisely that window of audio (within one frame ≈ 80 ms) with no post-hoc tempo change, which is what game-dubbing / lip-sync work needs. Per request. |
 | `frequency_penalty` | `0.0` | Opt-in repeated generated-token penalty for AR TTS backends. `0.0` disabled. |
 | `top_p` | backend default | Nucleus-sampling cutoff for AR TTS backends (tada, chatterbox). Applied per request; omit to keep the backend default. |
 | `top_k` | backend default | Top-k sampling cutoff (`0` = disabled). Honoured by tada. Per request. |
@@ -351,8 +353,11 @@ curl http://localhost:8080/v1/audio/speech \
 | `noise_temp` | backend default | tada flow-matching noise temperature (Python `noise_temp`, default 0.9). Per request. |
 | `speed` | `1.0` | Tempo multiplier `0.25 .. 4.0` (OpenAI range). Applied as a post-synth linear resampler. Out-of-range returns 400 with `code=invalid_speed`. |
 | `response_format` | `"wav"` | `wav` (16-bit PCM RIFF, 24 kHz mono — default), `pcm` (OpenAI spec: 24 kHz signed 16-bit LE raw, no header), `f32` (crispasr-specific raw float32 for downstream DSP), or the compressed containers `mp3` / `aac` / `opus` — all encoded in-tree by [glint](https://github.com/CrispStrobe/glint), no build deps. `opus` returns a standard **Ogg Opus** file (`audio/ogg`); set `CRISPASR_OPUS_ENCODER=libopus` (build with libopus) to fall back to the legacy raw-packet framing (`audio/opus`) instead. |
-| `consent_attestation` | empty | Required when `voice` is a **clone**: a `.wav` reference, or a `.gguf` pack stamped `crispasr.voice.cloned_from_recording` by the baker that derived it from a real recording. The name is resolved against `--voice-dir` first, so a bare `"victim"` is treated exactly like `"victim.wav"`. A free-text statement attesting speaker consent, e.g. `"I have the speaker's consent"`. Logged for audit, with the reason the voice was classified a clone. Preset packs (kokoro, vibevoice, `tada-ref-<lang>`, …) carry no stamp and need no attestation — see [`eu-ai-act.md` §6.2](eu-ai-act.md#62-art-504--deepfake-disclosure). |
+| `consent_attestation` | empty | Required when `voice` is a **clone**: a `.wav` reference, or a `.gguf` pack stamped `crispasr.voice.cloned_from_recording` by the baker that derived it from a real recording. The name is resolved against `--voice-dir` first, so a bare `"victim"` is treated exactly like `"victim.wav"`. A free-text statement attesting speaker consent, e.g. `"I have the speaker's consent"`. Logged for audit, with the reason the voice was classified a clone. Preset packs (kokoro, vibevoice, `tada-ref-<lang>`, …) carry no stamp and need no attestation — see [`eu-ai-act.md` §6.2](eu-ai-act.md#62-art-504--deepfake-disclosure). Note that "no attestation" is not "nothing to disclose": a preset whose voice is a real person still owes the audible label, via `speaker_identity` below. |
 | `ref_text` | empty | Transcript of the `.wav` clone reference, used by TADA on-the-fly cloning (#201). A companion `<name>.txt` in `--voice-dir` is used when omitted. Ignored by backends that clone from audio alone. |
+| `language` | server's `-l` | The language to **speak** (alias: `target_lang`). ISO-639-1 (`de`) or an English name (`German`). cosyvoice3 compares it to the reference voice's language and switches to cross-lingual synthesis when they differ; qwen3-tts sets the talker's explicit `codec_language_id`; moss-tts fills its `- Language:` prompt field; kokoro/zonos/piper pick the eSpeak voice. Language-agnostic backends (voxcpm2, f5-tts, vibevoice) ignore it and read the script of `input` instead. |
+| `source_lang` | empty | The language the **cloning reference** is spoken in (alias: `ref_lang`) — not the output language. Only cosyvoice3 acts on it, to decide whether the requested `language` needs cross-lingual synthesis. Optional: the backend otherwise infers it from the voice-bank entry or from `ref_text`. That inference declines rather than guesses on a short transcript, and when it declines the requested `language` has no effect and the clone keeps the reference's accent — set this to make it explicit (#329). |
+| `speaker_identity` | empty (`unknown`) | Whose voice a **preset** voice is: `real_person`, `synthetic` or `unknown`. `real_person` adds the audible AI disclosure to non-cloned output — a preset shipped inside a model can be an identifiable individual, which makes the output a deep fake under Art. 3(60) even though nothing was cloned. It does **not** require `consent_attestation`: whether that donor agreed to the model being trained is settled upstream and you cannot attest to it. Outranks the pack's own `crispasr.voice.speaker_identity` stamp and the backend default. An unrecognised value is a `400` with `code=invalid_speaker_identity` rather than a silent downgrade. See [`eu-ai-act.md` §6.2a](eu-ai-act.md#62a-whose-voice-is-a-preset-voice-speaker_identity). |
 | `spoken_disclaimer` | `true` | Set to `false` to skip the audible AI-disclosure prefix on voice-cloned output. Machine-readable provenance (watermark + C2PA) is always applied. When `false`, the caller assumes responsibility for providing appropriate AI-disclosure to end users — which is why the opt-out is only honoured when attested (see `marking_attestation`). |
 | `marking_attestation` | empty | Required (since v0.8.22) to **honour** `"spoken_disclaimer": false` on a voice clone — a free-text affirmation that you accept the AI-content disclosure duty, e.g. `"I will disclose this is AI-generated"`. Logged for audit. A server launched with `--accept-marking-responsibility` has already accepted that duty for every response it serves and satisfies this per-request field. **Without it the opt-out is denied, not the request** (since v0.8.24): the response is still `200`, but it carries the spoken disclaimer and the headers below say so. Earlier v0.8.22/v0.8.23 servers returned `400 marking_attestation_required` instead. |
 
@@ -396,6 +401,32 @@ The listing reflects the filesystem; whether a particular backend
 actually accepts a given voice depends on the backend's own resolution
 (e.g. CustomVoice models only accept names baked into the GGUF
 metadata — the `<voice-dir>` files are irrelevant to those).
+
+**Voice upload — requires a consent attestation:**
+
+```bash
+curl -X POST http://localhost:8080/v1/voices \
+  -F voice=@speaker.wav \
+  -F name=vivian \
+  -F consent_attestation="I have the speaker's consent" \
+  -F transcript="the reference transcript"   # optional, Qwen3-TTS ICL prefill
+# 201 {"name": "vivian", "format": "wav", "size_bytes": 220544}
+```
+
+`consent_attestation` is **mandatory** — a missing or empty field is a `400`
+with `code=consent_required`. Storing a recording as a reusable voiceprint *is*
+the cloning step, the same act the CLI gates behind `--i-have-rights` and every
+voice baker gates at bake time; taking the attestation only later, at
+`/v1/audio/speech`, would mean a third party's voice could be enrolled by anyone
+who could reach the endpoint. The upload emits an
+`[CONSENT] scope=voice-upload …` audit line. See
+[`eu-ai-act.md`](eu-ai-act.md) §6.2.
+
+> **Breaking change.** This field is new; clients that provisioned voices
+> without it get a `400` until they add it.
+
+Requires `--voice-dir`; names must match `[a-zA-Z0-9_-]+`; an existing name
+needs `?force=true`. `DELETE /v1/voices/{name}` removes one.
 
 ### Voice file conventions
 
@@ -516,8 +547,8 @@ audio is watermarked by default, same as TTS (process-level opt-out via
 |---|---|
 | Streaming response (chunked / SSE) | Pending — see PLAN §70 (couples with chunked-VAE for the full latency win). |
 | `mp3` / `aac` / `opus` encoding | **Done** — encoded in-tree by glint, no build deps (`response_format=mp3\|aac\|opus`; `opus` = Ogg Opus). `flac` output still pending. |
-| `POST /v1/voices` (multipart upload for runtime provisioning) | Pending — security review (size limits, content-type validation, disk quota). |
-| `DELETE /v1/voices/{name}` | Pending alongside upload. |
+| `POST /v1/voices` (multipart upload for runtime provisioning) | **Done** — gated on `consent_attestation` (see above). Disk quota and content-type validation still pending. |
+| `DELETE /v1/voices/{name}` | **Done**. |
 | Native-backend `speed` (duration knobs vs server-side resample) | Pending — backend-by-backend. |
 
 ## Translation endpoint

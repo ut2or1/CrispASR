@@ -26,10 +26,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
+
+# EU AI Act Art. 50(4): whose voice this checkpoint's preset speakers are.
+# Shared with every other converter so the metadata key cannot drift — a drift
+# fails OPEN (the stamp is simply never found) and nothing errors.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _speaker_identity_arg import add_speaker_identity_arg, stamp_speaker_identity
+
 
 try:
     from gguf import GGUFWriter, GGMLQuantizationType
@@ -65,6 +73,7 @@ def convert_one(in_path: Path, out_path: Path) -> None:
 
     w = GGUFWriter(str(out_path), arch="kokoro-voice", use_temp_file=False)
     w.add_name(f"kokoro-voice-{name}")
+    stamp_speaker_identity(w, args)
     w.add_string("kokoro_voice.name", name)
     w.add_uint32("kokoro_voice.max_phonemes", arr.shape[0])
     w.add_uint32("kokoro_voice.style_dim", arr.shape[2])
@@ -85,6 +94,7 @@ def main() -> None:
                     help="Directory of voice .pt files (batch mode)")
     ap.add_argument("--output-dir",
                     help="Output directory (with --input-dir)")
+    add_speaker_identity_arg(ap)
     args = ap.parse_args()
 
     if args.input_dir:

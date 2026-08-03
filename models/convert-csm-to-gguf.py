@@ -59,10 +59,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
+
+# EU AI Act Art. 50(4): whose voice this checkpoint's preset speakers are.
+# Shared with every other converter so the metadata key cannot drift — a drift
+# fails OPEN (the stamp is simply never found) and nothing errors.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _speaker_identity_arg import add_speaker_identity_arg, stamp_speaker_identity
+
 
 try:
     from gguf import GGUFWriter, GGMLQuantizationType
@@ -360,6 +368,7 @@ def main():
                     help="HF model ID (e.g. sesame/csm-1b) or local dir")
     ap.add_argument("--output", required=True, help="Output GGUF path")
     ap.add_argument("--outtype", default="f16", choices=["f32", "f16"])
+    add_speaker_identity_arg(ap)
     args = ap.parse_args()
 
     model_dir = load_model_dir(args.input)
@@ -454,6 +463,7 @@ def main():
 
     # Metadata
     w.add_name("csm-1b")
+    stamp_speaker_identity(w, args)
 
     def u32(k, v): w.add_uint32(k, int(v))
     def f32(k, v): w.add_float32(k, float(v))

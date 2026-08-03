@@ -974,10 +974,72 @@ impl Session {
         Ok(())
     }
 
+    /// Declare whose voice a PRESET voice is: `"real_person"`,
+    /// `"synthetic"` or `"unknown"`.
+    ///
+    /// Cloning is not the only way to produce a deep fake: a preset voice
+    /// shipped inside a model can be an identifiable individual — a named
+    /// donor, or a corpus speaker such as VCTK's `p225` — and EU AI Act
+    /// Art. 3(60) attaches to the audio resembling that person, not to which
+    /// pipeline produced it. Setting `real_person` makes the Art. 50(4)
+    /// reminder fire for a non-cloned voice.
+    ///
+    /// It does **not** require a consent attestation: whether that donor
+    /// agreed to the model being trained is a licensing matter settled
+    /// upstream, which you cannot attest to.
+    ///
+    /// Returns `Err` on an unrecognised value rather than silently
+    /// downgrading it to `unknown`.
+    pub fn set_speaker_identity(&self, identity: &str) -> Result<(), String> {
+        let c = CString::new(identity).map_err(|e| e.to_string())?;
+        let rc =
+            unsafe { crispasr_sys::crispasr_session_set_speaker_identity(self.handle, c.as_ptr()) };
+        match rc {
+            0 => Ok(()),
+            -2 => Err(format!(
+                "unrecognised speaker_identity {identity:?} (expected real_person, synthetic or unknown)"
+            )),
+            _ => Err(format!("set_speaker_identity failed (rc={rc})")),
+        }
+    }
+
+    /// Embed the AI-content watermark into f32 mono PCM, in place.
+    ///
+    /// The other half of [`Session::synthesize_raw`]: opting out of automatic
+    /// marking makes marking the result *your* duty (EU AI Act Art. 50(2)), and
+    /// this is what discharges it. Do the post-processing you opted out for —
+    /// resample, mix, concatenate — then call this on the finished buffer.
+    ///
+    /// Uses the robust, reliably detectable default strength; AudioSeal instead
+    /// if a model was loaded. Associated function, not a method: marking is a
+    /// property of the samples, not of the session that produced them.
+    pub fn watermark_embed(pcm: &mut [f32]) {
+        if pcm.is_empty() {
+            return;
+        }
+        unsafe {
+            crispasr_sys::crispasr_watermark_embed(pcm.as_mut_ptr(), pcm.len() as c_int, -1.0)
+        };
+    }
+
+    /// Confidence in `[0, 1]` that `pcm` carries the watermark.
+    ///
+    /// A weak diagnostic, not proof: the spread-spectrum detector's null mean is
+    /// 0.5, not 0, and a negative result on a short clip is mostly evidence that
+    /// the clip was short. See `docs/eu-ai-act.md` §6.7 before reading anything
+    /// into a number from here.
+    pub fn watermark_detect(pcm: &[f32]) -> f32 {
+        if pcm.is_empty() {
+            return 0.0;
+        }
+        unsafe { crispasr_sys::crispasr_watermark_detect(pcm.as_ptr(), pcm.len() as c_int) }
+    }
+
     /// UNMARKED synthesis (no watermark / disclosure), for callers that embed
     /// the mark themselves after post-processing. Hard-refused (returns `Err`)
     /// unless [`Session::accept_marking_responsibility`] was called first.
     /// Prefer [`Session::synthesize`] for the default watermarked output.
+    /// Mark the result with [`Session::watermark_embed`].
     pub fn synthesize_raw(&self, text: &str) -> Result<Vec<f32>, String> {
         let ctext = CString::new(text).map_err(|e| e.to_string())?;
         let mut n: c_int = 0;
@@ -1036,6 +1098,29 @@ impl Session {
             unsafe { crispasr_sys::crispasr_session_set_target_language(self.handle, c.as_ptr()) };
         if rc != 0 {
             return Err(format!("set_target_language failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Language a voice-cloning reference clip is spoken in (issue #329).
+    ///
+    /// Cross-lingual TTS backends (cosyvoice3) compare it to the requested
+    /// output language — [`set_target_language`](Session::set_target_language),
+    /// falling back to [`set_source_language`](Session::set_source_language) —
+    /// and drop the reference transcript when they differ, so the clone speaks
+    /// the target language instead of carrying the reference's accent.
+    ///
+    /// Optional: the backend otherwise infers the reference language from the
+    /// voice-bank entry or the reference transcript. That inference cannot
+    /// answer for a short transcript, and when it cannot, the requested target
+    /// language has no effect — set this to make it explicit.
+    pub fn set_tts_reference_language(&self, lang: &str) -> Result<(), String> {
+        let c = CString::new(lang).map_err(|e| e.to_string())?;
+        let rc = unsafe {
+            crispasr_sys::crispasr_session_set_tts_reference_language(self.handle, c.as_ptr())
+        };
+        if rc != 0 {
+            return Err(format!("set_tts_reference_language failed (rc={})", rc));
         }
         Ok(())
     }

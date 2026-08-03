@@ -386,6 +386,15 @@ CRISPASR_SESSION_API float* crispasr_session_synthesize_raw(crispasr_session* s,
 CRISPASR_SESSION_API float* crispasr_session_synthesize(crispasr_session* s, const char* text, int* out_n_samples);
 // Attest acceptance of AI-content marking/disclosure duty (required for _raw); recorded for audit.
 CRISPASR_SESSION_API int crispasr_session_accept_marking_responsibility(crispasr_session* s, const char* attestation);
+// Declare whose voice the current PRESET voice is: "real_person" | "synthetic" |
+// "unknown". A preset can be an identifiable individual (a named donor, a corpus
+// speaker), which makes its output a deep fake under Art. 3(60) even though no
+// recording passed through a baker — so "not a clone" is not the same as
+// "nothing to disclose". Setting real_person makes the Art. 50(4) reminder fire
+// for a non-cloned voice; it does NOT require a consent attestation, because the
+// donor's agreement to the training is settled upstream and you cannot attest to
+// it. Returns 0, -1 on a bad session, -2 on an unrecognised value.
+CRISPASR_SESSION_API int crispasr_session_set_speaker_identity(crispasr_session* s, const char* identity);
 
 // ─── Spoken AI-disclosure for voice clones (EU AI Act Art. 50(4)) ──────
 //
@@ -634,6 +643,13 @@ CRISPASR_SESSION_API int crispasr_kokoro_resolve_fallback_voice_abi(const char*,
 CRISPASR_SESSION_API int crispasr_session_kokoro_clear_phoneme_cache(crispasr_session*);
 CRISPASR_SESSION_API int crispasr_session_set_source_language(crispasr_session* s, const char* lang);
 CRISPASR_SESSION_API int crispasr_session_set_target_language(crispasr_session* s, const char* lang);
+// #329 — the language a voice-cloning REFERENCE clip is spoken in (ISO-ish;
+// "" or NULL clears). Cross-lingual TTS backends (cosyvoice3) compare it to the
+// requested output language and, when they differ, drop the reference
+// transcript so the clone speaks the target language instead of carrying the
+// reference's accent. Optional: the backend otherwise infers it from the voice
+// bank or the reference transcript, which cannot answer for a short one.
+CRISPASR_SESSION_API int crispasr_session_set_tts_reference_language(crispasr_session* s, const char* lang);
 CRISPASR_SESSION_API int crispasr_session_set_punctuation(crispasr_session* s, int enable);
 // Select + load a punctuation-restoration model (alias auto|firered|fullstop|
 // punctuate-all|pcs, or a .gguf path; "none"/NULL unloads). Auto-downloads on

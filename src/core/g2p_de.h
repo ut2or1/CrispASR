@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include "core/num2words_de.h" // #316: spell digits out before phonemizing
+
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -687,7 +689,15 @@ inline std::string word_to_ipa(const context& ctx, const std::string& word) {
 }
 
 inline std::string text_to_ipa(const context& ctx, const std::string& text) {
-    auto words = tokenize(text);
+    // #316: spell numbers out FIRST. Digits are in no pronunciation dictionary
+    // and no letter-to-sound rule, so a numeric token phonemized to the EMPTY
+    // string and vanished from the audio — "Ich habe 82 Euro" was spoken as
+    // "Ich habe Euro". Nothing errored; the number was simply gone.
+    //
+    // This must run before tokenize(), which splits on ',' and '.' — the two
+    // characters German uses as decimal mark and thousands separator. Expanding
+    // afterwards would already have "3,14" torn into "3", "," and "14".
+    auto words = tokenize(core_num2words_de::expand(text));
     std::string ipa;
     for (const auto& w : words) {
         if (w.size() == 1 &&

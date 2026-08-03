@@ -228,6 +228,16 @@ def main():
                     help="Comma-separated fixed-speaker NAMES (used as the "
                          "`name: text` prefix at synthesis time). Defaults to "
                          "the canopylabs orpheus-3b-0.1-ft 8-voice EN set.")
+    ap.add_argument("--speaker-identity", dest="speaker_identity", default="",
+                    choices=["", "real_person", "synthetic", "unknown"],
+                    help="whose voice this checkpoint's preset speakers are. Stamped into the "
+                         "GGUF as crispasr.voice.speaker_identity and read back by the runtime "
+                         "to decide whether output needs the EU AI Act Art. 50(4) audible "
+                         "disclosure. real_person for checkpoints whose speakers are "
+                         "identifiable people (e.g. kartoffel-orpheus-de-natural, whose 19 "
+                         "speakers were extracted from real recordings). Omit when the model "
+                         "card does not say - unknown is a question, synthetic is a claim, and "
+                         "guessing synthetic silently removes a disclosure.")
     ap.add_argument("--variant", default="base", choices=["base", "fixed_speaker"],
                     help="orpheus.tts_model_type metadata. Most ft checkpoints "
                          "(canopylabs orpheus-3b-0.1-ft, Kartoffel_*) are "
@@ -293,6 +303,14 @@ def main():
 
     # ----- metadata -----------------------------------------------------
     w.add_name(f"orpheus-{args.variant}")
+
+    # EU AI Act Art. 50(4): whose voice this checkpoint speaks as. Stamped here
+    # so the runtime does not have to infer it from the file name — one orpheus
+    # backend serves Canopy's base model and Kartoffel's German fine-tune, and
+    # they have different answers. See examples/cli/crispasr_speaker_identity.h.
+    # Absent means "not established"; it is never written as a guess.
+    if args.speaker_identity and args.speaker_identity != "unknown":
+        w.add_string("crispasr.voice.speaker_identity", args.speaker_identity)
 
     def u32(k, v): w.add_uint32(k, int(v))
     def f32(k, v): w.add_float32(k, float(v))

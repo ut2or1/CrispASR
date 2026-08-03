@@ -44,6 +44,14 @@ export CRISPASR_MODEL_DOTS_TTS="${CRISPASR_MODEL_DOTS_TTS:-$CRISPASR_MODELS_DIR/
 export CRISPASR_MODEL_DOTS_TTS_VOCODER="${CRISPASR_MODEL_DOTS_TTS_VOCODER:-$CRISPASR_MODELS_DIR/dots-tts-soar-vocoder-f16.gguf}"
 export CRISPASR_MODEL_COHERE="${CRISPASR_MODEL_COHERE:-$CRISPASR_MODELS_DIR/cohere-transcribe.gguf}"
 
+# ── Kokoro TTS + its G2P live check (#316) ──
+# tests/test-kokoro-g2p-live.sh reads these three and silently skips without
+# them, so the G2P path — the one that used to drop numbers entirely — was
+# never exercised by a `source tests/env-live-tests.sh` run. The defaults match
+# the names the script already falls back to.
+export CRISPASR_KOKORO_MODEL="${CRISPASR_KOKORO_MODEL:-$CRISPASR_MODELS_DIR/kokoro-82m-q8_0.gguf}"
+export CRISPASR_KOKORO_VOICE="${CRISPASR_KOKORO_VOICE:-$CRISPASR_MODELS_DIR/kokoro-voice-af_heart.gguf}"
+
 # ── Parakeet JA long-form regression guard (issue #89) ──
 # Fixture: hf download cstr/crispasr-regression-fixtures \
 #     parakeet-tdt-0.6b-ja/reazon_baseball_14s/audio.wav --local-dir <dir>

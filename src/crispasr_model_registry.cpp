@@ -1160,8 +1160,13 @@ constexpr Entry k_registry[] = {
     // Parler TTS Mini v1.1: prompt-conditioned TTS (~900M). T5 encoder +
     // MusicGen decoder + DAC 44.1 kHz codec. Describe the voice in text
     // via --instruct. Apache-2.0.
-    {"parler-tts", "parler-mini-v1.1-q8_0.gguf",
-     "https://huggingface.co/cstr/parler-tts-mini-v1.1-GGUF/resolve/main/parler-mini-v1.1-q8_0.gguf",
+    // NOTE the `parler-tts-` prefix. The repo also held a `parler-mini-` set
+    // with byte-identical tensors that was MISSING parler.tokenizer.is_bpe —
+    // and parler_tts.cpp defaults that to false, i.e. Viterbi unigram instead
+    // of BPE, so `-m auto` silently tokenized prompts with the wrong algorithm.
+    // The stale set has been removed upstream; keep this name.
+    {"parler-tts", "parler-tts-mini-v1.1-q8_0.gguf",
+     "https://huggingface.co/cstr/parler-tts-mini-v1.1-GGUF/resolve/main/parler-tts-mini-v1.1-q8_0.gguf",
      "~900 MB", nullptr, nullptr},
 
     // Text-LID — three families, one auto-routing dispatcher

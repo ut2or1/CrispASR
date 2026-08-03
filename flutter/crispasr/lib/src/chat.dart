@@ -195,6 +195,25 @@ class CrispasrChatSession {
   final int _nCtx;
   bool _closed = false;
 
+  /// The canonical "you are talking to an AI" disclosure (EU AI Act
+  /// Art. 50(1)), read from the C ABI so it cannot drift from the CLI and
+  /// server wording.
+  ///
+  /// **This binding is why the duty is real here.** §6.3's defence for the
+  /// rest of CrispASR — "a CLI transcription tool is obvious to a reasonably
+  /// well-informed person" — does not carry to a chat bubble in a Flutter app.
+  /// Show this at or before the first turn, and show it *visibly*: Art. 50(5)
+  /// requires disclosures to meet accessibility requirements.
+  ///
+  /// Art. 50(2) marking of the generated text is yours too; nothing here marks
+  /// it (see `docs/eu-ai-act.md` §6.6).
+  static String aiDisclosureText({DynamicLibrary? lib}) {
+    lib ??= DynamicLibrary.open(CrispASR.defaultLibName());
+    final fn = lib.lookupFunction<Pointer<Utf8> Function(),
+        Pointer<Utf8> Function()>('crispasr_chat_ai_disclosure_text');
+    return fn().toDartString();
+  }
+
   /// Name of the chat template the session resolved against
   /// (e.g. `chatml`, `llama3`, `gemma`).
   String get templateName => _templateName;

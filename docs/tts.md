@@ -338,6 +338,88 @@ any `crispasr --server` instance whose loaded backend declares
 `whisper_params`. Long-form input is auto-chunked on sentence
 boundaries.
 
+## Output language and cross-lingual cloning (`-tl` / `-sl`)
+
+Issue #329: *"there is usually an option to select the target language, but I
+don't find it for these engines."* It exists — here is where it lives on each
+surface, and what each backend does with it.
+
+**The target language is the language to SPEAK.** For a TTS backend `-l`, `-tl`
+and the server's `"language"` all mean the same thing; `-tl` /
+`--target-lang` is the spelling to reach for when you are dubbing, and it wins
+over `-l` where both are given.
+
+```bash
+# CLI — synthesize German
+./build/bin/crispasr --backend cosyvoice3-tts -m auto -tl de \
+    --tts "Guten Morgen, wie geht es Ihnen?" --tts-output out.wav
+
+# CLI — clone an ENGLISH reference clip, speaking GERMAN
+./build/bin/crispasr --backend cosyvoice3-tts -m auto \
+    -tl de -sl en \
+    --voice ref_en.wav --ref-text "This is my reference recording." \
+    --i-have-rights \
+    --tts "Guten Morgen, wie geht es Ihnen?" --tts-output out.wav
+```
+
+```jsonc
+// POST /v1/audio/speech
+{
+  "input":       "Guten Morgen, wie geht es Ihnen?",
+  "voice":       "ref_en.wav",
+  "language":    "de",     // what to speak    (alias: "target_lang")
+  "source_lang": "en",     // what the REFERENCE is spoken in (alias: "ref_lang")
+  "consent_attestation": "..."
+}
+```
+
+```python
+# Python / Rust / Flutter session API
+s.set_target_language("de")          # what to speak
+s.set_tts_reference_language("en")   # what the reference clip is spoken in
+```
+
+**`-sl` / `--source-lang` / `"source_lang"` names the language of the CLONING
+REFERENCE, not of the output.** It only matters for cross-lingual cloning, and
+only cosyvoice3 acts on it today.
+
+### What each backend does with it
+
+| Backend | Effect |
+|---|---|
+| **`cosyvoice3-tts`** | When the target language differs from the reference voice's language, mirrors upstream `frontend_cross_lingual`: the reference **transcript** is dropped from the LM prompt (and the LM's reference speech tokens with it) while the flow keeps the reference speech + mel for **timbre**. That is what stops a German sentence coming out with the English reference's accent. Same language (or no target) = plain zero-shot, unchanged. |
+| **`qwen3-tts`** | Sets the talker's explicit `codec_language_id` in the prefill instead of the model's auto ("nothink") path. Applies to preset voices, cloned voices and VoiceDesign alike. Languages come from the model's own `codec_language_names` table; one outside it prints a warning and falls back to auto. |
+| **`moss-tts` / `moss-tts-local`** | Fills the `- Language:` field of the generation prompt. |
+| **`kokoro`, `zonos`, `piper`** | Selects the eSpeak voice / G2P language. |
+| **`voxcpm2`, `f5-tts`, `vibevoice`, …** | Language-agnostic — they read the script of the input text itself, which is why they need no knob (and why voxcpm2 "just works" in #329). |
+
+### When cosyvoice3 says it could not determine the reference language
+
+To decide *whether* to go cross-lingual, cosyvoice3 needs the reference clip's
+language. It resolves that in this order:
+
+1. `-sl` / `"source_lang"` / `set_tts_reference_language()` — you said so.
+2. The voice-bank entry, for the baked `fleurs-<lang>` voices.
+3. Detection over the reference transcript (`--ref-text`): writing system first,
+   then function words for Latin-script languages
+   (`src/core/tts_lang.h`, covered by `tests/test-tts-lang.cpp`).
+
+Step 3 answers "unknown" rather than guessing when the transcript is short or
+its language is not one it knows. In that case the target language cannot be
+acted on and you get:
+
+```
+cosyvoice3_tts: target language 'de' requested but the reference voice's language
+could not be determined (transcript too short or unsupported script) —
+synthesising zero-shot, which keeps the reference's accent. Pass
+--source-lang <lang> (server: "source_lang") to enable cross-lingual synthesis.
+```
+
+Passing `-sl` resolves it. Before #329, detection covered only Hangul / Kana /
+Han / Cyrillic, so **every Latin-script pair** — en↔de, en↔fr, es↔it, the ones a
+subtitle-dubbing workflow actually asks for — landed in that unknown case, with
+no message and no way to override it.
+
 ## G2P Phonemization (`--g2p-dict`)
 
 TTS backends that use IPA phonemes (piper, kokoro) need a
@@ -1049,7 +1131,7 @@ the voice you want in text via `--instruct`.
 
 # Explicit model path:
 ./build/bin/crispasr --backend parler-tts \
-    -m parler-mini-v1.1-q8_0.gguf \
+    -m parler-tts-mini-v1.1-q8_0.gguf \
     --instruct "A young male speaker with an energetic tone." \
     --tts "Welcome to CrispASR text-to-speech." \
     --tts-output welcome.wav

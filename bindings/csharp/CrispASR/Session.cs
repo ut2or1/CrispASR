@@ -189,6 +189,15 @@ namespace CrispASR
         public void SetTargetLanguage(string? lang)
             => Check(NativeMethods.crispasr_session_set_target_language(Handle, lang ?? ""), "set_target_language");
 
+        /// <summary>Language a voice-cloning reference clip is spoken in (#329). Cross-lingual TTS
+        /// backends (cosyvoice3) drop the reference transcript when it differs from the requested
+        /// output language, so the clone speaks that language instead of carrying the reference's
+        /// accent. Optional — inferred from the voice bank or reference transcript otherwise, and
+        /// that inference declines rather than guesses on a short transcript.</summary>
+        public void SetTtsReferenceLanguage(string? lang)
+            => Check(NativeMethods.crispasr_session_set_tts_reference_language(Handle, lang ?? ""),
+                     "set_tts_reference_language");
+
         /// <summary>Toggle punctuation + capitalisation. Default true.</summary>
         public void SetPunctuation(bool enable)
             => Check(NativeMethods.crispasr_session_set_punctuation(Handle, enable ? 1 : 0), "set_punctuation");
@@ -345,6 +354,37 @@ namespace CrispASR
                      "accept_marking_responsibility");
 
         /// <summary>
+        /// Declare whose voice a PRESET voice is: <c>real_person</c>,
+        /// <c>synthetic</c> or <c>unknown</c>.
+        /// <para>
+        /// Cloning is not the only way to produce a deep fake: a preset voice
+        /// shipped inside a model can be an identifiable individual — a named
+        /// donor, or a corpus speaker such as VCTK's <c>p225</c> — and EU AI Act
+        /// Art. 3(60) attaches to the audio resembling that person, not to which
+        /// pipeline produced it. Setting <c>real_person</c> makes the Art. 50(4)
+        /// reminder fire for a non-cloned voice.
+        /// </para>
+        /// <para>
+        /// It does <b>not</b> require a consent attestation: whether that donor
+        /// agreed to the model being trained is a licensing matter settled
+        /// upstream that you cannot attest to.
+        /// </para>
+        /// </summary>
+        /// <exception cref="ArgumentException">
+        /// Thrown on an unrecognised value, rather than silently downgrading it
+        /// to <c>unknown</c>.
+        /// </exception>
+        public void SetSpeakerIdentity(string identity)
+        {
+            int rc = NativeMethods.crispasr_session_set_speaker_identity(Handle, identity ?? "");
+            if (rc == -2)
+                throw new ArgumentException(
+                    $"unrecognised speaker_identity '{identity}' " +
+                    "(expected real_person, synthetic or unknown)", nameof(identity));
+            Check(rc, "set_speaker_identity");
+        }
+
+        /// <summary>
         /// UNMARKED synthesis (no watermark), for callers that post-process before
         /// embedding the mark themselves. Hard-refused (throws) unless
         /// <see cref="AcceptMarkingResponsibility"/> was called first. Prefer
@@ -366,6 +406,40 @@ namespace CrispASR
             {
                 NativeMethods.crispasr_pcm_free(ptr);
             }
+        }
+
+        /// <summary>
+        /// Embed the AI-content watermark into mono float32 PCM, in place.
+        /// <para>
+        /// The other half of <see cref="SynthesizeRaw"/>: opting out of automatic
+        /// marking makes marking the result your duty under EU AI Act Art. 50(2),
+        /// and this is what discharges it. Do the post-processing you opted out
+        /// for — resample, mix, concatenate — then mark the finished buffer.
+        /// </para>
+        /// <para>
+        /// Uses the robust, reliably detectable default strength; AudioSeal
+        /// instead when a model has been loaded. Static because marking is a
+        /// property of the samples, not of the session that produced them.
+        /// </para>
+        /// </summary>
+        public static void WatermarkEmbed(float[] pcm)
+        {
+            if (pcm == null || pcm.Length == 0)
+                return;
+            NativeMethods.crispasr_watermark_embed(pcm, pcm.Length, -1.0f);
+        }
+
+        /// <summary>
+        /// Confidence in [0, 1] that <paramref name="pcm"/> carries the watermark.
+        /// A weak diagnostic, not proof: the spread-spectrum detector's null mean
+        /// is 0.5, not 0, and a negative result on a short clip is mostly evidence
+        /// that the clip was short. See <c>docs/eu-ai-act.md</c> §6.7.
+        /// </summary>
+        public static float WatermarkDetect(float[] pcm)
+        {
+            if (pcm == null || pcm.Length == 0)
+                return 0.0f;
+            return NativeMethods.crispasr_watermark_detect(pcm, pcm.Length);
         }
 
         /// <summary>

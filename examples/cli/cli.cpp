@@ -3,9 +3,10 @@
 
 #include "crispasr.h"
 #include "grammar-parser.h"
-#include "whisper_params.h"            // struct whisper_params (shared with crispasr_*)
-#include "crispasr_backend.h"          // crispasr_run_backend() dispatch entry point
-#include "crispasr_diagnostics.h"      // --version / --diagnostics + verbose banner (#31)
+#include "whisper_params.h"       // struct whisper_params (shared with crispasr_*)
+#include "crispasr_backend.h"     // crispasr_run_backend() dispatch entry point
+#include "crispasr_diagnostics.h" // --version / --diagnostics + verbose banner (#31)
+#include "crispasr_consent_record.h"
 #include "crispasr_diarize_cli.h"      // crispasr_apply_diarize / pyannote cache (#107)
 #include "crispasr_speaker_embedder.h" // pluggable speaker embedder (#107 P3)
 #include "crispasr_stream_punc.h"      // streaming punctuation mode helpers (#112)
@@ -642,10 +643,17 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.watermark_model = ARGV_NEXT;
     } else if (arg == "--detect-watermark") {
         params.detect_watermark_file = ARGV_NEXT;
+    } else if (arg == "--print-speaker-identity") {
+        // Whose voice does this file produce? Prints real_person / synthetic /
+        // unknown and exits — the same answer the disclosure gate uses.
+        params.print_speaker_identity_file = ARGV_NEXT;
     } else if (arg == "--c2pa-cert") {
         params.c2pa_cert = ARGV_NEXT;
     } else if (arg == "--c2pa-key") {
         params.c2pa_key = ARGV_NEXT;
+    } else if (arg == "--consent-log") {
+        params.consent_log = ARGV_NEXT;
+        crispasr_consent::set_log_path(params.consent_log);
     } else if (arg == "--i-have-rights") {
         // Voice-cloning consent attestation. Required when --voice points
         // to a .wav reference file (i.e. voice cloning). By passing this
@@ -653,6 +661,11 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         // voice this clones, or it is my own voice."
         params.tts_voice_clone_consent = true;
         params.tts_consent_attestation = "CLI --i-have-rights flag";
+    } else if (arg == "--speaker-identity") {
+        // Whose voice a PRESET voice is: real_person | synthetic | unknown.
+        // Answers the Art. 50(4) question the model card usually leaves open;
+        // validated at use so a typo can't silently weaken the duty.
+        params.tts_speaker_identity = ARGV_NEXT;
     } else if (arg == "--no-spoken-disclaimer") {
         params.tts_no_spoken_disclaimer = true;
     } else if (arg == "--no-watermark") {
@@ -1069,10 +1082,12 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.backend.c_str());
     fprintf(stderr, "  --list-backends                   list backends compiled into this binary and exit\n");
     fprintf(stderr, "  --list-backends-json              same as --list-backends but JSON-formatted, for tooling\n");
-    fprintf(stderr, "  -sl LANG,  --source-lang LANG     [%-7s] source language (canary AST)\n",
+    fprintf(stderr, "  -sl LANG,  --source-lang LANG     [%-7s] source language (canary AST; TTS: the\n",
             params.source_lang.c_str());
-    fprintf(stderr, "  -tl LANG,  --target-lang LANG     [%-7s] target language (canary AST)\n",
+    fprintf(stderr, "                                              language a --voice clone reference is spoken in)\n");
+    fprintf(stderr, "  -tl LANG,  --target-lang LANG     [%-7s] target language (canary AST; TTS: the\n",
             params.target_lang.c_str());
+    fprintf(stderr, "                                              language to speak, overrides -l)\n");
     fprintf(stderr, "             --no-punctuation       [%-7s] disable punctuation (canary, cohere)\n",
             params.punctuation ? "false" : "true");
     fprintf(stderr,
@@ -1303,11 +1318,17 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.tts_voice.c_str());
     fprintf(
         stderr,
+        "  --consent-log PATH                [       ] append every [CONSENT] audit record to PATH as JSON Lines,\n"
+        "                                              in addition to stderr. Tamper-resistance is the storage's\n"
+        "                                              job (append-only perms / WORM / SIEM), not this flag's.\n"
         "             --i-have-rights                    required for voice cloning and for --make-ref; attests "
         "consent\n"
         "             --accept-license TAG                accept a restricted model licence (SPDX tag, or 'all');\n"
         "                                                required before downloading cc-by-nc-*/gemma/llama* weights\n"
         "                                                 of the cloned speaker or that it is your own voice\n"
+        "             --speaker-identity VALUE            whose voice a PRESET voice is: real_person | synthetic |\n"
+        "                                                unknown. real_person adds the audible AI disclosure\n"
+        "                                                (Art. 50(4)); it does NOT require --i-have-rights\n"
         "             --no-spoken-disclaimer              skip audible AI-disclosure prefix on voice-cloned\n"
         "                                                 output (watermark + C2PA provenance still applied)\n"
         "             --no-watermark                     disable AI-content audio watermark on TTS output;\n"
@@ -2413,6 +2434,13 @@ int main(int argc, char** argv) {
     // or input files — route directly to the backend (which handles it
     // and exits before any model resolution).
     if (!params.detect_watermark_file.empty()) {
+        return crispasr_run_backend(params);
+    }
+
+    // --print-speaker-identity is the same shape: it inspects a FILE, not a
+    // session, so it must be routed before the "no input files" guard below.
+    // Missing this is why the verb returned 2 the first time it was run.
+    if (!params.print_speaker_identity_file.empty()) {
         return crispasr_run_backend(params);
     }
 

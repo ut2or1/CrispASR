@@ -100,6 +100,26 @@ def main():
     refs_dir = sorted(p.name for p in (ROOT / "tools/reference_backends").glob("*.py"))
     adapters = {p.name for p in (ROOT / "examples/cli").glob("crispasr_backend_*.cpp")}
 
+    # Prose names a backend the way a READER would, not the way the CLI does:
+    # `crepe` appears as "CREPE", `tabcnn` as "TabCNN", `beat-this` as
+    # "Beat This!". A raw case-sensitive substring test called all three
+    # undocumented when the README documents every one of them, under `--pitch`,
+    # `--tab` and `--beats`. Three false positives out of four advisory gaps is
+    # exactly the noise ratio that teaches people to ignore the audit.
+    #
+    # So compare case-insensitively, and also with separators removed on BOTH
+    # sides so "beat-this" finds "Beat This!". Kept as explicit variants rather
+    # than stripping the whole document once, to limit the chance of a short
+    # name matching inside an unrelated word.
+    def mentioned(haystack, name):
+        hay = haystack.lower()
+        if name.lower() in hay:
+            return True
+        if name.replace("-", " ").replace("_", " ").lower() in hay:
+            return True
+        squash = lambda t: t.replace("-", "").replace("_", "").replace(" ", "")
+        return squash(name.lower()) in squash(hay)
+
     def in_available_backends(name):
         # entries look like:  list += ",moss-transcribe";  or packed:
         # list += ",granite,granite-4.1,granite-4.1-plus";
@@ -161,6 +181,16 @@ def main():
     # unlike name-matching, which produced 21/76 noise. Demangling matters:
     # some runtimes are C++-linkage, so `sidon_init_from_file` appears only as
     # `__Z20sidon_init_from_file...` and a raw grep misses it.
+    # Scanned once and used by BOTH the shipped-library check and the
+    # orphan-runtime check below; the latter must run even with no built library.
+    inits_all = {}
+    for h in (ROOT / "src").glob("*.h"):
+        try:
+            for m in re.finditer(r"\b([a-z0-9_]+)_init_from_file\s*\(", h.read_text(errors="ignore")):
+                inits_all[m.group(1)] = h.name
+        except OSError:
+            pass
+
     lib_fail = []
     libpath = None
     for c in ("build/src/libcrispasr.dylib", "build/src/libcrispasr.so",
@@ -171,13 +201,7 @@ def main():
     if libpath:
         raw = subprocess.run(["nm", "-gU", str(libpath)], capture_output=True, text=True).stdout
         dem = subprocess.run(["c++filt"], input=raw, capture_output=True, text=True).stdout
-        inits = {}
-        for h in (ROOT / "src").glob("*.h"):
-            try:
-                for m in re.finditer(r"\b([a-z0-9_]+)_init_from_file\s*\(", h.read_text(errors="ignore")):
-                    inits[m.group(1)] = h.name
-            except OSError:
-                pass
+        inits = dict(inits_all)
 
         def runtime_stem(n):
             b = n.replace("-", "_")
@@ -187,6 +211,47 @@ def main():
             hit = next((v for v in runtime_stem(name) if v in inits), None)
             if hit and (hit + "_init_from_file") not in dem:
                 lib_fail.append((name, hit))
+
+    # ---------------------------------------------------------------------
+    # ORPHAN-RUNTIME check: a runtime in NEITHER the CLI roster NOR the c_api
+    # list is invisible to every check above — the state mel-band-roformer was
+    # in while being the default `--separate` model.
+    #
+    # The signal is "src/*.h declares <x>_init_from_file but nothing is named
+    # <x>". Raw, it fires on 20 of 82 stems and 17 are legitimate components, so
+    # it was long left unshipped: a gate with 17 false positives trains everyone
+    # to ignore the audit. tools/backend-components.txt names those 17 once, with
+    # their consumer, which turns each into a recorded decision and drops the
+    # false-positive count to zero — so this CAN fail the run.
+    #
+    # Alias-reachable backends (canary-ctc, irodori-tts, t5-translate) are NOT
+    # allowlisted: cli_resolves() asks the binary about them, and allowlisting
+    # would hide a real regression if an alias ever broke.
+    components, comp_missing = set(), None
+    comp_path = ROOT / "tools/backend-components.txt"
+    if comp_path.exists():
+        for line in comp_path.read_text(encoding="utf-8").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                components.add(line)
+    else:
+        comp_missing = str(comp_path)
+
+    def name_variants(stem):
+        b = stem.replace("_", "-")
+        return {stem, b, b.replace("-tts", ""), b + "-tts", b.replace("-asr", ""), b + "-asr", b.replace("-", "")}
+
+    orphans = []
+    for stem in sorted(inits_all):
+        if name_variants(stem) & cli_names:
+            continue
+        if stem in components:
+            continue
+        # Ask the binary before calling it an orphan — several runtimes are
+        # reachable only under an alias.
+        if any(cli_resolves(v) for v in (stem, stem.replace("_", "-"))):
+            continue
+        orphans.append((stem, inits_all[stem]))
 
     required_fail = []   # (name, [missing required checks])
     advisory_gap = []    # (name, [missing advisory checks])
@@ -220,7 +285,7 @@ def main():
             required_fail.append((name, req_missing))
 
         adv_missing = []
-        if name not in readme:
+        if not mentioned(readme, name):
             adv_missing.append("README")
         if not any_file_has(tests_dir, name):
             adv_missing.append("test")
@@ -302,6 +367,17 @@ def main():
               "    appears in --list-backends and the generated docs/feature-matrix.md.\n"
               "    See examples/cli/crispasr_backend_btc.cpp for the pattern.)")
 
+    if comp_missing:
+        print(f"\n⚠️  component allowlist not found at {comp_missing} — orphan-runtime check skipped")
+    elif orphans:
+        print(f"\n❌ Runtime declared in src/ but reachable from NOWHERE ({len(orphans)}):")
+        for stem, hdr in orphans:
+            print(f"   {stem:24} {hdr}: not a backend name, no alias resolves, not in tools/backend-components.txt")
+        print("   Either wire it up (CLI factory + roster + c_api) so users can select it,\n"
+              "   or record it as a sub-module in tools/backend-components.txt with its consumer.")
+    else:
+        print(f"✅ Orphan runtimes: none ({len(components)} known components allowlisted).")
+
     if required_fail:
         print(f"\n❌ REQUIRED wiring gaps ({len(required_fail)}):")
         for name, miss in required_fail:
@@ -336,6 +412,8 @@ def main():
         causes.append("c_api-only backend")
     if lib_fail:
         causes.append("missing symbol in shipped library")
+    if not comp_missing and orphans:
+        causes.append("orphan runtime")
     if not go_ok and not is_macos:
         causes.append("Go cgo LDFLAGS drift")
     print()

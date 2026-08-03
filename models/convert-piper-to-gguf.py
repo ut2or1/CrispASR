@@ -27,10 +27,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
+
+# EU AI Act Art. 50(4): whose voice this checkpoint's preset speakers are.
+# Shared with every other converter so the metadata key cannot drift — a drift
+# fails OPEN (the stamp is simply never found) and nothing errors.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _speaker_identity_arg import add_speaker_identity_arg, stamp_speaker_identity
+
 
 try:
     from gguf import GGUFWriter, GGMLQuantizationType
@@ -104,6 +112,7 @@ def main():
     parser.add_argument("--onnx", required=True, help="Path to .onnx model")
     parser.add_argument("--json", default=None, help="Path to .onnx.json config (auto-detected if omitted)")
     parser.add_argument("--output", required=True, help="Output .gguf path")
+    add_speaker_identity_arg(parser)
     args = parser.parse_args()
 
     onnx_path = Path(args.onnx)
@@ -132,6 +141,7 @@ def main():
 
     # ── Write GGUF ──────────────────────────────────────────────────
     writer = GGUFWriter(str(args.output), arch="piper")
+    stamp_speaker_identity(writer, args)
 
     # Hparams from config
     sample_rate = config.get("audio", {}).get("sample_rate", 22050)

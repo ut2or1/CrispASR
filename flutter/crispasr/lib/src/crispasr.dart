@@ -3015,6 +3015,36 @@ class CrispasrSession {
     }
   }
 
+  /// Language a voice-cloning REFERENCE clip is spoken in (issue #329).
+  ///
+  /// Cross-lingual TTS backends (cosyvoice3) compare it to the requested output
+  /// language — [setTargetLanguage], falling back to [setSourceLanguage] — and
+  /// drop the reference transcript when they differ, so the clone speaks the
+  /// target language instead of carrying the reference's accent.
+  ///
+  /// Optional: the backend otherwise infers it from the voice bank or the
+  /// reference transcript, and that inference declines rather than guesses on a
+  /// short transcript. When it declines the requested target language has no
+  /// effect — set this to make it explicit. Empty string clears.
+  void setTtsReferenceLanguage(String lang) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_tts_reference_language')) {
+      throw UnsupportedError(
+          'session-state API not present in this libcrispasr build');
+    }
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Utf8>),
+        int Function(Pointer<Void>,
+            Pointer<Utf8>)>('crispasr_session_set_tts_reference_language');
+    final p = lang.toNativeUtf8();
+    try {
+      final rc = fn(_handle, p);
+      if (rc != 0) throw Exception('setTtsReferenceLanguage failed (rc=$rc)');
+    } finally {
+      calloc.free(p);
+    }
+  }
+
   /// Toggle punctuation + capitalisation in the output (canary/cohere
   /// natively; LLM backends via post-process strip). Default true.
   void setPunctuation(bool enable) {
@@ -3994,6 +4024,46 @@ class CrispasrSession {
   /// Act Art. 50). REQUIRED before [synthesizeRaw] will return unmarked audio;
   /// the default [synthesize] is watermarked and needs no attestation.
   /// [attestation] is a human-readable affirmation recorded for audit.
+  /// Declare whose voice a PRESET voice is: `real_person`, `synthetic` or
+  /// `unknown`.
+  ///
+  /// Cloning is not the only way to produce a deep fake: a preset voice
+  /// shipped inside a model can be an identifiable individual (a named donor,
+  /// a corpus speaker), and EU AI Act Art. 3(60) attaches to the audio
+  /// resembling that person rather than to which pipeline made it. Setting
+  /// `real_person` makes the Art. 50(4) reminder fire for a non-cloned voice.
+  ///
+  /// It does NOT require a consent attestation — whether the donor agreed to
+  /// the model being trained is a licensing matter settled upstream that you
+  /// cannot attest to.
+  ///
+  /// Throws [ArgumentError] on an unrecognised value rather than silently
+  /// treating it as `unknown`.
+  void setSpeakerIdentity(String identity) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_speaker_identity')) {
+      throw UnsupportedError(
+          'speaker-identity API not available in this libcrispasr build');
+    }
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Utf8>),
+        int Function(Pointer<Void>, Pointer<Utf8>)>(
+      'crispasr_session_set_speaker_identity',
+    );
+    final p = identity.toNativeUtf8();
+    try {
+      final rc = fn(_handle, p);
+      if (rc == -2) {
+        throw ArgumentError(
+            "unrecognised speaker_identity '$identity'; expected "
+            "'real_person', 'synthetic' or 'unknown'");
+      }
+      if (rc != 0) throw StateError('setSpeakerIdentity failed (rc=$rc)');
+    } finally {
+      calloc.free(p);
+    }
+  }
+
   void acceptMarkingResponsibility([String attestation = '']) {
     if (_closed) throw StateError('CrispasrSession is closed');
     if (!_lib.providesSymbol('crispasr_session_accept_marking_responsibility')) {
@@ -5516,12 +5586,19 @@ class CrispasrWatermark {
 
   /// Embed a watermark into float32 mono PCM (in-place).
   ///
-  /// [alpha] controls spread-spectrum strength (0.005 default); ignored
-  /// when AudioSeal is loaded.
+  /// [alpha] controls spread-spectrum strength; ignored when AudioSeal is
+  /// loaded. The default (`<= 0`) selects the band-limited strength that makes
+  /// the mark reliably *detectable* — the property EU AI Act Art. 50(2)
+  /// requires, and the reason this is the call `synthesizeRaw` callers use to
+  /// discharge marking themselves.
+  ///
+  /// This defaulted to `0.005`, which the C ABI documents as too faint to
+  /// reliably detect on real speech. An explicit positive alpha is used
+  /// verbatim and bypasses the robust default; only pass one to A/B strength.
   ///
   /// Returns a new [Float32List] with the watermark applied.
   static Float32List embed(Float32List pcm,
-      {double alpha = 0.005, DynamicLibrary? lib}) {
+      {double alpha = -1.0, DynamicLibrary? lib}) {
     lib ??= DynamicLibrary.open(CrispASR.defaultLibName());
     final fn = lib.lookupFunction<Void Function(Pointer<Float>, Int32, Float),
         void Function(Pointer<Float>, int, double)>('crispasr_watermark_embed');

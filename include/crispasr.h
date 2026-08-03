@@ -628,6 +628,16 @@ CRISPASR_API float* crispasr_session_synthesize_raw(struct crispasr_session* s, 
 // (EU AI Act Art. 50). REQUIRED to use crispasr_session_synthesize_raw(); the
 // default marked paths do not need it. `attestation` is recorded for audit.
 CRISPASR_API int crispasr_session_accept_marking_responsibility(struct crispasr_session* s, const char* attestation);
+// Declare whose voice the current PRESET voice is: "real_person" | "synthetic" |
+// "unknown". Cloning is not the only way to produce a deep fake: a preset voice
+// shipped inside a model can be an identifiable individual (a named donor, a
+// corpus speaker such as VCTK's p225), and Art. 3(60) attaches to the audio
+// resembling that person, not to which pipeline made it. Setting real_person
+// makes the Art. 50(4) reminder fire for a non-cloned voice. It does NOT require
+// a consent attestation — whether the donor agreed to the model being trained is
+// a licensing matter settled upstream that you cannot attest to.
+// Returns 0, -1 on a bad session, -2 on an unrecognised value.
+CRISPASR_API int crispasr_session_set_speaker_identity(struct crispasr_session* s, const char* identity);
 
 // Spoken AI-disclosure for voice clones (EU AI Act Art. 50(4)). The watermark
 // on synthesize() covers the machine-readable marking duty (Art. 50(2)), but a
@@ -886,8 +896,14 @@ CRISPASR_API int crispasr_lcs_dedup_prefix_count(const int32_t* prev_tail_tokens
 CRISPASR_API float crispasr_watermark_detect(const float* pcm, int n_samples);
 
 // Embed watermark into float32 mono PCM (in-place).
-// `alpha` controls spread-spectrum strength (0.005 default); ignored
-// when AudioSeal is loaded.
+//
+// `alpha` controls spread-spectrum strength; ignored when AudioSeal is loaded.
+// PASS alpha <= 0 — that selects the band-limited default (~0.05) which is
+// what makes the mark reliably DETECTABLE, the property EU AI Act Art. 50(2)
+// actually requires. An explicit positive alpha is used verbatim, so passing
+// the old 0.005 documented here produces a mark too faint to find again on
+// real speech: marking that cannot be detected is not marking. Only pass a
+// literal alpha if you are deliberately A/B-ing watermark strength.
 CRISPASR_API void crispasr_watermark_embed(float* pcm, int n_samples, float alpha);
 
 // C2PA (Content Credentials) signing of an in-memory audio CONTAINER (WAV/MP3

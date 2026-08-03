@@ -834,7 +834,7 @@ CA_EXPORT void crispasr_vad_free(float* spans) {
 
 #include "../examples/cli/crispasr_voice_clone_policy.h"
 #include "../examples/cli/crispasr_voice_provenance.h"
-#include "../examples/cli/crispasr_watermark.h"
+#include "core/crispasr_watermark.h"
 #include "audioseal.h"
 
 // Global AudioSeal context for C ABI callers.
@@ -870,7 +870,9 @@ CA_EXPORT float crispasr_watermark_detect(const float* pcm, int n_samples) {
         if (probs)
             free(probs);
     }
-    return ::crispasr_watermark_detect_impl(pcm, n_samples);
+    // Selector, not the sign test directly — the CLI dispatch uses the same one
+    // so both surfaces always report the same statistic (HARD RULE #6).
+    return ::crispasr_watermark_detect_select(pcm, n_samples);
 }
 
 CA_EXPORT void crispasr_watermark_embed(float* pcm, int n_samples, float alpha) {
@@ -1658,6 +1660,12 @@ struct crispasr_session {
     // crispasr_session_get_disclaimer_pcm), so instead it records the fact,
     // warns once, and hands the caller the disclaimer to prepend themselves.
     bool voice_is_clone = false;
+    // Whose voice the current voice is, as DECLARED by its pack or bank entry,
+    // and the integrator's override. Independent of voice_is_clone: a preset
+    // that is a real person owes the Art. 50(4) disclosure without owing the
+    // consent attestation. See crispasr_speaker_identity.h.
+    crispasr_voice::SpeakerIdentity voice_pack_identity = crispasr_voice::SpeakerIdentity::Unknown;
+    crispasr_voice::SpeakerIdentity speaker_identity_override = crispasr_voice::SpeakerIdentity::Unknown;
     std::string voice_path;
     // Cached disclosure PCM. The disclaimer is a fixed sentence in the session's
     // neutral voice, so it is identical for every clip — but the documented
@@ -1677,8 +1685,12 @@ struct crispasr_session {
     // args still win when supplied; these are the fallback.
     std::string source_language; // canary/cohere/voxtral source-lang hint
     std::string target_language; // canary/cohere/voxtral target-lang (≠ source ⇒ translate)
-    bool punctuation = true;     // canary/cohere per-call arg + post-process gate
-    bool translate = false;      // whisper sticky --translate (others: use src/tgt mismatch)
+    // #329: the language a voice-cloning REFERENCE clip is spoken in. Distinct
+    // from source_language, which for TTS already serves as the output-language
+    // fallback when target_language is unset.
+    std::string tts_reference_language;
+    bool punctuation = true; // canary/cohere per-call arg + post-process gate
+    bool translate = false;  // whisper sticky --translate (others: use src/tgt mismatch)
 
     // Acoustic language detected by the last transcribe (whisper only —
     // whisper_full_lang_id → whisper_lang_str, an ISO-639-1 code). Set on
@@ -2081,6 +2093,11 @@ struct crispasr_session {
     std::string cosyvoice3_ref_text; // ref transcription for *.wav cloning
     std::string cosyvoice3_camp_path;
     std::string cosyvoice3_s3tok_path;
+    // The voices bundle cosyvoice3 resolved at open. set_voice() classifies a
+    // bank entry from this file; without it a bare bank name (the header's own
+    // example, "fleurs-en") names nothing on disk and every zero-shot clone in
+    // the bundle read as a preset — no [CONSENT] line, no Art. 50(4) warning.
+    std::string cosyvoice3_voices_path;
     bool cosyvoice3_cloning_models_loaded = false;
     std::mutex cosyvoice3_cloning_mutex;
 #endif
@@ -3543,6 +3560,7 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         }
         s->cosyvoice3_camp_path = std::move(cv3_camp);
         s->cosyvoice3_s3tok_path = std::move(cv3_s3tok);
+        s->cosyvoice3_voices_path = std::move(cv3_voices);
         return s;
     }
 #endif
@@ -7759,8 +7777,13 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
     // predicate reads the baker's crispasr.voice.cloned_from_recording stamp.
     // (`ends_with_wav` is still used by the arms below for backend routing —
     // that is a file-format question, not a legal one.)
-    s->voice_is_clone =
-        crispasr_voice::classify_voice(path, /*voice_dir=*/std::string(), /*baked_from_wav_this_run=*/false).is_clone;
+    // The bank path matters here for the same reason it does on the CLI: with
+    // cosyvoice3 loaded, `path` is usually an entry name inside voices.gguf
+    // rather than a file, and every entry in that bundle is a baked clone.
+    const crispasr_voice::CloneDecision voice_decision = crispasr_voice::classify_voice(
+        path, /*voice_dir=*/std::string(), /*baked_from_wav_this_run=*/false, s->cosyvoice3_voices_path);
+    s->voice_is_clone = voice_decision.is_clone;
+    s->voice_pack_identity = voice_decision.pack_identity;
     s->voice_path = path;
     // Any voice change invalidates the cached neutral-voice disclosure.
     s->disclaimer_pcm.clear();
@@ -8305,6 +8328,25 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
             v.size() >= 4 && (v.compare(v.size() - 4, 4, ".wav") == 0 || v.compare(v.size() - 4, 4, ".WAV") == 0);
         if (is_wav && !crispasr_session_ensure_cosyvoice3_cloning_models(s))
             return nullptr;
+        // #304/#329 cross-lingual. The session ABI reimplements each backend's
+        // synthesize inline rather than calling the CLI adapter, so the adapter's
+        // language wiring never reached bindings / server / Flutter — a
+        // cosyvoice3 clone from those surfaces ignored the requested language
+        // outright and always came out with the reference's accent.
+        //
+        // Output language: target_language → source_language, the same fallback
+        // every other TTS backend here uses. Reference-clip language: the
+        // dedicated setter, else source_language *when target_language is set* —
+        // at that point target is already serving as the output language, so
+        // source carries the CLI's `-sl` meaning with no ambiguity.
+        {
+            const std::string out_lang = !s->target_language.empty() ? s->target_language : s->source_language;
+            cosyvoice3_tts_set_target_language(s->cosyvoice3_ctx, out_lang.c_str());
+            const std::string ref_lang = !s->tts_reference_language.empty() ? s->tts_reference_language
+                                         : !s->target_language.empty()      ? s->source_language
+                                                                            : std::string();
+            cosyvoice3_tts_set_reference_language(s->cosyvoice3_ctx, ref_lang.c_str());
+        }
         int n = 0;
         float* pcm = is_wav ? cosyvoice3_tts_synth_from_wav(s->cosyvoice3_ctx, text, v.c_str(),
                                                             s->cosyvoice3_ref_text.c_str(), &n)
@@ -8757,21 +8799,28 @@ CA_EXPORT int crispasr_session_accept_marking_responsibility(crispasr_session* s
 // posture depending on which surface you call — this line is what stops that
 // asymmetry from being silent. Not a refusal, and not repeated per call.
 static void crispasr_session_warn_unmarked_clone(crispasr_session* s) {
-    if (!s || !s->voice_is_clone || s->marking_responsibility_accepted || s->warned_clone_unmarked)
+    if (!s || s->marking_responsibility_accepted || s->warned_clone_unmarked)
+        return;
+    // Art. 50(4) is owed for a clone OR for a preset voice that belongs to an
+    // identifiable person — the audience cannot tell the two apart, and
+    // Art. 3(60) does not ask them to. See crispasr_speaker_identity.h.
+    const crispasr_voice::SpeakerIdentity identity = crispasr_voice::resolve_speaker_identity(
+        s->speaker_identity_override, s->voice_pack_identity, crispasr_voice::SpeakerIdentity::Unknown);
+    if (!crispasr_voice::requires_spoken_disclosure(s->voice_is_clone, identity))
         return;
     s->warned_clone_unmarked = true;
     std::time_t t = std::time(nullptr);
     char ts[64];
     std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
     fprintf(stderr,
-            "[MARKING] ts=%s scope=abi voice_clone=yes watermark=yes spoken_disclaimer=no\n"
-            "  crispasr: warning: cloned-voice output is watermarked, but the ABI does not prepend the\n"
+            "[MARKING] ts=%s scope=abi voice_clone=%s speaker_identity=%s watermark=yes spoken_disclaimer=no\n"
+            "  crispasr: warning: this output is watermarked, but the ABI does not prepend the\n"
             "  spoken AI-disclosure that the CLI and server add. If you publish this audio you owe an\n"
             "  audible or visible \"AI-generated\" label yourself. Use\n"
             "  crispasr_session_get_disclaimer_pcm() (before set_voice) or\n"
             "  crispasr_session_disclaimer_text(); call\n"
             "  crispasr_session_accept_marking_responsibility() to silence this.\n",
-            ts);
+            ts, s->voice_is_clone ? "yes" : "no", crispasr_voice::to_string(identity));
 }
 
 // Synthesize WITHOUT the watermark — an explicit provenance opt-out for callers
@@ -8811,6 +8860,36 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
         crispasr_watermark_embed(pcm, *out_n_samples, -1.0f);
     }
     return pcm;
+}
+
+// Declare whose voice the current PRESET voice is: "real_person", "synthetic"
+// or "unknown"/NULL. Outranks whatever the voice pack declares.
+//
+// This exists because `is a clone` and `is a real person` are different
+// questions, and the ABI could only answer the first. A preset voice shipped
+// inside a model can be an identifiable individual — a named donor, a corpus
+// speaker — and synthesizing with it produces a deep fake under Art. 3(60)
+// whether or not a recording ever passed through one of our bakers.
+//
+// Setting real_person makes the Art. 50(4) reminder below fire for a non-cloned
+// voice. It does NOT require a consent attestation: whether that donor agreed
+// to the model being trained is a licensing question settled upstream, which
+// you cannot attest to and this ABI will not pretend you can.
+//
+// Returns 0, -1 on a bad session, -2 on an unrecognised value (which is left
+// unchanged rather than silently becoming "unknown").
+CA_EXPORT int crispasr_session_set_speaker_identity(crispasr_session* s, const char* identity) {
+    if (!s)
+        return -1;
+    bool recognised = true;
+    const crispasr_voice::SpeakerIdentity parsed =
+        crispasr_voice::parse_speaker_identity(identity ? identity : "", &recognised);
+    if (!recognised)
+        return -2;
+    s->speaker_identity_override = parsed;
+    // A changed answer can turn the reminder on; let it fire again.
+    s->warned_clone_unmarked = false;
+    return 0;
 }
 
 // The canonical spoken AI-disclosure text, identical to the one the CLI and
@@ -10391,6 +10470,23 @@ CA_EXPORT int crispasr_session_set_target_language(crispasr_session* s, const ch
     if (!s)
         return -1;
     s->target_language = (lang ? lang : "");
+    return 0;
+}
+
+// #329 — the language a voice-cloning REFERENCE clip is spoken in (ISO-ish,
+// "" clears). Only cross-lingual-capable TTS backends read it (cosyvoice3
+// today): when it differs from the requested output language the reference
+// transcript is dropped so the clone speaks the target language instead of
+// carrying the reference's accent. Optional — the backend otherwise infers it
+// from the voice-bank entry or the reference transcript, which cannot answer
+// for a short transcript. This is the session mirror of the CLI's
+// `--source-lang`; it exists as its own setter because for TTS
+// crispasr_session_set_source_language already doubles as the output-language
+// fallback.
+CA_EXPORT int crispasr_session_set_tts_reference_language(crispasr_session* s, const char* lang) {
+    if (!s)
+        return -1;
+    s->tts_reference_language = (lang ? lang : "");
     return 0;
 }
 

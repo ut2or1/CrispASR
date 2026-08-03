@@ -551,11 +551,27 @@ extern "C" {
         s: *mut CrispasrSession,
         attestation: *const c_char,
     ) -> c_int;
+    // Declare whose voice a PRESET voice is: "real_person" | "synthetic" |
+    // "unknown". A preset can be an identifiable individual, which makes its
+    // output a deep fake under Art. 3(60) without any cloning. Returns 0, -1 on
+    // a bad session, -2 on an unrecognised value.
+    pub fn crispasr_session_set_speaker_identity(
+        s: *mut CrispasrSession,
+        identity: *const c_char,
+    ) -> c_int;
     // Sample rate the backend expects for input PCM (16000 for Whisper-family,
     // the model's native rate otherwise; 0 on error). Pair with s2s/synthesize to
     // feed input at the right rate.
     pub fn crispasr_session_input_sample_rate(s: *mut CrispasrSession) -> c_int;
     pub fn crispasr_pcm_free(pcm: *mut f32);
+    // Embed the AI-content watermark into f32 mono PCM, in place. The other
+    // half of `synthesize_raw`: opting out of automatic marking obliges the
+    // caller to mark the result, and this is what they mark it with.
+    // `alpha <= 0` selects the robust, reliably detectable default.
+    pub fn crispasr_watermark_embed(pcm: *mut f32, n_samples: c_int, alpha: c_float);
+    // Confidence in [0, 1] that `pcm` carries the watermark. A weak diagnostic:
+    // the spread-spectrum null mean is 0.5, not 0 (see docs/eu-ai-act.md §6.7).
+    pub fn crispasr_watermark_detect(pcm: *const c_float, n_samples: c_int) -> c_float;
     // Drop the kokoro per-session phoneme cache. No-op for non-kokoro
     // backends. Returns 0 on success, -1 if `s` is null. (PLAN #56 #5)
     pub fn crispasr_session_kokoro_clear_phoneme_cache(s: *mut CrispasrSession) -> c_int;
@@ -566,6 +582,10 @@ extern "C" {
         lang: *const c_char,
     ) -> c_int;
     pub fn crispasr_session_set_target_language(
+        s: *mut CrispasrSession,
+        lang: *const c_char,
+    ) -> c_int;
+    pub fn crispasr_session_set_tts_reference_language(
         s: *mut CrispasrSession,
         lang: *const c_char,
     ) -> c_int;

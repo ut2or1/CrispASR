@@ -98,7 +98,7 @@ char* sensevoice_transcribe(struct sensevoice_context* ctx, const float* samples
 // Act's open-source exemption (Art. 2(12)) does not cover either category.
 // CrispASR does not ship the capability at all, so no configuration of it is
 // an emotion recognition system. See docs/eu-ai-act.md. Do not re-add this
-// field; the regression guard is tests/test-sensevoice-no-emotion.cpp.
+// field; the regression guard is tests/test-no-emotion-recognition.cpp.
 struct sensevoice_result {
     char* language;    // e.g. "en", "zh", "yue", "ja", "ko", "nospeech"
     char* audio_event; // e.g. "Speech", "Music", "BGM", "Applause"

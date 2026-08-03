@@ -30,6 +30,21 @@
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/crispasr_env.h"
 
+// EU AI Act Art. 50(2): this file writes a real WAV of synthesized speech (see
+// csm_tts_diag_synth_wav), so it needs the mark like any other emitter.
+//
+// The header-only *_impl, not the crispasr_watermark_embed() C ABI: that symbol
+// lives in the session layer (src/crispasr_c_api.cpp), and a backend static lib
+// referencing it does not link — libcsm-tts.a is below that layer, which
+// test-csm-params found immediately. The impl is `inline`, so this adds no link
+// dependency at all.
+//
+// The header lives in src/core/ next to crispasr_c2pa.h, which is where marking
+// primitives belong. It used to live under examples/cli/, so src/ reached into
+// the examples tree to find it — this call site was the second instance of that
+// inversion and the reason it got moved.
+#include "core/crispasr_watermark.h"
+
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -2398,6 +2413,19 @@ extern "C" int csm_tts_diag_synth_wav(struct csm_tts_context* ctx, const char* t
     if (!pcm || n <= 0) {
         return -2;
     }
+
+    // Art. 50(2). This is a DIAGNOSTIC writer — it exists so a developer can
+    // listen to a parity run — but it is reached from crispasr-diff, which is
+    // an INSTALLED binary, and it writes a real, playable, distributable WAV of
+    // synthesized speech. "It's a dev tool" is exactly the reasoning that left
+    // the Wyoming server marking nothing for four releases; the file does not
+    // know what you meant to use it for.
+    //
+    // Marked before the peak-normalise below so the mark is scaled with the
+    // signal rather than applied on top of a rescaled one. The spread-spectrum
+    // watermark is band-limited and ~38 dB down, so it does not move an ASR
+    // round-trip — which is what this file is usually fed to.
+    crispasr_watermark_embed_impl(pcm, n);
 
     // Peak-normalise to 0.95 to avoid clipping on write.
     float peak = 1e-6f;

@@ -41,6 +41,7 @@
 #include "core/wav_reader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/crispasr_env.h"
+#include "core/tts_lang.h" // #329 cross-lingual language tags + reference LID
 #include "chatterbox_campplus.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -394,6 +395,13 @@ struct cosyvoice3_tts_context {
     // reference's language (the accent reported in #304). Empty = zero-shot
     // (reference transcript kept), the same-language default.
     std::string target_language;
+    // #329: the language the REFERENCE clip is spoken in, when the caller knows
+    // it (CLI --source-lang, server "source_lang",
+    // crispasr_session_set_source_language). Outranks the detector below — a
+    // human statement about their own recording beats anything we can infer,
+    // and it is the only way to reach cross-lingual mode from a reference whose
+    // transcript is too short to identify.
+    std::string reference_language;
 
     cv3_hp hp;
     cv3_lm lm;
@@ -1282,6 +1290,14 @@ extern "C" void cosyvoice3_tts_set_target_language(struct cosyvoice3_tts_context
     if (!ctx)
         return;
     ctx->target_language = (lang && std::strcmp(lang, "auto") != 0) ? lang : "";
+}
+
+// #329: declare the reference clip's own language, overriding detection. Takes
+// the same tags as set_target_language ("" / nullptr / "auto" clears it).
+extern "C" void cosyvoice3_tts_set_reference_language(struct cosyvoice3_tts_context* ctx, const char* lang) {
+    if (!ctx)
+        return;
+    ctx->reference_language = (lang && std::strcmp(lang, "auto") != 0) ? lang : "";
 }
 
 extern "C" int cosyvoice3_tts_get_hparams(struct cosyvoice3_tts_context* ctx, uint32_t* d_model, uint32_t* n_layers,
@@ -5125,80 +5141,28 @@ extern "C" int cosyvoice3_tts_init_campplus_from_file(struct cosyvoice3_tts_cont
 
 namespace {
 
-// #304 cross-lingual helpers ------------------------------------------------
-// Normalize a language tag to a lowercase 2-letter base for comparison
-// ("en-US"->"en", "cmn"/"zho"->"zh", "jpn"->"ja", …).
-std::string cv3_lang_norm(const std::string& s) {
-    std::string t;
-    for (char c : s) {
-        if (c == '-' || c == '_')
-            break;
-        t += (char)std::tolower((unsigned char)c);
-    }
-    if (t == "cmn" || t == "zho" || t == "chi")
-        return "zh";
-    if (t == "jpn")
-        return "ja";
-    if (t == "kor")
-        return "ko";
-    if (t == "eng")
-        return "en";
-    if (t == "deu" || t == "ger")
-        return "de";
-    if (t == "fra" || t == "fre")
-        return "fr";
-    if (t == "spa")
-        return "es";
-    return t.size() > 2 ? t.substr(0, 2) : t;
-}
-
-// Infer the reference voice's language. Built-in voices are named
-// "fleurs-<lang>"; otherwise best-effort script detection of the reference
-// transcript (the text after "<|endofprompt|>") for the non-Latin scripts.
-// Returns "" when undeterminable (Latin/unknown) → synth stays zero-shot.
-std::string cv3_voice_language(const std::string& name, const std::string& prompt_text) {
+// #304/#329 cross-lingual helpers -------------------------------------------
+// The tag normalisation and the transcript language ID both live in
+// core/tts_lang.h — weight-free and covered by tests/test-tts-lang.cpp, because
+// this predicate decides whether the reference transcript is dropped and the
+// per-stage diff harness cannot see the difference.
+//
+// Resolve the reference voice's language, in descending order of authority:
+// the caller's explicit tag (#329), then the built-in "fleurs-<lang>" bank
+// name, then detection over the reference transcript (the text after
+// "<|endofprompt|>"). Returns "" when undeterminable → synth stays zero-shot.
+//
+// #329: detection used to be script-only, so every Latin-script reference
+// answered "" and cross-lingual never engaged for the en↔de / en↔fr / es↔it
+// pairs a subtitle-dubbing workflow actually asks for.
+std::string cv3_voice_language(const std::string& name, const std::string& prompt_text,
+                               const std::string& explicit_lang) {
     const std::string pfx = "fleurs-";
-    if (name.rfind(pfx, 0) == 0)
-        return cv3_lang_norm(name.substr(pfx.size()));
+    const std::string bank = (name.rfind(pfx, 0) == 0) ? name.substr(pfx.size()) : std::string();
     const std::string delim = "<|endofprompt|>";
-    size_t q = prompt_text.find(delim);
+    const size_t q = prompt_text.find(delim);
     const std::string body = (q == std::string::npos) ? prompt_text : prompt_text.substr(q + delim.size());
-    bool hangul = false, kana = false, han = false, cyr = false;
-    for (size_t i = 0; i < body.size();) {
-        unsigned char c = (unsigned char)body[i];
-        uint32_t cp = c;
-        int n = 1;
-        if (c >= 0xF0) {
-            cp = c & 0x07;
-            n = 4;
-        } else if (c >= 0xE0) {
-            cp = c & 0x0F;
-            n = 3;
-        } else if (c >= 0xC0) {
-            cp = c & 0x1F;
-            n = 2;
-        }
-        for (int k = 1; k < n && i + (size_t)k < body.size(); k++)
-            cp = (cp << 6) | ((unsigned char)body[i + k] & 0x3F);
-        i += (size_t)n;
-        if (cp >= 0xAC00 && cp <= 0xD7A3)
-            hangul = true;
-        else if (cp >= 0x3040 && cp <= 0x30FF)
-            kana = true;
-        else if (cp >= 0x4E00 && cp <= 0x9FFF)
-            han = true;
-        else if (cp >= 0x0400 && cp <= 0x04FF)
-            cyr = true;
-    }
-    if (hangul)
-        return "ko";
-    if (kana)
-        return "ja";
-    if (han)
-        return "zh";
-    if (cyr)
-        return "ru";
-    return ""; // Latin or unknown — can't disambiguate en/de/fr/es here
+    return core_tts_lang::resolve_reference_language(explicit_lang, bank, body);
 }
 
 // Tokenise a CV3 prompt fragment. The only special marker we expect in
@@ -5803,9 +5767,23 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
     // text and collapses the AR decode to 1-2 tokens. Same-language / no target
     // set stays full zero-shot (reference transcript + speech), the default.
     std::string prompt_for_lm = voice->prompt_text;
-    const std::string cv3_tgt = cv3_lang_norm(ctx->target_language);
-    const std::string cv3_vlang = cv3_voice_language(voice->name, voice->prompt_text);
-    const bool cross_lingual = !cv3_tgt.empty() && !cv3_vlang.empty() && cv3_tgt != cv3_vlang;
+    const std::string cv3_tgt = core_tts_lang::norm(ctx->target_language);
+    const std::string cv3_vlang = cv3_voice_language(voice->name, voice->prompt_text, ctx->reference_language);
+    const bool cross_lingual = core_tts_lang::is_cross_lingual(cv3_tgt, cv3_vlang);
+    // #329: a target language that cannot be acted on is worse than no target —
+    // the user asked for German and silently got an accented English clone. Say
+    // so, and name the flag that resolves it. Only fires when a target IS set
+    // and the reference is unidentifiable, so it stays quiet on every default
+    // and same-language run — so it is unconditional, like every other
+    // "your request could not be honoured" line in this file.
+    if (!cv3_tgt.empty() && cv3_vlang.empty()) {
+        fprintf(stderr,
+                "cosyvoice3_tts: target language '%s' requested but the reference voice's language could not be "
+                "determined (transcript too short or unsupported script) — synthesising zero-shot, which keeps the "
+                "reference's accent. Pass --source-lang <lang> (server: \"source_lang\") to enable cross-lingual "
+                "synthesis.\n",
+                cv3_tgt.c_str());
+    }
     if (cross_lingual) {
         const std::string delim = "<|endofprompt|>";
         const size_t eop = prompt_for_lm.find(delim);

@@ -6,6 +6,7 @@
 // reference through the codec encoder and clones that speaker.
 
 #include "crispasr_backend.h"
+#include "crispasr_speech_window.h"
 #include "crispasr_backend_utils.h"
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
@@ -169,6 +170,27 @@ public:
         // 1s ≈ 12.5 tokens, so max_audio_frames is the token-level AR cap.
         if (params.tts_max_speech_tokens >= 0)
             sp.max_audio_frames = params.tts_max_speech_tokens;
+        // min_speech_tokens maps to min_audio_frames: when both min and max are
+        // set to the same value, the model is forced to generate exactly that
+        // many frames — exact-duration synthesis (lip-sync / game dubbing).
+        if (params.tts_min_speech_tokens >= 0) {
+            sp.min_audio_frames = params.tts_min_speech_tokens;
+            // #330: the floor is not the only bound — the decode loop stops at
+            // max_new_frames regardless, so an unreachable floor silently
+            // yields SHORTER audio than asked for. For a feature whose whole
+            // point is exact duration, say so rather than let it pass.
+            crispasr_speech_window::Window win;
+            win.min_frames = sp.min_audio_frames;
+            win.max_frames = sp.max_audio_frames > 0 ? sp.max_audio_frames : -1;
+            // This backend bounds its loop on max_new_tokens (moss_tts.cpp:955),
+            // not max_new_frames. One AR step emits one delayed frame, so the
+            // token bound is the frame bound to within the delay offset — close
+            // enough to warn on, and the warning is advisory either way.
+            win.frame_cap = sp.max_new_tokens > 0 ? sp.max_new_tokens : crispasr_speech_window::kDefaultFrameCap;
+            const std::string warn = crispasr_speech_window::diagnose(win);
+            if (!warn.empty())
+                fprintf(stderr, "crispasr[moss-tts]: warning: %s\n", warn.c_str());
+        }
         if (params.tts_top_p >= 0.0f)
             sp.audio_top_p = params.tts_top_p;
         if (params.tts_top_k >= 0)

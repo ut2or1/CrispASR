@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -756,6 +757,53 @@ bool crispasr_compute_sherpa_cache(const float* full_audio, int n_samples, const
     if (!params.no_prints)
         fprintf(stderr, "crispasr[diarize]: sherpa global → %zu speaker regions\n", out.segments.size());
     return true;
+}
+
+void crispasr_diarize_merged_by_slice(
+    std::vector<crispasr_segment>& segs, const std::vector<crispasr_audio_slice>& slices,
+    const std::function<void(const crispasr_audio_slice&, std::vector<crispasr_segment>&)>& diarize_slice) {
+    if (segs.empty() || slices.empty() || !diarize_slice)
+        return;
+
+    std::vector<crispasr_segment> out;
+    out.reserve(segs.size());
+
+    size_t seg_offset = 0;
+    for (size_t i = 0; i < slices.size(); ++i) {
+        // Segments belonging to this slice: everything up to the first one that
+        // starts at or after the NEXT slice's t0. The last slice takes the rest.
+        size_t seg_count = 0;
+        for (size_t j = seg_offset; j < segs.size(); ++j) {
+            if (i + 1 < slices.size() && segs[j].t0 >= slices[i + 1].t0_cs)
+                break;
+            seg_count++;
+        }
+        if (seg_count == 0)
+            continue;
+
+        std::vector<crispasr_segment> slice_segs(
+            std::make_move_iterator(segs.begin() + (ptrdiff_t)seg_offset),
+            std::make_move_iterator(segs.begin() + (ptrdiff_t)(seg_offset + seg_count)));
+        seg_offset += seg_count;
+
+        diarize_slice(slices[i], slice_segs);
+
+        // Append whatever came back — MORE than went in when the diarizer split
+        // a segment at a speaker turn, fewer if it dropped one. Neither case can
+        // lose a segment or index past the end here, which the old in-place
+        // copy-back of `seg_count` elements did both of (#324).
+        for (auto& s : slice_segs)
+            out.push_back(std::move(s));
+    }
+
+    // Anything the slice walk never claimed survives unlabelled rather than
+    // being dropped. The last slice takes the remainder, so this is normally
+    // empty — it keeps "never lose a segment" a property of this function
+    // instead of a consequence of that special case.
+    for (; seg_offset < segs.size(); ++seg_offset)
+        out.push_back(std::move(segs[seg_offset]));
+
+    segs = std::move(out);
 }
 
 bool crispasr_apply_foxnose_global(std::vector<crispasr_segment>& all_segs, const std::vector<float>& samples,
