@@ -5,6 +5,7 @@
 // auto-download here where the CLI's cache / UX policy lives.
 
 #include "crispasr_lid_cli.h"
+#include "crispasr_backend.h"
 #include "crispasr_cache.h"
 #include "crispasr_lid.h" // shared library header (src/)
 #include "crispasr_subprocess.h"
@@ -232,6 +233,29 @@ bool detect_with_sherpa(const float* samples, int n_samples, const whisper_param
 
 } // namespace
 
+bool crispasr_backend_probe_language(CrispasrBackend& backend, const float* samples, int n_samples,
+                                     const whisper_params& params, crispasr_lid_result& out) {
+    out = {};
+    if (!samples || n_samples <= 0)
+        return false;
+
+    // An explicitly named external backend wins — the probe is only the
+    // default when the user expressed no preference (or asked for it).
+    const std::string& be = params.lid_backend;
+    if (!be.empty() && be != "probe" && be != "self")
+        return false;
+
+    std::string lang;
+    float confidence = 0.0f;
+    if (!backend.detect_language(samples, n_samples, params, lang, confidence) || lang.empty())
+        return false;
+
+    out.lang_code = lang;
+    out.confidence = confidence;
+    out.source = std::string(backend.name()) + "-probe";
+    return true;
+}
+
 bool crispasr_detect_language_cli(const float* samples, int n_samples, const whisper_params& params,
                                   crispasr_lid_result& out) {
     out = {};
@@ -241,6 +265,14 @@ bool crispasr_detect_language_cli(const float* samples, int n_samples, const whi
     std::string be = params.lid_backend;
     if (be.empty())
         be = "whisper";
+    if (be == "probe" || be == "self") {
+        // Reached only when the backend's own probe declined or failed —
+        // crispasr_backend_probe_language() already had its turn. Fall back to
+        // the external default rather than erroring on a valid flag value.
+        fprintf(stderr, "crispasr[lid]: this backend has no self-probe (or it returned nothing) — "
+                        "falling back to whisper-tiny LID\n");
+        be = "whisper";
+    }
 
     if (be == "whisper" || be == "whisper-tiny") {
         CrispasrLidOptions opts;

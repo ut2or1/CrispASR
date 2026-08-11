@@ -118,6 +118,32 @@ These are not tied to a single backend.
 | `CRISPASR_SESSION_PERBACKEND_CHUNK` | Use per-backend chunk-window tuning instead of a flat window. |
 | `CRISPASR_SESSION_UNIFIED_DISPATCH` | Route surfaces through the unified library dispatch path. |
 
+### Post-decode hygiene (PLAN.md §W2–W7)
+
+All OFF unless set. Each of these can delete or alter user-visible text, so
+none of them switches on by surprise; a wrong deletion is worse than a
+surviving artifact. Applied on both the CLI and the session C-ABI.
+
+| Variable | Purpose |
+|----------|---------|
+| `CRISPASR_SEG_MAX_CHARS` | Truncate any segment longer than N **code points**, backing up to the last `。．.！!？?、,` but never below 75% of the cap. A line past the cap is almost always a repetition hallucination that survived the n-gram collapse. |
+| `CRISPASR_SEG_DROP_NONVERBAL` | Drop segments that are entirely a non-verbal marker — `[Music]`, `(applause)`, `（喘ぎ声）`, `♪`. Running speech merely *containing* such a word is never dropped. |
+| `CRISPASR_SEG_LOGPROB_THOLD` | Drop segments whose average log-probability is below this. Post-hoc, on top of the decoder's own fallback gate. |
+| `CRISPASR_SEG_LOGPROB_MARGIN` | Loosen that threshold by this much for segments ≤1.6 s — a short segment's mean logprob is noisier, so it gets more room, not less. |
+| `CRISPASR_SEG_MERGE_REPEATS` | Collapse runs of near-identical adjacent segments into one spanning the whole run. Catches a phrase repeating *across* segment boundaries, which per-segment loop fixes cannot see. |
+| `CRISPASR_SEG_MERGE_SIMILARITY` | Similarity bar for the above (default 0.90; LCS over code points). |
+| `CRISPASR_SEG_MERGE_GAP_CS` | Never merge across a gap wider than this many centiseconds (default 200). Two identical lines a minute apart are two real utterances. |
+| `CRISPASR_SEG_MERGE_MIN_RUN` | Minimum consecutive similar segments before merging (default 3), so an ordinary repeated "yes." pair survives. |
+
+### Alignment and VAD sanity checks
+
+| Variable | Purpose |
+|----------|---------|
+| `CRISPASR_ALIGN_SENTINEL` | `0` disables the forced-alignment collapse check. On by default, **detect + warn only**. Catches `ctc_forced_align()` returning words at `t0 == t1 == 0` — its two silent-zero paths (characters absent from the CTC vocab, or a word the Viterbi path never visited) produce garbage timestamps inside a *successful* return. |
+| `CRISPASR_ALIGN_SENTINEL_REDISTRIBUTE` | `1` opts into repair: respace the words across the clip in proportion to character count. Off by default — a wrong auto-repair would be just as invisible as the collapse. |
+| `CRISPASR_VAD_FAILOVER` | `0` disables the VAD sanity check. On by default: if a clip over 120 s comes back with under 1% speech coverage (or a couple of segments covering under 10% of a very long clip), the VAD is wrong and the run falls back to fixed full-clip chunks rather than losing the transcript. |
+| `CRISPASR_NGRAM_LOOPFIX_OFF` | `1` disables the repeated-n-gram collapse entirely, exposing the RAW decoded text. Diagnostic: for telling whether a loop originates in the decode itself or is merely being masked. |
+
 ### Decoding / beam search (shared)
 
 | Variable | Purpose |
@@ -138,6 +164,12 @@ These are not tied to a single backend.
 | `CRISPASR_ESPEAK_DATA_PATH` | eSpeak-NG data directory. |
 | `CRISPASR_KOKORO_G2P` | Kokoro G2P backend selection. |
 | `CRISPASR_KOKORO_MISAKI_IPA` | `0` disables the espeak-IPA → misaki-alphabet conversion Kokoro needs (#316), restoring the raw G2P spelling for A/B. On by default. |
+| `CRISPASR_G2P_DE_UNSTRESS` | `1` reads the German closed class the way espeak reads it in a SENTENCE (`sie` → `ziː`) instead of the citation form our per-word dictionary stores (`zˈiː`). Off by default: it takes phoneme agreement with espeak from 45.9% to 87.1%, but the ASR round-trip could not resolve a difference, and that metric measures intelligibility rather than naturalness (#316). |
+| `CRISPASR_KOKORO_DE_MISAKI_ALPHABET` | `1` applies misaki's tied-sequence collapse for German (`tsvˈaɪ` → `ʦvˈI`), which is what the published training recipe does. Off by default: it made the ASR round-trip worse on the `kokoro-de-hui-base` model we ship, which appears to predate that part of the recipe (#316). The `ʏ`→`y` vocabulary fixup is applied either way. |
+| `CRISPASR_T5_REPEAT_BREAK` | `0` disables the decode-loop break for madlad/T5 translation, restoring exact PyTorch-blueprint behaviour. On by default: MADLAD greedy-decodes into a repeated token cycle on some short inputs and burns the whole token budget on it. The blueprint does the same — this is a deliberate improvement on it, not a parity fix (#333). |
+| `CRISPASR_T5_NO_KV_REUSE` | `1` re-forwards the whole decoder prefix each step instead of appending to the KV cache. Same output, much slower; an A/B lever for isolating cache bugs (#333). |
+| `CRISPASR_T5_KEEP_EMBED` | `1` keeps `shared.embed.*` and `lm_head.*` at source precision when quantizing a T5 model. **Off by default because it was measured and loses**: on madlad400 it makes q8_0 3.38→3.62 GB and q4_k 2.04→2.41 GB for a worst-stage cosine that does not improve (0.999922→0.999920, 0.992929→0.992606). The Q4_K loss accumulates through the 32 encoder blocks, not in the embedding lookup (#333). |
+| `CRISPASR_KOKORO_PUNCT` | `0` drops punctuation from the phoneme string for the German/French/Spanish built-in G2Ps, restoring pre-0.8.26 behaviour for A/B. On by default: Kokoro's vocabulary contains `,.;:!?` and they are how it pauses (#316). English is not gated — it is settled against misaki. |
 
 ### Watermark / provenance
 
@@ -380,6 +412,14 @@ suffixes.
 - `CRISPASR_COSYVOICE3_FLOW_STEPS`
 - `CRISPASR_COSYVOICE3_HIFT_PATH`
 - `CRISPASR_COSYVOICE3_KV_BUCKET`
+- `CRISPASR_COSYVOICE3_NO_CLONE_CACHE` — re-extract the `--voice ref.wav`
+  speaker (s3tokenizer + CAMPPlus + prompt mel) on every synthesis instead of
+  once per reference. Output-identical; the cached path is ~30% faster on a
+  multi-sentence `--tts` (#334).
+- `CRISPASR_COSYVOICE3_NO_MIN_LEN` — drop the decode's minimum-length floor
+  (2 speech tokens per target text token, upstream's `min_token_text_ratio`).
+  Without the floor a single unlucky sample at step 0 ends the decode with no
+  audio at all (#334).
 - `CRISPASR_COSYVOICE3_VOICES_PATH`
 
 ### CosyVoice3 (diff-harness assets)
@@ -781,6 +821,13 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 ### OmniVoice
 
 - `CRISPASR_OMNIVOICE_ACENC_BISECT`
+- `CRISPASR_OMNIVOICE_AUTO_LANG` — **default on.** When no language was requested
+  (`-l` / `-tl` / the server's `"language"` / `set_target_language`), guess one
+  from the text being spoken and use it if it maps to an id the model knows.
+  An explicitly requested language always wins; a low-confidence guess resolves
+  to nothing and behaves exactly as before. `=0` restores the old
+  always-language-agnostic behaviour. Exists because SubtitleEdit's language
+  menu is not yet wired to its request payload (#13273).
 - `CRISPASR_OMNIVOICE_BENCH`
 - `CRISPASR_OMNIVOICE_CFG_INTERVAL`
 - `CRISPASR_OMNIVOICE_CHUNK`
@@ -928,6 +975,22 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_QWEN3_TTS_CODEC_GPU`
 - `CRISPASR_QWEN3_TTS_CODEC_TRACE`
 - `CRISPASR_QWEN3_TTS_EMBD_CHECK`
+- `CRISPASR_QWEN3_TTS_DUMP_LOGITS=<dir>` — write the raw per-frame talker
+  logits (f32, before the repetition penalty and the suppress mask) plus a
+  top-5 line to stderr. The instrument for a cross-backend diff: tokens
+  alone cannot tell a miscompute from amplified rounding (#337).
+- `CRISPASR_QWEN3_TTS_REPLAY_CODES=<file>` — 16 whitespace-separated codec ids
+  per frame; the decode uses them instead of sampling. Teacher forcing, and
+  the ONLY way to compare two backends step by step: pin the whole frame or
+  the 15 residual codebooks (which must be sampled) diverge and the diff
+  measures trajectory, not arithmetic (#337).
+- `CRISPASR_QWEN3_TTS_REPLAY_TOKENS=<file>` — the weaker form: codebook-0 ids
+  only. Useful for forcing a trajectory, NOT sufficient for a logits diff.
+- `CRISPASR_QWEN3_TTS_GREEDY` — force the talker's codebook-0 sampler to argmax
+  (top_k=1). The frame sequence then depends only on the logits, so two
+  backends agree if and only if their logits agree — this is the lever for
+  telling a GPU miscompute apart from a sampling difference, and without it a
+  CPU-vs-GPU token comparison proves nothing (#337).
 - `CRISPASR_QWEN3_TTS_MAX_FRAMES`
 - `CRISPASR_QWEN3_TTS_SKIP_REF_DECODE`
 

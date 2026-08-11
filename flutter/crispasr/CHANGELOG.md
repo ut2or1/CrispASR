@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.8.28
+
+* **HIP/ROCm on Linux**: first release since 0.8.25 with a
+  `crispasr-linux-x86_64-hip` tarball. The packaging step rewrote `RUNPATH`
+  before asking `ldd` what the binaries needed, so ROCm's OpenMP runtime
+  (`libomp.so`, reachable only through that `RUNPATH`) was silently dropped and
+  the archive never built (#339).
+* The same defect in two more artifact kinds, neither reported (#341):
+  `libcrispasr-linux-x86_64-hip` shipped needing an unbundled `libomp.so`, and
+  the Python binding tarballs needed `libgomp.so.1` and `libblas.so.3` — so
+  `import crispasr` failed in the loader on any host without OpenBLAS and gcc's
+  OpenMP. Both are now bundled and gated.
+* GPU archives no longer copy the build machine's CUDA/ROCm install into the
+  tarball, and carry those toolkit directories in their own `RUNPATH` instead —
+  so they resolve without the `/etc/ld.so.conf.d` post-install step.
+* CLI tarballs now ship `LICENSE` and `THIRD_PARTY_NOTICES.txt`, which now also
+  declare the bundled OpenMP runtimes (`libgomp`, `libomp`).
+
+## 0.8.27
+
+* **Linux users on 0.8.26 should upgrade**: that release published only one of
+  its seven Linux binary tarballs (plain x86_64, arm64, CUDA, CUDA 13, Vulkan
+  and HIP all failed to build). Two shell bugs in the release workflow, fixed
+  (#339).
+* Fixed a null-pointer crash in the audio loader on a malformed Ogg file: a
+  Vorbis comment header declares its entry count before the array is
+  allocated, so an attacker-sized count left a non-zero length with a null
+  pointer that the teardown path then indexed. Reachable from
+  `crispasr_audio_load` on untrusted input.
+* qwen3-tts: `--temperature` now reaches the talker (it had only ever reached
+  the code predictor), plus greedy/replay/logit-dump levers for cross-backend
+  diagnosis (#337).
+
+## 0.8.26
+
+* CosyVoice3 voice cloning was conditioned on the wrong speaker embedding
+  (cosine 0.737 against upstream's CAMPPlus ONNX): the export folds
+  `out_nonlinear`'s BatchNorm into the preceding convolution and the fused bias
+  was dropped. Now 0.999997. Baked bank voices were never affected (#334).
+* CosyVoice3 `--ref-text` is now optional — the reference is auto-transcribed
+  and cached — and the decode has upstream's minimum-length floor, so it can no
+  longer end at step 0 with no audio (#334).
+* New CosyVoice3 RL talker: `--backend cosyvoice3-tts-rl` (#334).
+* Voxtral TTS could index its embedding table out of bounds on some inputs: a
+  Tekken vocabulary blob may serialize more pieces than the checkpoint
+  activates. Bounded, in both `voxtral-tts` and `voxtral4b` (#338).
+* qwen3-tts could emit 300 s of audio for one sentence — the frame budget was
+  the KV cache ceiling rather than anything derived from the input text (#337).
+* madlad400 F16 and Q8_0 artifacts published; F16 verified at cosine 1.000000
+  on all 14 stages against the PyTorch reference (#333).
+* Kokoro punctuation was being discarded, in German, French and Spanish too,
+  and the contextual G2P rules had shipped switched off (#316).
+* `-tl` / `--target-lang` was silently discarded by cosyvoice3 and omnivoice
+  (#329).
+* Rust and Dart diarize ABI mirrors were 24 bytes short; FoxNose exposed, plus
+  `session_output_sample_rate` and channel getters (#332).
+
 ## 0.8.25
 
 * New ASR backend: GigaAM-v3 (Russian, CTC + RNN-T, punctuation-native `e2e` heads).

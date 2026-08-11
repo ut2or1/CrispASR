@@ -5,6 +5,23 @@ All wrappers are thin shells over the same C-ABI surface in
 diarize, LID, align, download — is one function call in every
 language.
 
+## Session audio-format getters (#332)
+
+Four read-only getters describe the PCM a session consumes and produces, so
+callers don't hard-code per-backend rates:
+
+| C-ABI getter | Returns |
+|---|---|
+| `crispasr_session_input_sample_rate(s)` | Rate (Hz) the backend expects for input PCM — 16000 for Whisper-family, the model's native rate otherwise. Pair with `crispasr_audio_load_at_rate` to avoid a double resample. |
+| `crispasr_session_output_sample_rate(s)` | Rate (Hz) of the PCM `synthesize` / `synthesize_streaming` / `get_disclaimer_pcm` / `speech_to_speech` return — the "backend-native rate" those calls document. `0` = the backend produces no audio output (ASR-only). |
+| `crispasr_session_input_channels(s)` | `1` (mono) for every current backend. Source separation is the stereo exception and has its own surface (`separate*`). |
+| `crispasr_session_output_channels(s)` | `1` (mono), or `0` when the backend produces no audio output. |
+
+All return `0` on a NULL/invalid session. Exposed as `output_sample_rate` /
+`input_channels` / `output_channels` (Rust, Ruby), `outputSampleRate()` /
+`inputChannels()` / `outputChannels()` (Java, C# `OutputSampleRate()` etc.),
+and `sessionOutputSampleRate()` etc. in the WASM/JS binding.
+
 ## Session setter reference
 
 All generation-control setters are available in every binding. Each
@@ -35,6 +52,7 @@ backend doesn't expose that knob, but the call is safe to make.
 | `set_return_logits(enable)` | `set_return_logits` / `set_return_logits` / `SetReturnLogits` / `setReturnLogits` | Opt-in dense CTC grid capture for backends that expose frame-level CTC scores |
 | `set_grammar_text(gbnf, root, penalty)` | `set_grammar_text` / `set_grammar_text` / `SetGrammarText` / `setGrammarText` | GBNF constrained decoding (whisper); empty string clears |
 | `set_fallback_thresholds(...)` | `set_fallback_thresholds` / `set_fallback_thresholds` / `SetFallbackThresholds` / `setFallbackThresholds` | Whisper entropy/logprob/no-speech thresholds + temp-inc |
+| `set_sensitivity(preset)` | `set_sensitivity` / `set_sensitivity` / `SetSensitivity` / `setSensitivity` | The four thresholds above as one named bundle: `conservative` / `balanced` / `aggressive` (aliases `strict` / `default` / `loose`). `balanced` is the shipped defaults, so it is always a no-op. **rc=-2 means an unknown preset and every wrapper raises** — a typo must never decode silently at the defaults. A later `set_fallback_thresholds` overrides it. HTTP: the `sensitivity` form field, applied before the individual threshold fields so those still win. |
 | `set_alt_n(n)` | `set_alt_n` / `set_alt_n` / `SetAltN` / `setAltN` | Per-token alternative candidates (whisper greedy) |
 | `set_whisper_decode_extras(...)` | `set_whisper_decode_extras` / `set_whisper_decode_extras` / `SetWhisperDecodeExtras` / `setWhisperDecodeExtras` | suppress_nst, suppress_regex, carry_initial_prompt |
 | `set_ask(prompt)` | `set_ask` / `set_ask` / `SetAsk` / `setAsk` | Free-form prompt for instruct-tuned audio-LLM backends (granite, voxtral, qwen3-asr, glm-asr, gemma4-e2b, mimo-asr). Empty string clears. |

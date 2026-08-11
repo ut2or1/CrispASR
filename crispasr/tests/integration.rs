@@ -721,3 +721,40 @@ fn vad_slices_null_model() {
     );
     assert!(result.is_err());
 }
+
+// -------------------------------------------------------------------------
+// Diarization (#332) — model-free, so it always runs.
+//
+// Regression: CrispasrDiarizeOptsAbi was 24 bytes short of the C layout
+// after #324 appended the FoxNose fields, so every call made the C side
+// read past the Rust allocation. These calls crossing the ABI at the full
+// 48-byte layout (plus the layout test in crispasr-sys) pin the fix.
+// -------------------------------------------------------------------------
+
+#[test]
+fn diarize_vad_turns_model_free() {
+    let pcm = vec![0.01f32; 16000 * 4]; // 4 s of quiet mono PCM
+    let mut segs = vec![
+        crispasr::DiarizeSegment::new(0.0, 1.0),
+        crispasr::DiarizeSegment::new(2.0, 3.0), // 1 s gap > 600 ms turn gap
+    ];
+    let opts = crispasr::DiarizeOptions::default();
+    crispasr::diarize_segments(&mut segs, &pcm, None, false, &opts)
+        .expect("vad_turns diarize failed");
+    assert_ne!(
+        segs[0].speaker, segs[1].speaker,
+        "VadTurns must alternate speakers across a >600 ms gap"
+    );
+}
+
+#[test]
+fn diarize_foxnose_missing_model_errors() {
+    let pcm = vec![0.01f32; 16000];
+    let mut segs = vec![crispasr::DiarizeSegment::new(0.0, 1.0)];
+    let mut opts = crispasr::DiarizeOptions::default();
+    opts.method = crispasr::DiarizeMethod::FoxNose;
+    opts.foxnose_embedder_path = Some("/nonexistent/wespeaker.gguf".to_string());
+    let err = crispasr::diarize_segments(&mut segs, &pcm, None, false, &opts)
+        .expect_err("foxnose with a missing embedder must fail, not crash");
+    assert!(err.contains("load failed"), "unexpected error: {err}");
+}

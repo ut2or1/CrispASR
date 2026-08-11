@@ -183,3 +183,11 @@ echo "Live test env configured (CRISPASR_MODELS_DIR=$CRISPASR_MODELS_DIR)"
 
 # qwen3-tts live tests
 export CRISPASR_MODEL_QWEN3_TTS="${CRISPASR_MODEL_QWEN3_TTS:-$CRISPASR_MODELS_DIR/qwen3-tts-0.6b-q4_k.gguf}"
+
+# omnivoice live tests (#13273): style-token parity + three-surface parity.
+# Both SKIP cleanly when these are unset, and the tokenizer must be the F16
+# build — the q8_0 one loads and synthesizes but cannot be read back as f32, so
+# a reference encode yields garbage codes (and poisons the content-addressed
+# voice cache for later F16 runs).
+export CRISPASR_TEST_OMNIVOICE_MODEL="${CRISPASR_TEST_OMNIVOICE_MODEL:-$CRISPASR_MODELS_DIR/omnivoice-q4_k.gguf}"
+export CRISPASR_TEST_OMNIVOICE_TOKENIZER="${CRISPASR_TEST_OMNIVOICE_TOKENIZER:-$CRISPASR_MODELS_DIR/omnivoice-tokenizer-f16.gguf}"

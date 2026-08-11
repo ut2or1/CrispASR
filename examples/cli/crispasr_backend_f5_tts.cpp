@@ -11,6 +11,7 @@
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
 #include "core/tts_ref_cache.h"
+#include "crispasr_tts_ref_text.h"
 #include "whisper_params.h"
 
 #include "f5_tts.h"
@@ -114,54 +115,6 @@ static std::vector<float> resample_linear(const std::vector<float>& in, int sr_i
     return out;
 }
 
-// Auto-transcribe reference audio using any CrispASR backend.
-// The backend name defaults to "whisper" but can be overridden via
-// --ref-asr (e.g. --ref-asr parakeet, --ref-asr moonshine).
-// The model is resolved via the registry (auto-download if needed).
-static std::string transcribe_ref_audio(const std::vector<float>& pcm_16k, const whisper_params& p,
-                                        const std::string& asr_backend) {
-    auto backend = crispasr_create_backend(asr_backend);
-    if (!backend) {
-        if (!p.no_prints)
-            fprintf(stderr, "crispasr[f5-tts]: unknown ASR backend '%s' for ref-text transcription\n",
-                    asr_backend.c_str());
-        return "";
-    }
-
-    // Build minimal params for the ASR backend — just model + threads.
-    // Resolve the model path via the registry (handles auto-download).
-    whisper_params asr_p = {};
-    asr_p.n_threads = p.n_threads;
-    asr_p.no_prints = true; // suppress ASR model load chatter
-    asr_p.language = p.language.empty() ? "en" : p.language;
-    asr_p.auto_download = true;
-    asr_p.model = crispasr_resolve_model_cli("auto", asr_backend, /*quiet=*/true,
-                                             /*cache_dir=*/"", /*auto_download=*/true);
-
-    if (!backend->init(asr_p)) {
-        if (!p.no_prints)
-            fprintf(stderr, "crispasr[f5-tts]: failed to init '%s' for ref-text transcription\n", asr_backend.c_str());
-        return "";
-    }
-
-    auto segments = backend->transcribe(pcm_16k.data(), (int)pcm_16k.size(), 0, asr_p);
-    backend->shutdown();
-
-    std::string result;
-    for (const auto& seg : segments) {
-        if (!result.empty())
-            result += " ";
-        result += seg.text;
-    }
-
-    // Trim leading/trailing whitespace
-    size_t start = result.find_first_not_of(" \t\n\r");
-    size_t end = result.find_last_not_of(" \t\n\r");
-    if (start == std::string::npos)
-        return "";
-    return result.substr(start, end - start + 1);
-}
-
 class F5TtsBackend : public CrispasrBackend {
 public:
     ~F5TtsBackend() override { F5TtsBackend::shutdown(); }
@@ -245,7 +198,7 @@ public:
                         fprintf(stderr, "crispasr[f5-tts]: --ref-text not set, auto-transcribing via %s...\n",
                                 asr_name.c_str());
                     }
-                    ref_text_str = transcribe_ref_audio(ref_16k, p, asr_name);
+                    ref_text_str = crispasr_ref_text::transcribe(ref_16k, p, asr_name, "crispasr[f5-tts]");
                     if (cache_enabled && !ref_text_str.empty()) {
                         crispasr_ref_cache::save(cache_path, "f5-reftext", {(uint32_t)ref_text_str.size()},
                                                  ref_text_str.data(), ref_text_str.size());

@@ -17,6 +17,9 @@ so each can import this right after the clone:
         kh.sh_with_progress(f"stdbuf -oL -eL cmake --build {BUILD} "
                             f"--target {target} -j{kh.safe_build_jobs(gpu=True)}")
     token = kh.resolve_hf_token()            # env → Secret(retry) → dataset
+    # Uploading kernels: kh.resolve_hf_token(require=True) FIRST, before any
+    # build/compute — a missing token then aborts in seconds instead of the
+    # finished run losing every artifact to upload 401s.
 
 Design rules (so a kernel never dies *because of* the harness):
   * pure stdlib at import time — huggingface_hub / kaggle_secrets are
@@ -540,6 +543,14 @@ def kaggle_secret(name: str, retries: int = 3, backoff_s: float = 5.0) -> str | 
     return None
 
 
+def _kaggle_input_root() -> Path:
+    """Root of Kaggle dataset mounts. Overridable via KAGGLE_INPUT_ROOT so the
+    token-resolution logic is unit-testable off-Kaggle against a fake tree
+    (tests/test_kaggle_harness_token.py). On a real worker this is always
+    /kaggle/input."""
+    return Path(os.environ.get("KAGGLE_INPUT_ROOT", "/kaggle/input"))
+
+
 def kaggle_token_from_dataset(filename: str = "hf_token.txt") -> str | None:
     """Read an HF token from a private Kaggle Dataset mounted via
     kernel-metadata.json `dataset_sources` (e.g. chr1str/crispasr-hf-token
@@ -548,39 +559,56 @@ def kaggle_token_from_dataset(filename: str = "hf_token.txt") -> str | None:
 
     Kaggle mounts datasets at several locations depending on the
     environment version:
-      /kaggle/input/<slug>/           — classic path
-      /kaggle/input/datasets/<owner>/<slug>/  — newer environments
-    We scan both roots."""
+      /kaggle/input/<slug>/           — classic ("short") path
+      /kaggle/input/datasets/<owner>/<slug>/  — newer ("long") environments
+    We scan BOTH depths, short first, each sorted. Some workers mount
+    attached datasets ONLY under the long path: CrispEmbed's T19-E3 run 1
+    (2026-08) completed a full 21-minute pipeline on such a worker
+    ("/kaggle/input contains 1 entries: ['datasets']") and then lost every
+    artifact to upload 401s, because its (stale, vendored) copy of this
+    resolver never descended into datasets/<owner>/<slug>. Keep both depths
+    covered here, and keep this file the single source of truth.
+
+    kaggle_usage.md gotcha #26 also applies to how kernels REACH this code:
+    a Kaggle *script* kernel ships ONLY its `code_file` — sibling files
+    (this harness, corpora, reference audio) are NOT present at runtime.
+    Kernels must `git clone` the repo in-kernel and import the harness FROM
+    THE CLONE; never read data via Path(__file__).parent, and never rely on
+    a bundled copy (bundled = local-dev fallback only)."""
+    root = _kaggle_input_root()
     candidates: list[Path] = [
-        Path("/kaggle/input/crispasr-hf-token") / filename,
+        root / "crispasr-hf-token" / filename,
     ]
     # Owner-agnostic scan: probe <filename> in EVERY mounted dataset dir, at
-    # both the classic depth (/kaggle/input/<slug>/) and the newer nested depth
-    # (/kaggle/input/datasets/<owner>/<slug>/). The old code only matched owner
+    # both the classic depth (<root>/<slug>/) and the newer nested depth
+    # (<root>/datasets/<owner>/<slug>/). The old code only matched owner
     # names containing "hf-token" and hard-coded chr1str, so a chr1s4 kernel on
     # the newer mount path (/kaggle/input/datasets/chr1s4/crispasr-hf-token/)
     # never had its token file scanned → token silently unresolved (the
     # 2026-06-20 v2/v3 full-sweep runs). Don't filter by dir name — probe the file.
-    dataset_dirs: list[Path] = []
-    inp = Path("/kaggle/input")
-    if inp.exists():
-        for sub in inp.iterdir():
+    # Deterministic precedence (matches the t19 driver's sorted short-then-long
+    # glob order): classic dirs first, then nested dirs, each depth sorted.
+    classic_dirs: list[Path] = []
+    nested_dirs: list[Path] = []
+    if root.exists():
+        for sub in sorted(root.iterdir()):
             if not sub.is_dir():
                 continue
             if sub.name == "datasets":
-                for owner in sub.iterdir():  # nested <owner>/<slug>
+                for owner in sorted(sub.iterdir()):  # nested <owner>/<slug>
                     if owner.is_dir():
-                        dataset_dirs.extend(s for s in owner.iterdir() if s.is_dir())
+                        nested_dirs.extend(
+                            s for s in sorted(owner.iterdir()) if s.is_dir())
             else:
-                dataset_dirs.append(sub)  # classic /kaggle/input/<slug>
-    for d in dataset_dirs:
+                classic_dirs.append(sub)  # classic <root>/<slug>
+    for d in classic_dirs + nested_dirs:
         for fn in (filename, "hf_token.txt", "token", "access_token"):
             p = d / fn
             if p not in candidates:
                 candidates.append(p)
     # Also try the flat file variants
-    candidates.append(Path("/kaggle/input/crispasr-hf-token") / "token")
-    candidates.append(Path("/kaggle/input/crispasr-hf-token") / "access_token")
+    candidates.append(root / "crispasr-hf-token" / "token")
+    candidates.append(root / "crispasr-hf-token" / "access_token")
 
     # Debug: list what we're scanning
     for p in candidates:
@@ -598,11 +626,10 @@ def kaggle_token_from_dataset(filename: str = "hf_token.txt") -> str | None:
         except Exception as e:
             print(f"HF auth: {p} error: {e}", flush=True)
 
-    # Last resort: dump what's actually under /kaggle/input for debugging
-    root = Path("/kaggle/input")
+    # Last resort: dump what's actually under the input root for debugging
     if root.exists():
         dirs = sorted(root.iterdir())
-        print(f"HF auth: /kaggle/input contains {len(dirs)} entries: "
+        print(f"HF auth: {root} contains {len(dirs)} entries: "
               f"{[d.name for d in dirs[:10]]}", flush=True)
         # Also check one level deeper
         for d in dirs:
@@ -617,10 +644,21 @@ def kaggle_token_from_dataset(filename: str = "hf_token.txt") -> str | None:
     return None
 
 
-def resolve_hf_token(secret_name: str = "HF_TOKEN") -> str | None:
+def resolve_hf_token(secret_name: str = "HF_TOKEN",
+                     require: bool = False) -> str | None:
     """3-tier HF auth: env HF_TOKEN → Kaggle Secret (with retry) → mounted
     Kaggle Dataset file. Exports HF_TOKEN + HUGGING_FACE_HUB_TOKEN +
-    HF_HUB_ENABLE_HF_TRANSFER on success and returns the token (or None)."""
+    HF_HUB_ENABLE_HF_TRANSFER on success and returns the token (or None).
+
+    Any kernel that UPLOADS must call this with require=True at the very
+    top, BEFORE building or computing anything: with require=True a missing
+    token raises SystemExit immediately, instead of the run completing and
+    then losing every artifact to 401s at upload time (CrispEmbed T19-E3
+    run 1 burned a full 21-minute pipeline exactly this way — the token
+    dataset was mounted only under the long path and the resolver missed
+    it; `hf_token_ok: False` was in the log all along). Download-only
+    kernels can keep the default require=False: public cstr/* repos work
+    unauthenticated."""
     tok = (os.environ.get("HF_TOKEN")
            or kaggle_secret(secret_name)
            or kaggle_token_from_dataset())
@@ -628,6 +666,12 @@ def resolve_hf_token(secret_name: str = "HF_TOKEN") -> str | None:
         os.environ["HF_TOKEN"] = tok
         os.environ["HUGGING_FACE_HUB_TOKEN"] = tok
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    elif require:
+        raise SystemExit(
+            "FATAL: no HF token from env/secret/dataset — uploads would 401 "
+            "after the compute finishes; aborting up front. Attach the "
+            "hf-token dataset (kernel-metadata.json dataset_sources) or the "
+            "HF_TOKEN secret.")
     else:
         print("HF auth: no token from env/secret/dataset — public-only "
               "downloads (fine for cstr/* public repos).", flush=True)

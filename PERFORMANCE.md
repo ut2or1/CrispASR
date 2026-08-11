@@ -4,6 +4,47 @@ Test audio: jfk.wav (11.0s), Q4_K quantization, greedy decode (`-bs 1`).
 
 ---
 
+## Metal im2col: the v0.17 sync silently dropped the batch-1 occupancy win — restored as kernel_im2col_flat, melotts hifigan back to ~1.85x (Apple M1, 2026-08-06)
+
+The v0.17 ggml sync removed `CRISPASR_METAL_IM2COL_OCC` (upstream reworked
+the dispatch; see `tools/upstream-prs/SYNC-v0.17-CONFLICTS.md` "re-derive if
+regressions appear") — which un-fixed the melotts/piper "P0 hifigan" row
+below: every batch-1 Metal conv went back to KH*KW-thread threadgroups. The
+re-derivation now lives in the shared fork as **`kernel_im2col_flat`**
+(`89a2039d`, branch `sync/upstream-v0.17`; authored against CrispEmbed's
+PP-OCR profile, where the same kernel is 2.3x on the recognizer): one thread
+per dst element from a `(ceil(OW*CHW/256), OH, N)` grid, predicate
+`N*KH*KW < 128 || IC == 1` (also covers the `conv_2d_dw` lowering the OCC
+variant missed), `CRISPASR_METAL_IM2COL_FLAT=0` restores the standard
+kernel. A first cut with int64-divmod flat indexing was SLOWER than the
+broken dispatch — Apple GPUs emulate int64 division.
+
+This pin bump (`a0f7289d` → `89a2039d`) re-activates the win. Measured, M1,
+interleaved same-binary pairs:
+
+- **melotts** (en-q8, 3.2 s utterance): hifigan_decode 2026/2019 ms →
+  **1097/1094 ms (1.85x)**, synthesize 2315/2318 → 1364/1365 ms (1.7x) on
+  the two quiet pairs; ASR round-trip reproduces the text. WAV byte-compare
+  is NOT a valid gate for melotts — the VITS flow is stochastic and two
+  legacy-arm runs already differ; the round-trip is the gate.
+- **moonshine-tiny** (jfk.wav): transcript **byte-identical** flat vs
+  legacy, RTF neutral-to-slightly-better (82.0 vs 80.0x / 73.7 vs 70.4x /
+  62.5 vs 62.6x).
+- **paraformer-zh-q4_k**: transcript **byte-identical**. Wall pairs were
+  noise-dominated (0.85–15.1 s spread; other sessions held load at 14–18,
+  and an order-reversal control still disagreed with itself) — the
+  attributable quantity is the per-op GPU time of its 2 im2col nodes:
+  **8.5–9.1 ms/node legacy → 0.4–1.0 ms/node flat (9–20x)**, ~16 ms saved
+  per run, <1.5% of wall either way. No mechanism for a regression.
+- 1473/1473 unit tests on the bumped pin.
+
+The historical OCC numbers in the melotts row below (2–3x hifigan, 1.65x
+moonshine) were measured on the pre-v0.17 variant on a quiet box; today's
+moonshine is closer to neutral because the current decode path spends its
+time elsewhere. CrispEmbed-side evidence (2.3x PP-OCR rec, 1.6x
+layout_detect, 18-fixture byte-identity) is in their `PERFORMANCE.md`.
+`tools/upstream-prs/23` should be re-drafted from this kernel for upstream.
+
 ## Backend × Optimization matrix
 
 At-a-glance view of which performance knobs each backend supports today,

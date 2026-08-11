@@ -8,6 +8,7 @@
 #include "crispasr_aligner.h"
 #include "align.h"
 #include "canary_ctc.h"
+#include "core/align_sentinel.h" // §W3 collapse detection
 #include "core/uroman.h"
 #include "gguf.h"
 #include "qwen3_asr.h"
@@ -442,9 +443,76 @@ std::vector<CrispasrAlignedSegment> crispasr_group_aligned_segments(const std::v
     return out;
 }
 
+// PLAN.md §W3: forced-alignment collapse check.
+//
+// Installed at the ONE join every aligner backend funnels through, rather than
+// in each of the three branches below — the multi-surface trap is that a check
+// added to one path silently misses the CLI, the session ABI, the bindings or
+// the server. `crispasr_align_words` is what all of them call.
+//
+// Default is DETECT + WARN. `assess()` is a new heuristic against a failure we
+// have never measured in the field, so it does not get to silently rewrite
+// timestamps; a wrong auto-repair would be just as invisible as the collapse.
+// Opt in to repair with CRISPASR_ALIGN_SENTINEL_REDISTRIBUTE=1, or turn the
+// whole check off with CRISPASR_ALIGN_SENTINEL=0.
+static void align_sentinel_check(std::vector<CrispasrAlignedWord>& words, int n_samples, int64_t t_offset_cs) {
+    if (words.empty())
+        return;
+    {
+        const char* off = std::getenv("CRISPASR_ALIGN_SENTINEL");
+        if (off && off[0] == '0')
+            return;
+    }
+
+    // Assess in CLIP-RELATIVE seconds. The offset must come back out first:
+    // align.cpp's silent-zero words are (0,0) before `t_offset_cs` is added,
+    // and a chunk at offset 30 s would otherwise present them as (30.0, 30.0)
+    // — a plausible-looking position, and the signal would never fire.
+    std::vector<core_align_sentinel::Word> probe;
+    probe.reserve(words.size());
+    for (const auto& w : words)
+        probe.push_back({w.text, (float)((double)(w.t0_cs - t_offset_cs) / 100.0),
+                         (float)((double)(w.t1_cs - t_offset_cs) / 100.0)});
+
+    const float audio_sec = n_samples > 0 ? (float)n_samples / 16000.0f : -1.0f;
+    const auto a = core_align_sentinel::assess(probe, audio_sec);
+    if (!a.collapsed)
+        return;
+
+    fprintf(stderr, "crispasr[aligner]: WARNING: %s\n", core_align_sentinel::describe(a).c_str());
+
+    const char* fix = std::getenv("CRISPASR_ALIGN_SENTINEL_REDISTRIBUTE");
+    if (!(fix && fix[0] == '1'))
+        return;
+    if (audio_sec <= 0.0f)
+        return;
+
+    const auto spread = core_align_sentinel::redistribute(probe, 0.0f, audio_sec);
+    for (size_t i = 0; i < words.size() && i < spread.size(); i++) {
+        words[i].t0_cs = t_offset_cs + (int64_t)std::llround((double)spread[i].t0 * 100.0);
+        words[i].t1_cs = t_offset_cs + (int64_t)std::llround((double)spread[i].t1 * 100.0);
+    }
+    fprintf(stderr, "crispasr[aligner]: redistributed %zu words across %.2fs\n", words.size(), (double)audio_sec);
+}
+
+static std::vector<CrispasrAlignedWord> align_words_impl(const std::string& aligner_model,
+                                                         const std::string& transcript, const float* samples,
+                                                         int n_samples, int64_t t_offset_cs, int n_threads,
+                                                         bool* out_load_failed);
+
 std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner_model, const std::string& transcript,
                                                       const float* samples, int n_samples, int64_t t_offset_cs,
                                                       int n_threads, bool* out_load_failed) {
+    std::vector<CrispasrAlignedWord> out =
+        align_words_impl(aligner_model, transcript, samples, n_samples, t_offset_cs, n_threads, out_load_failed);
+    align_sentinel_check(out, n_samples, t_offset_cs);
+    return out;
+}
+
+static std::vector<CrispasrAlignedWord> align_words_impl(const std::string& aligner_model,
+                                                         const std::string& transcript, const float* samples,
+                                                         int n_samples, int64_t t_offset_cs, int n_threads,
+                                                         bool* out_load_failed) {
     std::vector<CrispasrAlignedWord> out;
     if (out_load_failed)
         *out_load_failed = false;

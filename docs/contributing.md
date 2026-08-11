@@ -142,8 +142,9 @@ std::vector<std::string> crispasr_list_backends() {
 }
 ```
 
-Add the architecture string to `crispasr_detect_backend_from_gguf()`
-so `general.architecture` auto-detection works.
+Add the architecture string to the shared table in
+`src/core/arch_backend_map.h` so `general.architecture` auto-detection works
+on **every** surface at once (CLI, C ABI, and therefore every binding).
 
 ## 4. Wire into CMake
 
@@ -194,6 +195,15 @@ TTS backends need extra wiring beyond ASR:
    it's not 24000 (default). The CLI uses this for WAV header + any
    downstream resampling.
 
+   **Also register the rate in `crispasr_session_output_sample_rate()`
+   (`src/crispasr_c_api.cpp`) — the session ABI cannot reach the CLI
+   adapter, so the getter keeps its own per-backend table (#332).** Every
+   audio-producing ctx must appear there: a backend at the 24 kHz default
+   adds its ctx to the 24 kHz fallthrough list; a non-24 kHz backend adds
+   the explicit rate (or its `<name>_sample_rate(ctx)` getter when the
+   rate is a model hparam). A ctx missing from the table makes the
+   session report "no audio output" (0) for a backend that synthesizes.
+
 4. **Codec companion loading**: if your backend needs a separate codec
    GGUF (SNAC, DAC, Mimi), handle `params.tts_codec_model` in `init()`:
    ```cpp
@@ -221,12 +231,24 @@ TTS backends need extra wiring beyond ASR:
 below. **`chatterbox` is the canonical template** — `grep -n chatterbox`
 (or `CA_HAVE_CHATTERBOX`) in each file shows the exact pattern to copy.
 
-### CLI auto-detection — `examples/cli/crispasr_backend.cpp`
-So `-m model.gguf` *without* `--backend` routes correctly, add the name to
-**both** passes of `crispasr_detect_backend_from_gguf()`:
-- Pass 1 (filename heuristic): `if (contains_ci("yourmodel")) return "yourmodel";`
-- Pass 2 (GGUF `general.architecture`): `else if (a == "<arch>") result = "yourmodel";`
-  — `<arch>` is whatever your converter passes to `GGUFWriter(arch=...)`.
+### Auto-detection — filename pass + the shared architecture table
+So `-m model.gguf` *without* `--backend` routes correctly, wire **both** passes:
+- Pass 1 (filename heuristic, CLI only) in `examples/cli/crispasr_backend.cpp`:
+  `if (contains_ci("yourmodel")) return "yourmodel";`
+- Pass 2 (GGUF `general.architecture`) in **`src/core/arch_backend_map.h`**:
+  `{"<arch>", "yourmodel"},` — `<arch>` is whatever your converter passes to
+  `GGUFWriter(arch=...)`, verbatim, including underscores. List every spelling
+  that ships.
+
+That table is the single source of truth for both the CLI's pass 2 and the C
+ABI's `crispasr_detect_backend_from_gguf()`. **It used to be two copies, and
+issue #335 is what that cost:** they drifted by 113 architecture strings, so
+granite-speech (converter writes `granite_speech`, the C-ABI copy only knew
+`granite-speech`) opened fine in the CLI — rescued by the filename pass — and
+returned a NULL session from Rust/Python/Go/Dart. Only the CLI has a filename
+pass, so a missing table entry is invisible on the surface you are most likely
+to test on. `tests/test-arch-backend-map.cpp` pins the mapping and drives the
+real C-ABI export over a synthesised metadata-only GGUF.
 
 The `--list-backends` capability row is read live from the backend's
 `capabilities()`, so it needs no separate edit.
@@ -323,6 +345,42 @@ owned buffer then free via `crispasr_pcm_free`; free any `out_text` via
 The canonical surface is `include/crispasr_session.h`; `docs/bindings.md` has the
 per-wrapper setter table.
 
+### Append-only ABI structs — update EVERY hand-written mirror in the same commit
+
+Some ABI entry points take struct pointers whose layout is defined only in
+`src/crispasr_c_api.cpp` (`crispasr_diarize_seg_abi`, `crispasr_diarize_opts_abi`)
+or in `include/crispasr_session.h` (`crispasr_vad_abi_opts`). Bindings that
+cannot include a C header lay these structs out **by hand**, byte for byte:
+the Go cgo preamble, `crispasr-sys/src/lib.rs` (`#[repr(C)]` mirrors), and the
+flutter binding's offset-written buffers in `crispasr.dart`.
+
+The C side reads **every field unconditionally**, so a mirror that is one
+append behind makes the C side read past the caller's allocation — undefined
+behaviour on every call, not just calls that use the new fields. This is not
+hypothetical: #324 appended the FoxNose fields to `crispasr_diarize_opts_abi`
+and updated only the Go mirror; #332 found the Rust and Dart mirrors 24 bytes
+short, with a garbage pointer handed to `std::string` on the C side.
+
+Rules when you touch one of these structs:
+
+1. **Append at the END; never reorder or insert.** The structs are
+   append-only by contract — old mirrors must stay prefix-compatible
+   while they're being caught up (they aren't safe, but they're findable).
+2. **Update every mirror in the same commit.** The authoritative mirror
+   list lives in the comment next to the struct in `crispasr_c_api.cpp`;
+   extend that list when a new binding grows a mirror.
+3. **Keep the layout guards in sync**: the `static_assert`s next to the
+   struct in `crispasr_c_api.cpp` pin the canonical sizes/offsets, and each
+   mirror carries its own guard — `crispasr-sys`'s `diarize_abi_layout`
+   test, flutter's `DiarizeMethod` index-parity smoke test, and
+   `tests/test-session-abi-nulls.cpp` (which calls the ABI through a
+   fourth hand-written mirror, so a silent layout change fails a unit
+   test even if a binding is missed).
+4. **Enum values that cross the ABI are append-only too** — the Dart
+   `DiarizeMethod`/`LidMethod` enums dispatch on `.index`, and the Rust
+   enums on `as i32`; a reorder or mid-enum insertion silently routes
+   calls to the wrong method. The index-parity tests pin this.
+
 **C# is CI-tested** (`.github/workflows/bindings-csharp.yml`) — it compiles the
 binding against the ABI and runs `CrispASR.Tests`. Do not let it drift; it was
 unbuilt for a long time and shipped a units bug (#291) precisely because nothing
@@ -402,12 +460,15 @@ Wire ALL of the following:
 4. **Factory + roster** — the `if (name == ...)` alias line and the roster list
    entry in `crispasr_backend.cpp`, plus the shim's forward declaration, plus
    the file in `examples/cli/CMakeLists.txt`.
-5. **Both detect passes** — filename heuristic and GGUF `general.architecture`,
-   in `crispasr_backend.cpp` AND in `crispasr_detect_backend_from_gguf()` in
-   `src/crispasr_c_api.cpp`. These are two different functions in two different
-   files; the c_api one is what every binding uses, and its own source comment
-   records that crepe and htdemucs were once wired in the CLI but not there, so
-   every binding got a null session.
+5. **Both detect passes** — the filename heuristic in `crispasr_backend.cpp`
+   (CLI only) and the GGUF `general.architecture` entry in the shared table
+   `src/core/arch_backend_map.h` (CLI *and* every binding, since both the CLI's
+   pass 2 and `crispasr_detect_backend_from_gguf()` read it). The table was
+   itself two divergent copies until #335; crepe and htdemucs had already been
+   caught getting a null session in every binding while working in the CLI, and
+   granite-speech was that same bug again — unifying the table is what stops it
+   recurring. Only the CLI has a filename pass, so **testing
+   auto-detection through the CLI alone proves nothing about the bindings.**
 6. **Session C ABI** — task-specific entry points, NOT `transcribe()`. Follow
    `crispasr_session_pitch*` / `crispasr_session_chords*`: a `run` call
    returning a count, an `n_*` accessor, a FLAT float view for the bulk read,

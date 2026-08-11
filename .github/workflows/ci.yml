@@ -75,8 +75,12 @@ jobs:
         with:
           submodules: recursive
 
+      # patchelf is for test-bundle-linux-runtime, which exercises the release
+      # packaging scripts. Without it that test SKIPs, and a skip is
+      # indistinguishable from a pass in the summary — which is how the release
+      # packaging went unobserved in the first place.
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build g++ libopenblas-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build g++ libopenblas-dev patchelf
 
       # Examples/server stay at their defaults: some tests link `common`, which
       # lives under examples/, so switching them off would break configure.
@@ -272,11 +276,27 @@ jobs:
           # the fuzzing-standard config for parsers over untrusted size fields.
           ASAN_OPTIONS: detect_leaks=0:allocator_may_return_null=1
         run: |
-          mkdir -p fuzz-corpus
+          mkdir -p fuzz-corpus fuzz-artifacts
           cp samples/jfk.wav samples/jfk.au samples/jfk.amr samples/jfk.webm \
              samples/jfk-vorbis.webm samples/jfk.m4a fuzz-corpus/ 2>/dev/null || true
+          # Inputs that once crashed a parser. A seeded 45 s run rediscovers a
+          # crash only by luck — replaying these makes each fixed bug a
+          # deterministic gate instead of a coin flip.
+          cp tests/fuzz/regressions/*.ogg fuzz-corpus/ 2>/dev/null || true
           ./build-fuzz/bin/crispasr-fuzz-audio -max_total_time=45 -max_len=1048576 \
-             -rss_limit_mb=4096 fuzz-corpus
+             -rss_limit_mb=4096 -artifact_prefix=fuzz-artifacts/ fuzz-corpus
+
+      # Without this the crash input dies with the runner and all you have is a
+      # stack trace — which is how the stb_vorbis SEGV went unchased: the job
+      # is stochastic, so "re-run it" is not a reproduction strategy. Keep the
+      # input that actually crashed.
+      - name: Upload the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-audio
+          path: fuzz-artifacts/
+          if-no-files-found: ignore
 
   # ===========================================================================
   # Linux x86_64 + Vulkan

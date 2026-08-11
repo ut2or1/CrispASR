@@ -212,6 +212,35 @@ document (issue #228).
 | `--lcs-min-length N` | Minimum LCS length to act on (default 1; raise to 3-4 on long-silence audio where blank tokens dominate boundaries) |
 | `--parakeet-decoder ctc\|tdt\|maes` | Select decode strategy: `ctc` (CTC head), `tdt` (TDT greedy/beam, default), `maes` (MAES beam search — requires `-bs N` with N>1) |
 | `-bs N`, `--beam-size N` | Parakeet TDT/RNNT beam search width (default 1 = greedy). `2`–`4` recommended with hotwords or MAES. CTC decode is frame-synchronous and always greedy |
+| `--sensitivity conservative\|balanced\|aggressive` | Named bundle of the four whisper fallback thresholds (`-et`, `-lpt`, `-nth`, temperature step). `balanced` is the shipped default and always a no-op. See below |
+
+#### `--sensitivity` — the four decode thresholds as one knob
+
+`entropy_thold`, `logprob_thold`, `no_speech_thold` and the temperature step
+interact: a decode is only rejected and retried when the logprob **and**
+no-speech bars are both crossed, so moving one alone produces a combination
+that does not mean what you intended. `--sensitivity` moves them as a set.
+
+| Preset | Behaviour |
+|---|---|
+| `conservative` | Tighter entropy/logprob bars and a **lower** no-speech bar, so the "this is silence" verdict is reached sooner and borderline segments are discarded rather than guessed at. Fewer hallucinations, some marginal speech lost. Use on noisy or music-heavy material where a confident wrong sentence is worse than a missing one |
+| `balanced` | The shipped defaults (2.40 / -1.00 / 0.60). Naming it changes nothing |
+| `aggressive` | Looser bars and a **higher** no-speech bar, so quiet or whispered audio still produces text instead of being written off as silence. Use when the audio is quiet by nature and you would rather post-filter than lose content |
+
+`strict`, `default` and `loose` are accepted aliases. An unrecognised name is
+rejected with a non-zero exit rather than silently treated as `balanced` — a
+mistyped preset decoding at the wrong thresholds is exactly what the flag
+exists to prevent.
+
+Last flag wins, so an explicit threshold after the preset overrides it:
+
+```bash
+crispasr -m model.bin -f noisy.wav --sensitivity conservative
+crispasr -m model.bin -f quiet.wav --sensitivity aggressive -nth 0.9   # preset, then override
+```
+
+Same bundles from the session API: `crispasr_session_set_sensitivity()` in C,
+`Session.set_sensitivity("conservative")` in Python.
 
 #### Reusing VAD boundaries across backends (#227)
 

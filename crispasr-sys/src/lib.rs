@@ -154,8 +154,14 @@ pub struct CrispasrDiarizeSegAbi {
 }
 
 /// ABI options for [`crispasr_diarize_segments_abi`]. `method` is a
-/// value in 0..3: 0 = Energy, 1 = Xcorr, 2 = VadTurns, 3 = Pyannote.
-/// `pyannote_model_path` is required for Pyannote, ignored otherwise.
+/// value in 0..4: 0 = Energy, 1 = Xcorr, 2 = VadTurns, 3 = Pyannote,
+/// 4 = FoxNose. `pyannote_model_path` is required for Pyannote,
+/// `foxnose_embedder_path` for FoxNose; each is ignored otherwise.
+///
+/// This layout is hand-maintained and MUST match
+/// `crispasr_diarize_opts_abi` in `src/crispasr_c_api.cpp`, which is
+/// APPEND-ONLY: the C side reads every field unconditionally, so a
+/// short struct here is an out-of-bounds read even for methods 0..3.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct CrispasrDiarizeOptsAbi {
@@ -163,6 +169,15 @@ pub struct CrispasrDiarizeOptsAbi {
     pub n_threads: c_int,
     pub slice_t0_cs: i64,
     pub pyannote_model_path: *const c_char,
+    // #324 FoxNose (method 4). Ignored by the other methods.
+    pub foxnose_embedder_path: *const c_char,
+    /// 0 -> 1
+    pub min_speakers: c_int,
+    /// 0 -> 8
+    pub max_speakers: c_int,
+    /// >0 pins the speaker count and skips estimation
+    pub num_speakers: c_int,
+    pub _pad2: c_int,
 }
 
 extern "C" {
@@ -563,6 +578,12 @@ extern "C" {
     // the model's native rate otherwise; 0 on error). Pair with s2s/synthesize to
     // feed input at the right rate.
     pub fn crispasr_session_input_sample_rate(s: *mut CrispasrSession) -> c_int;
+    // #332: output-side counterparts. output_sample_rate is the rate of the
+    // PCM synthesize / speech_to_speech return (0 = backend has no audio
+    // output); the channel getters are 1 (mono) for every current backend.
+    pub fn crispasr_session_output_sample_rate(s: *mut CrispasrSession) -> c_int;
+    pub fn crispasr_session_input_channels(s: *mut CrispasrSession) -> c_int;
+    pub fn crispasr_session_output_channels(s: *mut CrispasrSession) -> c_int;
     pub fn crispasr_pcm_free(pcm: *mut f32);
     // Embed the AI-content watermark into f32 mono PCM, in place. The other
     // half of `synthesize_raw`: opting out of automatic marking obliges the
@@ -598,6 +619,10 @@ extern "C" {
         s: *mut CrispasrSession,
         hotwords: *const c_char,
         boost: c_float,
+    ) -> c_int;
+    pub fn crispasr_session_set_sensitivity(
+        s: *mut CrispasrSession,
+        preset: *const c_char,
     ) -> c_int;
     pub fn crispasr_session_set_g2p_dict(s: *mut CrispasrSession, source: *const c_char) -> c_int;
     pub fn crispasr_session_set_speaker_id(s: *mut CrispasrSession, id: c_int) -> c_int;
@@ -1012,4 +1037,28 @@ extern "C" {
         i_word: c_int,
         i_alt: c_int,
     ) -> c_float;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Guards the hand-maintained mirrors of the APPEND-ONLY structs in
+    // src/crispasr_c_api.cpp. The C side reads every field unconditionally,
+    // so a short layout here is an out-of-bounds read even for methods
+    // that ignore the trailing fields (#332).
+    #[test]
+    fn diarize_abi_layout() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<CrispasrDiarizeSegAbi>(), 24);
+        assert_eq!(size_of::<CrispasrDiarizeOptsAbi>(), 48);
+        assert_eq!(offset_of!(CrispasrDiarizeOptsAbi, slice_t0_cs), 8);
+        assert_eq!(offset_of!(CrispasrDiarizeOptsAbi, pyannote_model_path), 16);
+        assert_eq!(
+            offset_of!(CrispasrDiarizeOptsAbi, foxnose_embedder_path),
+            24
+        );
+        assert_eq!(offset_of!(CrispasrDiarizeOptsAbi, min_speakers), 32);
+        assert_eq!(offset_of!(CrispasrDiarizeOptsAbi, num_speakers), 40);
+    }
 }

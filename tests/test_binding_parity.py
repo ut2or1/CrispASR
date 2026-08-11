@@ -131,6 +131,7 @@ ALL_SYMBOLS = [
     "crispasr_session_set_punc_model",
     "crispasr_session_set_punctuation",
     "crispasr_session_set_repetition_penalty",
+    "crispasr_session_set_sensitivity",
     "crispasr_session_set_source_language",
     "crispasr_session_set_speaker_name",
     "crispasr_session_set_target_language",
@@ -214,7 +215,7 @@ def test_symbol_resolves(lib, symbol):
 
 def test_symbol_count(lib):
     """Sanity-check accidental edits to the maintained symbol set."""
-    assert len(ALL_SYMBOLS) == 154, f"expected 154 symbols, got {len(ALL_SYMBOLS)}"
+    assert len(ALL_SYMBOLS) == 155, f"expected 155 symbols, got {len(ALL_SYMBOLS)}"
 
 
 def test_python_binding_imports():

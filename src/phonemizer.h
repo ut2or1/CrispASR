@@ -43,7 +43,12 @@ bool phonemize_espeak_popen(const std::string& lang, const std::string& text, st
 // table is tuned for. A backend trained on a different spelling (Kokoro was
 // trained on misaki's) converts the result with core_phoneme::convert() rather
 // than changing what this function emits, which would regress the others.
-bool phonemize_builtin_en(const std::string& lang, const std::string& text, std::string& out);
+// `misaki_style` selects the CONSUMER's output conventions (contextual function
+// words, punctuation carried through, hyphenated compounds kept whole) rather
+// than a different dictionary — Kokoro needs them even on this CMUdict fallback
+// path, piper must not have them. See g2p_en::style.
+bool phonemize_builtin_en(const std::string& lang, const std::string& text, std::string& out,
+                          bool misaki_style = false);
 
 // #316: same, but Tier 0 is misaki's own lexicon (Kokoro's G2P, Apache-2.0)
 // instead of CMUdict — ~94% phoneme agreement with misaki on ordinary prose vs
@@ -59,13 +64,19 @@ bool misaki_lexicon_available();
 // dictionary (787K words, auto-loaded from ~/.cache/crispasr/ipa_dict_de.txt
 // or CRISPASR_DE_DICT_PATH env var, CC-BY-SA from open-dict-data).
 // For non-German, returns false and falls through.
-bool phonemize_builtin_de(const std::string& lang, const std::string& text, std::string& out);
+// `tts_punctuation` keeps `,.;:!?` in the phoneme string. Kokoro's vocabulary
+// has them and they are how it pauses; piper's espeak inventory has never been
+// fed them. See g2p_en::style — same split, one language further on.
+bool phonemize_builtin_de(const std::string& lang, const std::string& text, std::string& out,
+                          bool tts_punctuation = false);
 
 // Built-in French G2P: LTS rules (always available) + optional IPA dictionary.
-bool phonemize_builtin_fr(const std::string& lang, const std::string& text, std::string& out);
+bool phonemize_builtin_fr(const std::string& lang, const std::string& text, std::string& out,
+                          bool tts_punctuation = false);
 
 // Built-in Spanish G2P: LTS rules (seseo, lenition, yeísmo) + optional dict.
-bool phonemize_builtin_es(const std::string& lang, const std::string& text, std::string& out);
+bool phonemize_builtin_es(const std::string& lang, const std::string& text, std::string& out,
+                          bool tts_punctuation = false);
 
 // Try all available phonemizers in priority order.
 // Order: builtin_{en,de,fr,es} → espeak_dlopen → espeak_popen

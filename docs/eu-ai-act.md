@@ -217,15 +217,6 @@ substantially altered audio marks it, by default, on every surface:
 | WASM / JS (`ttsSynthesize`, `ttsSpeechToSpeech`) | audio watermark; `c2paSign()` available |
 | All language bindings | inherit the C ABI — they cannot reach an unmarked path by accident |
 
-**This table is the thing that rots.** Wyoming (`--wyoming-port`, Home Assistant
-Assist) shipped for four releases marking nothing at all — no watermark, no
-clone classification, no spoken disclaimer, no consent gate — because it was
-added for #172 and never entered this list, and the compliance work was
-organised by walking the list. A client sending `{"voice":{"name":"x"}}` got
-back unmarked, undisclosed cloned speech. Existing coverage
-(`tests/test-server-wyoming.py`) exercised only the protocol handshake, so it
-stayed green throughout.
-
 Enumerate surfaces by **grepping for emitters** — `->synthesize(`,
 `speech_to_speech(`, anything writing audio — not by reading this table. The
 table is a summary of what was found; it is not evidence that nothing else

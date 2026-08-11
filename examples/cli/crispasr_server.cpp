@@ -23,6 +23,7 @@
 // Adapted from examples/server/server.cpp for multi-backend support.
 
 #include "crispasr_backend.h"
+#include "core/asr_sensitivity.h" // §W7 --sensitivity presets over the HTTP API
 #include "crispasr_diarize_cli.h"
 #include "tiron_link.h" // #295: tiron cross-window speaker linking (shared with the CLI)
 #include "crispasr_gap_fill.h"
@@ -58,6 +59,7 @@
 #include "crispasr_voice_clone_policy.h"
 #include "crispasr_voice_provenance.h"
 #include "core/crispasr_watermark.h"
+#include "core/omnivoice_instruct.h" // #13273: validate `instructions` at the edge
 #include "crispasr_watermark_dispatch.h"
 #include "core/crispasr_wav_writer.h"
 #include "core/worker_pool.h"     // improvements Phase 4b: concurrent ASR worker pool
@@ -675,7 +677,10 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
             }
             const bool used_speech_lid = !lid_speech.empty();
             crispasr_lid_result lid;
-            if (crispasr_detect_language_cli(lid_samples, lid_n_samples, rp, lid)) {
+            // Backend self-probe first (see crispasr_lid_cli.h); external LID
+            // only when it declines.
+            const bool probed = crispasr_backend_probe_language(*backend, lid_samples, lid_n_samples, rp, lid);
+            if (probed || crispasr_detect_language_cli(lid_samples, lid_n_samples, rp, lid)) {
                 rp.language = lid.lang_code;
                 if (rp.source_lang.empty() || rp.source_lang == "auto")
                     rp.source_lang = lid.lang_code;
@@ -1503,6 +1508,28 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.best_of = form_int(req, "best_of", rp.best_of);
         rp.beam_size = form_int(req, "beam_size", rp.beam_size);
         rp.return_logits = form_bool(req, "return_logits", rp.return_logits);
+        // `sensitivity` is applied FIRST so an explicit entropy/logprob/
+        // no_speech/temperature_inc field in the same request still wins —
+        // same last-wins rule as the CLI, where --sensitivity is overridden by
+        // a later -et/-lpt/-nth. An unknown preset is ignored with a warning
+        // rather than failing the request, since the four fields below can
+        // still fully specify the decode.
+        {
+            const std::string sens = form_string(req, "sensitivity", "");
+            if (!sens.empty()) {
+                core_sensitivity::Preset sp;
+                if (core_sensitivity::parse_preset(sens, sp)) {
+                    const auto st = core_sensitivity::preset(sp);
+                    rp.entropy_thold = st.entropy_thold;
+                    rp.logprob_thold = st.logprob_thold;
+                    rp.no_speech_thold = st.no_speech_thold;
+                    rp.temperature_inc = st.temperature_inc;
+                } else {
+                    fprintf(stderr, "crispasr[server]: ignoring unknown sensitivity '%s' (expected: %s)\n",
+                            sens.c_str(), core_sensitivity::preset_list());
+                }
+            }
+        }
         rp.entropy_thold = form_float(req, "entropy_thold", rp.entropy_thold);
         rp.logprob_thold = form_float(req, "logprob_thold", rp.logprob_thold);
         rp.no_speech_thold = form_float(req, "no_speech_thold", rp.no_speech_thold);
@@ -1614,6 +1641,9 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     //   grammar_rule     (optional) — root rule for grammar
     //   best_of          (optional) — whisper best-of-N sampling
     //   beam_size        (optional) — whisper beam search size
+    //   sensitivity      (optional) — conservative|balanced|aggressive: the four
+    //                      threshold fields below as one bundle. Applied first,
+    //                      so an explicit field in the same request still wins.
     //   entropy_thold    (optional) — entropy threshold for decoder fail
     //   no_speech_thold  (optional) — no-speech probability threshold
     //   chunk_seconds    (optional) — max chunk duration for long audio
@@ -1695,6 +1725,28 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.best_of = form_int(req, "best_of", rp.best_of);
         rp.beam_size = form_int(req, "beam_size", rp.beam_size);
         rp.return_logits = form_bool(req, "return_logits", rp.return_logits);
+        // `sensitivity` is applied FIRST so an explicit entropy/logprob/
+        // no_speech/temperature_inc field in the same request still wins —
+        // same last-wins rule as the CLI, where --sensitivity is overridden by
+        // a later -et/-lpt/-nth. An unknown preset is ignored with a warning
+        // rather than failing the request, since the four fields below can
+        // still fully specify the decode.
+        {
+            const std::string sens = form_string(req, "sensitivity", "");
+            if (!sens.empty()) {
+                core_sensitivity::Preset sp;
+                if (core_sensitivity::parse_preset(sens, sp)) {
+                    const auto st = core_sensitivity::preset(sp);
+                    rp.entropy_thold = st.entropy_thold;
+                    rp.logprob_thold = st.logprob_thold;
+                    rp.no_speech_thold = st.no_speech_thold;
+                    rp.temperature_inc = st.temperature_inc;
+                } else {
+                    fprintf(stderr, "crispasr[server]: ignoring unknown sensitivity '%s' (expected: %s)\n",
+                            sens.c_str(), core_sensitivity::preset_list());
+                }
+            }
+        }
         rp.entropy_thold = form_float(req, "entropy_thold", rp.entropy_thold);
         rp.logprob_thold = form_float(req, "logprob_thold", rp.logprob_thold);
         rp.no_speech_thold = form_float(req, "no_speech_thold", rp.no_speech_thold);
@@ -2170,6 +2222,18 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         }
         std::string consent_attestation = body.value("consent_attestation", "");
         std::string instructions = body.value("instructions", "");
+        // #13273: omnivoice's instruct is a CLOSED 48-item vocabulary and
+        // upstream rejects anything else. Validate at the edge so a bad value
+        // is a 400 naming the offending item, not a 500 from a synthesis that
+        // failed three layers down. Free: the validator is a weight-free header.
+        if (!instructions.empty() && backend_name == "omnivoice") {
+            const auto parsed = core_omnivoice_instruct::parse(instructions);
+            if (parsed.status != core_omnivoice_instruct::Status::ok &&
+                parsed.status != core_omnivoice_instruct::Status::cleared) {
+                json_error(res, 400, parsed.error, "invalid_instructions", "instructions");
+                return;
+            }
+        }
         // #316: drive the acoustic model with these phonemes, skipping the G2P.
         // kokoro and piper only; refused elsewhere rather than silently
         // synthesizing `input`, which would make an A/B look like the phonemes

@@ -1102,20 +1102,20 @@ constexpr Entry k_registry[] = {
      "~4 MB"},
 
     // Piper — rhasspy/piper VITS TTS. 250+ community voices, 30+ languages.
-    // Default voice: en_US-lessac-medium (~16 MB F16).
+    // Default voice: en_US-lessac-medium (~30 MB F16).
     {"piper", "piper-en_US-lessac-medium-f16.gguf",
      "https://huggingface.co/cstr/piper-en_US-lessac-medium-GGUF/resolve/main/piper-en_US-lessac-medium-f16.gguf",
-     "~16 MB", nullptr, nullptr},
+     "~30 MB", nullptr, nullptr},
     // German voices from the consolidated piper-voices-GGUF repo
     {"piper", "piper-de_DE-thorsten-medium-f16.gguf",
      "https://huggingface.co/cstr/piper-voices-GGUF/resolve/main/piper-de_DE-thorsten-medium-f16.gguf",
      "~30 MB", nullptr, nullptr},
     {"piper", "piper-de_DE-thorsten-high-f16.gguf",
      "https://huggingface.co/cstr/piper-voices-GGUF/resolve/main/piper-de_DE-thorsten-high-f16.gguf",
-     "~60 MB", nullptr, nullptr},
+     "~54 MB", nullptr, nullptr},
     {"piper", "piper-de_DE-kerstin-low-f16.gguf",
      "https://huggingface.co/cstr/piper-voices-GGUF/resolve/main/piper-de_DE-kerstin-low-f16.gguf",
-     "~12 MB", nullptr, nullptr},
+     "~30 MB", nullptr, nullptr},
 
     // Bark — suno/bark 3-stage hierarchical TTS (MIT). bark-small ~300M params,
     // 24 kHz, 10 German speakers (v2/de_speaker_0..9). Single GGUF packs all
@@ -1214,6 +1214,17 @@ constexpr Entry k_registry[] = {
     // voices (57 KB) = ~745 MB. F16 reference also on the same repo.
     {"cosyvoice3-tts", "cosyvoice3-llm-q4_k.gguf",
      "https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF/resolve/main/cosyvoice3-llm-q4_k.gguf",
+     "~384 MB",
+     "cosyvoice3-flow-q8_0.gguf",
+     "https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF/resolve/main/cosyvoice3-flow-q8_0.gguf",
+     "~361 MB"},
+    // Same engine, upstream's OTHER talker: llm.rl.pt, reinforcement-learning
+    // tuned for speech quality, pronunciation accuracy and generation
+    // stability. Only the LLM differs — flow / HiFT / CAMPPlus / s3tok /
+    // voices are the shared companions below, so `--backend cosyvoice3-tts-rl
+    // -m auto` swaps one 384 MB file (#334).
+    {"cosyvoice3-tts-rl", "cosyvoice3-llm-rl-q4_k.gguf",
+     "https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF/resolve/main/cosyvoice3-llm-rl-q4_k.gguf",
      "~384 MB",
      "cosyvoice3-flow-q8_0.gguf",
      "https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF/resolve/main/cosyvoice3-flow-q8_0.gguf",
@@ -1342,6 +1353,7 @@ constexpr ExtraList k_extras[] = {
     {"dots-tts", k_dots_tts_extras},
     {"vibevoice-tts", k_vibevoice_tts_extras},
     {"cosyvoice3-tts", k_cosyvoice3_tts_extras},
+    {"cosyvoice3-tts-rl", k_cosyvoice3_tts_extras},
     {"qwen3-tts", k_qwen3_tts_base_extras},
     {"qwen3-tts-1.7b-base", k_qwen3_tts_base_extras},
     {"tada", k_tada_3b_extras},

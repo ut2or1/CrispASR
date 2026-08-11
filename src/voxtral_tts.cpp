@@ -28,6 +28,8 @@
 
 #include "voxtral_tts.h"
 
+#include "voxtral_tekken_vocab.h" // #338 active-vocabulary bound
+
 #include "core/attention.h"
 #include "core/conv.h"
 #include "core/ffn.h"
@@ -326,35 +328,21 @@ static std::vector<int> parse_int_list(const std::string& s) {
 // Tekken BPE tokenizer (adapted from voxtral4b.cpp)
 // ---------------------------------------------------------------------------
 
-static void tekken_build_vocab(voxtral_tts_vocab& v) {
-    // Decode the packed vocab blob into piece strings and build the merge table.
-    const uint8_t* p = v.tekken_vocab_blob.data();
-    const uint8_t* end = p + v.tekken_vocab_blob.size();
-    v.id_to_piece.clear();
-    v.piece_to_id.clear();
-
-    // Specials come first (IDs 0 .. n_specials-1)
-    for (int i = 0; i < v.n_specials && i < (int)v.specials.size(); i++) {
-        v.id_to_piece.push_back(v.specials[i]);
-        v.piece_to_id[v.specials[i]] = i;
-    }
-    // Pad if fewer specials stored
-    while ((int)v.id_to_piece.size() < v.n_specials) {
-        v.id_to_piece.push_back("");
-    }
-
-    // BPE vocab entries
-    int bpe_id = v.n_specials;
-    while (p + 2 <= end) {
-        uint16_t len = *(const uint16_t*)p;
-        p += 2;
-        if (p + len > end)
-            break;
-        std::string piece((const char*)p, len);
-        p += len;
-        v.id_to_piece.push_back(piece);
-        v.piece_to_id[piece] = bpe_id;
-        bpe_id++;
+// #338: `llm_vocab_size` is the width of the embedding table, and the Tekken
+// blob is allowed to be LONGER than it — the tail entries are inert padding
+// this checkpoint never activates. Admitting them to the encoder's map lets it
+// emit ids past the table, which reaches `ggml_get_rows(token_embd, …)` out of
+// bounds. The bound and the decode both live in voxtral_tekken_vocab.h so this
+// runtime and the diff harness's reference tokenizer cannot drift apart again.
+static void tekken_build_vocab(voxtral_tts_vocab& v, int llm_vocab_size, int verbosity) {
+    const int active_limit = voxtral_tekken::active_bpe_count(llm_vocab_size, v.n_specials);
+    const auto st = voxtral_tekken::decode_blob(v.tekken_vocab_blob, v.n_specials, v.specials, active_limit,
+                                                v.id_to_piece, v.piece_to_id);
+    if (st.n_inactive > 0 && verbosity >= 1) {
+        fprintf(stderr,
+                "voxtral_tts: tekken vocab: %d active BPE pieces, %d inactive tail entries ignored "
+                "(llm_vocab_size=%d, %d specials)\n",
+                st.n_active, st.n_inactive, llm_vocab_size, v.n_specials);
     }
 }
 
@@ -404,54 +392,10 @@ static void tekken_bpe_encode(const voxtral_tts_vocab& v, const uint8_t* data, s
     }
 }
 
-// Tekken regex pre-tokenizer, hand-rolled. The tekken.json pattern
-// (`[^\r\n\p{L}\p{N}]?[\p{Lu}...]*[\p{Ll}...]+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+`)
-// attaches an optional single leading non-alphanumeric byte (typically a space)
-// to the following letter/number run — so "Hello world" → ["Hello", " world"] not
-// ["Hello", " ", "world"]. Skipping this lets greedy BPE merge across word
-// boundaries and mis-tokenise. UTF-8 continuation/lead bytes (≥0x80) are treated
-// as letters (approximates \p{L} without a full Unicode table).
+// Pre-tokenizer lives in voxtral_tekken_vocab.h so the runtime and its
+// tests share one implementation (the #338 lesson).
 static std::vector<std::string> tekken_pre_tokenize(const std::string& text) {
-    std::vector<std::string> out;
-    const size_t n = text.size();
-    auto is_alpha = [](unsigned char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c >= 0x80; };
-    auto is_digit = [](unsigned char c) { return c >= '0' && c <= '9'; };
-    auto is_ws = [](unsigned char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
-    size_t i = 0;
-    while (i < n) {
-        const unsigned char c = (unsigned char)text[i];
-        // Optional single leading non-alnum/non-newline byte before a word/number.
-        size_t k = i;
-        if (!is_alpha(c) && !is_digit(c) && c != '\n' && c != '\r')
-            k = i + 1;
-        if (k < n && is_alpha((unsigned char)text[k])) {
-            size_t j = k;
-            while (j < n && is_alpha((unsigned char)text[j]))
-                j++;
-            out.push_back(text.substr(i, j - i));
-            i = j;
-        } else if (k < n && is_digit((unsigned char)text[k])) {
-            size_t j = k;
-            while (j < n && is_digit((unsigned char)text[j]))
-                j++;
-            out.push_back(text.substr(i, j - i));
-            i = j;
-        } else if (is_ws(c)) {
-            size_t j = i;
-            while (j < n && is_ws((unsigned char)text[j]))
-                j++;
-            out.push_back(text.substr(i, j - i));
-            i = j;
-        } else {
-            size_t j = i;
-            while (j < n && !is_alpha((unsigned char)text[j]) && !is_digit((unsigned char)text[j]) &&
-                   !is_ws((unsigned char)text[j]))
-                j++;
-            out.push_back(text.substr(i, j - i));
-            i = j;
-        }
-    }
-    return out;
+    return voxtral_tekken::pre_tokenize(text);
 }
 
 static std::vector<int32_t> voxtral_tts_tokenize(voxtral_tts_context* ctx, const std::string& text) {
@@ -495,6 +439,32 @@ static std::vector<int32_t> voxtral_tts_tokenize(voxtral_tts_context* ctx, const
             }
         }
         pos = next_special;
+    }
+    // #338 belt-and-braces: the bounded vocab above should make this
+    // unreachable, but an out-of-range id here becomes an out-of-bounds row in
+    // `ggml_get_rows(token_embd, …)` — a CPU assertion, or NaN-from-frame-0 and
+    // runaway generation on CUDA. Drop it loudly instead of handing it to ggml;
+    // a missing token mangles one word, a bad row index takes down the process
+    // or the whole utterance.
+    {
+        const int vs = (int)ctx->hp.llm_vocab_size;
+        size_t n_bad = 0;
+        std::vector<int32_t> kept;
+        kept.reserve(ids.size());
+        for (int32_t id : ids) {
+            if (voxtral_tekken::token_id_in_range(id, vs)) {
+                kept.push_back(id);
+            } else {
+                n_bad++;
+            }
+        }
+        if (n_bad > 0) {
+            fprintf(stderr,
+                    "voxtral_tts: dropped %zu token id(s) outside [0, %d) before embedding lookup — the tokenizer "
+                    "produced an id this checkpoint cannot address (please report with the input text)\n",
+                    n_bad, vs);
+            ids.swap(kept);
+        }
     }
     return ids;
 }
@@ -778,7 +748,7 @@ extern "C" voxtral_tts_context* voxtral_tts_init_from_file(const char* path_mode
             }
         }
     }
-    tekken_build_vocab(ctx->vocab);
+    tekken_build_vocab(ctx->vocab, (int)hp.llm_vocab_size, ctx->verbosity);
 
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "voxtral_tts: LLM %dL d=%d heads=%d/%d\n", hp.llm_n_layers, hp.llm_dim, hp.llm_n_heads,

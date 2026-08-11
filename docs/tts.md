@@ -13,7 +13,7 @@ trade-off:
 | **`miotts`** | MioTTS-0.6B (Qwen3 LLM + MioCodec-v2). EN/JA. Single GGUF, 44.1 kHz output. Codec-aware mixed quantization (LLM Q4_K + codec F16). | Yes — `--voice preset.emb.gguf` (preset speaker embeddings) | 502 MB Q4_K via `-m auto` |
 | **`moss-tts`** | MOSS-TTS-v1.5 (MossTTSDelay): Qwen3-8B backbone emitting 32 RVQ audio codebooks under a delay pattern, decoded by a 1.6B transformer codec. Needs the codec companion (`--codec-model`, or auto-downloaded/sibling). | Yes — `--voice ref.wav` (the codec encoder clones the reference speaker) | ~5 GB Q4_K backbone + ~3.5 GB F16 codec via `-m auto` |
 | **`moss-tts-local`** | MOSS-TTS-Local-Transformer-v1.5 (MossTTSLocal, 4B): Qwen3-4B backbone + a 1-layer local/depth transformer that autoregressively emits 12 RVQ codebooks per frame (RQ-Transformer; no delay pattern), decoded to 48 kHz stereo by MOSS-Audio-Tokenizer-v2 (downmixed to mono). Needs the codec companion (`--codec-model`, or auto-downloaded/sibling). | `--voice ref.wav --i-have-rights` (needs the encoder-carrying codec, `--codec-model moss-tts-local-v1.5-codec-enc.gguf`; the plain `-codec.gguf` is decode-only and falls back to the default voice) | ~9.1 GB F16 backbone + ~2.1 GB codec via `-m auto` (F16 is the reliable target; Q4_K long-form runs away) |
-| **`omnivoice`** | 600+ languages. Qwen3-0.6B backbone with masked iterative 8-codebook TTS (SoundStorm-style). Zero-shot voice cloning from reference audio. Supports finetunes (omnivoice-singing). | Yes (`--voice <wav> --ref-text "..."`) | ~1.2 GB F16 + ~400 MB tokenizer |
+| **`omnivoice`** | 600+ languages, selected with `-l` / `-tl` (or `"language"` on `/v1/audio/speech`) — see the language note below. Qwen3-0.6B backbone with masked iterative 8-codebook TTS (SoundStorm-style). Zero-shot voice cloning from reference audio. Supports finetunes (omnivoice-singing). | Yes (`--voice <wav> --ref-text "..."`) | ~1.2 GB F16 + ~400 MB tokenizer |
 | **`vibevoice-tts`** | Lowest-latency streaming TTS, designed for realtime. | Preset voice packs | ~636 MB via `-m auto` |
 | **`vibevoice-1.5b`** | Base VibeVoice TTS model with WAV cloning. | Yes (`CRISPASR_VIBEVOICE_VOICE_AUDIO=<wav>` or `--voice <wav>`) | ~1.6 GB via `-m auto` |
 | **`orpheus`** | Llama-3.2-3B talker + SNAC 24 kHz codec. 8 baked English speakers; expressive output. Greedy loops — pass `--temperature 0.6`. | Preset names via `--voice tara/leah/...` | ~3.5 GB via `-m auto` (talker Q8 + 26 MB SNAC) |
@@ -41,7 +41,7 @@ trade-off:
 | **`mini-omni2`** | gpt-omni/mini-omni2: Whisper-small encoder + Qwen2-0.5B LLM with 8-stream architecture + SNAC 24 kHz decoder → 24 kHz. Also does ASR and speech-to-speech. MIT license. Requires `--codec-model snac-24khz.gguf` companion. | No | ~1.0 GB Q4_K + ~80 MB SNAC companion |
 | **`voxtral-tts`** | Mistral Voxtral-4B-TTS-2603: Ministral-3B AR backbone (26L GQA, NORMAL/adjacent-pair RoPE) + 3L bidirectional flow-matching acoustic transformer (8-step Euler ODE + CFG α=1.2, no positional encoding) + Voxtral codec decoder (ALiBi sliding-window attention + reflect-causal conv + ConvTranspose upsampling) → 24 kHz. 20 preset voices across 9 languages (en/fr/de/es/it/pt/nl/ar/hi); strong on French technical text. CC-BY-NC-4.0. | No (20 preset voices via `--voice <name>`, e.g. `fr_female`) | ~2.4 GB Q4_K / ~4.3 GB Q8_0 / ~8.2 GB F16 via `-m auto` |
 
-All backends write mono WAV via `--tts-output` (22 kHz for piper/fastpitch/bananamind-tts, 16 kHz for speecht5, 24 kHz for most others, 44.1 kHz for melotts/dia/parler-tts/zonos-tts, 48 kHz for voxcpm2-tts).
+All backends write mono WAV via `--tts-output` (22 kHz for piper/fastpitch/bananamind-tts, 16 kHz for speecht5, 44.1 kHz for melotts/dia/parler-tts/zonos-tts, 48 kHz for voxcpm2-tts/dots-tts/irodori-tts/moss-tts-local/sidon, 24 kHz for most others). Programmatic callers don't need this table: `crispasr_session_output_sample_rate()` returns the active backend's output rate, with `crispasr_session_input_channels()` / `output_channels()` alongside (everything is mono today) — #332.
 
 ## dots.tts — voice cloning and performance
 
@@ -338,6 +338,80 @@ any `crispasr --server` instance whose loaded backend declares
 `whisper_params`. Long-form input is auto-chunked on sentence
 boundaries.
 
+## CosyVoice3 — voice cloning from a WAV
+
+```bash
+./build/bin/crispasr --backend cosyvoice3-tts -m auto \
+    --voice ref.wav --i-have-rights \
+    --tts "Text to speak." --tts-output out.wav
+```
+
+**Leave `--ref-text` off unless you have an exact transcript.** The reference
+is auto-transcribed (whisper by default, `--ref-asr` to pick another backend)
+and the result is cached beside the clip as `<voice>.cv3reftext`, so only the
+first run pays for ASR.
+
+The reason this matters is issue #334: a transcript that does not match the
+clip is the one input that quietly ruins the output. The talker LM is
+conditioned on the pair *(reference transcript, reference speech)* and infers
+the speaker's rate from it. Hand it 18 s of audio labelled with one sentence
+and it concludes the speaker says a sentence in 18 s, then either stops
+immediately — `AR decode produced 0 tokens`, no audio — or crams the line you
+asked for into far too few 40 ms frames, which is heard as rushed, pitched-up
+speech. Measured on a 17.7 s reference: with a one-sentence guess the requested
+line vanished from the output entirely; auto-transcribed, it came out in full.
+
+If you do pass `--ref-text`, it must be a complete, exact transcription.
+Upstream's decode only ever spends between 2 and 20 speech tokens per text
+token, so the runtime checks what you passed against that same band and warns
+when the pairing cannot be a transcript:
+
+```
+cosyvoice3_tts: WARNING: the reference clip holds 17.72 s of speech but
+--ref-text is only 7 token(s) long (63.3 speech frames per text token; a
+matching transcript lands between 2 and 20). …
+```
+
+If you cannot transcribe the whole clip, either drop `--ref-text` and let the
+backend do it, or **trim the clip to the part you did transcribe** — a clean
+4–10 s excerpt clones better than 20 s with an approximate transcript.
+
+### Reference sample rate
+
+Any rate works and none is preferred: the reference is resampled internally to
+16 kHz for the speech tokenizer and the CAMPPlus speaker encoder, and to 24 kHz
+for the prompt mel. 8/16/22.05/24/32/44.1/48 kHz references of the same
+recording all round-trip to the same transcript with the same speaking rate.
+The output is always 24 kHz mono regardless of the reference.
+
+### Base vs RL talker
+
+`FunAudioLLM/Fun-CosyVoice3-0.5B-2512` ships two talker checkpoints: `llm.pt`
+(pre-trained) and `llm.rl.pt` (reinforcement-learning tuned by the authors for
+speech quality, pronunciation accuracy and generation stability). Only the
+talker differs — flow, HiFT, CAMPPlus, the speech tokenizer and the voice bank
+are shared, so the RL build swaps exactly one 384 MB file:
+
+```bash
+./build/bin/crispasr --backend cosyvoice3-tts-rl -m auto \
+    --voice fleurs-en --i-have-rights \
+    --tts "The northern lights can be heard as well as seen." --tts-output out.wav
+```
+
+`cosyvoice3-tts-rl` is the same engine; the alias exists so `-m auto` fetches
+`cosyvoice3-llm-rl-q4_k.gguf` instead of the base talker. Both live in
+[`cstr/cosyvoice3-0.5b-2512-GGUF`](https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF)
+(F16 and Q4_K), and pointing `-m` at either file directly works too — the
+companions are found by name.
+
+To rebuild either talker from the upstream checkpoint:
+
+```bash
+python models/convert-cosyvoice3-to-gguf.py \
+    --input FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --output-dir out \
+    --llm-checkpoint llm.rl.pt --skip flow --skip hift   # → cosyvoice3-llm-rl-f16.gguf
+```
+
 ## Output language and cross-lingual cloning (`-tl` / `-sl`)
 
 Issue #329: *"there is usually an option to select the target language, but I
@@ -419,6 +493,80 @@ Passing `-sl` resolves it. Before #329, detection covered only Hangul / Kana /
 Han / Cyrillic, so **every Latin-script pair** — en↔de, en↔fr, es↔it, the ones a
 subtitle-dubbing workflow actually asks for — landed in that unknown case, with
 no message and no way to override it.
+
+### OmniVoice: ISO 639-3 ids, and what the tag can and cannot do
+
+OmniVoice carries the language as a literal string in its prompt, so the value
+has to be one the model was trained on: an **ISO 639-3 id** from its own
+646-entry map, or the English name for one. `-l de`, `-l German` and
+`{"language": "German"}` all produce byte-identical output; anything else —
+`de-DE`, `en_US`, a typo — is not a language the model knows and falls back to
+language-agnostic synthesis with a warning naming the nearest match:
+
+```
+crispasr[omnivoice]: language 'de-DE' is not one of the model's 646 language IDs — did you mean 'de'?
+crispasr[omnivoice]: falling back to language-agnostic synthesis. Pass an ISO 639-3 id (e.g. 'en', 'de', 'arb') or an English name (e.g. 'German').
+```
+
+**If you request nothing, the language is guessed from the text.** An explicit
+`-l` / `-tl` / `"language"` always wins; the guess only fills the gap that used
+to be filled by "language-agnostic", and only when it is confident enough to
+land on an id the model knows (short lines usually are not, and stay agnostic).
+`CRISPASR_OMNIVOICE_AUTO_LANG=0` turns it off. This is why OmniVoice speaks
+German subtitles as German through a client that never sends a language field.
+
+Two things that surprise people:
+
+- **Macrolanguage codes are absent.** The map lists individual languages, so
+  Arabic is `arb` (Standard), `arz` (Egyptian), `ary` (Moroccan) and ~20 more —
+  there is no `ar`. Same shape for other macrolanguages. This is the model's
+  vocabulary, not a gap in ours.
+- **The tag is not an accent control.** Unlike CosyVoice3, OmniVoice has no
+  cross-lingual mode: a voice clone always conditions on the
+  (reference transcript, reference audio) pair, and dropping the transcript
+  would desynchronize it from the audio. So cloning an English speaker onto
+  German text may still carry the speaker's accent, and `-tl de` is not
+  guaranteed to remove it — measured over three German sentences, whisper LID
+  could not tell the tagged and untagged output apart. If accent-free output in
+  the target language matters more than exact timbre, use a reference clip
+  already spoken in that language, or use CosyVoice3 with `-sl` (above), which
+  does have a transcript-dropping cross-lingual path.
+
+### OmniVoice: `--instruct` is a closed vocabulary, and it is validated
+
+Voice design (`--instruct`, server `"instructions"`) is not free prose for this
+backend. OmniVoice was trained on a fixed 48-item vocabulary in one exact
+spelling, and the string reaches the prompt literally — `Male, British Accent`
+and `male, british accent` share **no** token ids, so an unnormalised value is
+a different request as far as the model is concerned.
+
+CrispASR mirrors upstream's resolver: items are lowercased, half/full-width
+commas are both accepted, and everything is unified into one language before it
+reaches the prompt. Anything outside the vocabulary is **rejected** — the CLI
+exits non-zero, the server returns `400 invalid_instructions` — rather than
+being dropped, because a voice-design request that silently does nothing is the
+failure this replaced:
+
+```
+crispasr[omnivoice]: unsupported instruct item 'britsh accent' — did you mean 'british accent'?
+```
+
+The categories, at most one item from each:
+
+| category | items |
+|---|---|
+| gender | `male`, `female` |
+| age | `child`, `teenager`, `young adult`, `middle-aged`, `elderly` |
+| pitch | `very low pitch`, `low pitch`, `moderate pitch`, `high pitch`, `very high pitch` |
+| style | `whisper` |
+| accent (English only) | `american accent`, `british accent`, `australian accent`, `canadian accent`, `indian accent`, `chinese accent`, `japanese accent`, `korean accent`, `portuguese accent`, `russian accent` |
+| dialect (Chinese only) | `河南话`, `陕西话`, `四川话`, `贵州话`, `云南话`, `桂林话`, `济南话`, `石家庄话`, `甘肃话`, `宁夏话`, `青岛话`, `东北话` |
+
+Each item has a Chinese counterpart (`male` ↔ `男`), and the whole instruct is
+unified to one language before synthesis: a dialect forces Chinese, an accent
+forces English, otherwise it follows the language of the text being spoken. So
+`--instruct "male, elderly"` on Chinese text becomes `男，老年`. Mixing a
+dialect with an accent is rejected — they belong to different speech.
 
 ## G2P Phonemization (`--g2p-dict`)
 

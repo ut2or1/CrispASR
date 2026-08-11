@@ -50,9 +50,25 @@ class TestBackendConfig(unittest.TestCase):
         self.assertIn("const int T_pack = T_proj * 4;", impl)
 
     def test_cli_only_loads_all_backends_when_gpu_is_enabled(self) -> None:
+        """`ggml_backend_load_all()` must stay behind BOTH gates.
+
+        Asserted on structure rather than on one exact source line: this test
+        used to pin the literal `if (params.use_gpu && params.gpu_backend !=
+        "cpu") {` and went red the moment fd3c0e5e split it into a nested pair
+        — same behaviour, different formatting, red nightly. What matters is
+        that the call is reached only when the GPU is on AND the chosen backend
+        is not "cpu"; how the two conditions are spelled is not the contract.
+        """
         text = read("examples/cli/cli.cpp")
-        self.assertIn('if (params.use_gpu && params.gpu_backend != "cpu") {', text)
-        self.assertIn("ggml_backend_load_all();", text)
+        start = text.find("if (params.use_gpu)")
+        if start < 0:
+            start = text.find("if (params.use_gpu &&")
+        self.assertGreater(start, 0, "no `if (params.use_gpu)` guard in cli.cpp")
+        window = text[start:start + 400]
+        self.assertIn('params.gpu_backend != "cpu"', window)
+        self.assertIn("ggml_backend_load_all();", window)
+        # ...and nowhere else: an unguarded call would defeat the whole point.
+        self.assertEqual(text.count("ggml_backend_load_all();"), 1)
 
     def test_omniasr_keeps_explicit_cpu_fallback_backend(self) -> None:
         text = read("src/omniasr.cpp")

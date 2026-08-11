@@ -33,7 +33,10 @@
 #include "core/wav_reader.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h"
-#include "core/tts_ref_cache.h" // shared content-addressed reference-voice cache (issue #265)
+#include "core/omnivoice_instruct.h" // closed-vocabulary voice-design validation (#13273)
+#include "core/omnivoice_lang.h"     // ISO-639-3 resolution for the <|lang_start|> tag (#13273)
+#include "core/omnivoice_prompt.h"   // style-prefix assembly, unit-testable (#13273)
+#include "core/tts_ref_cache.h"      // shared content-addressed reference-voice cache (issue #265)
 #include "core/crispasr_env.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -72,6 +75,13 @@ bool env_bool(const char* k) {
 const char* env_str(const char* k) {
     const char* v = crispasr_env::get(k);
     return (v && *v) ? v : nullptr;
+}
+// For default-ON gates: unset means `dflt`, an explicit "0" always disables.
+bool env_bool_default(const char* k, bool dflt) {
+    const char* v = crispasr_env::get(k);
+    if (!v || !*v)
+        return dflt;
+    return std::strcmp(v, "0") != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -384,7 +394,9 @@ struct omnivoice_context {
 
     // Language / instruct
     std::string language;
-    std::string instruct;
+    // Validated at set time; the final string is rendered per synthesis because
+    // the EN/ZH choice depends on the text being spoken (see omnivoice_instruct.h).
+    core_omnivoice_instruct::Parsed instruct;
 
     // Speaking-rate multiplier for the target-length estimate (>1 faster/shorter).
     float speed = 1.0f;
@@ -1603,15 +1615,51 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
 
     // 3. Build style prefix. When cloning, a <|denoise|> token leads the style
     //    (Python create_voice_clone_prompt), then language + instruct.
-    std::string style_text;
-    if (ctx->ref_T > 0)
-        style_text += "<|denoise|>";
-    std::string lang_str = ctx->language.empty() ? "None" : ctx->language;
-    std::string instruct_str = ctx->instruct.empty() ? "None" : ctx->instruct;
-    style_text += "<|lang_start|>" + lang_str + "<|lang_end|>";
-    style_text += "<|instruct_start|>" + instruct_str + "<|instruct_end|>";
+    // The language the caller asked for wins outright. Only when nobody set one
+    // do we guess from the text (#13273): SubtitleEdit's language menu is still
+    // not wired to the payload upstream, so without this every dubbed line
+    // arrives language-agnostic no matter what the user picked.
+    //
+    // Computed PER CALL into a local — never written back to ctx->language.
+    // The server reuses one context across requests, so a sticky guess would
+    // leak line N's detected language onto line N+1, which is the exact
+    // per-call-vs-init bug this whole change exists to fix.
+    //
+    // ⚠ Detect over `text` (the target), NOT `combined_text` — the latter has
+    // the reference transcript glued to its front, so an English reference clip
+    // would pull every German subtitle's guess to English.
+    std::string eff_lang = ctx->language;
+    if (eff_lang.empty() && env_bool_default("CRISPASR_OMNIVOICE_AUTO_LANG", true)) {
+        eff_lang = core_omnivoice_lang::auto_detect(text);
+        if (debug && !eff_lang.empty())
+            fprintf(stderr, "omnivoice: no language requested; detected '%s' from the target text\n", eff_lang.c_str());
+    }
+
+    // Render the validated instruct for THIS text: a dialect forces Chinese, an
+    // accent forces English, otherwise it follows whether the target text is
+    // Chinese. Text-dependent, so it cannot be baked in at set time.
+    const std::string instruct_rendered =
+        core_omnivoice_instruct::render(ctx->instruct, core_omnivoice_instruct::text_is_zh(text));
+
+    // Assembly lives in a weight-free header so the exact prompt string is
+    // unit-testable (tests/test-omnivoice-prompt.cpp) instead of only
+    // observable by loading the model and reading the debug print below.
+    const std::string style_text = core_omnivoice_prompt::build_style_text(ctx->ref_T > 0, eff_lang, instruct_rendered);
     std::vector<int32_t> style_ids = tokenize(ctx->vocab, style_text);
     int T_style = (int)style_ids.size();
+
+    // The style prefix is where the language conditioning actually lives, and a
+    // BPE difference here is invisible in every downstream metric — the graph
+    // still computes, the audio still sounds like speech. Print the ids so
+    // prompt-token parity against the HF tokenizer stays a one-command check
+    // (dev-guide step 0 for any AR model):
+    //   AutoTokenizer.from_pretrained(<lm-src>)(style_text).input_ids
+    if (debug) {
+        fprintf(stderr, "omnivoice: style '%s' -> %d ids:", style_text.c_str(), T_style);
+        for (int id : style_ids)
+            fprintf(stderr, " %d", id);
+        fprintf(stderr, "\n");
+    }
 
     // 4. Build the full input sequence
     // Layout: [style_tokens | text_tokens | ref_audio_tokens? | target_mask_tokens]
@@ -3029,6 +3077,9 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
         return -1;
     }
     fprintf(stderr, "omnivoice encode-diff vs %s\n", ref_path);
+    // Failed main-chain stages; the return value reflects this so callers can
+    // gate on it (a diff that prints FAIL but exits 0 is not a gate).
+    int n_fail = 0;
 
     // --- Stage HuBERT frontend: feed ref wav16k_pad (isolates resampling) →
     //     hb_featextract + hb_featproj. Uses a separate archive via env. ---
@@ -3166,11 +3217,15 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
             if ((int)mine.size() == T * C && T_out == T) {
                 float cmin, cmean, mabs;
                 higgs_cos(mine.data(), (const float*)r_ac->data, T, C, cmin, cmean, mabs);
+                const bool ok = cmin >= 0.999f;
+                if (!ok)
+                    n_fail++;
                 fprintf(stderr, "  acoustic_enc (→e_acoustic): cos_min=%.6f cos_mean=%.6f max_abs=%.3e  %s\n", cmin,
-                        cmean, mabs, cmin >= 0.999f ? "PASS" : "FAIL");
+                        cmean, mabs, ok ? "PASS" : "FAIL");
             } else {
                 fprintf(stderr, "  acoustic_enc: shape mismatch mine=%zu (T_out=%d) ref=(%d,%d)\n", mine.size(), T_out,
                         T, C);
+                n_fail++;
             }
         } else {
             fprintf(stderr, "  acoustic_enc: ref missing input_wav24k/e_acoustic\n");
@@ -3187,10 +3242,14 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
             if ((int)mine.size() == T * C) {
                 float cmin, cmean, mabs;
                 higgs_cos(mine.data(), (const float*)r_es->data, T, C, cmin, cmean, mabs);
+                const bool ok = cmin >= 0.999f;
+                if (!ok)
+                    n_fail++;
                 fprintf(stderr, "  encoder_semantic (→e_semantic): cos_min=%.6f cos_mean=%.6f max_abs=%.3e  %s\n", cmin,
-                        cmean, mabs, cmin >= 0.999f ? "PASS" : "FAIL");
+                        cmean, mabs, ok ? "PASS" : "FAIL");
             } else {
                 fprintf(stderr, "  encoder_semantic: size mismatch mine=%zu ref=%d\n", mine.size(), T * C);
+                n_fail++;
             }
         } else {
             fprintf(stderr, "  encoder_semantic: ref missing sem_ds/e_semantic\n");
@@ -3220,8 +3279,11 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
             higgs_linear(fc_w, fc_b, cat.data(), T, H, H, mine);
             float cmin, cmean, mabs;
             higgs_cos(mine.data(), (const float*)r_emb->data, T, H, cmin, cmean, mabs);
+            const bool ok = cmin >= 0.999f;
+            if (!ok)
+                n_fail++;
             fprintf(stderr, "  concat+fc (→emb_fc): cos_min=%.6f cos_mean=%.6f max_abs=%.3e  %s\n", cmin, cmean, mabs,
-                    cmin >= 0.999f ? "PASS" : "FAIL");
+                    ok ? "PASS" : "FAIL");
         } else {
             fprintf(stderr, "  concat+fc: ref missing e_acoustic/e_semantic/emb_fc or fc weights\n");
         }
@@ -3257,7 +3319,13 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
                         match++;
                         per_cb[k]++;
                     }
-            fprintf(stderr, "  RVQ (emb_fc→codes): %ld/%ld exact (%.1f%%)  per-cb:", match, tot, 100.0 * match / tot);
+            // 99.5%: measured 99.9% on the pinned fixture; the handful of
+            // off-by-one codes are borderline nearest-centroid ties.
+            const bool ok = match * 1000 >= tot * 995;
+            if (!ok)
+                n_fail++;
+            fprintf(stderr, "  RVQ (emb_fc→codes): %ld/%ld exact (%.1f%%)  %s  per-cb:", match, tot,
+                    100.0 * match / tot, ok ? "PASS" : "FAIL");
             for (int k = 0; k < NQ; k++)
                 fprintf(stderr, " %d/%d", per_cb[k], T);
             fprintf(stderr, "\n    mine cb0[:12]:");
@@ -3292,14 +3360,23 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
                 for (size_t i = 0; i < refc.size(); i++)
                     if (mine[i] == refc[i])
                         match++;
-                fprintf(stderr, "  FULL wav→codes: %ld/%zu exact (%.1f%%), T=%d\n", match, refc.size(),
-                        100.0 * match / refc.size(), T_out);
+                // 95%: measured 99.0% on the pinned fixture; the residual is
+                // our resampler vs torchaudio's Hann sinc, not a port bug.
+                // The corrupt-tokenizer failure mode sits at 15%.
+                const bool ok = match * 100 >= (long)refc.size() * 95;
+                if (!ok)
+                    n_fail++;
+                fprintf(stderr, "  FULL wav→codes: %ld/%zu exact (%.1f%%), T=%d  %s\n", match, refc.size(),
+                        100.0 * match / refc.size(), T_out, ok ? "PASS" : "FAIL");
             } else {
                 fprintf(stderr, "  FULL wav→codes: T_out=%d ref T=%d (align)\n", T_out, T);
+                n_fail++;
             }
         }
     }
-    return 0;
+    if (n_fail > 0)
+        fprintf(stderr, "omnivoice encode-diff: %d stage(s) FAILED\n", n_fail);
+    return n_fail == 0 ? 0 : 1;
 }
 
 } // namespace
@@ -3477,17 +3554,59 @@ int omnivoice_set_voice_prompt(struct omnivoice_context* ctx, const char* wav_pa
     return 0;
 }
 
+// The stored value goes VERBATIM into `<|lang_start|>…<|lang_end|>`, so resolve
+// it here rather than at the call sites — this is the one funnel every surface
+// (CLI, server, session ABI, bindings) passes through, and #13273 was three
+// separate surfaces each getting the wiring wrong on its own.
+//
+// Mirrors the blueprint's `_resolve_language()`: a valid ISO 639-3 ID passes
+// through, an English name maps to its ID, anything else becomes None
+// (language-agnostic) — never itself. Passing an unrecognized string through
+// is the silent failure: the prompt still builds, the graph still computes, and
+// the model is conditioned on tokens it never saw in that slot.
 int omnivoice_set_language(struct omnivoice_context* ctx, const char* lang) {
     if (!ctx)
         return -1;
-    ctx->language = lang ? lang : "";
+
+    const std::string requested = lang ? lang : "";
+    const auto resolved = core_omnivoice_lang::resolve(requested);
+    ctx->language = resolved.id;
+
+    if (resolved.status == core_omnivoice_lang::Status::unrecognized) {
+        // Not fatal — synthesis proceeds language-agnostic, exactly as upstream
+        // does — but say so, because the caller asked for something specific
+        // and is not getting it. Silence here is what made the SubtitleEdit
+        // language menu look like it worked.
+        const std::string hint = core_omnivoice_lang::suggest(requested);
+        fprintf(stderr, "crispasr[omnivoice]: language '%s' is not one of the model's %d language IDs",
+                requested.c_str(), core_omnivoice_lang::kLangTableN);
+        if (!hint.empty())
+            fprintf(stderr, " — did you mean '%s'?", hint.c_str());
+        fprintf(stderr, "\ncrispasr[omnivoice]: falling back to language-agnostic synthesis. Pass an ISO "
+                        "639-3 id (e.g. 'en', 'de', 'arb') or an English name (e.g. 'German').\n");
+        return -2;
+    }
     return 0;
 }
 
+// Upstream `_resolve_instruct()` RAISES on an unsupported item, a
+// dialect+accent mix, or two items from one category, and we mirror that rather
+// than degrade: the instruct is a closed 48-item vocabulary, and a voice-design
+// request that silently does nothing is exactly the failure this fixes. On
+// rejection the previous instruct is CLEARED, so a bad value can never leave a
+// stale one conditioning later lines on a reused server context.
 int omnivoice_set_instruct(struct omnivoice_context* ctx, const char* instruct) {
     if (!ctx)
         return -1;
-    ctx->instruct = instruct ? instruct : "";
+
+    core_omnivoice_instruct::Parsed parsed = core_omnivoice_instruct::parse(instruct ? instruct : "");
+    if (parsed.status != core_omnivoice_instruct::Status::ok &&
+        parsed.status != core_omnivoice_instruct::Status::cleared) {
+        fprintf(stderr, "crispasr[omnivoice]: %s\n", parsed.error.c_str());
+        ctx->instruct = core_omnivoice_instruct::Parsed{};
+        return -2;
+    }
+    ctx->instruct = std::move(parsed);
     return 0;
 }
 

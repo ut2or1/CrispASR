@@ -38,6 +38,7 @@ extern int crispasr_session_set_speaker_name(struct CrispasrSession* s, const ch
 extern int crispasr_session_set_speaker_id(struct CrispasrSession* s, int id);
 extern int crispasr_session_set_punc_model(struct CrispasrSession* s, const char* punc_model);
 extern int crispasr_session_set_hotwords(struct CrispasrSession* s, const char* hotwords, float boost);
+extern int crispasr_session_set_sensitivity(struct CrispasrSession* s, const char* preset);
 extern int crispasr_session_set_g2p_dict(struct CrispasrSession* s, const char* source);
 extern int crispasr_session_n_speakers(struct CrispasrSession* s);
 extern const char* crispasr_session_get_speaker_name(struct CrispasrSession* s, int i);
@@ -53,6 +54,10 @@ extern int crispasr_session_set_speaker_identity(struct CrispasrSession* s, cons
 extern float* crispasr_session_speech_to_speech(struct CrispasrSession* s, const float* in_samples, int n_in_samples,
                                                 char** out_text, int* out_n_samples);
 extern int crispasr_session_input_sample_rate(struct CrispasrSession* s);
+/* #332: output-side counterparts (rate of synthesize/s2s PCM; mono channels). */
+extern int crispasr_session_output_sample_rate(struct CrispasrSession* s);
+extern int crispasr_session_input_channels(struct CrispasrSession* s);
+extern int crispasr_session_output_channels(struct CrispasrSession* s);
 extern void crispasr_pcm_free(float* pcm);
 /* AI-content marking (EU AI Act Art. 50(2)) — the other half of synthesize_raw. */
 extern void crispasr_watermark_embed(float* pcm, int n_samples, float alpha);
@@ -701,6 +706,20 @@ static VALUE rb_session_set_hotwords(VALUE self, VALUE handle, VALUE hotwords, V
     return Qnil;
 }
 
+/* Named bundle of the four decoder fallback thresholds: "conservative",
+ * "balanced" (the shipped defaults, a no-op) or "aggressive". Mirrors the CLI's
+ * --sensitivity. rc=-2 is an unrecognised name, raised as ArgumentError so a
+ * typo is never silently treated as "balanced". */
+static VALUE rb_session_set_sensitivity(VALUE self, VALUE handle, VALUE preset) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_sensitivity(s, NIL_P(preset) ? "" : StringValueCStr(preset));
+    if (rc == -2)
+        rb_raise(rb_eArgError, "unknown sensitivity preset (expected: conservative, balanced, aggressive)");
+    if (rc != 0)
+        rb_raise(rb_eRuntimeError, "set_sensitivity failed (rc=%d)", rc);
+    return Qnil;
+}
+
 static VALUE rb_session_set_g2p_dict(VALUE self, VALUE handle, VALUE source) {
     struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
     int rc = crispasr_session_set_g2p_dict(s, NIL_P(source) ? "" : StringValueCStr(source));
@@ -810,8 +829,7 @@ static VALUE rb_session_set_speaker_identity(VALUE self, VALUE handle, VALUE ide
     struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
     int rc = crispasr_session_set_speaker_identity(s, NIL_P(identity) ? "" : StringValueCStr(identity));
     if (rc == -2)
-        rb_raise(rb_eArgError,
-                 "unrecognised speaker_identity (expected real_person, synthetic or unknown)");
+        rb_raise(rb_eArgError, "unrecognised speaker_identity (expected real_person, synthetic or unknown)");
     return INT2NUM(rc);
 }
 
@@ -904,6 +922,26 @@ static VALUE rb_session_speech_to_speech(VALUE self, VALUE handle, VALUE pcm_arr
 static VALUE rb_session_input_sample_rate(VALUE self, VALUE handle) {
     struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
     return INT2NUM(crispasr_session_input_sample_rate(s));
+}
+
+// CrispASR::Session.output_sample_rate(handle) -> Integer
+//   Sample rate of the PCM synthesize/speech_to_speech produce; 0 when the
+//   backend has no audio output (ASR-only). (#332)
+static VALUE rb_session_output_sample_rate(VALUE self, VALUE handle) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    return INT2NUM(crispasr_session_output_sample_rate(s));
+}
+
+// CrispASR::Session.input_channels(handle) / output_channels(handle) -> Integer
+//   1 (mono) for every current backend; output_channels is 0 for ASR-only. (#332)
+static VALUE rb_session_input_channels(VALUE self, VALUE handle) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    return INT2NUM(crispasr_session_input_channels(s));
+}
+
+static VALUE rb_session_output_channels(VALUE self, VALUE handle) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    return INT2NUM(crispasr_session_output_channels(s));
 }
 
 // --- ASR transcription (PLAN #59) ---
@@ -1827,6 +1865,7 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "set_speaker_id", rb_session_set_speaker_id, 2);
     rb_define_singleton_method(mSession, "set_punc_model", rb_session_set_punc_model, 2);
     rb_define_singleton_method(mSession, "set_hotwords", rb_session_set_hotwords, 3);
+    rb_define_singleton_method(mSession, "set_sensitivity", rb_session_set_sensitivity, 2);
     rb_define_singleton_method(mSession, "set_g2p_dict", rb_session_set_g2p_dict, 2);
     rb_define_singleton_method(mSession, "speakers", rb_session_speakers, 1);
     rb_define_singleton_method(mSession, "set_instruct", rb_session_set_instruct, 2);
@@ -1838,6 +1877,9 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "accept_marking_responsibility", rb_session_accept_marking_responsibility, 2);
     rb_define_singleton_method(mSession, "speech_to_speech", rb_session_speech_to_speech, 2);
     rb_define_singleton_method(mSession, "input_sample_rate", rb_session_input_sample_rate, 1);
+    rb_define_singleton_method(mSession, "output_sample_rate", rb_session_output_sample_rate, 1);
+    rb_define_singleton_method(mSession, "input_channels", rb_session_input_channels, 1);
+    rb_define_singleton_method(mSession, "output_channels", rb_session_output_channels, 1);
     rb_define_singleton_method(mSession, "transcribe", rb_session_transcribe, 2);
     rb_define_singleton_method(mSession, "transcribe_with_logits", rb_session_transcribe_with_logits, 2);
     rb_define_singleton_method(mSession, "ctc_vocab", rb_session_ctc_vocab, 1);

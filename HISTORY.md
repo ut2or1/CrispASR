@@ -6,6 +6,605 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## WhisperJAV port — post-decode text hardening (§W1–W7), archived from PLAN.md 2026-08-09
+
+Landed `3d64e7c5..48ae0c41`, all on `main`. Originated from a user report on
+CrispEmbed#44 asking for the best Japanese model — the reporter named
+WhisperJAV and noted it had stopped being updated. Answered on that issue.
+
+**Still open:** `crispasr_session_set_sensitivity` is exposed in Python and the
+C ABI only; the other seven binding surfaces (Go, Java, C#, Ruby,
+JS/emscripten, Flutter) still lack it. Mirror `set_fallback_thresholds`.
+
+**§W4 measured end-to-end 2026-08-09** — it was written from reasoning, so it
+was worth checking against the real CLI rather than only the unit predicate.
+Two controls through `crispasr --vad -vm webrtc --vad-export` (webrtc needs no
+model, so this is reproducible with no download):
+
+| Case | Slices | Audio reaching the model |
+|---|---|---|
+| 301 s, 1 s of speech, `CRISPASR_VAD_FAILOVER=0` (old behaviour) | 1 | **1.1 s of 301 s — 0.4%** |
+| same file, failover on (new default) | 11 | 301 s — 100% |
+| 154 s of continuous real speech (negative control) | 6 | 154 s — 100%, failover correctly silent |
+
+So on the failure case the user was losing 99.6% of their audio with no error,
+and the healthy case is untouched. That is the asymmetry the whole heuristic
+was justified by, now measured rather than argued.
+
+⚠ Caveat on the fixture: the silence is digital zeros, not room tone. Real
+noisy-but-speechless audio may read differently to an energy VAD, so this
+demonstrates the wiring and the direction, not a tuned threshold.
+
+**§W3 measured end-to-end 2026-08-09**, with `canary-ctc-aligner-q4_k.gguf` on
+real audio via `--align-only`:
+
+| Case | Result |
+|---|---|
+| correct English transcript vs `samples/jfk.wav` (negative control) | sentinel **silent**; 22 words, plausible timestamps ending 10.08–10.16 s in an 11 s clip |
+| Japanese transcript vs the same English-vocab aligner | sentinel **fires**: `zero-position words 28/28 (1.000 > 0.100); coverage 0.000 < 0.050 of 11.000s` |
+
+The positive case is the real documented failure, not a synthetic one: the
+aligner returned **all 28 words at `t0 == t1 == 0`** and exited **0**. The SRT
+shows 27 of 28 cues as `00:00:00,000 --> 00:00:00,000` (the 28th is the
+formatter clamping the last cue to the clip end). Text intact, every timestamp
+worthless, and before this sentinel nothing said a word about it. Two of the
+five signals fired independently, which is the design working as intended.
+
+⚠ **Trap that nearly produced a false bug report on our own code:** the first
+check said the sentinel had NOT fired. It had. The CLI echoes the transcript
+through `%.80s`, which truncated the Japanese mid-UTF-8 and left an invalid
+byte in the captured output — so `grep` classified the file as binary and
+silently suppressed every match. Use `grep -a` on any captured CrispASR output
+containing non-Latin text, or verify in Python. A binary-suppressed grep looks
+exactly like "the feature did not run".
+
+Survey of https://github.com/meizhong986/WhisperJAV (Python orchestration over
+faster-whisper; nothing ports at the code level, the *algorithms* do). It is
+worth taking seriously because JAV audio is an adversarial worst case for
+Whisper — long-form, heavy non-verbal vocalisation, low SNR — so its
+post-processing stack is far ahead of ours. Full survey in `LEARNINGS.md`.
+
+**The survey immediately found a live bug, verified, see W1.**
+
+### W1 — `core_ngram::fix_loops` was a NO-OP on CJK — DONE 2026-08-09
+
+`src/core/ngram_loop_fix.h:68` `split_words()` splits on ASCII whitespace only.
+Japanese/Chinese has none, so the entire segment is one "word", `collapse()`
+can never fire, and the guard is inert. Compiled the header standalone
+2026-08-09:
+
+```
+ああああああああ            → UNCHANGED
+はい、はい、はい、はい、      → UNCHANGED
+謝謝觀看，謝謝觀看，謝謝觀看， → UNCHANGED     ← *the* canonical Whisper zh hallucination
+hey hey hey hey hey         → "hey hey hey"  (changed)
+```
+
+Real caller list, verified by grep (an earlier draft of this section named
+`firered_asr` — wrong, see W1b): `src/moss_transcribe.cpp:1503`,
+`src/moss_transcribe_diarize.cpp:1504`, `src/higgs_stt.cpp:1674`, and six sites
+in `src/crispasr_c_api.cpp` covering cohere, granite and glm-asr. Of those,
+**moss-transcribe is zh/en and glm-asr is Mandarin + Chinese dialects +
+Cantonese** (README.md:107, :126) — the guard was dead on its two most
+CJK-exposed consumers. Same class as "prove the new code path EXECUTES":
+wired, never fires.
+
+Also: `fix_loops()` re-joins survivors with single spaces, so on mixed CJK/Latin
+it would rewrite original spacing if it ever did split. Any fix must not
+normalise whitespace on text it does not otherwise change.
+
+**Port**: WhisperJAV `modules/repetition_cleaner.py:174` `_detect_generic_repetition`
+— script-agnostic, needs no word tokenizer. For substring lengths 2..50, candidate
+starts limited to offsets `0..sub_len-1` (a repeating unit must begin within its
+own length), count non-overlapping occurrences, and if
+`count*sub_len / len(text) >= coverage_threshold` (~0.5) reduce to 1–2 copies
+(2 if the unit is short, else 1). O(n·L²) worst case, but subtitle-line sized.
+Operate on Unicode code points, not bytes. Gate on "segment contains no
+whitespace" or "majority CJK" so Latin text keeps today's word-level path
+byte-for-byte.
+
+**Landed.** `split_codepoints` / `decode_codepoint` / `is_cjk_codepoint` /
+`wants_codepoint_collapse` / `fix_loops_codepoints` in
+`src/core/ngram_loop_fix.h`, called per surviving token from `fix_loops`. The
+*same* `collapse_indices()` runs over code points instead of words — one
+algorithm, two tokenizations — rather than WhisperJAV's
+"replace-the-line-with-the-dominant-unit" form, which eats a good prefix
+(`今日はいい天気ですね。` + `あ`×30 would have become `ああ`). Gate:
+≥8 code points AND ≥60% CJK, so Latin and short natural reduplication
+(`ええ`, `はいはい`, `Mississippi`) are untouched.
+
+Guard: `tests/test-ngram-loop-fix-cjk.cpp`, 9 cases / 30 assertions. **Watched
+red first — 6 of 9 failed before the fix**, and the 3 that passed were the
+must-not-change invariants (natural CJK, Latin, edge cases), which is the point.
+`test-ngram-loop-fix.cpp` (Latin, 36 assertions) unchanged and still green.
+The gate can still go red on demand: the last case asserts
+`CRISPASR_NGRAM_LOOPFIX_OFF=1` restores the raw text *and* that clearing it
+restores the collapse — both directions, so a silently-dead path fails.
+
+**Known limitation, deliberate:** `fix_loops_keep_indices` is untouched. It
+reports *membership* for parallel per-word arrays (SRT/VTT word timings), and
+the CJK path rewrites token *content*, not membership — so word-level output on
+CJK is still uncollapsed. On these scripts a whitespace-delimited "word" is not
+a linguistic unit anyway; doing this properly needs word timings from the
+aligner, not from a space split.
+
+`fix_loops` still normalises whitespace to single spaces on rejoin — that was
+already true and `test-ngram-loop-fix.cpp:86` pins it. Not changed here.
+
+### W1b — firered-asr had NO `fix_loops` at all — DONE 2026-08-09
+
+Turned up checking W1's blast radius. `src/firered_asr.cpp` does not even
+`#include "core/ngram_loop_fix.h"`; the only mention is a comment at :2270
+saying so out loud — *"firered's CLI adapter has no `core_ngram::fix_loops`, so
+this also cleans the garbage tail"*, justifying the decode-time
+`core_repeat::tail_is_repetition` break as a substitute.
+
+That substitute is **greedy-only by construction** (wired into the
+`beam_size == 1` branch only, since beam search self-terminates), so a firered
+run with `beam_size > 1` has neither guard. firered-asr is Mandarin + 20+
+Chinese dialects (README.md:110) — i.e. precisely the script W1 is about, on
+the backend with the least coverage.
+
+**Landed.** `examples/cli/crispasr_backend_firered_asr.cpp` now runs
+`fix_loops_keep_indices` over the token texts (filtering `seg.tokens` in
+lockstep, mirroring the canary-qwen path at `crispasr_c_api.cpp:5675`) and
+`fix_loops` over `seg.text`.
+
+Guard: `tests/test-loopfix-wiring.cpp`. A pure-predicate test could never have
+caught this — the predicate was always correct, the *join* was missing — so
+this one is a source scan asserting each AR adapter contains the CALL, not the
+`#include` (an include nothing invokes is precisely the state firered shipped
+in). **Proven red**: stashing the firered change makes it fail naming that
+exact file; restored and green after. Costs nothing, needs no model.
+
+The list of six adapters in that test pins *observed* wiring — it is not a
+claim that every adapter needs the collapse (CTC/RNN-T backends do not loop
+this way; higgs-stt and moss-transcribe call it in-library, which the test
+checks separately).
+
+### W2 / W5 / W6 — segment hygiene — DONE 2026-08-09
+
+One header, `src/core/segment_hygiene.h`, because all three are the same kind of
+thing: a transform on the assembled segment list, downstream of the logits,
+where `crispasr-diff` reads cos 1.000000 whether they work or not. That
+harness-blind zone is why they get hermetic unit tests
+(`tests/test-segment-hygiene.cpp`, 30 cases) — it is the only check available.
+
+- **W2 `cap_length`** — truncate a runaway line, backing up to the last
+  `。．.！!？?、,` but never below 75% of the cap, so an early boundary cannot
+  throw away a legitimate line. Counts CODE POINTS: a byte cap cuts mid-character
+  and produces mojibake, and reads 3x short on CJK.
+- **W6 `should_drop` / `looks_nonverbal`** — logprob gate with a margin that
+  LOOSENS for segments ≤1.6 s (a short segment's mean logprob is noisier, so it
+  gets more room, not less), plus `[Music]` / `（喘ぎ声）` / `♪` dropping.
+- **W5 `merge_repeats`** — collapse runs of ≥3 near-identical adjacent segments
+  within a 2 s gap, keeping the first text and the run's full span. Similarity is
+  LCS over code points. Compares each candidate against the run's FIRST text, not
+  its predecessor, so a slowly-drifting chain cannot merge unboundedly.
+
+**Two corrections to WhisperJAV, both pinned by a test:**
+
+1. Its non-verbal filter substring-matches a keyword list against the whole
+   line, so "The music started and everyone danced." is deleted as a music
+   marker. Ours only considers a line that is ENTIRELY a bracketed descriptor.
+2. Its bracket handling is ASCII-only. A Japanese marker is written `（喘ぎ声）`
+   or `【笑い】` — so the ASCII test fires on exactly zero real Japanese markers
+   while claiming to support them. Found by the test suite, not by reading.
+
+**Wiring.** All three run from `merge_segments()` in `crispasr_run.cpp` — the
+structural chokepoint all four `merge_segments(...)` call sites pass through.
+Patching the four sites by hand is the shape of bug the copies-in-sync guard
+exists for. It must also be here rather than per-slice: a repetition straddling
+a slice boundary is only visible once the slices are flat.
+
+**Every stage is OFF unless its env var is set** (`CRISPASR_SEG_MAX_CHARS`,
+`_DROP_NONVERBAL`, `_LOGPROB_THOLD`, `_LOGPROB_MARGIN`, `_MERGE_REPEATS`,
+`_MERGE_SIMILARITY`, `_MERGE_GAP_CS`, `_MERGE_MIN_RUN`). Each can delete
+user-visible text and a wrong deletion is worse than a surviving artifact, so
+none may switch on by surprise. Dropped counts print to stderr — silent loss is
+the failure mode.
+
+**Both surfaces wired.** `crispasr_c_api.cpp` reimplements every backend's
+transcribe inline and never calls the CLI adapter, so it needs its own arm —
+`apply_session_hygiene()`, called from the two `transcribe_lang` paths and from
+`transcribe_vad_lang`. The other three public entries are thin wrappers over
+those. It runs BEFORE `apply_session_punc_model`, matching the CLI where
+`merge_segments()` precedes `apply_punc_model()`; the order is not cosmetic,
+since the length cap prefers to cut at a sentence mark and whether punctuation
+exists yet moves the cut.
+
+⚠ **The VAD path defers the merge** (`hygiene_defer_merge`).
+`crispasr_session_transcribe_vad_lang` transcribes a STITCHED buffer — silence
+removed, replaced with uniform 0.1 s joins — so every segment pair looks 10 cs
+apart and the repeat-merge would collapse utterances that are minutes apart in
+the real audio. Cap and filter are timestamp-independent and still run inline;
+the merge waits until after `crispasr_vad_remap_timestamp` restores the real
+timeline. Do not "simplify" this back into one call.
+
+### W3 — aligner collapse sentinel — DONE 2026-08-09
+
+`src/core/align_sentinel.h` + `tests/test-align-sentinel.cpp` (10 cases).
+
+The failure is REAL in our code, not a ported hypothetical. `ctc_forced_align()`
+cannot fail loudly — it returns `{}` only when the whole call is unusable — while
+two paths inside it emit `t0 == t1 == 0` for individual words inside a
+SUCCESSFUL return: `wranges[wi].cs < 0` (characters absent from the CTC vocab,
+documented in `align.h`'s `@return`) and `t0_frame < 0` (the Viterbi path never
+visited the word). Feed a Chinese transcript to a Latin-vocab CTC model and
+EVERY word comes back that way.
+
+Five signals — (0,0) ratio >10%, zero-length-span ratio >40%, chars/sec >50,
+coverage <5%, span <0.5 s — each with its own precondition so a short clip, a
+two-word clip, or unknown audio duration is not condemned. chars/sec counts code
+points; on bytes it reads 3x high and would flag every correct Japanese
+alignment.
+
+Wired at `crispasr_align_words()`, the ONE join all three aligner backends
+(qwen3-fa, wav2vec2, canary-ctc) funnel through, so CLI + session ABI + bindings
++ server are covered by one call. **The offset is subtracted before assessing** —
+a chunk at 30 s would otherwise present silent-zero words as (30.0, 30.0), a
+plausible-looking position, and the signal could never fire.
+
+Detect + warn by default. `CRISPASR_ALIGN_SENTINEL_REDISTRIBUTE=1` opts into
+repair, `=0` disables. Repair is opt-in because this is a new heuristic against a
+failure we have never measured in the field; a wrong auto-repair would be just as
+invisible as the collapse it replaces.
+
+Mutation-checked: a sentinel that never fires (= today's `main`) fails 7 of 10
+cases, and the 3 that pass are the must-not-fire ones.
+
+### W4 — VAD failover — DONE 2026-08-09
+
+`src/core/vad_failover.h` + `tests/test-vad-failover.cpp` (10 cases). Wired into
+`crispasr_compute_vad_slices` — again the single shared entry point.
+
+**Placed after the merge and BEFORE the re-chunk.** The re-chunk splits long
+segments at `chunk_seconds`, so one 10-minute monologue becomes ~20 slices;
+measuring segment COUNT after that reports a healthy number for any input and the
+few-segment signal could never fire.
+
+Falls back to `crispasr_fixed_chunk_slices`, not one giant slice — "transcribe
+everything" has to stay inside the chunk length the backend's context expects.
+`CRISPASR_VAD_FAILOVER=0` disables.
+
+**Deliberate correction to WhisperJAV.** Its few-segment rule is
+`len(segments) <= 2 and duration >= 480` with no coverage condition, which
+misfires on a 10-minute continuous monologue detected as ONE segment at 99%
+coverage and needlessly re-transcribes it. Verified by building their exact rule
+against our fixtures — it fails the monologue test. Ours also requires
+coverage <10%.
+
+### W7 — sensitivity presets — DONE 2026-08-09
+
+`src/core/asr_sensitivity.h` + `tests/test-asr-sensitivity.cpp` (8 cases).
+`--sensitivity conservative|balanced|aggressive` on the CLI,
+`crispasr_session_set_sensitivity()` on the session ABI (both surfaces, because
+the C-ABI does not call the CLI).
+
+The four thresholds INTERACT: `crispasr.cpp:8499` requires `avg_logprob <
+logprob_thold` AND `no_speech_prob < no_speech_thold` together, so moving one
+alone produces a combination that does not mean what its name says. The tests pin
+each preset's DIRECTION against balanced and that the two sit on OPPOSITE sides
+of it — asserting each against balanced separately would still allow both to
+drift the same way.
+
+`balanced` is byte-identical to the shipped defaults, and a test pins those
+defaults against `crispasr.cpp:6523` so a change there without a change here
+fails. An unknown name is REJECTED (CLI errors, ABI returns -2) rather than
+silently treated as balanced, so a typo is visible. A test also round-trips every
+name advertised in `--help` through the parser, guarding the classic
+documented-but-unparseable drift.
+
+### Follow-ups left open by this round
+
+1. ~~Session C-ABI does not get W2/W5/W6.~~ **DONE** — `apply_session_hygiene()`
+   with the VAD deferred-merge handling above. The `[seg-hygiene][wiring]`
+   guard now requires the session arm to be defined AND called (>=3 sites),
+   proven red by deleting the call sites — the §W1b state exactly.
+2. ~~No wiring guard for the hygiene call.~~ **DONE** — the `[seg-hygiene]
+   [wiring]` case in `tests/test-segment-hygiene.cpp` source-scans
+   `crispasr_run.cpp` for the `config_from_env` + `apply_all` CALLS (not the
+   `#include` — that is exactly the state §W1b found firered in) and requires
+   them inside `merge_segments`. Proven red by stubbing the call out.
+3. **The sentinel and failover thresholds have never been measured against real
+   field data.** They are reasoned, not fitted. If either turns out to fire on
+   real audio, the numbers are the thing to revisit, not the structure.
+
+### Deliberately NOT porting
+
+- **The hallucination phrase blacklist** (`data/hallucination_filters/`,
+  150 KB `filter_list_v08.json` + `regexp_v09.json`). Heavily JA- and
+  JAV-specific, a maintenance liability, and real false-positive risk — its
+  first regex strips *all* parenthesised content. If we ever want this, take
+  the shape (categories + per-pattern confidence + aggressiveness multiplier),
+  never the payload.
+- Speech-enhancement backends, the ensemble/two-pass orchestrator, translation,
+  the webview GUI. Orchestration-layer, or things we already do differently.
+
+---
+
+## #316 Kokoro G2P, round 2 — archived from PLAN.md 2026-08-05
+
+Landed `619e74b6..4b875be0`. Round 1 is the entry further down
+("#316 — first the numbers, then the units beside them" and the round-2 summary
+above it); this is the working detail, moved out of PLAN.md when it closed.
+
+### The round-1 rules were never switched on
+
+Reporter re-tested 0.8.25 (2026-08-03) and it still "doesn't sound natural":
+"the strange pronunciation of *dramatic*" and "the unnecessary emphasis on *I*
+and *a*". All three are reproduced, root-caused and fixed on
+`fix/316-kokoro-prosody`.
+
+**Measured, 500 sentences of running prose, misaki 0.9.4 as the reference**
+(`tools/check_misaki_g2p_agreement.py`, which compiles a dumper against the real
+headers so it measures the code path the product uses):
+
+| | shipped 0.8.25 | this branch |
+|---|---|---|
+| token agreement (tokens misaki phonemizes) | 67.0% | **95.7%** |
+| exact sentences, misaki-clean | 0.3% | **82.1%** |
+
+The reporter's own paragraph now comes out **byte-identical to misaki**, and the
+ASR round-trip separates the two arms without needing an ear:
+
+    before:  "...and moody atmosphere EYE built into the prompt instead of
+              bright flat commercial product photography."
+    after:   "...and moody atmosphere I built into the prompt. Instead of
+              bright, flat, commercial product photography,"
+
+Whisper heard the *noun* "eye" for the pronoun, which is what primary stress on
+`ˈI` does to it — the reporter's "unnecessary emphasis on I", objectively. And
+every comma and sentence boundary in the second transcript is one Whisper
+recovered from prosody that did not exist in the first.
+
+Four defects, in descending order of how audible they are:
+
+1. **`context_words` was never set by anything.** Round 1 wrote
+   `core/g2p_ctxwords.h` (the/to/a/an/in + capitalisation stress + the
+   phrase-final lexicon), gated it behind `g2p_en::context::context_words`,
+   tested it — and no call site ever turned it on. It shipped inert in 0.8.24
+   *and* 0.8.25. So `the` stayed `ði` in every position (the original "old
+   English" complaint the release claimed to fix), `to` stayed `tu`, the pronoun
+   `I` kept PRIMARY stress where misaki gives secondary, and the article `a` was
+   read as **the letter**, `ˈA` = stressed "eɪ". That last one IS the reporter's
+   "unnecessary emphasis on a", and it was one line away the whole time.
+   The tests could not catch it: they called `core_g2p_ctxwords::lookup()`
+   directly, never `text_to_ipa`. `tests/test-kokoro-misaki-wiring.cpp` now goes
+   through `crispasr::phonemize_misaki_en` — the function kokoro.cpp calls.
+2. **Punctuation was dropped from the phoneme string.** `,` `.` `;` `:` `!` `?`
+   `…` `—` `"` `«»` `“”` are all in Kokoro's 178-symbol vocabulary and misaki
+   emits them; they are how the model knows to pause. The reporter's two-sentence
+   paragraph reached the model as 250-odd phonemes with not one mark in it —
+   delivered in a single breath. (`kokoro_synthesize` does no sentence splitting,
+   so nothing downstream put the pauses back.) The old join also emitted TWO
+   spaces around every dropped mark, i.e. two space tokens.
+3. **A quoted word never reached the lexicon.** The tokenizer split on
+   `,.!?;:-` only, so `"dramatic"` was looked up as the literal string
+   `"dramatic"`, missed every tier, and came back out of the letter-to-sound
+   rules as `dɹˈæmætɪk` — DRAM-atic, first-syllable stress, against misaki's
+   `dɹəmˈæTɪk`. That is the reported "strange pronunciation of dramatic". Fixed
+   for every consumer, so piper gained three corrections in the same 500
+   sentences (`[Illustration:` and `library!"` were falling to LTS there too).
+4. **`high-contrast` was two words with two primary stresses and a gap through
+   the middle.** misaki resolves a compound to one token, `hˌIkˈɑntɹˌæst`
+   (`resolve_tokens` demotes the lighter half). Ported as
+   `core_g2p_ctxwords::join_compound`.
+5. **Three smaller ones the corpus surfaced.** An abbreviation's period is part
+   of the word — splitting it off gave every `Mr. Darcy` a full-stop pause; the
+   merge is driven off misaki's own seven dotted lexicon entries, with `no.`
+   excluded ("she said no." is a sentence, not a number) and `etc.` requiring a
+   word to follow. `_` and `/` join `-` as silent separators (misaki's
+   SUBTOKEN_JUNKS), so Gutenberg-style `_you_` reaches the lexicon instead of
+   coming out of the letter-to-sound rules as `jˈW` — that one fixed piper too.
+   And a mark never takes a leading space, because a dropped silent separator
+   used to put one there and in Kokoro's vocabulary a space is a real token.
+
+**Consumer conventions are now separate from the dictionary** (`g2p_en::style`).
+They have to be: ONE `g2p_en::context` serves both piper and Kokoro's
+no-lexicon fallback, so `phonemize_builtin_en(..., misaki_style=true)` lets
+Kokoro keep its punctuation on the CMUdict path without piper inheriting it.
+That conflation is what made a per-context flag the wrong shape in round 1.
+Everything Kokoro-specific is off by default; piper's output over 500 sentences
+is unchanged except the three LTS corrections and the double-space collapse.
+
+**Also done in this round, each on its own evidence:**
+- **Acronyms.** misaki's `get_NNP`, both entry
+  shapes (dotted acronym and out-of-lexicon ALLCAPS), byte-identical to misaki
+  on `U.S.A.` / `e.g.` / `Ph.D.` / `XXXVIII` / `PDF` / `USB` — and on the two
+  that must NOT change, `NASA` and `HELLO` (misaki lowercases an ALLCAPS word
+  and looks THAT up first). The letter readings needed their own
+  `context::letters` table, because "A" the letter and "a" the article collide
+  once `load_misaki_json` lowercases the key. That table is also the gate: it is
+  empty for the espeak dicts, every path is a no-op when it is empty, so piper
+  is byte-identical over 500 sentences with no flag of its own.
+- **de/fr/es punctuation.** Each of `g2p_de.h` / `g2p_fr.h` / `g2p_es.h` has its
+  own tokenizer and its own punctuation-skipping join, and all three had the
+  same defect plus the same quoted-word one. They now take
+  `context::emit_punctuation` (default OFF, so piper is unchanged) and Kokoro
+  asks for it, gated `CRISPASR_KOKORO_PUNCT=0`. There is no misaki reference for
+  these languages, so the default was flipped on a round-trip A/B rather than on
+  parity. That first A/B used ggml-base as the ASR and read 70.6% -> 78.4%;
+  **re-measured on large-v3-turbo with a bigger set it is 85.9% -> 90.6%** —
+  see the German section below, which also corrects the absolute level.
+
+**"Would it just be easier to port misaki?" — measured, and the answer is no,
+because this IS the port.** Asked at the end of round 2 and worth writing down,
+because the headline agreement number invites exactly the wrong conclusion.
+
+`python tools/check_misaki_g2p_agreement.py --corpus … --classify --tagger-value`
+answers it in one command. On the 500-sentence corpus:
+
+| residual bucket | tokens | who owns it |
+|---|---|---|
+| tokenisation (whole line misaligned) | 504 (5.27%) | **misaki** — 14 of the 20 misaligned lines are the Gutenberg `--` convention, where its `resolve_tokens` glues the words either side into one nonsense token (`service--and` → `sˈɜɹvəsænd`). Ours is the correct output. 5 more are its own `❓`. **1 line is genuinely our tokenizer.** |
+| segments differ | 40 (0.42%) | mixed |
+| stress only | 38 (0.40%) | mostly POS |
+| punctuation attachment | 12 (0.13%) | Gutenberg `,--` |
+
+So the 95.75% headline is pessimistic by construction: it charges us for a whole
+line whenever misaki mis-tokenises. On aligned lines, excluding misaki's own
+failures, agreement is **99.0%** — 90 disagreeing tokens out of ~9,000.
+
+And the remaining prize is smaller than it looks. `--tagger-value` runs misaki
+against ITSELF with the tag withheld, which is precisely our situation:
+
+    5.42% of misaki's tokens change when it has a tagger
+    ...but 90% of those are `in`, `a` and `I` — which core/g2p_ctxwords.h
+       already gets right from capitalisation + the following vowel, no tagger
+    genuinely tag-dependent remainder: 0.34%  (`that`, `read`, `object`,
+       `console`, `use`, `lived`)
+
+**0.34% is the entire return on porting spaCy's `en_core_web_sm`** — a 12 MB
+neural tok2vec + tagger pipeline. That is a bad trade, and it is the only part
+of misaki still missing: `en.py` itself is ported (lexicon, `get_special_case`,
+`apply_stress`, the `_s`/`_ed`/`_ing` stemmers, `get_NNP`, `resolve_tokens`
+compound de-stressing, `token_context`, the phrase-final `None` key, `ɾ`→`T`).
+If someone does want the last third of a percent, a closed-class rule for `that`
+alone is ~24 of the ~32 tokens and needs no model.
+
+### German, measured properly (2026-08-05)
+
+The first German A/B used **ggml-base** as the ASR and I quoted it as
+70.6% -> 78.4%. Re-run with **large-v3-turbo** on a bigger set, most of that
+spread was the ASR, not the TTS. The A/B rule's "a noisy box fabricates wins" is
+usually about machine load; this is the same failure with the *reference model*
+as the noise source. Corrected table — `kokoro-de-hui-base` q8_0, 8 sentences ×
+2 voices (df_eva, dm_bernd), each synthesis its own process:
+
+| arm | word accuracy | median | min |
+|---|---|---|---|
+| B builtin, no punctuation (what 0.8.25 shipped) | 85.9% | 88.9% | 58.3% |
+| C espeak, no punctuation | 87.1% | 88.9% | 66.7% |
+| **A builtin + punctuation (shipped default)** | **90.6%** | 91.7% | 70.0% |
+| D builtin + punctuation + unstressed function words | 89.4% | 90.9% | 75.0% |
+
+**The punctuation default is confirmed: +4.7 pts (B→A)**, on a better ASR and a
+bigger sample than the number it replaces. German sits at ~90%, not the ~78% I
+first reported. Our builtin G2P is 1.2 pts behind espeak with punctuation held
+constant (B vs C) — small, and builtin stays the default because espeak is an
+optional system dependency.
+
+**A real German defect found on the way, now gated OFF.** `espeak_de.tsv` was
+generated by running espeak over a word list ONE WORD AT A TIME, so every entry
+is the citation form — and espeak stresses a word in isolation that it leaves
+unstressed in a sentence:
+
+    espeak "sie"                       ->  zˈiː
+    espeak "sie ging dann nach Hause"  ->  ziː ɡˈɪŋ dan nɑːx hˈaʊzə
+
+So we put a primary stress on every article, pronoun, preposition and auxiliary.
+That is the German shape of the #316 English bug — a per-word lexicon can only
+store `the` as `ði`, never `ðə`. The rule is purely LEXICAL (espeak reads even a
+sentence-initial "Der" as `dɛɾ`), so it is recoverable from espeak itself:
+`tools/gen-g2p-de-unstressed.py` derives 72 entries by comparing each
+candidate's isolated reading against two carrier frames and accepting only a
+pure stress loss. Token agreement with espeak's sentence output:
+**45.9% -> 87.1%**.
+
+**Then the training recipe was found, and it settles the question.**
+`dida-80b/kokoro-deutsch` (the repo, not the gated model card) ships
+`scripts/prepare_dataset.py`, and it phonemizes with
+
+    from misaki import espeak
+    g2p = espeak.EspeakG2P(language="de")
+
+i.e. **whole sentences through espeak**, so espeak's sentence-level de-stressing
+IS the training data and our citation form is a spelling the model never saw.
+The newer `kikiri-tts` models say the same thing in their card ("G2P: misaki
+0.9.4 + espeak-ng"). So un-stressing ships **ON** on source evidence, not on the
+round-trip — which could not resolve it either way (−1.2 pts, ~3 words over 16
+clips). `CRISPASR_G2P_DE_UNSTRESS=0` reverts.
+
+### Reading the recipe turned up two more things
+
+`misaki/espeak.py::EspeakG2P` is:
+
+    EspeakBackend(language="de", preserve_punctuation=True, with_stress=True,
+                  tie='^', language_switch='remove-flags')
+
+then a map collapsing every TIED sequence to one codepoint: `t^s`→`ʦ`,
+`a^ɪ`→`I`, `a^ʊ`→`W`, `ɔ^ɪ`→`Y`, `t^ʃ`→`ʧ`, `d^ʒ`→`ʤ`, `e^ɪ`→`A`, `o^ʊ`→`O`.
+`preserve_punctuation=True` independently confirms the punctuation fix above.
+
+**(1) `ʏ` IS NOT IN THE GERMAN MODEL'S VOCABULARY — we were deleting it.**
+Found by scanning our German output against the GGUF's own
+`tokenizer.ggml.tokens`: two symbols we emit are absent, `ʏ` (U+028F) and the
+non-syllabic mark (U+032F). An absent symbol is not approximated by
+`kokoro_phonemes_to_ids`, it is **dropped** — so the vowel left every München,
+Frühstück, fünf, Stück, Glück, Küche, zurück. dida-80b hit the same wall and
+made the same substitution in their dataset script (`ʏ → y`, "the duration
+difference is learned from audio"), which is what confirms it. Same class as
+round 1's "the digits phonemized to the empty string and vanished".
+Measured on the real model, same binary, same voice, `--tts-phonemes` for the
+old spelling:
+
+    before:  "Menjen und FRISCH, fünf Stück Glück in der KERRE."
+    after:   "Männchen und FRÜHSTÜCK, fünf Stück Glück in der Kühe."
+
+Shipped ON unconditionally for German (`Dialect::DeVocab`) — an approximate
+vowel always beats a deleted one.
+
+**(2) The tied-alphabet collapse is right by the recipe and WRONG on the model
+we ship — gated OFF (`CRISPASR_KOKORO_DE_MISAKI_ALPHABET=1`).** Applying it took
+agreement with the recipe from 81.2% to 85.9% — on one sentence, byte-identical
+to it — and the ASR round-trip got 5.3 pts *worse*. Not a dropped-symbol
+problem: `ʦ ʣ W I Y A O Q ʧ ʤ` are all in the model's vocabulary, checked.
+The likeliest reading is that the hui base we ship predates this part of the
+recipe (the training repo's commits stop in April; the misaki fork was updated
+in July), so it is probably right for the newer `kikiri-tts` models and wrong
+here. Kept and gated rather than deleted, per the A/B rule. ⚠ It also has a
+real limitation of its own: our dictionary has no ties, so `ts`→`ʦ` is a
+blanket rewrite that cannot tell an affricate from a compound seam.
+**The clean fix for both is to regenerate `espeak_de.tsv` with `--tie`** — that
+removes the ambiguity and lets the collapse be exact.
+
+⚠ fr/es almost certainly have the same citation-stress defect, and possibly the
+same out-of-vocabulary symbols. The vocabulary scan is three lines and worth
+running for every non-English Kokoro model we ship.
+
+⚠ fr/es almost certainly have the same citation-stress defect (same dictionary
+provenance; the same generator would work). Not investigated.
+
+**Still open, then, and deliberately:**
+- `that` as a determiner wants `ðˈæt`, as a complementiser `ðæt` (23 hits/500).
+  DEFAULT wins 68% of occurrences over a wider sample, so a blanket flip loses
+  two for every one gained — see the POS_OVERRIDES note in `load_misaki_json`.
+- `read`, `used`, `by`, `am`, `object`, `console`, `use` are the same shape.
+
+### Round-1 follow-ups, as they stood when round 2 closed
+
+- **Numbers: DONE for all four built-in G2Ps** (en `num2words_en.h`, de
+  `num2words_de.h` `ce7c8226`, fr+es `num2words_fr.h`/`num2words_es.h`
+  `ddb08ae1`). Every one of them used to phonemize `82` to the empty string and
+  drop it silently. Hermetic coverage in `tests/test-num2words-de.cpp` (55
+  assertions) and `tests/test-num2words-fr-es.cpp` (87).
+  Each language needed rules the others do not have, and two were caught only by
+  running the tables: **French** 80 000 came out "quatre-vingt**s** mille" (the
+  plural s must drop before a SCALE word, not just before another digit group),
+  and **Spanish** 21 000 came out "veintiuno mil" (`uno` apocopates before a
+  masculine noun and `mil` counts → "veintiún mil").
+  ⚠ Two deliberate limitations: German ordinals emit the citation form, so
+  "Am 1. Mai" reads "erste" where German inflects to "ersten" (case is not
+  recoverable inside a G2P); Spanish ordinals are lexical to décimo and fall back
+  to the cardinal above, rather than inventing "vigésimo primero" forms a TTS
+  voice has rarely been trained on.
+- **misaki's reduced vowels `ᵊ` / `ᵻ` are not modelled.** We emit plain `ə`/`ɪ`
+  where misaki reduces. Measured worth: exact whole-word phoneme match goes
+  58.3% → ~63% if handled. It is context-dependent (misaki uses both forms), so
+  it needs the rule, not a blanket substitution.
+- **The rest of the gap is dictionary-level**, not spelling: CMUdict stress
+  placement and unstressed-vowel choices vs misaki's lexicon (~190 stress
+  differences and ~130 ɪ/ə swaps over a 1508-word corpus). Closing it means
+  shipping misaki's lexicon, not more conversion rules.
+- Reproduce any of this with
+  `tools/` + `misaki` (pip): run both G2Ps over a word list and diff symbol
+  inventories — the invariant that matters is that we never emit a symbol
+  outside the model's vocab or outside the reference's inventory.
+
+
+---
+
 ## #227 — VAD info reuse (archived from PLAN.md 2026-08-03)
 
 ### #227 — VAD info reuse — DONE (CLI: feat/vad-export-import; server: feat/server-vad-reuse)
@@ -58,6 +657,44 @@ called `set_target_language` at all, so bindings/Flutter/Android had no
 cross-lingual by any route; and qwen3-tts discarded `-tl` for want of a
 capability bit. `src/core/tts_lang.h`, `tests/test-tts-lang.cpp`,
 `docs/issue-329/PLAN.md`.
+
+**#316 round 2 — the rules shipped, switched off.** The reporter came back on
+0.8.25: still "strange pronunciation of *dramatic*", still "unnecessary emphasis
+on *I* and *a*". Round 1 had written the contextual function-word rules
+(`the`/`to`/`a`/`in` + capitalisation stress + the phrase-final lexicon), tested
+them, and left them behind `g2p_en::context::context_words` — which **nothing
+anywhere set**. Two releases read `the` as `ði` in every position and the article
+"a" as the LETTER, `ˈA` with primary stress. The unit tests could not see it:
+they called `core_g2p_ctxwords::lookup()` directly, never `text_to_ipa`. Three
+more defects sat behind that one: punctuation was dropped from the phoneme string
+entirely (Kokoro's vocabulary contains `,.;:!?…—"«»“”` and misaki emits them —
+without them a paragraph arrives as one breath), a quoted word reached the
+lexicon still wearing its quotes and fell through to the letter-to-sound rules
+(`"dramatic"` → `dɹˈæmætɪk`, DRAM-atic), and a hyphenated compound was two words
+with two primary stresses. Token agreement with misaki 67.0% → 95.7% over 500
+sentences of prose; the reporter's own paragraph now byte-identical to misaki's
+output. The evidence that settles it is the ASR round-trip: before, Whisper
+transcribed the pronoun as the noun **"eye"** and found no comma anywhere; after,
+it reads "atmosphere I built into the prompt." with every clause boundary
+recovered from prosody. Durable lesson, third time now: a feature behind a flag
+nobody sets is not shipped, and a test that calls the helper instead of the
+product cannot tell you which. `tests/test-kokoro-misaki-wiring.cpp` goes through
+`crispasr::phonemize_misaki_en` for exactly that reason, and was watched failing
+before the fix. `g2p_en::style` now separates the CONSUMER's conventions from the
+dictionary, because one context serves both piper and Kokoro's fallback and
+conflating them is what made a per-context flag the wrong shape.
+
+Two more landed on top. **Acronyms** — `U.S.A.` phonemized as `jˈu.ˈɛs.ɐ.`, so
+the model paused INSIDE the word and the trailing "a" was read as the article;
+misaki's `get_NNP` spells the letters and promotes only the last one, and the
+readings needed their own table because "A" the letter and "a" the article
+collide once the lexicon key is lowercased. That table is also what keeps the
+path off for piper — it is empty there, so no flag was needed. **de/fr/es** had
+the identical punctuation defect (three separate tokenizers, three separate
+join loops) and Kokoro ships voices for all three; with no misaki to compare
+against, the default was flipped on a round-trip A/B instead — German word
+accuracy 70.6% → 78.4% over 3 sentences × 2 voices, one clip regressing, the
+old path kept behind `CRISPASR_KOKORO_PUNCT=0`.
 
 **#316 — first the numbers, then the units beside them.** `g2p_de`, `g2p_fr` and
 `g2p_es` had no number path at all: digits are in no pronunciation dictionary
@@ -987,6 +1624,21 @@ added via `[archive addComputePipelineFunctionsWithDescriptor:]`;
 `crispasr_metal_pipeline_cache_flush()` serialises to disk at device free. This is
 the source of the `crispasr_metal_pipeline_cache_open/_flush` log lines seen on every
 CLI/server run. The whole "TO DO" below matches what shipped.
+
+**Write-path decision (2026-08-05, CrispEmbed G8=F10 coordination).** The flush
+runs only at `ggml_metal_device_free`; CrispASR binaries exit normally so it
+fires on every CLI/server run and the archive grows unboundedly (the shared dev
+box reached 683 MB; open costs ~1 ms/MB and CrispEmbed measured no first-encode
+benefit even from the full-size archive). Decided: KEEP flush-at-device-free
+(no flush-per-run — it adds a per-run serialise and accelerates growth; no
+per-engine scoping — it fragments the cache and multiplies disk), and ADOPT the
+CrispEmbed T18/G4 open-time cap: `src/core/metal_pipeline_cache_policy.h`,
+applied in `crispasr_init_gpu_backend()`. `CRISPASR_METAL_PIPELINE_CACHE_MAX_MB`
+(default 64, `0` = uncapped) — when the largest archive exceeds the cap, ggml's
+own `GGML_METAL_PIPELINE_CACHE_DISABLE` is set, which skips the open AND leaves
+`dev->binary_archive` nil so the flush no-ops: an oversized archive stops
+growing too. CrispEmbed's `_exit()`ing one-shot CLIs deliberately never write
+(decided on their side). Unit-tested in `tests/test-gpu-backend-pref.cpp`.
 
 <details><summary>original TODO (all satisfied — kept for reference)</summary>
 

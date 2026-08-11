@@ -13,6 +13,7 @@
 #include "core/bpe.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h"
 #include "core/istft.h"
 
 #include "ggml.h"
@@ -276,8 +277,10 @@ miotts_context* miotts_init_from_file(const char* path_model, miotts_context_par
     auto c = std::make_unique<miotts_context>();
     c->params = params;
 
-    // Init backend
-    c->backend = ggml_backend_init_best();
+    // Init backend — via the process-global preference helper so
+    // --gpu-backend (incl. the "cpu" short-circuit) is honoured here too;
+    // this was the one direct init_best() bypass left in the tree.
+    c->backend = crispasr_init_gpu_backend();
     if (!c->backend) {
         fprintf(stderr, "miotts: failed to init backend\n");
         return nullptr;

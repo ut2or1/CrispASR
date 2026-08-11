@@ -39,6 +39,7 @@ public final class CrispasrSession implements AutoCloseable {
         int     crispasr_session_set_speaker_id(Pointer session, int id);
         int     crispasr_session_set_punc_model(Pointer session, String puncModel);
         int     crispasr_session_set_hotwords(Pointer session, String hotwords, float boost);
+        int     crispasr_session_set_sensitivity(Pointer session, String preset);
         int     crispasr_session_set_g2p_dict(Pointer session, String source);
         int     crispasr_session_n_speakers(Pointer session);
         String  crispasr_session_get_speaker_name(Pointer session, int i);
@@ -57,6 +58,10 @@ public final class CrispasrSession implements AutoCloseable {
         Pointer crispasr_session_speech_to_speech(Pointer session, float[] inSamples, int nInSamples,
                                                   PointerByReference outText, IntByReference outNSamples);
         int     crispasr_session_input_sample_rate(Pointer session);
+        // #332: output-side counterparts (rate of synthesize/s2s PCM; mono channels).
+        int     crispasr_session_output_sample_rate(Pointer session);
+        int     crispasr_session_input_channels(Pointer session);
+        int     crispasr_session_output_channels(Pointer session);
         void    crispasr_pcm_free(Pointer pcm);
         // AI-content marking (EU AI Act Art. 50(2)) — the other half of synthesize_raw.
         void    crispasr_watermark_embed(float[] pcm, int nSamples, float alpha);
@@ -661,6 +666,28 @@ public final class CrispasrSession implements AutoCloseable {
         if (rc != 0) throw new IllegalStateException("set_hotwords failed (rc=" + rc + ")");
     }
 
+    /**
+     * Apply a named bundle of the four decoder fallback thresholds:
+     * {@code "conservative"}, {@code "balanced"} (the shipped defaults, a no-op)
+     * or {@code "aggressive"}. {@code "strict"}/{@code "default"}/{@code "loose"}
+     * are aliases. Mirrors the CLI's {@code --sensitivity}.
+     *
+     * <p>The four thresholds interact — a decode is only retried when the logprob
+     * <em>and</em> no-speech bars are both crossed — so they move as a set. A later
+     * {@link #setFallbackThresholds} overrides this.
+     *
+     * @throws IllegalArgumentException if the preset is unrecognised; a typo is
+     *     never silently treated as {@code "balanced"}.
+     */
+    public void setSensitivity(String preset) {
+        int rc = Lib.INSTANCE.crispasr_session_set_sensitivity(handle, preset);
+        if (rc == -2) {
+            throw new IllegalArgumentException(
+                "unknown sensitivity preset '" + preset + "' (expected: conservative, balanced, aggressive)");
+        }
+        if (rc != 0) throw new IllegalStateException("set_sensitivity failed (rc=" + rc + ")");
+    }
+
     /** Select the G2P pronunciation dictionary for TTS ({@code olaph}/{@code open-dict}/path). */
     public void setG2pDict(String source) {
         int rc = Lib.INSTANCE.crispasr_session_set_g2p_dict(handle, source);
@@ -884,6 +911,31 @@ public final class CrispasrSession implements AutoCloseable {
      */
     public int inputSampleRate() {
         return Lib.INSTANCE.crispasr_session_input_sample_rate(handle);
+    }
+
+    /**
+     * Sample rate of the PCM synthesize/speechToSpeech produce for this
+     * backend. Returns 0 when the backend has no audio output (ASR-only). (#332)
+     */
+    public int outputSampleRate() {
+        return Lib.INSTANCE.crispasr_session_output_sample_rate(handle);
+    }
+
+    /**
+     * Channel count for audio input: 1 (mono) for every current backend,
+     * 0 on error. Source separation is the stereo exception and has its own
+     * surface. (#332)
+     */
+    public int inputChannels() {
+        return Lib.INSTANCE.crispasr_session_input_channels(handle);
+    }
+
+    /**
+     * Channel count for synthesized / s2s output audio: 1 (mono), or 0 when
+     * the backend has no audio output. (#332)
+     */
+    public int outputChannels() {
+        return Lib.INSTANCE.crispasr_session_output_channels(handle);
     }
 
     /**

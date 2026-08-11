@@ -65,6 +65,7 @@
 #include "crispasr_watermark_dispatch.h"
 #include "crispasr_watermark_stats.h"
 #include "core/crispasr_wav_writer.h"
+#include "core/segment_hygiene.h" // PLAN.md §W2/§W5/§W6 opt-in segment cleanup
 #include "crispasr_mp3_writer.h"  // MP3 output via in-tree glint encoder
 #include "crispasr_aac_writer.h"  // AAC-LC (ADTS) output via in-tree glint encoder
 #include "crispasr_mp4_writer.h"  // AAC/Opus-in-MP4 muxer (C2PA-capable container)
@@ -437,6 +438,17 @@ int warn_unsupported(const CrispasrBackend& backend, const whisper_params& p) {
 }
 
 // Merge individual-slice results into a flat list preserving time order.
+//
+// PLAN.md §W2/§W5/§W6 hygiene runs HERE rather than at the four
+// `merge_segments(...)` call sites, because this is the structural chokepoint
+// they all pass through — a hand-patched list of call sites is the exact shape
+// of bug the copies-in-sync guard was built for (it covered 1 of 14 files for
+// months). Every stage is opt-in via env; with none set this is byte-for-byte
+// the old function.
+//
+// It also has to be here rather than per-slice: §W5 collapses runs of
+// near-identical segments, and a loop that straddles a slice boundary is only
+// visible once the slices are flat.
 std::vector<crispasr_segment> merge_segments(std::vector<std::vector<crispasr_segment>>&& per_slice,
                                              const std::vector<crispasr_audio_slice>& /*slices*/) {
     std::vector<crispasr_segment> out;
@@ -448,7 +460,51 @@ std::vector<crispasr_segment> merge_segments(std::vector<std::vector<crispasr_se
         for (auto& s : v)
             out.push_back(std::move(s));
     }
-    return out;
+
+    const auto hy = core_seg_hygiene::config_from_env();
+    if (!core_seg_hygiene::any_enabled(hy))
+        return out;
+
+    std::vector<core_seg_hygiene::Seg> view;
+    view.reserve(out.size());
+    for (const auto& s : out)
+        view.push_back({s.text, s.t0, s.t1, 0.0f, false});
+
+    int dropped = 0;
+    const auto kept = core_seg_hygiene::apply_all(view, hy, &dropped);
+
+    // Map each surviving view back onto its original, so every field the view
+    // does not carry (speaker, words, tokens, chunk_id) is preserved rather
+    // than reconstructed. apply_all only removes segments and rewrites
+    // text/t1 — it never reorders — so a forward scan on t0 is exact.
+    //
+    // Resolve the whole mapping BEFORE touching `out`: the bail-out below
+    // returns `out` unchanged, which is only true if nothing has been moved
+    // out of it yet. Matching first, mutating second, keeps that promise.
+    std::vector<size_t> pick;
+    pick.reserve(kept.size());
+    size_t oi = 0;
+    for (const auto& k : kept) {
+        while (oi < out.size() && out[oi].t0 != k.t0)
+            oi++;
+        if (oi >= out.size())
+            break;
+        pick.push_back(oi++);
+    }
+    if (pick.size() != kept.size()) // unmatched view: never silently lose content
+        return out;
+
+    std::vector<crispasr_segment> res;
+    res.reserve(pick.size());
+    for (size_t i = 0; i < pick.size(); i++) {
+        crispasr_segment seg = std::move(out[pick[i]]);
+        seg.text = kept[i].text;
+        seg.t1 = kept[i].t1; // a merged run spans to the end of its last member
+        res.push_back(std::move(seg));
+    }
+    if (dropped > 0 || res.size() != out.size())
+        fprintf(stderr, "crispasr[hygiene]: %zu -> %zu segments (%d dropped)\n", out.size(), res.size(), dropped);
+    return res;
 }
 
 bool crispasr_words_have_positive_span(const std::vector<crispasr_word>& words) {
@@ -828,7 +884,31 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             fprintf(stderr, "crispasr: %s is %s-only — skipping language detection\n", backend.name(), sole_lang);
     }
 
+    // Some backends can identify the language with the model already loaded
+    // (cohere probes its own supported set). Prefer that over an external
+    // detector when the user did not name one explicitly: it downloads
+    // nothing, and — the real reason — it can only return a language the
+    // backend actually supports, whereas whisper-tiny LID knows 99 and will
+    // happily hand back one the model was never trained on.
+    bool probed_ok = false;
     if (want_auto_lang && !has_native_lid && !lid_disabled) {
+        crispasr_lid_result probe;
+        if (crispasr_backend_probe_language(backend, samples.data(), (int)samples.size(), params, probe)) {
+            lid_info.lang_code = probe.lang_code;
+            lid_info.confidence = probe.confidence;
+            lid_info.source = probe.source;
+            params.language = probe.lang_code;
+            if (params.source_lang.empty())
+                params.source_lang = probe.lang_code;
+            probed_ok = true;
+            if (!params.no_prints) {
+                fprintf(stderr, "crispasr: LID -> language = '%s' (%s, p=%.3f)\n", probe.lang_code.c_str(),
+                        probe.source.c_str(), probe.confidence);
+            }
+        }
+    }
+
+    if (want_auto_lang && !has_native_lid && !lid_disabled && !probed_ok) {
         crispasr_lid_result lid;
         if (crispasr_detect_language_cli(samples.data(), (int)samples.size(), params, lid)) {
             lid_info.lang_code = lid.lang_code;
@@ -2633,8 +2713,21 @@ int crispasr_run_backend(const whisper_params& params_in) {
             const float slice_chunk = params.vad_export_raw         ? 0.0f
                                       : params.chunk_seconds > 0.0f ? params.chunk_seconds
                                                                     : 30.0f;
-            auto slices =
-                crispasr_compute_audio_slices(samples.data(), (int)samples.size(), SR, (int)slice_chunk, params);
+            bool export_vad_load_failed = false;
+            auto slices = crispasr_compute_audio_slices(samples.data(), (int)samples.size(), SR, (int)slice_chunk,
+                                                        params, &export_vad_load_failed);
+            // #311 follow-up: --vad-export is a separate verb from the
+            // transcribe path, and only that path carried the strict check. A
+            // VAD model that failed to load here still wrote a file full of
+            // fixed chunk boundaries labelled as if VAD had produced them —
+            // and, with --strict-pipeline, still exited 0.
+            if (export_vad_load_failed && crispasr_compute_strict_reqs(params).vad) {
+                fprintf(stderr,
+                        "crispasr: error: required VAD model '%s' failed to load for '%s' "
+                        "(--require-vad/--strict-pipeline) — refusing to export fixed chunks as VAD output.\n",
+                        params.vad_model.c_str(), fname.c_str());
+                return CRISPASR_STRICT_RC_VAD;
+            }
             // Multi-file: each input gets its own export path derived
             // from the input name. Single-file: use the explicit path.
             std::string export_path = params.vad_export_file;
@@ -4451,7 +4544,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
                                     params.lid_backend == "none";
         if (want_auto_lang && !has_native_lid && !lid_disabled) {
             crispasr_lid_result lid;
-            if (crispasr_detect_language_cli(samples.data(), (int)samples.size(),
+            // Backend self-probe first (see crispasr_lid_cli.h); external LID
+            // only when it declines.
+            const bool probed = crispasr_backend_probe_language(*backend, samples.data(),
+                                                                (int)samples.size(), params, lid);
+            if (probed ||
+                crispasr_detect_language_cli(samples.data(), (int)samples.size(),
                                           params, lid)) {
                 params.language = lid.lang_code;
                 if (params.source_lang.empty()) {

@@ -309,6 +309,24 @@ public:
     // multilingual backend — that would wrongly force its output language.
     virtual const char* sole_language() const { return nullptr; }
 
+    // Detect the spoken language using the ALREADY-LOADED model, when the
+    // backend can do so without a second one. Returns false (the default) when
+    // it cannot, and the caller falls back to external LID (whisper-tiny etc.).
+    //
+    // This is NOT the same as CAP_LANGUAGE_DETECT. That cap means "detection
+    // happens inside transcribe(), the CLI need not resolve a language at all";
+    // declaring it on a backend that in fact needs a language in its prompt
+    // leaves `-l auto` unresolved. This hook is for the opposite case: the
+    // backend REQUIRES a language but can work one out from its own weights.
+    //
+    // A backend whose language set is smaller than the external detector's also
+    // has a correctness reason to prefer this: external LID can return a
+    // language the model does not support, which is unfixable after the fact.
+    virtual bool detect_language(const float* /*samples*/, int /*n_samples*/, const whisper_params& /*params*/,
+                                 std::string& /*out_lang*/, float& /*out_confidence*/) {
+        return false;
+    }
+
     // Streaming transcription callback type.
     // Called with partial text (empty string counts as keep-alive)
     // and is_final flag. When is_final is true, partial_text is the

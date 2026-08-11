@@ -2,6 +2,7 @@
 
 #include "crispasr_backend.h"
 #include "whisper_params.h"
+#include "core/arch_backend_map.h" // #335: general.architecture → backend table, SHARED with the C ABI
 
 // Forward declarations of per-backend constructors. Each is implemented in
 // its own crispasr_backend_X.cpp file and compiled only if the backend's
@@ -208,8 +209,13 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_voxcpm2_tts_backend();
     if (name == "voxcpm2-vae" || name == "voxcpm2_vae" || name == "voxcpm2-upscaler")
         return crispasr_make_voxcpm2_vae_backend();
+    // `cosyvoice3-tts-rl` is the same engine pointed at upstream's OTHER talker
+    // checkpoint (llm.rl.pt — reinforcement-learning tuned for stability and
+    // pronunciation accuracy). Flow, HiFT, CAMPPlus, the speech tokenizer and
+    // the voice bank are shared, so the alias exists only so `-m auto` fetches
+    // the RL LLM GGUF instead of the base one (#334).
     if (name == "cosyvoice3" || name == "cosyvoice3-tts" || name == "cosyvoice3_tts" || name == "cv3" ||
-        name == "cv3-tts")
+        name == "cv3-tts" || name == "cosyvoice3-rl" || name == "cosyvoice3-tts-rl" || name == "cv3-rl")
         return crispasr_make_cosyvoice3_tts_backend();
     if (name == "m2m100" || name == "m2m-100" || name == "translate" || name == "m2m100-wmt21" || name == "wmt21" ||
         name == "m2m100-1.2b")
@@ -350,6 +356,7 @@ std::vector<std::string> crispasr_list_backends() {
         "voxcpm2-tts",
         "voxcpm2-vae",
         "cosyvoice3-tts",
+        "cosyvoice3-tts-rl",
         "m2m100",
         "m2m100-wmt21",
         "madlad",
@@ -761,6 +768,12 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
     //
     // Only reached when the filename didn't clearly identify a backend.
     // Reads just the "general.architecture" key; no weight tensors.
+    //
+    // The architecture -> backend table is SHARED with the C ABI's
+    // `crispasr_detect_backend_from_gguf` (src/core/arch_backend_map.h). Issue
+    // #335: the two used to be independent copies and had drifted by 113
+    // architecture strings. The filename pass above hid that from CLI users
+    // while every binding got a NULL session for the very same GGUF.
     struct gguf_init_params gip = {/*.no_alloc=*/true, /*.ctx=*/nullptr};
     gguf_context* gctx = gguf_init_from_file(model_path.c_str(), gip);
     if (!gctx)
@@ -770,178 +783,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
     const int key = gguf_find_key(gctx, "general.architecture");
     if (key >= 0) {
         const char* arch = gguf_get_val_str(gctx, key);
-        if (arch) {
-            const std::string a = arch;
-            if (a == "whisper")
-                result = "whisper";
-            else if (a == "sidon")
-                result = "sidon";
-            else if (a == "nemotron" || a == "nemotron-asr" || a == "nemotron-streaming")
-                result = "nemotron";
-            else if (a == "gigaam")
-                result = "gigaam";
-            else if (a == "parakeet")
-                result = "parakeet";
-            else if (a == "parakeet-tdt" || a == "parakeet-ja" || a == "parakeet_ja")
-                result = "parakeet";
-            else if (a == "canary")
-                result = "canary";
-            else if (a == "canary_qwen" || a == "canary-qwen")
-                result = "canary-qwen";
-            else if (a == "lfm2-audio")
-                result = "lfm2-audio";
-            else if (a == "mini-omni2")
-                result = "mini-omni2";
-            else if (a == "canary-ctc")
-                // FastConformer-CTC standalones + canary CTC aligners run on the
-                // canary_ctc runtime (CTC greedy decode), NOT the AED "canary"
-                // encoder-decoder backend, which has no CTC head.
-                result = "fastconformer-ctc";
-            else if (a == "cohere")
-                // Also covers the "cohere-ar" alias: the GGUF's general.architecture
-                // is always "cohere" (the Arabic model shares the runtime); the
-                // alias only affects the model-registry lookup and CLI dispatch
-                // (crispasr_create_backend), not this filename/GGUF-metadata pass.
-                result = "cohere";
-            else if (a == "cohere-transcribe")
-                result = "cohere";
-            else if (a == "qwen3-asr" || a == "qwen3_asr" || a == "qwen3asr")
-                result = "qwen3";
-            else if (a == "qwen3-tts" || a == "qwen3_tts" || a == "qwen3tts")
-                result = "qwen3-tts";
-            else if (a == "miotts" || a == "mio-tts")
-                result = "miotts";
-            else if (a == "moss-tts-local" || a == "moss_tts_local")
-                result = "moss-tts-local";
-            else if (a == "moss-tts" || a == "moss_tts" || a == "moss-tts-delay")
-                result = "moss-tts";
-            else if (a == "orpheus")
-                result = "orpheus";
-            else if (a == "kokoro" || a == "styletts2" || a == "styletts2-ljspeech")
-                result = "kokoro";
-            else if (a == "voxcpm2-vae" || a == "voxcpm2_vae")
-                result = "voxcpm2-vae";
-            else if (a == "voxcpm2" || a == "voxcpm2_tts" || a == "voxcpm2-tts")
-                result = "voxcpm2-tts";
-            else if (a == "cosyvoice3" || a == "cosyvoice3-tts" || a == "cosyvoice3_tts" || a == "cosyvoice3-llm")
-                result = "cosyvoice3-tts";
-            else if (a == "fastpitch" || a == "fastpitch-tts" || a == "fastpitch_tts")
-                result = "fastpitch";
-            else if (a == "bananamind_tts" || a == "bananamind-tts")
-                result = "bananamind-tts";
-            else if (a == "omnivoice" || a == "omnivoice-tts" || a == "omnivoice_tts")
-                result = "omnivoice";
-            else if (a == "piper" || a == "piper-tts" || a == "piper_tts" || a == "vits")
-                result = "piper";
-            else if (a == "melotts" || a == "melo-tts" || a == "melo_tts" || a == "vits2")
-                result = "melotts";
-            else if (a == "f5-tts" || a == "f5_tts" || a == "f5tts")
-                result = "f5-tts";
-            else if (a == "irodori-tts" || a == "irodori_tts" || a == "irodori")
-                result = "irodori-tts";
-            else if (a == "chatterbox" || a == "chatterbox_turbo" || a == "kartoffelbox")
-                result = "chatterbox";
-            else if (a == "tada" || a == "tada-tts" || a == "tada-1b" || a == "tada-tts-1b" || a == "tada-3b-ml")
-                result = "tada";
-            else if (a == "m2m100" || a == "m2m_100")
-                result = "m2m100";
-            else if (a == "voxtral")
-                result = "voxtral";
-            else if (a == "higgs-stt" || a == "higgs_stt" || a == "higgs-audio-v3-stt")
-                result = "higgs-stt";
-            else if (a == "voxtral_tts" || a == "voxtral-tts")
-                result = "voxtral-tts";
-            else if (a == "voxtral4b" || a == "voxtral-4b" || a == "voxtral_4b")
-                result = "voxtral4b";
-            else if (a == "granite-speech" || a == "granite_speech" || a == "granitespeech")
-                result = "granite";
-            else if (a == "granite-nle" || a == "granite_nle" || a == "granitenle")
-                result = "granite-4.1-nar";
-            else if (a == "wav2vec2" || a == "wav2vec2-ctc")
-                result = "wav2vec2";
-            else if (a == "vibevoice" || a == "vibevoice-asr" || a == "vibevoice_asr" || a == "vibevoice-bitnet" ||
-                     a == "vibevoice-asr-bitnet" || a == "vibevoice_bitnet")
-                result = "vibevoice";
-            else if (a == "kugelaudio" || a == "kugelaudio-tts" || a == "kugelaudio_tts")
-                result = "kugelaudio";
-            else if (a == "fastconformer-ctc" || a == "stt-fastconformer-ctc" || a == "stt_fastconformer_ctc")
-                result = "fastconformer-ctc";
-            else if (a == "glmasr" || a == "glm-asr" || a == "glm_asr")
-                result = "glm-asr";
-            else if (a == "htdemucs" || a == "demucs")
-                result = "htdemucs";
-            else if (a == "mel-band-roformer" || a == "mel_band_roformer")
-                result = "mel-band-roformer";
-            else if (a == "crepe")
-                result = "crepe";
-            else if (a == "btc")
-                result = "btc-chords";
-            else if (a == "tabcnn")
-                result = "tabcnn";
-            else if (a == "rvc")
-                result = "rvc-svc";
-            else if (a == "beat-this")
-                result = "beat-this";
-            else if (a == "kyutai-stt" || a == "kyutai_stt" || a == "kyutaistt")
-                result = "kyutai-stt";
-            else if (a == "firered-asr" || a == "firered_asr" || a == "firereadasr" || a == "firered-lid" ||
-                     a == "firered_lid")
-                result = "firered-asr";
-            else if (a == "moonshine_streaming")
-                return "moonshine-streaming";
-            else if (a == "gemma4e2b" || a == "gemma4_e2b")
-                return "gemma4-e2b";
-            else if (a == "moonshine" || a == "moonshine-tiny" || a == "moonshine-base")
-                result = "moonshine";
-            else if (a == "omniasr-ctc" || a == "omniasr_ctc" || a == "omniasr" || a == "omniasr-300m" ||
-                     a == "omniasr-llm" || a == "omniasr_llm")
-                result = "omniasr";
-            else if (a == "hubert" || a == "hubert-ctc")
-                result = "wav2vec2";
-            else if (a == "data2vec" || a == "data2vec-audio" || a == "data2vec_audio")
-                result = "wav2vec2";
-            else if (a == "fireredpunc")
-                result = "fireredpunc";
-            else if (a == "mimo_asr" || a == "mimo-asr")
-                result = "mimo-asr";
-            else if (a == "arkasr" || a == "ark-asr" || a == "ark_asr")
-                result = "ark-asr";
-            else if (a == "moss_audio" || a == "moss-audio")
-                result = "moss-audio";
-            else if (a == "moss_transcribe" || a == "moss-transcribe")
-                result = "moss-transcribe";
-            else if (a == "moss_transcribe_diarize" || a == "moss-transcribe-diarize" || a == "moss_diarize" ||
-                     a == "moss-diarize")
-                result = "moss-diarize";
-            else if (a == "funasr" || a == "fun_asr" || a == "fun-asr")
-                result = "funasr";
-            else if (a == "paraformer")
-                result = "paraformer";
-            else if (a == "sensevoice" || a == "sense_voice" || a == "sense-voice" || a == "sensevoicesmall")
-                result = "sensevoice";
-            else if (a == "indextts" || a == "indextts-1.5" || a == "indextts_1_5")
-                result = "indextts";
-            else if (a == "outetts" || a == "oute-tts" || a == "oute_tts")
-                result = "outetts";
-            else if (a == "pocket-tts" || a == "pocket_tts" || a == "pockettts")
-                result = "pocket-tts";
-            else if (a == "speecht5-tts" || a == "speecht5_tts" || a == "speecht5")
-                result = "speecht5";
-            else if (a == "bark" || a == "bark-tts" || a == "bark_tts")
-                result = "bark";
-            else if (a == "dia" || a == "dia-tts" || a == "dia_tts")
-                result = "dia";
-            else if (a == "dots-tts" || a == "dots_tts" || a == "dots.tts")
-                result = "dots-tts";
-            else if (a == "csm" || a == "csm-tts" || a == "csm_tts")
-                result = "csm";
-            else if (a == "parler-tts" || a == "parler_tts" || a == "parlertts")
-                result = "parler-tts";
-            else if (a == "zonos" || a == "zonos-tts" || a == "zonos_tts")
-                result = "zonos";
-            else if (a == "piano-transcription" || a == "piano_transcription")
-                result = "piano-transcription";
-        }
+        if (arch)
+            result = core_arch::backend_for_arch(arch);
     }
     gguf_free(gctx);
     return result;

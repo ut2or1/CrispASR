@@ -6,6 +6,8 @@
 //   - Same projector topology (stack-4-frames + 2×Linear)
 
 #include "voxtral4b.h"
+
+#include "voxtral_tekken_vocab.h" // #338 active-vocabulary bound
 #include "core/crispasr_env.h"
 
 #ifndef M_PI
@@ -376,10 +378,18 @@ static bool voxtral4b_load_model(voxtral4b_model& model, voxtral4b_vocab& vocab,
             vocab.tekken_vocab_blob.resize(n);
             for (size_t i = 0; i < n; i++)
                 vocab.tekken_vocab_blob[i] = (uint8_t)(int)f32[i];
-            vocab.rank_offset.reserve(vocab.n_vocab);
-            vocab.rank_length.reserve(vocab.n_vocab);
+            // #338: the same active-vocabulary bound voxtral_tts needed. A
+            // rank becomes the token id `rank + n_specials`, so ranks must stop
+            // at the last row of the embedding table — `n_vocab` here is the
+            // SERIALIZED length (default 150000) and is allowed to exceed
+            // llm_vocab_size (131072). Without the cap, a text whose BPE path
+            // reaches a tail entry indexes token_embd out of bounds.
+            const int n_active = voxtral_tekken::active_bpe_count((int)model.hparams.llm_vocab_size, vocab.n_specials);
+            const int n_ranks = (n_active > 0 && n_active < vocab.n_vocab) ? n_active : vocab.n_vocab;
+            vocab.rank_offset.reserve(n_ranks);
+            vocab.rank_length.reserve(n_ranks);
             size_t pos = 0;
-            for (int r = 0; r < vocab.n_vocab; r++) {
+            for (int r = 0; r < n_ranks; r++) {
                 if (pos + 2 > n)
                     break;
                 uint16_t len;

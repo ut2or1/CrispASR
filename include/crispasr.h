@@ -612,6 +612,14 @@ CRISPASR_API int crispasr_session_set_grammar_text(struct crispasr_session* s, c
 CRISPASR_API int crispasr_session_set_fallback_thresholds(struct crispasr_session* s, float entropy_thold,
                                                           float logprob_thold, float no_speech_thold,
                                                           float temperature_inc);
+// Apply a named bundle of the four thresholds above: "conservative",
+// "balanced" (== the shipped defaults, always a no-op) or "aggressive".
+// "strict"/"default"/"loose" are accepted aliases. Mirrors the CLI's
+// --sensitivity. Returns 0 on success, -1 on a null/empty argument, -2 for an
+// unrecognised name — an unknown preset is REJECTED rather than silently
+// treated as balanced, so a typo is visible. Call before transcribing; a later
+// crispasr_session_set_fallback_thresholds() overrides it.
+CRISPASR_API int crispasr_session_set_sensitivity(struct crispasr_session* s, const char* preset_name);
 CRISPASR_API int crispasr_session_set_alt_n(struct crispasr_session* s, int n);
 CRISPASR_API int crispasr_session_set_whisper_decode_extras(struct crispasr_session* s, int suppress_nst,
                                                             const char* suppress_regex, int carry_initial_prompt);
@@ -687,6 +695,23 @@ CRISPASR_API int crispasr_session_input_sample_rate(struct crispasr_session* s);
 // Backends that normally resample (e.g. 16 kHz → 24 kHz) will skip the
 // step when the rate already matches. Defaults to 16000 for back-compat.
 CRISPASR_API int crispasr_session_set_pcm_sample_rate(struct crispasr_session* s, int rate);
+
+// #332: Sample rate of the PCM produced by synthesize / synthesize_raw /
+// synthesize_streaming / get_disclaimer_pcm / speech_to_speech for this
+// session's backend (the "backend-native rate" those calls document).
+// Returns 0 for a NULL session or a backend that produces no audio output
+// (ASR-only). Mirrors the CLI adapters' tts_sample_rate().
+CRISPASR_API int crispasr_session_output_sample_rate(struct crispasr_session* s);
+
+// #332: channel counts for the session's audio input (transcribe / s2s /
+// voice input) and audio output (synthesize / s2s). Both are 1 (mono) for
+// every current backend — source separation is the stereo exception and has
+// its own surface (crispasr_session_separate*). Getters rather than
+// documented constants so a future multi-channel backend is additive.
+// Return 0 on a NULL session; output_channels is also 0 when the backend
+// produces no audio output.
+CRISPASR_API int crispasr_session_input_channels(struct crispasr_session* s);
+CRISPASR_API int crispasr_session_output_channels(struct crispasr_session* s);
 
 // CTC vocabulary access. Returns 0 / "" for backends without an exposed CTC
 // vocabulary. The token text pointer is model-owned and must not be freed.

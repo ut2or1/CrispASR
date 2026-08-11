@@ -57,6 +57,10 @@ int crispasr_session_set_speaker_identity(CrispasrSession* s, const char* identi
 float* crispasr_session_speech_to_speech(CrispasrSession* s, const float* in_samples, int n_in_samples, char** out_text,
                                          int* out_n_samples);
 int crispasr_session_input_sample_rate(CrispasrSession* s);
+// #332: output-side counterparts (rate of synthesize/s2s PCM; mono channels).
+int crispasr_session_output_sample_rate(CrispasrSession* s);
+int crispasr_session_input_channels(CrispasrSession* s);
+int crispasr_session_output_channels(CrispasrSession* s);
 int crispasr_session_set_g2p_dict(CrispasrSession* s, const char* source);
 int crispasr_session_set_speaker_id(CrispasrSession* s, int id);
 void crispasr_pcm_free(float* pcm);
@@ -106,6 +110,7 @@ int crispasr_session_set_tts_reference_language(CrispasrSession* s, const char* 
 int crispasr_session_set_punctuation(CrispasrSession* s, int enable);
 int crispasr_session_set_punc_model(CrispasrSession* s, const char* punc_model);
 int crispasr_session_set_hotwords(CrispasrSession* s, const char* hotwords, float boost);
+int crispasr_session_set_sensitivity(CrispasrSession* s, const char* preset);
 int crispasr_session_set_translate(CrispasrSession* s, int enable);
 int crispasr_session_set_temperature(CrispasrSession* s, float temperature, unsigned long long seed);
 int crispasr_session_set_tts_seed(CrispasrSession* s, unsigned long long seed);
@@ -457,6 +462,14 @@ EMSCRIPTEN_BINDINGS(whisper) {
                              return g_asr_session
                                         ? crispasr_session_set_hotwords(g_asr_session, w.c_str(), (float)boost)
                                         : -1;
+                         }));
+    // Named bundle of the four decoder fallback thresholds:
+    // "conservative" | "balanced" | "aggressive". Returns -2 for an unknown
+    // preset (JS callers should treat that as an error, not a no-op) and -1
+    // when no session is open.
+    emscripten::function("asrSetSensitivity", emscripten::optional_override([](const std::string& preset) {
+                             return g_asr_session ? crispasr_session_set_sensitivity(g_asr_session, preset.c_str())
+                                                  : -1;
                          }));
     emscripten::function("asrSetAsk", emscripten::optional_override([](const std::string& prompt) {
                              return g_asr_session ? crispasr_session_set_ask(g_asr_session, prompt.c_str()) : -1;
@@ -913,6 +926,17 @@ EMSCRIPTEN_BINDINGS(whisper) {
     // Whisper-family; feed it to S2S/transcribe input). 0 when no session is open.
     emscripten::function("sessionInputSampleRate", emscripten::optional_override([]() {
                              return g_tts_session ? crispasr_session_input_sample_rate(g_tts_session) : 0;
+                         }));
+    // #332: rate of the PCM ttsSynthesize/speech-to-speech produce (0 = the
+    // backend has no audio output), plus the mono channel-count getters.
+    emscripten::function("sessionOutputSampleRate", emscripten::optional_override([]() {
+                             return g_tts_session ? crispasr_session_output_sample_rate(g_tts_session) : 0;
+                         }));
+    emscripten::function("sessionInputChannels", emscripten::optional_override([]() {
+                             return g_tts_session ? crispasr_session_input_channels(g_tts_session) : 0;
+                         }));
+    emscripten::function("sessionOutputChannels", emscripten::optional_override([]() {
+                             return g_tts_session ? crispasr_session_output_channels(g_tts_session) : 0;
                          }));
     emscripten::function("sessionSetBestOf", emscripten::optional_override([](int n) {
                              return g_tts_session ? crispasr_session_set_best_of(g_tts_session, n) : -1;

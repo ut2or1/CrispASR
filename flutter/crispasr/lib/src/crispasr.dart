@@ -231,6 +231,10 @@ enum DiarizeMethod {
   /// Mono-friendly, ML-based. Runs the GGUF pyannote segmentation net.
   /// Requires [pyannoteModelPath].
   pyannote,
+
+  /// Mono-friendly, ML-based (#324): WeSpeaker embeddings + spectral
+  /// clustering (the FoxNose recipe). Requires [foxnoseEmbedderPath].
+  foxNose,
 }
 
 /// Assign a speaker index to each of [segs], based on the selected
@@ -240,14 +244,20 @@ enum DiarizeMethod {
 /// of a stereo pair. When `isStereo` is true, `right` must point at the
 /// right channel. All PCM is 16 kHz float32.
 ///
-/// Returns `true` on success. The only failure case is
-/// [DiarizeMethod.pyannote] when the GGUF model can't be loaded — all
-/// other methods always succeed (they may leave individual segments
-/// with `speaker = -1` when they had no information to decide).
+/// Returns `true` on success. The only failure cases are the
+/// model-backed methods ([DiarizeMethod.pyannote], [DiarizeMethod.foxNose])
+/// when their GGUF model can't be loaded — all other methods always
+/// succeed (they may leave individual segments with `speaker = -1` when
+/// they had no information to decide).
 ///
 /// `sliceT0` is the absolute start time (seconds) of the PCM buffer
 /// within the original audio, so absolute segment times in [DiarizeSegment]
 /// can be mapped back to sample indices.
+///
+/// [foxnoseEmbedderPath] (required for [DiarizeMethod.foxNose]) is the
+/// WeSpeaker embedder GGUF; [minSpeakers] / [maxSpeakers] bound the
+/// automatic speaker-count estimation (0 keeps the library defaults 1 / 8)
+/// and [numSpeakers] > 0 pins the count and skips estimation.
 bool diarizeSegments({
   required List<DiarizeSegment> segs,
   required Float32List left,
@@ -257,6 +267,10 @@ bool diarizeSegments({
   String? pyannoteModelPath,
   int nThreads = 4,
   double sliceT0 = 0.0,
+  String? foxnoseEmbedderPath,
+  int minSpeakers = 0,
+  int maxSpeakers = 0,
+  int numSpeakers = 0,
   DynamicLibrary? lib,
 }) {
   if (segs.isEmpty || left.isEmpty) return true;
@@ -287,9 +301,14 @@ bool diarizeSegments({
     (base + 20).cast<Int32>().value = 0;
   }
 
-  // ABI opts: int32 method, int32 n_threads, int64 slice_t0_cs, const char*.
-  // 4+4+8+8 = 24 bytes on 64-bit. We write each field explicitly.
-  final optsPtr = calloc<Uint8>(24);
+  // ABI opts layout — hand-maintained mirror of the APPEND-ONLY
+  // `crispasr_diarize_opts_abi` in src/crispasr_c_api.cpp. The C side reads
+  // every field unconditionally, so the buffer must cover the full struct:
+  // int32 method, int32 n_threads, int64 slice_t0_cs,
+  // const char* pyannote_model_path, const char* foxnose_embedder_path,
+  // int32 min_speakers, int32 max_speakers, int32 num_speakers, int32 _pad2.
+  // 4+4+8+8+8+4+4+4+4 = 48 bytes on 64-bit. We write each field explicitly.
+  final optsPtr = calloc<Uint8>(48);
   optsPtr.cast<Int32>().value = method.index;
   (optsPtr + 4).cast<Int32>().value = nThreads;
   (optsPtr + 8).cast<Int64>().value = (sliceT0 * 100).round();
@@ -299,6 +318,16 @@ bool diarizeSegments({
       ? pyannoteModelPath.toNativeUtf8()
       : nullptr;
   (optsPtr + 16).cast<IntPtr>().value = pathPtr.address;
+  final foxPathPtr = (method == DiarizeMethod.foxNose &&
+          foxnoseEmbedderPath != null &&
+          foxnoseEmbedderPath.isNotEmpty)
+      ? foxnoseEmbedderPath.toNativeUtf8()
+      : nullptr;
+  (optsPtr + 24).cast<IntPtr>().value = foxPathPtr.address;
+  (optsPtr + 32).cast<Int32>().value = minSpeakers;
+  (optsPtr + 36).cast<Int32>().value = maxSpeakers;
+  (optsPtr + 40).cast<Int32>().value = numSpeakers;
+  (optsPtr + 44).cast<Int32>().value = 0;
 
   final fn = lib.lookupFunction<
       Int32 Function(Pointer<Float>, Pointer<Float>, Int32, Int32,
@@ -319,6 +348,7 @@ bool diarizeSegments({
   calloc.free(segsPtr);
   calloc.free(optsPtr);
   if (pathPtr != nullptr) calloc.free(pathPtr);
+  if (foxPathPtr != nullptr) calloc.free(foxPathPtr);
 
   return rc == 0;
 }
@@ -4643,6 +4673,40 @@ class CrispasrSession {
     try {
       final rc = fn(_handle, p, boost);
       if (rc != 0) throw Exception('setHotwords failed (rc=$rc)');
+    } finally {
+      calloc.free(p);
+    }
+  }
+
+  /// Apply a named bundle of the four decoder fallback thresholds:
+  /// `"conservative"`, `"balanced"` (the shipped defaults, a no-op) or
+  /// `"aggressive"`. `"strict"`/`"default"`/`"loose"` are aliases. Mirrors the
+  /// CLI's `--sensitivity`.
+  ///
+  /// The four thresholds interact — a decode is only retried when the logprob
+  /// *and* no-speech bars are both crossed — so they move as a set. A later
+  /// [setFallbackThresholds] overrides this.
+  ///
+  /// Throws [ArgumentError] for an unrecognised preset: a typo must not be
+  /// silently treated as `"balanced"`. Gracefully degrades on older dylibs
+  /// that don't have the symbol.
+  void setSensitivity(String preset) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_sensitivity')) {
+      return;
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>),
+        int Function(Pointer<Void>, Pointer<Utf8>)>(
+        'crispasr_session_set_sensitivity');
+    final p = preset.toNativeUtf8();
+    try {
+      final rc = fn(_handle, p);
+      if (rc == -2) {
+        throw ArgumentError(
+            'unknown sensitivity preset "$preset" '
+            '(expected: conservative, balanced, aggressive)');
+      }
+      if (rc != 0) throw Exception('setSensitivity failed (rc=$rc)');
     } finally {
       calloc.free(p);
     }

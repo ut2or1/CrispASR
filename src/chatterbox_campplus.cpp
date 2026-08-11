@@ -797,8 +797,41 @@ static std::vector<float> unit_forward(const UnitCache& u, const float* in, int 
 
 // Helper: BN+ReLU+Conv1d (the order TransitLayer / DenseLayer use).
 // `bn` is the BN folded against C_in.
+//
+// `lin_b` is optional and usually absent — TransitLayer's Conv1d is declared
+// `bias=False`. It is NOT always absent, though, and dropping it is a silent
+// correctness bug (#334). CAMPPlus ends with
+//   … transit3.linear(Conv1d) → out_nonlinear(BN + ReLU) → StatsPool → dense
+// and an ONNX exporter is free to FOLD that trailing BatchNorm back into the
+// preceding convolution. CosyVoice3's `campplus.onnx` does exactly that: its
+// graph has a bare `/xvector/out_nonlinear/relu/Relu` with no BN parameters
+// anywhere, while `/xvector/transit3/linear/Conv` gained a fused weight AND a
+// fused bias (transit1/transit2 keep their named, bias-free weights because
+// no BN follows them). Skipping the absent out_nonlinear BN is therefore
+// right, but only if the bias that absorbed it is applied here.
+//
+// Measured on a 4.26 s reference: dropping it put the 192-d speaker embedding
+// at cos 0.737 against campplus.onnx — a real but plausible-looking vector,
+// so every WAV clone was conditioned on the wrong timbre while the baked
+// voice bank (whose embeddings come from the ONNX model in Python) was fine.
+// Zeroing the same bias in the ONNX reference reproduces the C++ output at
+// cos 0.999998, which is what pins the cause to this one term.
+//
+// The three consumers of this code ship TWO different export shapes, so read
+// the checkpoint rather than assuming either. Verified by listing the tensor
+// names in each published GGUF:
+//   chatterbox / chatterbox-turbo s3gen — 15 transit tensors, no transit
+//       `linear.bias`, and an explicit `s3.se.xv.out_nl.bn.*`
+//   dots.tts spk                        — 18 transit tensors, no transit
+//       `linear.bias`, explicit `…xvector.out_nonlinear.batchnorm.*`
+//   cosyvoice3 campplus                 — transit3 `linear.bias` present, NO
+//       out_nonlinear parameters at all (folded)
+// So this bias is a no-op for chatterbox and dots.tts — they are bit-identical
+// — and it is the whole fix for cosyvoice3. This code was written against the
+// un-folded shape and had simply never met a folded one.
 static std::vector<float> bn_relu_conv1d(const BNFolded& bn, const float* in, int C_in, int T,
-                                         const std::vector<float>& lin_w, int kw, int C_out, int s, int p) {
+                                         const std::vector<float>& lin_w, const std::vector<float>& lin_b, int kw,
+                                         int C_out, int s, int p) {
     std::vector<float> a((size_t)C_in * (size_t)T);
     std::memcpy(a.data(), in, a.size() * sizeof(float));
     apply_bn_inplace(a.data(), C_in, T, bn);
@@ -806,6 +839,7 @@ static std::vector<float> bn_relu_conv1d(const BNFolded& bn, const float* in, in
     const int T_out = (T + 2 * p - (kw - 1) - 1) / s + 1;
     std::vector<float> out((size_t)C_out * (size_t)T_out, 0.0f);
     conv1d_forward(a.data(), C_in, T, lin_w.data(), C_out, kw, s, p, 1, out.data());
+    add_channel_bias(out.data(), C_out, T_out, lin_b);
     return out;
 }
 
@@ -902,7 +936,8 @@ std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runti
 
     // transit1: BN(512) + ReLU + Conv1d 1×1 (512→256), bias=False
     BNFolded bn_t1 = fold_bn(m.transit1.bn_m, m.transit1.bn_v, m.transit1.bn_w, m.transit1.bn_b, C_blk1);
-    auto post_t1 = bn_relu_conv1d(bn_t1, post_blk1.data(), C_blk1, T_tdnn, state->xv_transit1.lin_w, 1, 256, 1, 0);
+    auto post_t1 = bn_relu_conv1d(bn_t1, post_blk1.data(), C_blk1, T_tdnn, state->xv_transit1.lin_w,
+                                  state->xv_transit1.lin_b, 1, 256, 1, 0);
 
     // block2: 24 layers, dilation=2 → 256 + 24*32 = 1024
     int C_blk2 = 0;
@@ -910,7 +945,8 @@ std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runti
 
     // transit2: BN(1024) + ReLU + Conv1d 1×1 (1024→512)
     BNFolded bn_t2 = fold_bn(m.transit2.bn_m, m.transit2.bn_v, m.transit2.bn_w, m.transit2.bn_b, C_blk2);
-    auto post_t2 = bn_relu_conv1d(bn_t2, post_blk2.data(), C_blk2, T_tdnn, state->xv_transit2.lin_w, 1, 512, 1, 0);
+    auto post_t2 = bn_relu_conv1d(bn_t2, post_blk2.data(), C_blk2, T_tdnn, state->xv_transit2.lin_w,
+                                  state->xv_transit2.lin_b, 1, 512, 1, 0);
 
     // block3: 16 layers, dilation=2 → 512 + 16*32 = 1024
     int C_blk3 = 0;
@@ -921,7 +957,8 @@ std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runti
 
     // transit3: BN(1024) + ReLU + Conv1d 1×1 (1024→512)
     BNFolded bn_t3 = fold_bn(m.transit3.bn_m, m.transit3.bn_v, m.transit3.bn_w, m.transit3.bn_b, C_blk3);
-    auto post_t3 = bn_relu_conv1d(bn_t3, post_blk3.data(), C_blk3, T_tdnn, state->xv_transit3.lin_w, 1, 512, 1, 0);
+    auto post_t3 = bn_relu_conv1d(bn_t3, post_blk3.data(), C_blk3, T_tdnn, state->xv_transit3.lin_w,
+                                  state->xv_transit3.lin_b, 1, 512, 1, 0);
 
     // out_nl: BN(512) + ReLU. Note: out_nl is a bare get_nonlinear, so its
     // GGUF tensors are at `out_nl.bn.*` (not `out_nl.nl.bn.*`); the bind

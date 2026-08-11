@@ -229,6 +229,12 @@ static void ensure_misaki_lexicon_loaded() {
     if (g_g2p_misaki_tried)
         return;
     g_g2p_misaki_tried = true;
+    // Kokoro reads misaki's output, so this context follows misaki's rules:
+    // contextual function words, punctuation carried through, hyphenated
+    // compounds kept whole. Nothing set these before, so the whole
+    // contextual-word layer shipped inert — "the" stayed `ði` everywhere and
+    // the article "a" was read as the LETTER, `ˈA` (#316).
+    g2p_en::configure_for_misaki(g_g2p_misaki_ctx);
     std::string path;
     if (const char* env = std::getenv("CRISPASR_MISAKI_DICT_PATH"); env && *env) {
         path = env;
@@ -243,7 +249,8 @@ static void ensure_misaki_lexicon_loaded() {
         // A .json path is misaki's own file; anything else is the TSV that
         // tools/convert-misaki-lexicon.py emits.
         const bool is_json = path.size() > 5 && path.compare(path.size() - 5, 5, ".json") == 0;
-        int n = is_json ? g2p_en::load_misaki_json(g_g2p_misaki_ctx.espeak_ipa, g_g2p_misaki_ctx.phrase_final, path)
+        int n = is_json ? g2p_en::load_misaki_json(g_g2p_misaki_ctx.espeak_ipa, g_g2p_misaki_ctx.phrase_final, path,
+                                                   &g_g2p_misaki_ctx.letters)
                         : g2p_en::load_ipa_dict_file(g_g2p_misaki_ctx.espeak_ipa, path);
         if (n > 0) {
             g_g2p_misaki_ctx.espeak_ipa.loaded = true;
@@ -276,7 +283,8 @@ static void ensure_misaki_lexicon_loaded() {
                                                                 /*quiet=*/true, "crispasr", "");
             if (p2.empty())
                 continue;
-            total += g2p_en::load_misaki_json(g_g2p_misaki_ctx.espeak_ipa, g_g2p_misaki_ctx.phrase_final, p2);
+            total += g2p_en::load_misaki_json(g_g2p_misaki_ctx.espeak_ipa, g_g2p_misaki_ctx.phrase_final, p2,
+                                              &g_g2p_misaki_ctx.letters);
         }
         if (total > 0) {
             g_g2p_misaki_ctx.espeak_ipa.loaded = true;
@@ -337,7 +345,7 @@ bool phonemize_misaki_en(const std::string& lang, const std::string& text, std::
     return !out.empty();
 }
 
-bool phonemize_builtin_en(const std::string& lang, const std::string& text, std::string& out) {
+bool phonemize_builtin_en(const std::string& lang, const std::string& text, std::string& out, bool misaki_style) {
     // Only handles English
     if (!lang.empty() && lang.find("en") == std::string::npos && lang != "auto")
         return false;
@@ -346,7 +354,11 @@ bool phonemize_builtin_en(const std::string& lang, const std::string& text, std:
         ensure_cmudict_loaded();
         ensure_neural_g2p_loaded();
     }
-    out = g2p_en::text_to_ipa(g_g2p_ctx, text);
+    // #316: this ONE context serves two consumers — piper, which wants espeak's
+    // conventions, and Kokoro's fallback for when the misaki lexicon could not
+    // be fetched. The dictionary is the same; the output conventions are not,
+    // and Kokoro needs its punctuation whichever dictionary it ended up with.
+    out = g2p_en::text_to_ipa(g_g2p_ctx, text, misaki_style ? g2p_en::misaki_style() : g_g2p_ctx.consumer());
     return !out.empty();
 }
 
@@ -365,13 +377,23 @@ static void ensure_de_dict_loaded() {
         fprintf(stderr, "g2p: loaded German IPA dict (%d entries)\n", n);
 }
 
-bool phonemize_builtin_de(const std::string& lang, const std::string& text, std::string& out) {
+bool phonemize_builtin_de(const std::string& lang, const std::string& text, std::string& out, bool tts_punctuation) {
     if (!lang.empty() && lang.find("de") == std::string::npos)
         return false;
     {
         std::lock_guard<std::mutex> g(g_g2p_de_mu);
         ensure_de_dict_loaded();
     }
+    g_g2p_de_ctx.emit_punctuation = tts_punctuation;
+    // #316: read the German closed class the way espeak reads it in a SENTENCE,
+    // not the citation form our per-word dictionary stores. Default ON — the
+    // German Kokoro training recipe phonemizes whole sentences through espeak,
+    // so the citation form is a spelling the model never saw.
+    static const bool de_unstress = [] {
+        const char* v = std::getenv("CRISPASR_G2P_DE_UNSTRESS");
+        return !(v && *v && std::strcmp(v, "0") == 0);
+    }();
+    g_g2p_de_ctx.unstress_function_words = de_unstress;
     out = g2p_de::text_to_ipa(g_g2p_de_ctx, text);
     return !out.empty();
 }
@@ -391,13 +413,14 @@ static void ensure_fr_dict_loaded() {
         fprintf(stderr, "g2p: loaded French IPA dict (%d entries)\n", n);
 }
 
-bool phonemize_builtin_fr(const std::string& lang, const std::string& text, std::string& out) {
+bool phonemize_builtin_fr(const std::string& lang, const std::string& text, std::string& out, bool tts_punctuation) {
     if (!lang.empty() && lang.find("fr") == std::string::npos)
         return false;
     {
         std::lock_guard<std::mutex> g(g_g2p_fr_mu);
         ensure_fr_dict_loaded();
     }
+    g_g2p_fr_ctx.emit_punctuation = tts_punctuation;
     out = g2p_fr::text_to_ipa(g_g2p_fr_ctx, text);
     return !out.empty();
 }
@@ -417,13 +440,14 @@ static void ensure_es_dict_loaded() {
         fprintf(stderr, "g2p: loaded Spanish IPA dict (%d entries)\n", n);
 }
 
-bool phonemize_builtin_es(const std::string& lang, const std::string& text, std::string& out) {
+bool phonemize_builtin_es(const std::string& lang, const std::string& text, std::string& out, bool tts_punctuation) {
     if (!lang.empty() && lang.find("es") == std::string::npos)
         return false;
     {
         std::lock_guard<std::mutex> g(g_g2p_es_mu);
         ensure_es_dict_loaded();
     }
+    g_g2p_es_ctx.emit_punctuation = tts_punctuation;
     out = g2p_es::text_to_ipa(g_g2p_es_ctx, text);
     return !out.empty();
 }

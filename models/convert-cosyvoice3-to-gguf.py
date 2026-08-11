@@ -165,9 +165,11 @@ def remap_llm(hf_name: str):
     return None
 
 
-def convert_llm(base, output_path):
+def convert_llm(base, output_path, checkpoint="llm.pt"):
     import torch
-    model_pt = os.path.join(base, "llm.pt")
+    model_pt = os.path.join(base, checkpoint)
+    if not os.path.exists(model_pt):
+        raise SystemExit(f"LLM checkpoint not found: {model_pt}")
     print(f"  Loading LLM state dict from {model_pt}")
     sd = torch.load(model_pt, map_location="cpu", weights_only=False)
     if isinstance(sd, dict) and "state_dict" in sd:
@@ -480,6 +482,18 @@ def main():
                     help="Directory to write the three GGUFs into")
     ap.add_argument("--skip", choices=["llm", "flow", "hift"], action="append", default=[],
                     help="Skip a sub-model (repeatable; useful for iterating).")
+    # FunAudioLLM/Fun-CosyVoice3-0.5B-2512 ships TWO talker checkpoints in the
+    # same repo: `llm.pt` (the pre-trained base) and `llm.rl.pt` (the same
+    # architecture after reinforcement learning, tuned for stability and
+    # pronunciation accuracy). Only the talker differs — flow, HiFT, CAMPPlus,
+    # the speech tokenizer and the voice bank are shared, so an RL build is
+    # just this converter pointed at the other checkpoint (#334).
+    ap.add_argument("--llm-checkpoint", default="llm.pt",
+                    help="Talker checkpoint filename inside the snapshot "
+                         "(llm.pt = base, llm.rl.pt = RL-tuned). Default: llm.pt")
+    ap.add_argument("--llm-output", default=None,
+                    help="Override the LLM GGUF filename (default derives from --llm-checkpoint: "
+                         "cosyvoice3-llm-f16.gguf / cosyvoice3-llm-rl-f16.gguf)")
     args = ap.parse_args()
 
     if os.path.isdir(args.input):
@@ -495,8 +509,11 @@ def main():
 
     if "llm" not in args.skip:
         print()
-        print("=== LLM (Qwen2 + speech heads) ===")
-        convert_llm(base, os.path.join(args.output_dir, "cosyvoice3-llm-f16.gguf"))
+        is_rl = "rl" in os.path.basename(args.llm_checkpoint).split(".")
+        default_name = "cosyvoice3-llm-rl-f16.gguf" if is_rl else "cosyvoice3-llm-f16.gguf"
+        llm_name = args.llm_output or default_name
+        print(f"=== LLM (Qwen2 + speech heads) — {args.llm_checkpoint} ===")
+        convert_llm(base, os.path.join(args.output_dir, llm_name), args.llm_checkpoint)
 
     if "flow" not in args.skip:
         print()

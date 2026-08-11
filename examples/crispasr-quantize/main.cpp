@@ -626,6 +626,36 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                __func__);
     }
 
+    // t5 / MADLAD-400 (#333). Keeping `shared.embed.weight` and
+    // `lm_head.weight` at source precision is OPT-IN, because it was measured
+    // and it LOSES.
+    //
+    // The reasoning that motivated it was: those two carry the whole 256K
+    // vocabulary, Q4_K's worst stages were enc_embed 0.9974 and enc_out 0.9937,
+    // therefore the loss is embedding-driven. Wrong. Re-quantizing with them
+    // held wide and diffing against the reference archive:
+    //
+    //     q8_0   3.38 -> 3.62 GB   worst cos 0.999922 -> 0.999920
+    //     q4_k   2.04 -> 2.41 GB   worst cos 0.992929 -> 0.992606
+    //
+    // Bigger and no better. The new worst stages say why — cross_v_blk0,
+    // enc_out, cross_k_blk0 — i.e. the error is what ACCUMULATES through 32
+    // encoder blocks, not what the embedding lookup rounds off. A wide
+    // embedding cannot fix a stack that has already drifted.
+    //
+    // Kept and inverted rather than deleted: a different T5 checkpoint (tied
+    // embeddings, a smaller vocabulary, an imatrix run) could land differently,
+    // and the lever costs nothing switched off.
+    const bool is_t5 = (arch == "t5");
+    const char* env_t5_keep = std::getenv("CRISPASR_T5_KEEP_EMBED");
+    const bool t5_keep_embed = is_t5 && env_t5_keep && *env_t5_keep && *env_t5_keep != '0';
+    if (t5_keep_embed) {
+        printf("%s: t5 — keeping shared.embed.* and lm_head.* at source precision "
+               "(CRISPASR_T5_KEEP_EMBED=1; measured BIGGER and no better on madlad400 — "
+               "see the note in this file)\n",
+               __func__);
+    }
+
     const bool is_parakeet = (arch == "parakeet");
     bool parakeet_is_rnnt = false;
     if (is_parakeet) {
@@ -829,6 +859,7 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             !(is_gigaam && !gigaam_quant_all &&
               (sname.find("joint.") == 0 || sname.find("decoder.") == 0 || sname.find("head.ctc.") == 0 ||
                sname.find("encoder.pre.") == 0 || sname.find("preprocessor.") == 0)) &&
+            !(t5_keep_embed && (sname.find("shared.embed") == 0 || sname.find("lm_head") == 0)) &&
             !(is_tada && !tada_quant_all && (sname.find("talker.token_embd") == 0 || sname.find("tada.") == 0)) &&
             ([&]() {
                 if (!is_tada || tada_quant_all || (tada_keep_head == 0 && tada_keep_tail == 0))

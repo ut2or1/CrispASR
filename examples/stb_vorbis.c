@@ -3662,7 +3662,16 @@ static int start_decoder(vorb *f)
    if (f->comment_list_length > 0)
    {
       f->comment_list = (char**) setup_malloc(f, sizeof(char*) * (f->comment_list_length));
-      if (f->comment_list == NULL)                  return error(f, VORBIS_outofmem);
+      // CrispASR patch: the length is already the ATTACKER-CONTROLLED value read
+      // above, so returning here with a NULL array leaves the two out of step and
+      // vorbis_deinit walks `comment_list_length` entries of a null pointer. Keep
+      // the invariant "length describes the array" true on the error path too.
+      // (The deinit guard below is the real defence; this keeps the struct sane
+      // for anything else that trusts the pair.)
+      if (f->comment_list == NULL) {
+         f->comment_list_length = 0;
+         return error(f, VORBIS_outofmem);
+      }
       // CrispASR patch: setup_malloc is a plain malloc, so these pointers start
       // as garbage. The loop below can `return error(...)` partway through (short
       // read or OOM) while comment_list_length keeps its full, ATTACKER-CONTROLLED
@@ -4219,8 +4228,19 @@ static void vorbis_deinit(stb_vorbis *p)
    int i,j;
 
    setup_free(p, p->vendor);
-   for (i=0; i < p->comment_list_length; ++i) {
-      setup_free(p, p->comment_list[i]);
+   // CrispASR patch: only walk the array when it EXISTS. `comment_list_length` is
+   // read straight from the file and is set before the allocation is attempted,
+   // so every path that fails between the two (OOM on an attacker-sized count,
+   // a short read) reaches here with a non-zero length and a NULL array — the
+   // fuzz-smoke job hit exactly that: "SEGV in vorbis_deinit" via
+   // crispasr_audio_load on a mutated Ogg. An earlier patch fixed the sibling
+   // case (garbage pointers from a partially-filled array, freed as if valid) by
+   // zeroing the allocation; it could not help when the allocation never
+   // happened. Guarding the loop here covers both, and any future path in.
+   if (p->comment_list) {
+      for (i=0; i < p->comment_list_length; ++i) {
+         setup_free(p, p->comment_list[i]);
+      }
    }
    setup_free(p, p->comment_list);
 

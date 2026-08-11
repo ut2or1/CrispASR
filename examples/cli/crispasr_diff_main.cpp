@@ -92,6 +92,7 @@
 #include "tada_encoder.h"
 #include "tada_tts.h"
 #include "dots_tts.h"
+#include "t5_translate.h"
 #include "miocodec.h"
 #include "miotts.h"
 #include "crepe.h"
@@ -1148,6 +1149,13 @@ static int tiron_diff(const std::string& model, const std::string& ref_path, con
 }
 
 int main(int argc, char** argv) {
+    // #333: madlad/t5 is a TEXT model — there is no audio to pass, so it is
+    // dispatched before the 5-arg gate rather than made to carry a dummy path.
+    if (argc >= 4) {
+        const std::string b = argv[1];
+        if (b == "madlad" || b == "t5")
+            return t5_translate_diff(argv[2], argv[3], /*verbosity=*/2);
+    }
     if (argc < 5) {
         fprintf(stderr,
                 "usage: %s <backend> <model.gguf> <reference.gguf> <audio.wav>\n"
@@ -1157,7 +1165,8 @@ int main(int argc, char** argv) {
                 "granite-4.1, "
                 "granite-nle, parakeet, gigaam, wespeaker, chatterbox, voxcpm2-tts, "
                 "canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, moonshine-streaming, "
-                "kyutai-stt, parler-tts, moss-audio\n"
+                "kyutai-stt, parler-tts, moss-audio, madlad\n"
+                "                (madlad/t5 is a text model: pass only <model.gguf> <reference.gguf>)\n"
                 "  model.gguf    crispasr-compatible model weights\n"
                 "  reference.gguf  archive produced by tools/dump_reference.py\n"
                 "  audio.wav     16 kHz mono WAV\n",
@@ -6003,6 +6012,87 @@ int main(int argc, char** argv) {
             }
         }
 
+        // ---- Phase 7 (#334) — the WAV-clone front-end ----
+        // Everything above ends at the talker/flow/HiFT. The three products
+        // that a `--voice ref.wav` clone actually rides on — the CAMPPlus
+        // speaker embedding, the 24 kHz prompt mel and the speech tokens —
+        // had no stage at all, and `cosyvoice3_tts_extract_{spk_emb,ref_mel,
+        // speech_tokens}` had no caller anywhere in the tree. That matters
+        // most for CAMPPlus: its ONNX export leaves the FCM head, TDNN,
+        // CAMDense blocks and transit3 as an ANONYMOUS initializer tail, so
+        // the converter assigns them by order and shape. A wrong assignment
+        // still loads, still produces a 192-d vector, and just clones the
+        // wrong timbre. Only comparing the embedding against the ONNX
+        // reference on real audio can catch that.
+        if (!ref.shape("clone_spk_emb").empty() || !ref.shape("clone_prompt_feat_24k").empty() ||
+            !ref.shape("clone_speech_tokens").empty()) {
+            std::string camp_path;
+            if (const char* env = crispasr_env::get("CRISPASR_CV3_CAMPPLUS_GGUF"); env && *env)
+                camp_path = env;
+            else {
+                camp_path = model_path;
+                if (const auto p = camp_path.find("llm"); p != std::string::npos)
+                    camp_path.replace(p, 3, "campplus");
+            }
+            std::string s3tok_path;
+            if (const char* env = crispasr_env::get("CRISPASR_CV3_S3TOK_GGUF"); env && *env)
+                s3tok_path = env;
+            else {
+                s3tok_path = model_path;
+                if (const auto p = s3tok_path.find("llm"); p != std::string::npos)
+                    s3tok_path.replace(p, 3, "s3tok");
+            }
+            const bool camp_ok = cosyvoice3_tts_init_campplus_from_file(ctx, camp_path.c_str()) == 0;
+            const bool s3_ok = cosyvoice3_tts_init_s3tok_from_file(ctx, s3tok_path.c_str()) == 0;
+
+            if (!ref.shape("clone_spk_emb").empty()) {
+                float emb[192] = {0};
+                if (camp_ok && cosyvoice3_tts_extract_spk_emb(ctx, audio_path.c_str(), emb) == 0) {
+                    auto rep = ref.compare("clone_spk_emb", emb, 192);
+                    print_row("clone_spk_emb", rep, COS_THRESHOLD);
+                    record(rep);
+                } else {
+                    printf("[SKIP] %-30s  campplus gguf '%s' not loaded (set CRISPASR_CV3_CAMPPLUS_GGUF)\n",
+                           "clone_spk_emb", camp_path.c_str());
+                    n_skip++;
+                }
+            }
+            if (!ref.shape("clone_prompt_feat_24k").empty()) {
+                int T_mel = 0;
+                float* pf = cosyvoice3_tts_extract_ref_mel(ctx, audio_path.c_str(), /*ref_text*/ "", &T_mel);
+                if (pf && T_mel > 0) {
+                    auto rep = compare_with_row_width(ref, "clone_prompt_feat_24k", pf, (size_t)T_mel * 80, 80);
+                    print_row("clone_prompt_feat_24k", rep, COS_THRESHOLD);
+                    record(rep);
+                } else {
+                    printf("[SKIP] %-30s  extract_ref_mel returned no data\n", "clone_prompt_feat_24k");
+                    n_skip++;
+                }
+                free(pf);
+            }
+            if (!ref.shape("clone_speech_tokens").empty()) {
+                int n_tok = 0;
+                int32_t* tk =
+                    s3_ok ? cosyvoice3_tts_extract_speech_tokens(ctx, audio_path.c_str(), "", &n_tok) : nullptr;
+                if (tk && n_tok > 0) {
+                    // Token ids are exact integers — any drift is a real
+                    // divergence, not quantisation, so compare as floats and
+                    // expect 1.000000.
+                    std::vector<float> tf((size_t)n_tok);
+                    for (int i = 0; i < n_tok; i++)
+                        tf[(size_t)i] = (float)tk[i];
+                    auto rep = ref.compare("clone_speech_tokens", tf.data(), tf.size());
+                    print_row("clone_speech_tokens", rep, COS_THRESHOLD);
+                    record(rep);
+                } else {
+                    printf("[SKIP] %-30s  s3tok gguf '%s' not loaded (set CRISPASR_CV3_S3TOK_GGUF)\n",
+                           "clone_speech_tokens", s3tok_path.c_str());
+                    n_skip++;
+                }
+                free(tk);
+            }
+        }
+
         cosyvoice3_tts_free(ctx);
     } else if (backend_name == "csm") {
         // CSM-1B backbone prefill per-layer diff. The reference archive is
@@ -7396,9 +7486,11 @@ int main(int argc, char** argv) {
         nemotron_free(ctx);
 
     } else if (backend_name == "omnivoice") {
-        // OmniVoice: masked iterative TTS. Minimal diff harness — load
-        // model, compare text embeddings. Full pipeline diff pending
-        // audio tokenizer implementation.
+        // OmniVoice: voice-clone ENCODE path (WAV → HiggsAudioV2 codes),
+        // stage-by-stage vs a Python reference (omnivoice-encode-ref.gguf,
+        // tools/dump_omnivoice_encode_reference.py). The comparison itself
+        // lives in the runtime (omnivoice_encode_diff, #254); this wires it
+        // to the harness front door and propagates its verdict.
         auto cp = omnivoice_context_default_params();
         cp.n_threads = 4;
         cp.verbosity = 0;
@@ -7408,13 +7500,39 @@ int main(int argc, char** argv) {
             return 4;
         }
 
-        // Stage: text_input_ids — verify tokenisation matches
-        auto ids_pair = ref.get_f32("text_input_ids");
-        if (ids_pair.first && ids_pair.second > 0) {
-            fprintf(stderr, "  text_input_ids: %d tokens in reference\n", (int)ids_pair.second);
+        // Audio-tokenizer GGUF: env override, else next to the model
+        // (same candidates the CLI adapter probes).
+        std::string tok_path;
+        if (const char* env_tok = crispasr_env::get("CRISPASR_OMNIVOICE_TOKENIZER_GGUF")) {
+            tok_path = env_tok;
+        } else {
+            std::string dir = model_path.substr(0, model_path.find_last_of("/\\") + 1);
+            for (const char* name :
+                 {"omnivoice-tokenizer.gguf", "omnivoice-tokenizer-f16.gguf", "omnivoice-audio-tokenizer.gguf"}) {
+                if (file_exists(dir + name)) {
+                    tok_path = dir + name;
+                    break;
+                }
+            }
+        }
+        if (tok_path.empty() || omnivoice_set_tokenizer_path(ctx, tok_path.c_str()) != 0) {
+            fprintf(stderr,
+                    "omnivoice: audio tokenizer GGUF not found/loadable ('%s') — set "
+                    "CRISPASR_OMNIVOICE_TOKENIZER_GGUF or place omnivoice-tokenizer-f16.gguf next to the model\n",
+                    tok_path.c_str());
+            omnivoice_free(ctx);
+            return 4;
         }
 
+        int rc = omnivoice_encode_diff(ctx, ref_path.c_str());
         omnivoice_free(ctx);
+        if (rc == 0) {
+            printf("[PASS] encode_path             (per-stage detail on stderr)\n");
+            n_pass++;
+        } else {
+            printf("[FAIL] encode_path             (per-stage detail on stderr)\n");
+            n_fail++;
+        }
 
     } else if (backend_name == "canary-qwen") {
         auto cp = canary_qwen_context_default_params();

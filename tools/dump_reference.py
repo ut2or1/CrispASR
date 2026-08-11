@@ -102,6 +102,11 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # under a delay pattern + 1.6B transformer codec. The greedy code grid
     # ("codes") is the Phase-3 byte-parity target; "waveform" (needs the codec)
     # is the Phase-4 decoded reference. Text from $MOSS_TTS_TEXT; --audio ignored.
+    # MADLAD-400 (google/madlad400-3b-mt) T5 1.1 encoder-decoder translation
+    # (#333). Text model — the shared --audio arg is ignored; source text comes
+    # from $MADLAD_TEXT and the target tag from $MADLAD_TL. Loads the 11.76 GB
+    # fp32 checkpoint ONE TENSOR AT A TIME, so it fits a ~13 GB box.
+    "madlad":     "reference_backends.madlad",
     "miotts":     "reference_backends.miotts",
     "moss-tts":   "reference_backends.moss_tts",
     "qwen3":      "reference_backends.qwen3",

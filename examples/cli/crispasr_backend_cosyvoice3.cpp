@@ -9,9 +9,13 @@
 
 #include "crispasr_backend.h"
 #include "crispasr_backend_utils.h"
+#include "crispasr_tts_ref_text.h" // #334 auto-transcribe a --voice WAV
 #include "whisper_params.h"
 
 #include "cosyvoice3_tts.h"
+
+#include "core/audio_resample.h"
+#include "core/wav_reader.h"
 
 #include <cctype>
 #include <cstdio>
@@ -228,14 +232,24 @@ public:
         int n = 0;
         float* pcm = nullptr;
         if (ends_with_ci(params.tts_voice, ".wav")) {
-            if (params.tts_ref_text.empty()) {
-                fprintf(stderr, "crispasr[cosyvoice3-tts]: --voice is a WAV but --ref-text was not set.\n");
+            // #334: the talker is conditioned on the (reference transcript,
+            // reference speech) pair and reads the speaker's rate off it, so a
+            // transcript that does not match the clip is the single most
+            // damaging input here — it stops the decode dead or rushes the
+            // requested line. Refusing to run without one only pushed that job
+            // onto the caller, who typically approximates. Transcribe it
+            // ourselves instead (cached beside the clip), exactly as f5-tts
+            // already does; an explicit --ref-text still wins.
+            const std::string ref_text = resolve_ref_text(params);
+            if (ref_text.empty()) {
+                fprintf(stderr,
+                        "crispasr[cosyvoice3-tts]: --voice is a WAV and --ref-text was not set, and the reference "
+                        "could not be auto-transcribed. Pass --ref-text \"<exact transcript of the clip>\".\n");
                 return {};
             }
             if (!ensure_cloning_models())
                 return {};
-            pcm = cosyvoice3_tts_synth_from_wav(ctx_, text.c_str(), params.tts_voice.c_str(),
-                                                params.tts_ref_text.c_str(), &n);
+            pcm = cosyvoice3_tts_synth_from_wav(ctx_, text.c_str(), params.tts_voice.c_str(), ref_text.c_str(), &n);
         } else {
             const char* voice = params.tts_voice.empty() ? nullptr : params.tts_voice.c_str();
             pcm = cosyvoice3_tts_synth(ctx_, text.c_str(), voice, &n);
@@ -258,6 +272,24 @@ public:
     }
 
 private:
+    // An explicit --ref-text wins; otherwise read the clip, resample to 16 kHz
+    // and hand it to the ASR backend behind the shared ref-text cache. Returns
+    // "" only when both are unavailable.
+    std::string resolve_ref_text(const whisper_params& p) {
+        if (!p.tts_ref_text.empty())
+            return p.tts_ref_text;
+        std::vector<float> pcm;
+        int sr = 0;
+        if (!crispasr::core::read_wav_mono_pcm16(p.tts_voice, pcm, sr) || pcm.empty() || sr <= 0) {
+            fprintf(stderr, "crispasr[cosyvoice3-tts]: could not read '%s' as PCM16 WAV for auto-transcription\n",
+                    p.tts_voice.c_str());
+            return "";
+        }
+        if (sr != 16000)
+            pcm = core_audio::resample_polyphase(pcm.data(), (int)pcm.size(), sr, 16000);
+        return crispasr_ref_text::resolve_cached(p.tts_voice, pcm, p, "crispasr[cosyvoice3-tts]", ".cv3reftext");
+    }
+
     bool ensure_cloning_models() {
         std::lock_guard<std::mutex> lock(cloning_models_mutex_);
         if (cloning_models_loaded_)

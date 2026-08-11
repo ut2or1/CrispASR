@@ -32,6 +32,7 @@ int              crispasr_session_set_tts_reference_language(CrispasrSession* s,
 int              crispasr_session_set_punctuation(CrispasrSession* s, int enable);
 int              crispasr_session_set_punc_model(CrispasrSession* s, const char* punc_model);
 int              crispasr_session_set_hotwords(CrispasrSession* s, const char* hotwords, float boost);
+int              crispasr_session_set_sensitivity(CrispasrSession* s, const char* preset);
 int              crispasr_session_set_translate(CrispasrSession* s, int enable);
 int              crispasr_session_set_temperature(CrispasrSession* s, float temperature, unsigned long long seed);
 int              crispasr_session_set_tts_seed(CrispasrSession* s, unsigned long long seed);
@@ -478,6 +479,28 @@ func (s *CrispasrSession) SetHotwords(hotwords string, boost float32) error {
 	rc := C.crispasr_session_set_hotwords(s.handle, ch, C.float(boost))
 	if rc != 0 {
 		return errors.New("crispasr_session_set_hotwords failed")
+	}
+	return nil
+}
+
+// SetSensitivity applies a named bundle of the four decoder fallback
+// thresholds: "conservative", "balanced" (the shipped defaults, a no-op) or
+// "aggressive". "strict"/"default"/"loose" are aliases. Mirrors the CLI's
+// --sensitivity.
+//
+// The four thresholds interact — a decode is only retried when the logprob and
+// no-speech bars are both crossed — so they move as a set. A later
+// SetFallbackThresholds overrides this. An unrecognised name is rejected
+// rather than silently treated as "balanced".
+func (s *CrispasrSession) SetSensitivity(preset string) error {
+	cp := C.CString(preset)
+	defer C.free(unsafe.Pointer(cp))
+	rc := C.crispasr_session_set_sensitivity(s.handle, cp)
+	if rc == -2 {
+		return errors.New("unknown sensitivity preset (expected: conservative, balanced, aggressive)")
+	}
+	if rc != 0 {
+		return errors.New("crispasr_session_set_sensitivity failed")
 	}
 	return nil
 }

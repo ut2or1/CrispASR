@@ -128,6 +128,7 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `best_of` | Whisper best-of-N sampling candidates |
 | `beam_size` | Whisper beam search width |
 | `return_logits` | `true`/`false` — for supported dense CTC backends, include `ctc_logits` in JSON responses (`n_frames`, `n_vocab`, frame-major `data`, optional `vocab`) |
+| `sensitivity` | `conservative` / `balanced` / `aggressive` — the four threshold fields as one bundle. Applied before them, so an explicit `entropy_thold` etc. in the same request still wins. An unknown value is ignored with a stderr warning |
 | `entropy_thold` | Entropy threshold for decoder fallback |
 | `logprob_thold` | Log-probability threshold for decoder fallback |
 | `no_speech_thold` | No-speech probability threshold |

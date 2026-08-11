@@ -30,6 +30,8 @@
 
 #include "cosyvoice3_tts.h"
 
+#include "cosyvoice3_prompt_policy.h" // #334 min/max token-per-text laws
+
 #include "core/attention.h"
 #include "core/bpe.h"
 #include "core/ffn.h"
@@ -61,6 +63,7 @@
 #include <sstream>
 #include <random>
 #include <string>
+#include <sys/stat.h> // #334 clone-voice cache key (size + mtime)
 #include <unordered_map>
 #include <vector>
 
@@ -481,6 +484,18 @@ struct cosyvoice3_tts_context {
     // table is populated separately via init_voices_from_file().
     cv3_vocab vocab{};
     cv3_voices voices{};
+
+    // #334 runtime clone-voice cache. Extracting a voice from a `--voice
+    // ref.wav` runs the whole s3tokenizer encoder + CAMPPlus + the 24 kHz
+    // prompt mel, and that ran again on EVERY synthesize() call: the CLI
+    // splits `--tts` into sentence chunks and synthesises each one, the
+    // spoken AI disclaimer is a further call, and a server/session caller
+    // re-synthesises per request with the same sticky voice. One key per
+    // reference (path + size + mtime + transcript) is enough — voice
+    // switching is rare, and a stale file changes size or mtime.
+    std::string clone_cache_key;
+    cv3_voice clone_cache_voice;
+    bool clone_cache_valid = false;
 };
 
 namespace {
@@ -5597,11 +5612,29 @@ bool cv3_build_lm_input_embeds(cosyvoice3_tts_context* ctx, const std::vector<in
 // `cosyvoice3_tts_generate_tokens_from_embeds`, but the RAS sampler
 // can land on a stop id — and we want to break on that.
 std::vector<int32_t> cv3_generate_tokens_with_stop_floor(cosyvoice3_tts_context* ctx, const float* embeds, int n_tokens,
-                                                         int max_tokens, int stop_floor) {
+                                                         int max_tokens, int stop_floor, int min_tokens) {
     std::vector<int32_t> out;
     const int speech_codebook = (int)ctx->hp.speech_codebook;
     const int speech_vocab = (int)ctx->hp.speech_vocab;
     const int max_steps = max_tokens > 0 ? max_tokens : (ctx->params.max_tokens > 0 ? ctx->params.max_tokens : 1500);
+    // #334: upstream forbids a stop token for the first `min_len` steps —
+    // `Qwen2LM.inference` (which CosyVoice3LM inherits) computes
+    //   min_len = int((text_len - prompt_text_len) * min_token_text_ratio)  # ratio 2
+    // and then passes `ignore_eos=True if i < min_len else False` into
+    // `sampling_ids`, which masks the stop id to -inf; the vLLM arm spells the
+    // same thing as `SamplingParams(min_tokens=min_len, stop_token_ids=...)`,
+    // i.e. the WHOLE stop set is suppressed, which is what we mirror here.
+    // Without it a single unlucky step-0 sample ends the decode: the reference
+    // clip in #334 tokenised to 201 prompt tokens either way, but the two token
+    // sets differed in ~37% of positions purely because one was resampled to
+    // 16 kHz and the other was already there — and one of them sampled a stop
+    // id at step 0, yielding "AR decode produced 0 tokens". Short of a total
+    // failure the same gap yields an utterance with far fewer speech tokens
+    // than the text needs, i.e. speech that is rushed and pitched up.
+    // CRISPASR_COSYVOICE3_NO_MIN_LEN=1 restores the pre-#334 behaviour (no
+    // floor) — kept as the A/B lever for the guard.
+    const int min_len =
+        cv3_env_true("CRISPASR_COSYVOICE3_NO_MIN_LEN") ? 0 : cosyvoice3_policy::clamp_min_tokens(min_tokens, max_steps);
 
     // Right-size the fixed-shape T=1 graph to this request.  This preserves
     // graph reuse while avoiding attention over thousands of unused KV slots.
@@ -5614,20 +5647,29 @@ std::vector<int32_t> cv3_generate_tokens_with_stop_floor(cosyvoice3_tts_context*
 
     const bool greedy = !(ctx->params.temperature > 0.0f) || cv3_env_true("CRISPASR_COSYVOICE3_GREEDY");
     int n_past = n_tokens;
+    std::vector<float> masked; // scratch for the ignore-stop window
     for (int step = 0; step < max_steps; step++) {
         int32_t pick = -1;
+        // Mask the stop ids while below min_len, then sample from the copy.
+        const float* step_logits = logits;
+        if (step < min_len && stop_floor < speech_vocab) {
+            masked.assign(logits, logits + speech_vocab);
+            for (int i = stop_floor; i < speech_vocab; i++)
+                masked[(size_t)i] = -INFINITY;
+            step_logits = masked.data();
+        }
         if (greedy) {
             // Greedy in full vocab — let the model end naturally.
             int n_pick = speech_vocab;
-            float bv = logits[0];
+            float bv = step_logits[0];
             pick = 0;
             for (int i = 1; i < n_pick; i++)
-                if (logits[i] > bv) {
-                    bv = logits[i];
+                if (step_logits[i] > bv) {
+                    bv = step_logits[i];
                     pick = i;
                 }
         } else {
-            pick = cosyvoice3_tts_sample_ras(ctx, logits, out.empty() ? nullptr : out.data(), (int)out.size());
+            pick = cosyvoice3_tts_sample_ras(ctx, step_logits, out.empty() ? nullptr : out.data(), (int)out.size());
         }
         free(logits);
         if (pick < 0)
@@ -5795,10 +5837,14 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
                     voice->name.c_str(), cv3_vlang.c_str(), cv3_tgt.c_str());
     }
     std::vector<int32_t> text_ids;
+    // Upstream's `text_len - prompt_text_len` — the TARGET text alone, with the
+    // reference transcript excluded. It sizes the decode's min/max length.
+    int n_target_text_ids = 0;
     {
         cosyvoice3_bench_stage _b("tokenize");
         std::vector<int32_t> prompt_ids = cv3_tokenise_prompt(ctx->vocab, prompt_for_lm);
         std::vector<int32_t> user_ids = cv3_tokenise_prompt(ctx->vocab, std::string(text));
+        n_target_text_ids = (int)user_ids.size();
         text_ids.reserve(prompt_ids.size() + user_ids.size());
         text_ids.insert(text_ids.end(), prompt_ids.begin(), prompt_ids.end());
         text_ids.insert(text_ids.end(), user_ids.begin(), user_ids.end());
@@ -5833,22 +5879,28 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
     int max_steps = ctx->params.max_tokens > 0 ? ctx->params.max_tokens : (int)text_ids.size() * 20;
     if (max_steps < 16)
         max_steps = 16;
+    // Upstream's min_len = (target text tokens) * min_token_text_ratio(=2).
+    // Every speech token is 40 ms, so this is also the floor on how fast the
+    // model is allowed to say the requested text (#334).
+    const int min_steps = cosyvoice3_policy::decode_min_tokens(n_target_text_ids);
     std::vector<int32_t> gen_tokens;
     {
         cosyvoice3_bench_stage _b("lm_ar_decode");
-        gen_tokens = cv3_generate_tokens_with_stop_floor(ctx, lm_embeds.data(), n_lm, max_steps, stop_floor);
+        gen_tokens = cv3_generate_tokens_with_stop_floor(ctx, lm_embeds.data(), n_lm, max_steps, stop_floor, min_steps);
     }
-    if (gen_tokens.empty()) {
-        fprintf(stderr, "cosyvoice3_tts: synth: AR decode produced 0 tokens\n");
-        return nullptr;
-    }
-    if (ctx->params.verbosity >= 1) {
-        fprintf(stderr, "cosyvoice3_tts: synth: generated %zu speech tokens\n", gen_tokens.size());
-    }
-
+    // The dump runs BEFORE the empty-decode bail-out: a 0-token decode is
+    // exactly the case where you need to see the prompt that produced it
+    // (#334 — a resampled reference decoded to 0 tokens while the same audio
+    // at 16 kHz decoded fine, and the prompt token ids were the only way to
+    // tell the two prompts apart).
     if (const char* dump = crispasr_env::get("CRISPASR_COSYVOICE3_DUMP_TOKENS")) {
-        FILE* f = std::fopen(dump, "w");
+        // Append, not truncate: one `--tts` run synthesises once per sentence
+        // chunk plus once more for the spoken AI disclaimer, and a truncating
+        // dump kept only the LAST of those — the disclaimer — hiding the very
+        // call under investigation (#334).
+        FILE* f = std::fopen(dump, "a");
         if (f) {
+            std::fprintf(f, "voice=%s\n", voice->name.c_str());
             std::fprintf(f, "text_ids(%zu):", text_ids.size());
             for (int32_t id : text_ids)
                 std::fprintf(f, " %d", id);
@@ -5862,6 +5914,14 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
             std::fclose(f);
             fprintf(stderr, "cosyvoice3_tts: synth: wrote token dump to %s\n", dump);
         }
+    }
+
+    if (gen_tokens.empty()) {
+        fprintf(stderr, "cosyvoice3_tts: synth: AR decode produced 0 tokens\n");
+        return nullptr;
+    }
+    if (ctx->params.verbosity >= 1) {
+        fprintf(stderr, "cosyvoice3_tts: synth: generated %zu speech tokens\n", gen_tokens.size());
     }
 
     // ---- 3. Compose full speech-token sequence + run pre_la + repeat_interleave ----
@@ -5972,6 +6032,54 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
     return audio;
 }
 
+// Identity of a `--voice ref.wav` extraction: the path plus the bytes the
+// file had when we read it, plus the transcript (which is baked into the
+// voice's prompt_text). Size+mtime catches a reference that was rewritten
+// under the same name between calls.
+std::string cv3_clone_cache_key(const char* wav_path, const char* ref_text) {
+    if (!wav_path || !*wav_path)
+        return {};
+    // CRISPASR_COSYVOICE3_NO_CLONE_CACHE=1 forces the re-extract-every-call
+    // path back on — the A/B lever, and the bisection escape hatch.
+    if (cv3_env_true("CRISPASR_COSYVOICE3_NO_CLONE_CACHE"))
+        return {};
+    struct stat st {};
+    if (stat(wav_path, &st) != 0)
+        return {};
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "|%lld|%lld|", (long long)st.st_size, (long long)st.st_mtime);
+    return std::string(wav_path) + buf + (ref_text ? ref_text : "");
+}
+
+// #334: a `--ref-text` that does not actually transcribe the reference clip
+// is the single most damaging way to use this backend, and it fails silently
+// — the LM sees a speaker who says N text tokens' worth of words in a wildly
+// different amount of speech, and either stops at once (0 tokens, "synthesis
+// failed") or rushes the requested line into far too few 40 ms frames, which
+// is what a listener hears as sped-up, pitched-up speech. Upstream's decode
+// only ever considers 2..20 speech tokens per text token
+// (min/max_token_text_ratio in Qwen2LM.inference); a prompt outside that band
+// cannot be a matching transcript, so say so and name the flag.
+void cv3_warn_on_ref_text_length_mismatch(cosyvoice3_tts_context* ctx, const cv3_voice& voice) {
+    const std::string delim = "<|endofprompt|>";
+    const size_t eop = voice.prompt_text.find(delim);
+    const std::string transcript =
+        (eop == std::string::npos) ? voice.prompt_text : voice.prompt_text.substr(eop + delim.size());
+    const size_t n_text = cv3_tokenise_prompt(ctx->vocab, transcript).size();
+    const size_t n_speech = voice.prompt_speech_tokens.size();
+    if (n_text == 0 || n_speech == 0)
+        return;
+    if (cosyvoice3_policy::prompt_length_plausible(n_speech, n_text))
+        return;
+    const double ratio = (double)n_speech / (double)n_text;
+    fprintf(stderr,
+            "cosyvoice3_tts: WARNING: the reference clip holds %.2f s of speech but --ref-text is only %zu token(s) "
+            "long (%.1f speech frames per text token; a matching transcript lands between 2 and 20). --ref-text must "
+            "be a full, exact transcription of the reference audio — if it is not, the clone comes out rushed, "
+            "pitch-shifted or empty. Trim the clip to the part you transcribed, or complete the transcript.\n",
+            (double)n_speech * cosyvoice3_policy::kSecondsPerSpeechToken, n_text, ratio);
+}
+
 } // namespace
 
 extern "C" float* cosyvoice3_tts_synth(struct cosyvoice3_tts_context* ctx, const char* text, const char* voice_name,
@@ -6017,11 +6125,22 @@ extern "C" float* cosyvoice3_tts_synth_from_wav(struct cosyvoice3_tts_context* c
         fprintf(stderr, "cosyvoice3_tts: synth_from_wav requires LLM + flow + hift to be loaded\n");
         return nullptr;
     }
+    // #334: reuse the extracted voice when the same reference comes back.
+    const std::string cache_key = cv3_clone_cache_key(wav_path, ref_text);
+    if (ctx->clone_cache_valid && !cache_key.empty() && ctx->clone_cache_key == cache_key)
+        return cv3_synth_with_voice(ctx, text, &ctx->clone_cache_voice, out_n_samples);
+
     cv3_voice voice;
     if (!cv3_extract_native_runtime_voice(ctx, wav_path, ref_text ? ref_text : "", voice) &&
         !cv3_load_runtime_voice(wav_path, ref_text ? ref_text : "", voice)) {
         fprintf(stderr, "cosyvoice3_tts: synth_from_wav: failed to bake runtime voice from '%s'\n", wav_path);
         return nullptr;
+    }
+    cv3_warn_on_ref_text_length_mismatch(ctx, voice);
+    if (!cache_key.empty()) {
+        ctx->clone_cache_key = cache_key;
+        ctx->clone_cache_voice = voice;
+        ctx->clone_cache_valid = true;
     }
     return cv3_synth_with_voice(ctx, text, &voice, out_n_samples);
 }

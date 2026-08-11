@@ -1783,6 +1783,23 @@ static size_t aheads_masks_nbytes(struct whisper_aheads_masks& aheads_masks) {
     return size;
 }
 
+// Shared GPU-device pref matcher for the vendored whisper stack. The wrapper
+// builds its own backend list AND its own weight-buffer-type list; both MUST
+// apply the same filter or weights land on a device the sched doesn't carry
+// (ggml_backend_sched_backend_id_from_cur abort — hit via `--gpu-backend cpu`
+// and `--gpu-backend metal` on -l auto's LID whisper). Empty pref matches
+// every device; "cpu" matches none; "metal" is aliased to ggml's "MTL"
+// device naming, same as crispasr_init_gpu_backend().
+static bool whisper_dev_matches_gpu_pref(const char* dev_name, std::string pref) {
+    if (pref.empty())
+        return true;
+    if (pref.size() <= 3 && ci_starts_with("cpu", pref.c_str()))
+        return false;
+    if (pref.size() >= 3 && ci_starts_with("metal", pref.c_str()))
+        pref = "mtl";
+    return ci_starts_with(dev_name, pref.c_str());
+}
+
 static ggml_backend_t whisper_backend_init_gpu(const whisper_context_params& params) {
     ggml_log_set(g_state.log_callback, g_state.log_callback_user_data);
 
@@ -1801,7 +1818,7 @@ static ggml_backend_t whisper_backend_init_gpu(const whisper_context_params& par
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 // If a gpu_backend preference is set, skip devices that
                 // don't match (e.g. skip CUDA devices when vulkan is wanted).
-                if (!pref.empty() && !ci_starts_with(dev_name, pref.c_str())) {
+                if (!whisper_dev_matches_gpu_pref(dev_name, pref)) {
                     CRISPASR_LOG_INFO("%s: skipping %s (--gpu-backend %s)\n", __func__, dev_name, pref.c_str());
                     continue;
                 }
@@ -1870,13 +1887,19 @@ static buft_list_t make_buft_list(whisper_context_params& params) {
     // Prio order: GPU -> CPU Extra -> CPU
     buft_list_t buft_list;
 
-    // GPU
+    // GPU — same pref filter as whisper_backend_init_gpu, or the weights get
+    // buffer types for a device the sched doesn't carry (see the matcher's
+    // comment).
     if (params.use_gpu) {
+        const std::string pref = crispasr_get_gpu_backend_pref();
         int cnt = 0;
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
                 ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                if (!whisper_dev_matches_gpu_pref(ggml_backend_dev_name(dev), pref)) {
+                    continue;
+                }
                 if (cnt == params.gpu_device) {
                     auto* buft = ggml_backend_dev_buffer_type(dev);
                     if (buft) {

@@ -11,6 +11,71 @@ to main before you start**. Several agents run here at once; a claim that lands
 with the work is a claim that did nothing. Delete it when the work lands, or if
 it goes stale for more than a day.
 
+## LANDED 2026-08-10 — voxtral-tts pre-tokenizer parity (c69ac61b, from #338)
+
+Carried out of #338 after it closed. Reporter measured 5/57 vs `mistral-common`;
+reproduced and fixed. **0 mismatches across ~16k strings**, 0 out-of-range ids.
+
+Three defects in `tekken_pre_tokenize`, now in `voxtral_tekken_vocab.h`:
+
+1. A whitespace run swallowed its last character — the letter and punctuation
+   alternatives each open with an optional leading slot, so `a  b` is
+   `["a"," "," b"]`. The slots DIFFER (letter takes any non-alnum, punctuation
+   takes a literal space only, `\p{N}` takes none), which is why this needed
+   the reference rather than a reading of the pattern.
+2. Every byte >= 0x80 counted as a letter. Bites on punctuation ADJACENCY, not
+   on letters — BPE recovers the same ids for accented text, which is why my
+   first guess at this was wrong. ASCII-only fuzz 0/4000; mixed 233/4000, 232
+   containing multibyte punctuation.
+3. `\p{N}` is one codepoint; digit runs were grouped. INVISIBLE to id-level
+   parity on this checkpoint (no multi-digit piece, so BPE re-splits to the same
+   ids). Only the generated split test caught it.
+
+**Two checks, because they fail on different things** — the durable lesson:
+- `tests/test-voxtral-pretokenize.cpp` — hermetic, pins the SPLIT from the
+  published `config.pattern` via Python `regex`. Caught (3).
+- `tools/check-voxtral-tokenizer-parity.py` — live, pins the IDS through BPE +
+  the #338 bound vs `mistral-common`. Caught (1) and (2).
+
+Reporter was told on the issue in case his in-flight PR overlaps; his harness is
+still wanted (real corpora, other languages, mistral-common version drift).
+
+## LANDED 2026-08-07 — #13273 omnivoice language knob, dead on three surfaces
+
+Full write-up: `docs/omnivoice/PLAN.md` §LANDED 2026-08-07. Fixed the CLI
+adapter (language applied only in `init()`, so a persistent server could never
+change it per request), the session C-ABI arm (#329's bug one backend over), and
+the runtime (no `_resolve_language()` mirror, so `de-DE` or a typo went into
+`<|lang_start|>` verbatim). Guards: `tests/test-omnivoice-lang.cpp` — predicate
+AND joins, all four join assertions watched red first.
+
+**Two things to know before touching this again:**
+
+- **A/B omnivoice on CODES, never on the WAV.** Output is watermarked and
+  carries a spoken disclaimer, so `cmp` on audio differs for every render
+  including two that should match. Use `CRISPASR_OMNIVOICE_DUMP_CODES` with
+  `--no-spoken-disclaimer --accept-marking-responsibility`, and include a
+  control arm whose expected answer is IDENTICAL.
+- **The accent half of the report is NOT fixed and may not be fixable here.**
+  whisper LID cannot separate tagged from untagged output (accent-robust by
+  design; the one sentence that moved was noise), and OmniVoice has no
+  cross-lingual drop-ref path to port #329 into. Needs a listener, not another
+  metric.
+
+**SE-side gap, no longer blocking:** `OmniVoiceCrispAsr.Speak()` accepts the
+language and never puts it in the payload. Worked around on our side —
+omnivoice guesses the language from the target text when nobody supplies one
+(`CRISPASR_OMNIVOICE_AUTO_LANG`, default ON; explicit always wins), verified
+byte-identical to an explicit `-l de` against the exact SE request shape.
+Sending the field is still better (exact, covers languages the detector does
+not); snippet is on the issue, but nothing here waits on it.
+
+**Honest residual, closed cheaply:** the style-token live test pins ids from a
+tokenizer run; a red test alone could not say which side moved. Now it can —
+the test header records the upstream revision (`c5fdb5cc`) + tokenizer.json
+sha256 and the one-command disambiguation, all 9 pins re-derived byte-identical
+2026-08-07. Vendoring the 7 MB tokenizer.json remains not worth it.
+
 ### Ready to take — scoped, unblocked, nobody on them
 
 | # | Task | Size | Where |
@@ -73,6 +138,580 @@ Earned the hard way; each cost a real bug getting through.
 5. **A hand-maintained list needs a machine check that it is complete.** The
    copies-in-sync guard covered 1 of 14 files for months — not a wrong entry, a
    missing one.
+
+## LANDED 2026-08-06 — #335 `Session::open()` could not open granite-speech
+
+Root cause is NOT granite-specific. The `general.architecture` → backend table
+existed **twice** — `examples/cli/crispasr_backend.cpp` pass 2 and
+`crispasr_detect_backend_from_gguf()` in `src/crispasr_c_api.cpp` — and the two
+had drifted by **113 architecture strings**. Every granite-speech GGUF carries
+`general.architecture = "granite_speech"` (underscore; that is what
+`models/convert-granite-speech-to-gguf.py` writes, confirmed by range-reading
+the header of the published `granite-speech-4.1-2b-plus-q4_k.gguf`), and the
+C-ABI copy only knew the hyphen spelling → detect returned `""` →
+`crispasr_session_open` returned NULL for every binding. The CLI never noticed
+because its **filename** pass matches `granite`+`speech` and short-circuits
+pass 2 — so **auto-detect working in the CLI proves nothing about the
+bindings**, and that is the durable lesson here.
+
+granite was one of many: nemotron, moonshine, kokoro, piper, melotts,
+sensevoice, funasr, paraformer, glm-asr, kyutai-stt, mini-omni2, csm, dia,
+bark, speecht5, fastpitch, pocket-tts, gemma4-e2b, mimo-asr, voxtral-tts,
+piano-transcription and more were CLI-only too — no binding could auto-detect
+any of them.
+
+Fix: one shared table, `src/core/arch_backend_map.h`, read by both surfaces.
+`tests/test-arch-backend-map.cpp` pins it and drives the real C-ABI export over
+a synthesised metadata-only GGUF (hermetic, no models) — deleting the
+`granite_speech` row makes it fail with `"" == "granite"`, rc=0, which is the
+reported bug exactly. Verified on the reporter's own artifact:
+`crispasr_session_open()` returns a live handle reporting backend `granite` and
+transcribes `samples/jfk.wav` correctly through the session ABI.
+
+## LANDED 2026-08-06 — cohere: the language whitelist, + probe LID
+
+Prompted by reading [bakrianoo/cohereX](https://github.com/bakrianoo/cohereX)
+(a WhisperX-shaped Python wrapper around the same model). Nothing to take from
+its runtime — we have the native port, CTC alignment and native diarization —
+but it validates `-l` against the model's `config.json` and we did not.
+
+**The bug.** Cohere Transcribe answers a wrong language *fluently* instead of
+failing, and we had no whitelist, so an unsupported `-l` was accepted in
+silence. Reachable without user error: `-l auto` is the CLI default and
+whisper-tiny LID knows 99 languages against this model's 14 — or the Arabic
+finetune's **two**.
+
+**The thing I got wrong first, and the reason this needed metadata.** I assumed
+`<|ru|>` was absent from the vocab and silently dropped by the prompt builder's
+`remove_if`. Measured on the published Arabic GGUF: the tokenizer carries **183
+`<|xx|>` tokens — the whole of ISO 639-1** — while the model supports two. So
+every real code is well-formed and a vocab check catches nothing. On one 8 s
+Arabic clip: `-l ru` added a hallucinated leading word, `-l ja` swapped the
+quote marks for brackets, `-l de` changed the diacritics. All plausible, none
+flagged. `config.json`'s `supported_languages` is the ONLY available signal —
+which is why it now rides in the GGUF (`cohere_transcribe.supported_languages`)
+rather than being inferred. (The `remove_if` backstop stays, but it only ever
+fires for non-ISO input: `<|auto|>` genuinely is absent.)
+
+Fixing it in `cohere_transcribe_ex` covers CLI + session ABI + server at once —
+no three-surface edit needed.
+
+**Probe LID** (`--lid-backend probe`, cohereX's `langid.py` idea): transcribe a
+20 s clip once per supported language, score
+`len × (1 + 3·text-LID-agreement) × distinct-token-ratio²`. Needs no second
+model and **cannot return a language the model does not support**. Verified on
+the Arabic finetune: Arabic clip → `ar` p=0.675, `jfk.wav` → `en` p=0.647.
+
+Measured again on the **real 14-language base model** (`cohere-transcribe-q4_k`,
+after republishing): the forced 14-way probe is **correct on both clips** —
+`jfk.wav` → `en` (228, p=0.169), Arabic clip → `ar` (292, p=0.254). The ≤4
+ceiling (`CRISPASR_COHERE_PROBE_MAX_LANGS`) is therefore a **cost** gate: 14
+probes take 37 s on an M1 against ~1 s for whisper-tiny.
+
+⚠ **I first documented the opposite and it was wrong.** The "forcing 14
+candidates picks `fr`" result came from forcing a 14-language list onto the
+**two-language Arabic finetune** — a model with no French, which *translates*
+rather than degrading, and cld3 then confirms the translation at 1.00. The real
+base model's `fr` probe code-switches instead ("Et so, my fellow Americans…",
+agreement 0.00, score 57) and loses. I had flagged that extrapolation as
+"suggestive, not conclusive" and shipped the conclusion anyway. **The lesson is
+narrow and reusable: a forced/mismatched capability list does not simulate a
+model that genuinely has that capability.** The scoring soft spot itself is real
+and stays documented (a fluent translation *can* outscore repetitive truth); it
+is just not what the candidate count controls.
+
+### Closed since (2026-08-06, same day)
+
+- **Metadata republished — all 10 GGUFs**, via `tools/gguf-add-cohere-langs.py`
+  (tensors passed through, per-tensor sha256 verified) on Kaggle kernel
+  `chr1str/cohere-langs-republish`. Confirmed independently by range-reading each
+  live file's KV section: Arabic ×4 = `['en','ar']`, base ×6 = the 14. The fix is
+  no longer inert; `CRISPASR_COHERE_LANGS` is now only for third-party GGUFs.
+- **Converter runs end-to-end** (2104 tensors, 4.14 GB, key + `max_clip_s`
+  present, output transcribes and enforces its own whitelist). Running it
+  surfaced a pre-existing bug: it wrote `general.architecture` twice, which
+  strict gguf-py versions reject.
+- **Server and session C-ABI surfaces exercised**, not just compiled — probe
+  fires and substitution warns on both.
+- **UTF-8 truncation bug** in the probe log (`%.60s` cut mid-character, killed
+  the Kaggle run via Python's stderr decode). Fixed + guarded.
+
+- **`prefers_vad()` for cohere** — and it was a bigger deal than "a plausible
+  quality win". The model transcribes SILENCE as speech: 10 s of pure digital
+  silence returns *"And I'm going to go ahead and do that."*, and 20 s of
+  trailing silence appends that same sentence to an otherwise perfect
+  `jfk.wav` transcript. (Low-level noise and a 440 Hz tone produce nothing, so
+  it is silence specifically.) A/B'd on real speech before flipping: on a 60 s
+  FLEURS clip the un-VAD'd run also cut mid-sentence, garbled a clause and
+  **dropped a whole sentence** the VAD run recovers — so it is content
+  recovery, not just a silence guard. Uses the existing >30 s safeguard.
+- **The cheaper probe** — encode once, decode per candidate. The two encode
+  blocks were already brace-delimited, so it is two `{` → `if (!reuse_enc) {`
+  with no re-indentation, and the cross-KV free/realloc lives *inside* the
+  second block so skipping it keeps the allocation live. 14-candidate A/B,
+  back-to-back and repeated in reverse order: **12 s → 4–5 s, byte-identical
+  output**. Gated `CRISPASR_COHERE_PROBE_REUSE_ENC=0`.
+- **`tools/gguf-add-merges.py`** — passed `sub_type=` to a `MetadataDetails`
+  that the installed gguf-py does not have, so it raised TypeError and could
+  not run at all. Now passes it only when the field exists; verified on a
+  synthetic glm-asr GGUF (merges land ARRAY/STRING, both pair- and string-form
+  inputs normalise, arch/vocab/tensors pass through).
+
+### Open follow-ups
+
+None tracked for cohere. Two things deliberately NOT done, with reasons:
+
+1. **Fresh-conversion vs published-f16 tensor equality** was never checked (it
+   would cost a 4.14 GB download to compare a converter run against an artifact
+   produced by an older converter). The republished files are guaranteed
+   byte-identical to their *pre-rewrite* selves by the tool's per-tensor sha256
+   `--verify`, which is the property that actually matters.
+2. ~~Silence-hallucination below the 30 s threshold~~ — **fixed** (99d8e60b),
+   and not the way I expected. Measuring first showed the defect is narrower
+   than "silence in a short clip": 23 s of speech + trailing silence is CLEAN.
+   Only an all-silent span fabricates, which means it needed no VAD at all —
+   just a digital-silence gate in `cohere_transcribe_ex`, free and with no
+   extra model. Threshold sits below one int16 LSB so one non-zero sample
+   disables it; the quietest real speech to hand peaks ~3800x higher.
+
+## LANDED 2026-08-10 — #339 HIP: the bundler erased the RUNPATH it needed to read
+
+v0.8.27 restored five of the six missing Linux tarballs and HIP still did not
+package. Separate defect, and one the first fix could not have caught: the build
+succeeds, then `check-bundled-deps.py` refuses the staged directory with
+`crispasr needs libomp.so`.
+
+`bundle-linux-runtime.sh` did its two jobs in the wrong order — rewrite RUNPATH
+to `$ORIGIN`, THEN ask `ldd` what the binaries need. `ldd` resolves through the
+binary's own RUNPATH, so erasing it first turns exactly those dependencies into
+`=> not found`, and the copy loop's `grep '^/'` dropped them with the blank
+lines. ROCm's clang links OpenMP against LLVM's `libomp.so` under
+`/opt/rocm/lib/llvm/lib`, reachable only that way; gcc's `libgomp.so.1` is in
+the default loader path, which is why six legs were unaffected and this
+survived v0.8.27.
+
+⚠ **The failing line printed the evidence and was read as progress.** The log
+says `rpath crispasr: '$ORIGIN:…:/opt/rocm-6.3.0/lib/llvm/lib:…' -> '$ORIGIN'`
+and then `rpaths normalised, 0 librar(ies) bundled`. The directory it needed
+was in the string being discarded, and "0 bundled" was a count nobody had a
+reason to expect to be non-zero.
+
+⚠ **A green summary line over a dropped dependency.** The bundler reported how
+many libraries it had copied and said nothing about the one it could not find;
+`grep '^/'` filtered `=> not found` out with the blank lines. It is now fatal
+there, naming the library, and consults the same exclusion list the copy loop
+uses — otherwise `libcuda.so.1`, legitimately absent from a driverless CI
+runner, would take down every CUDA leg.
+
+⚠ **These scripts only ever ran inside a release job.** That is why two defects
+in them shipped: there was no way to observe one without publishing a release.
+`tests/test-bundle-linux-runtime.sh` now reproduces the whole thing with `cc`
+and a private directory plus `-Wl,-rpath` — no ROCm, no GPU, no release — and
+sits in the `unit` tier on every push. Red-verified against the v0.8.27 script
+before being trusted. `patchelf` was added to the CI unit job for it, because a
+SKIP reads exactly like a PASS in the ctest summary.
+
+Dry runs of a single leg are now readable: `validate-version` compared VERSION
+against the branch name when `tag` was empty and failed on every dry run, which
+is the mode the input's own documentation recommends.
+
+**Then I went looking for the same shape elsewhere, and found two more (#341).**
+Both verified against the DOWNLOADED v0.8.27 assets, not inferred:
+`libcrispasr-linux-x86_64-hip` needs `libomp.so` + `libhipblas.so.2`;
+`crispasr-python-linux-{x86_64,arm64}` needs `libgomp.so.1` + `libblas.so.3`.
+Neither carried them, and neither leg ran `check-bundled-deps.py` at all — the
+python legs did the RUNPATH half inline with no closure step and no gate, so
+`import crispasr` died in the loader on any host without OpenBLAS and gcc's
+OpenMP.
+
+⚠ **A tolerance that `exit(0)`s is not a tolerance, it is a stop.**
+`verify-lib-bundle.sh` DID fail to dlopen the HIP bundle on `libomp.so` — and
+`libomp` is on its EXTERNAL list, so it printed "dlopen deferred: external
+driver absent in CI" and exited 0, skipping the rest of the verification too.
+The list was written for gcc's versioned `libgomp.so.1` on the default loader
+path and silently generalised to ROCm clang's unversioned `libomp.so`, which
+exists only under `/opt/rocm/lib/llvm/lib`. When adding to an allowlist, ask
+what a shipped artifact looks like if the entry is wrong.
+
+⚠ **Two gates asking different questions is not two gates.**
+`verify-lib-bundle.sh` gates INTRA-bundle resolvability — for every library the
+bundle ships, every dependency whose soname is ALSO shipped must be reachable.
+A dependency missing from the bundle entirely is outside the question, so it was
+never asked in five years of libs bundles. `check-bundled-deps.py` now runs on
+all five Linux libs legs and both python legs.
+
+⚠ **Licence text was not travelling with the binaries.** Every Windows, Android
+and libcrispasr artifact shipped LICENSE + THIRD_PARTY_NOTICES; no CLI tarball
+did, on any platform — while bundling `libgomp` (GPLv3 + GCC Runtime Library
+Exception) since #296. The RLE covers LINKING it into an MIT binary; shipping
+the `.so` is separately a GPLv3 conveyance with a §6 source obligation, so the
+notices now carry a source pointer and a written offer. `libomp` is Apache-2.0
+WITH LLVM-exception — notice only. The notices file also claimed OpenBLAS was
+"not bundled", false since #296.
+
+## LANDED 2026-08-10 — #339 fallout: a red Release run silently killed every GPU wheel
+
+The reported bug was six of seven Linux tarballs failing in v0.8.26 (two shell
+bugs in `release.yml`, fixed by the parallel session in 43231d0d). Verifying the
+asset SET rather than the count turned up a SECOND, unreported casualty:
+
+`release-python-wheels.yml` triggers on `workflow_run: [Release]` and gated on
+`github.event.workflow_run.conclusion == 'success'`. The six failing tarball
+legs reddened the run, so the whole wheel pipeline **skipped** — and the GPU
+wheels it publishes to the gh-pages PEP503 index
+(`crispstrobe.github.io/CrispASR/whl/{cuda,vulkan}/`) have been stale at 0.8.25
+since 2026-08-01. Nothing reported it: a skipped workflow is not a failure.
+
+The wheels repackage `libcrispasr-<platform>[-cuda|-vulkan]`, and every one of
+those assets built fine in v0.8.26 — so the inputs existed the whole time. The
+gate now accepts `failure` as well as `success`; each matrix leg already fails
+loudly if the asset it downloads is missing, which is the real precondition.
+
+⚠ **Two process lessons, both now in the dev guide.** (1) "A red Release run is
+often fine" is true for ASSETS and false for anything triggered by
+`workflow_run` — check what a downstream consumer gates on before calling a red
+run cosmetic. (2) Verify the asset SET, not the count: v0.8.26 published 21
+assets and was approved on that basis; the six missing tarballs were an
+absence, which a count cannot show. There is a normalised `comm -23` recipe in
+the guide, and it was proved red against v0.8.26 before being trusted.
+
+**Backfill — and the trap in it.** `release-python-wheels.yml` takes a `tag`
+input, so an old release's wheels can be regenerated by `workflow_dispatch`
+rather than re-tagging. ⚠ But its build jobs used `actions/checkout@v6` with NO
+`ref:`, so they always built from the DEFAULT BRANCH while uploading to the tag
+they were given. Dispatching `tag=v0.8.26` while main was 0.8.27 attached three
+**0.8.27-labelled wheels to the v0.8.26 release** — a wrong artifact under a
+version number, which is worse than a missing one. Assets removed; the three
+build jobs now check out `${{ needs.setup.outputs.tag }}`. `publish-gpu-index`
+keeps `ref: main` on purpose — it COMMITS the index there.
+
+⚠ This also exposed a limit of the normalised asset-set check: stripping
+version numbers to compare kinds is what makes the diff readable, and it is
+exactly what hides a version MISMATCH. The set check answers "is anything
+missing", not "is everything correctly labelled". Check both.
+
+## LANDED 2026-08-09 — #337 qwen3-tts "GPU runaway" is NOT a miscompute
+
+Reported on HIP: the talker picks a different token from CPU at frame 0, then
+runs to the KV ceiling — 3796 frames / 303.76 s for one sentence — with exit
+code 0 and a valid WAV. Reporter ruled out quantization, model size,
+flash-attn, HIP graph capture and the voice reference, each with a paired test.
+
+**Three measurements, and the second one overturned the first conclusion.**
+
+1. His CPU-vs-GPU token table was confounded: the talker hardcoded top_k=50 /
+   temp=0.9, and `qwen3_tts_set_temperature` reached the code predictor but NOT
+   the talker. The RNG stream is identical across backends, but the pick is a
+   multinomial draw over a softmax of 50 logits, so any float difference moves
+   it. Added `CRISPASR_QWEN3_TTS_GREEDY=1` (top_k=1) and wired the temperature.
+2. Under greedy on M1, CPU and Metal diverge — I first read that as "the bug
+   reproduces on Metal, so it is a GPU-path defect". **Wrong.** Dumping the raw
+   talker logits (`CRISPASR_QWEN3_TTS_DUMP_LOGITS`, the glm_ocr `*_DUMP_LOGITS`
+   pattern) shows cos **0.99992** at frame 0 — better than the 0.998–0.999 band
+   the guide calls normal for GPU-vs-CPU — decaying to 0.990 by frame 3 and
+   0.84 by frame 5 as the AR loop amplifies it. Neither `--no-flash-attn`
+   (bit-identical) nor `CRISPASR_KV_QUANT_{K,V}=f32` (5th decimal) moves it.
+   This is the voxtral-tts pattern in the guide verbatim: an AR pipeline
+   reproduces the reference at frame 0 then diverges as rounding amplifies —
+   NOT a bug. The two backends simply follow different plausible trajectories
+   after the argmax flips at frame 5; one of them didn't terminate.
+3. `core_repeat::tail_is_repetition` looked like the fix — 3 backends use it,
+   qwen3-tts never adopted it, and the degenerate output repeats. **Rejected by
+   measurement**: healthy CPU output repeats a codec frame **7×** mid-utterance
+   (period-1 `[1657]`) against the degenerate run's 8×. Structurally identical.
+   The helper was written for TEXT tokens; at 12 Hz a held sound legitimately
+   repeats, so it cannot discriminate here. Shipping the library default would
+   have truncated good audio — a worse bug than the one being fixed.
+
+**The actual defect** is that `max_frames` was the KV ceiling, so any input was
+allowed 4096 frames (340 s). Now bounded by the text, the same
+max_token_text_ratio idea upstream TTS models carry and that #334 ported for
+cosyvoice3: `max(240, codepoints × 12)`. Sized from measurement — five
+utterances ran 1.35–2.61 frames per codepoint, so 12 is ~5× the worst observed;
+verified all five are untouched (79–124 frames against caps of 528–804) and the
+cap branch is reachable. It only ever tightens the ceiling; `max_codec_steps`
+and `CRISPASR_QWEN3_TTS_MAX_FRAMES` still override.
+
+Hitting either bound now prints an explicit ERROR saying the output is a
+runaway and should be discarded, and that a GPU-only reproduction is expected
+arithmetic rather than a miscompute.
+
+### Still open
+
+- Making a runaway a non-zero exit rather than a log line. Deliberately not
+  done: it changes the contract for callers who may be relying on truncated
+  output.
+- The reporter's HIP run diverged at frame 0 under SAMPLING; whether it also
+  diverges at frame 0 under greedy is unknown and worth asking — a frame-0
+  greedy divergence would point at the prefill and would be a different story
+  from what Metal shows.
+
+## LANDED 2026-08-05 — #334 cosyvoice3 WAV cloning (85d60ba9, 88c02788)
+
+Reported as "long delay, pitch shifting and accent issues", blamed on sample
+rate. **The sample rate was a red herring** and that is worth remembering: the
+C++ speech tokens are byte-exact vs `speech_tokenizer_v3.onnx` (201/201) at
+every reference rate, and our polyphase resampler tracks torchaudio to inside
+the tokenizer's own sensitivity. What is real:
+
+- **s3tok token ids are NOT stable across resamplers.** ONNX on a sox-16 kHz
+  file vs the same audio resampled from 24 kHz agrees on only ~62% of tokens —
+  and torchaudio scores the same 62%. The FSQ codes are near-ties, so a −51 dB
+  difference flips a third of them. Any future "our tokens don't match" report
+  must first ask *which 16 kHz signal*.
+- **The talker had no minimum length.** Upstream masks the stop token while
+  `i < min_len = (target text tokens) × 2`. Without it one unlucky step-0
+  sample ends the decode ("AR decode produced 0 tokens", no audio); short of
+  that the model spends fewer than 2 frames per text token, which is the
+  reporter's chipmunk. Ported + gated `CRISPASR_COSYVOICE3_NO_MIN_LEN=1`.
+- **The actual trigger is a `--ref-text` that doesn't transcribe the clip.**
+  17.7 s of audio labelled with one sentence → collapse. Now warned against
+  the same 2..20 speech-tokens-per-text-token band the decode uses.
+- **The clone front-end re-ran per sentence chunk.** s3tok + CAMPPlus + prompt
+  mel on every `synthesize()`; cached per (path, size, mtime, transcript).
+  3-sentence `--tts` 66.0 s → 45.7 s, byte-identical.
+- **`resample_polyphase` truncated its filter on every downsample** — the
+  input window was `±num_zeros` where the filter spans `half_len/L` input
+  samples. The pre-existing DC test had a 5e-4 margin over a 5.4e-4 defect.
+- **RL talker published + wired**: `cosyvoice3-llm-rl-{f16,q4_k}.gguf` on
+  `cstr/cosyvoice3-0.5b-2512-GGUF`, `--backend cosyvoice3-tts-rl`.
+
+### OPEN follow-ups
+
+1. ~~Auto-transcribe the reference when `--ref-text` is missing.~~ **DONE.**
+   `examples/cli/crispasr_tts_ref_text.h` hoists f5-tts's transcriber + the
+   ref-text cache; cosyvoice3 now auto-transcribes instead of hard-erroring
+   (cached as `<voice>.cv3reftext`). Measured on a 17.7 s reference: a
+   one-sentence guess lost the requested line entirely, auto-transcribed it
+   came out in full. **Still CLI/server only** — `crispasr_session_set_voice`
+   keeps returning -2 for a WAV with no transcript, because the session C-ABI
+   cannot construct a second `CrispasrBackend` for ASR. That is the same
+   limit f5-tts has always had, so bindings callers must still pass a
+   transcript; lifting it means giving the library its own ASR entry point.
+2. ~~The clone front-end is a harness-blind zone.~~ **DONE, and it found a
+   real bug.** `clone_{spk_emb,prompt_feat_24k,speech_tokens}` stages now
+   exist on both sides and give the three `cosyvoice3_tts_extract_*` APIs
+   their first caller. First run: prompt mel 0.999948, speech tokens
+   1.000000 — and **spk_emb 0.737** against `campplus.onnx`.
+   Cause: CAMPPlus ends `transit3.linear(Conv1d, bias=False) →
+   out_nonlinear(BN+ReLU) → StatsPool`, and the ONNX exporter FOLDED that
+   trailing BN into the conv — the graph has a bare
+   `/xvector/out_nonlinear/relu/Relu` with no BN parameters, while
+   `/xvector/transit3/linear/Conv` gained a fused weight and a fused BIAS
+   (transit1/2 keep bias-free named weights, no BN follows them).
+   `bn_relu_conv1d` never applied a conv bias, so the fold was silently
+   dropped. Zeroing that bias in the ONNX reference reproduces the old C++
+   output at cos 0.999998 — that is what pins it. Fixed → 0.999997.
+   ⚠ Every WAV clone had been conditioned on the wrong timbre while the baked
+   voice bank was fine (its embeddings come from the ONNX model in Python) —
+   which is why this read as "cloning quality" rather than as a bug.
+   The bias is applied only when the checkpoint carries one.
+   **Cross-backend blast radius — VERIFIED, not assumed** (the first commit
+   message claimed "their converters emit no transit bias", which was
+   reasoning, not a check; chatterbox's GGUF is not even produced by an
+   in-tree converter). Listing the tensor names in each published GGUF over a
+   ranged HTTP read of the header:
+   | GGUF | transit tensors | transit `linear.bias` | out_nonlinear BN |
+   |---|---|---|---|
+   | chatterbox / -turbo s3gen | 15 | none | `s3.se.xv.out_nl.bn.*` present |
+   | dots.tts spk | 18 | none | `…out_nonlinear.batchnorm.*` present |
+   | cosyvoice3 campplus | — | **transit3 present** | **absent (folded)** |
+   So chatterbox and dots.tts are bit-identical, and cosyvoice3 is the only
+   folded export. The C++ was written against the un-folded shape and had
+   never met the other one.
+3. **Re-validation after the CAMPPlus fix — DONE.** Every #334 measurement
+   before it was taken through a cos-0.737 speaker embedding, so the
+   clone-quality claims needed re-running. Same reference at 8/16/22.05/24/
+   32/44.1/48 kHz, matching `--ref-text`: all seven ASR-round-trip to the
+   identical transcript, durations 7.62–8.94 s, and speaker similarity to the
+   reference (Resemblyzer) is 0.744–0.776, spread **0.032**, mean 0.762.
+   Timbre is now rate-invariant as well as content — the earlier conclusions
+   hold, and the direct 24 kHz comparison moved 0.7245 → 0.7537. (Absolute
+   values are dragged down in every arm by the prepended spoken disclaimer,
+   which is in a different voice; the spread and the delta are the signal.)
+4. **The 10 s prompt-mel cap is ours, not upstream's.** `compute_prompt_feat_24k`
+   is called with `max_samples = 10 * 24000`, so a longer reference gives the
+   flow a 10 s prompt while the LM keeps the full token set (deliberate, see
+   the #310 comment). A 17.7 s reference round-trips fine, so this is not a
+   bug — but it is an untested divergence worth an A/B.
+
+## #333 madlad400 — DONE 2026-08-05 (F16 + Q8_0 published, port validated)
+
+Reporter: only `q4_k` was on `cstr/madlad400-3b-mt-GGUF`, though the README
+listed F16 and Q8_0 — and the card's own quickstart told you to download
+`…-q8_0.gguf`, which 404'd. Both files are now published, and madlad went from
+having **no diff-harness coverage at all** to a full per-stage table.
+
+**Per-stage cosine vs the PyTorch blueprint** (`crispasr-diff madlad <gguf>
+<ref>`; 14 stages, encoder → cross-attention → decoder → step-0 logits):
+
+| | worst cosine | step-0 argmax |
+|---|---|---|
+| F16 | **1.000000** (every stage) | MATCH |
+| Q8_0 | 0.999894 | MATCH |
+| Q4_K | 0.993328 | MATCH |
+
+F16 at 1.000000 on all 14 says the T5 port is faithful to HF's semantics; the
+quants then degrade exactly in the expected order, and all three still pick the
+same first token. `enc_pos_bias` is bit-exact (max_abs 0.00000) at every
+precision, which is the relative-position-bucket logic — encoder-bidirectional
+vs decoder-causal — confirming itself.
+
+Shipped: `tools/reference_backends/madlad.py` (lazy per-tensor walk of the
+11.76 GB fp32 checkpoint), `t5_translate_diff()` in `src/t5_translate.cpp`, the
+`madlad`/`t5` arm in `crispasr-diff`, and `tools/kaggle/madlad-quants/` which
+produced and validated everything. Reference archive:
+`cstr/madlad400-3b-mt-GGUF/madlad400-3b-mt-ref.gguf` (1.5 MB).
+
+**Follow-ups this left open:**
+
+- ⚠ **The reference archive is in the MODEL repo, not
+  `cstr/crispasr-regression-fixtures`**, which is where the convention puts them
+  (`tests/regression/README.md`). It works where it is and the kernel points at
+  it, but it should be moved or mirrored, and pinned by `fixture_ref_path` so CI
+  can use it.
+- ~~Greedy decode does not always terminate cleanly~~ **RESOLVED, and it was
+  NOT a port bug.** The hypothesis was that the runaway pointed at the runtime,
+  since the blueprint presumably stopped. Measured instead of assumed, and the
+  answer is the opposite: **the PyTorch reference runs away identically** —
+  60 tokens, no EOS, byte-identical string
+  (`'Hello world! – 100000000000…'`). Ruled out along the way, each with its own
+  arm: quantization (reproduces at F16, where parity is 1.000000), the KV cache
+  (`CRISPASR_T5_NO_KV_REUSE=1` full re-forward gives the identical string), the
+  tokenizer (runtime independently emits the same 11 ids ending in EOS=2, and
+  `enc_embed` is cos=1.000000), the EOS id (config, GGUF and runtime all say 2),
+  and the graph (14/14 stages, argmax MATCH). The port reproduces the model
+  faithfully **including its failure mode**, which is itself evidence of
+  fidelity.
+  Shipped anyway as a decode-policy improvement: `core_repeat::tail_is_repetition`
+  in the greedy loop, which trims the repeated tail and stops
+  ("Hello world! – 10" instead of "…– 100000000000…"). **Gated
+  `CRISPASR_T5_REPEAT_BREAK=0`, because it deliberately DEVIATES from the
+  blueprint** — anyone diffing against HF needs the old behaviour back. Both
+  sentences the reference terminates cleanly on are byte-identical with it on
+  and off.
+- **`t5` quantizer rule: written, MEASURED, and defaulted OFF because it loses.**
+  The port pipeline's step 3 asks for a per-arch rule, so I added one keeping
+  `shared.embed.weight` and `lm_head.weight` at source precision — reasoning
+  that Q4_K's worst stages (`enc_embed` 0.9974, `enc_out` 0.9937) were
+  embedding-driven. **That reasoning was wrong.** Re-quantized from the F16 and
+  diffed against the reference archive:
+
+  | | size | worst cosine |
+  |---|---|---|
+  | q8_0 | 3.38 → 3.62 GB | 0.999922 → 0.999920 |
+  | q4_k | 2.04 → 2.41 GB | 0.992929 → 0.992606 |
+
+  Bigger and no better, so neither was published — the kernel's
+  "upload only if parity improves" gate held. The new worst stages say why:
+  `cross_v_blk0`, `enc_out`, `cross_k_blk0`, i.e. the error is what ACCUMULATES
+  through 32 encoder blocks, not what the embedding lookup rounds off. A wide
+  embedding cannot repair a stack that has already drifted.
+  Kept and inverted rather than deleted (`CRISPASR_T5_KEEP_EMBED=1`): a
+  different T5 checkpoint — tied embeddings, smaller vocabulary, or an imatrix
+  run — could land differently, and the lever costs nothing switched off.
+  **The published q4_k/q8_0 are the generic-path files and remain the
+  measured-best.**
+
+## OPEN 2026-08-05 — miotts writes a 24 kHz WAV header for 44.1 kHz audio
+
+Reported from another session as "docs say 44.1 kHz, adapter says 24 kHz".
+**Verified, and it is not a docs typo — it is a shipping defect:**
+
+- `models/convert-miotts-to-gguf.py:269` writes `miotts.codec.sample_rate =
+  44100` (default, or parsed from the upstream config).
+- `src/miotts.cpp:262` reads it correctly: `get_u32("miotts.codec.sample_rate",
+  24000)` — so the runtime synthesises at whatever the GGUF says, i.e. 44.1 kHz.
+- `examples/cli/crispasr_backend_miotts.cpp:35` **hardcodes**
+  `tts_sample_rate() { return 24000; }`, and that is what stamps the WAV header.
+
+So 44.1 kHz samples get a 24 kHz header: the file plays ~1.84× too slow and
+about an octave low. README.md:161, README.md:296 and docs/tts.md:13 all say
+44.1 kHz, so the docs are right and the adapter is wrong.
+
+**The fix is not "change 24000 to 44100"** — the rate is per-model GGUF metadata,
+so hardcoding the other constant just moves the bug. Add a
+`miotts_get_sample_rate(ctx)` accessor (there is none: `grep sample_rate
+src/miotts.h` is empty), have the adapter return it, and keep 24000 only as the
+pre-init fallback. Then check the session C-ABI arm too — per the multi-surface
+rule it reimplements the backend inline and will have its own copy.
+
+⚠ NOT fixed here because it needs the model to verify end-to-end (502 MB, not on
+this box) and an audible before/after is the only acceptance test that matters
+for a rate bug. Everything above is from the source, not from listening.
+
+## OPEN 2026-08-05 — carried out of the #316 round-2 work
+
+These are the loose ends from `619e74b6..4b875be0`. None block anything.
+
+1. **fr/es have not been checked for either German defect.** Both were found by
+   method, and the method transfers:
+   (a) *citation stress* — `espeak_fr.tsv`/`espeak_es.tsv` were generated the
+   same way (one word at a time), so they bake in the same isolation stress
+   German had. `tools/gen-g2p-de-unstressed.py` is the generator; pointing it at
+   another language is a few lines.
+   (b) *out-of-vocabulary symbols* — scan the G2P output against the model's own
+   `tokenizer.ggml.tokens`. Three lines of Python, and in German it found we
+   were deleting `ʏ` out of every München. Worth running for **every**
+   non-English Kokoro model we ship, not just fr/es.
+2. **Regenerate `espeak_de.tsv` with `--tie`.** Our dictionary has no tie marks,
+   so `core_phoneme`'s German `ts`→`ʦ` is a blanket rewrite that cannot tell an
+   affricate from a compound seam. espeak emits `t^s` only for the affricate, so
+   a tied dictionary makes the collapse exact — and would let
+   `CRISPASR_KOKORO_DE_MISAKI_ALPHABET` be judged on its merits instead of on an
+   approximation. Regenerate + re-upload to `cstr/g2p-dicts`.
+3. **The German tied-alphabet collapse needs a listening test, or a kikiri-tts
+   model to test against.** It matches the published recipe and made the ASR
+   round-trip worse on the hui base we ship; the hypothesis is that that model
+   predates that part of the recipe. `kikiri-tts/kikiri-german-{victoria,martin}`
+   are explicitly "misaki 0.9.4 + espeak-ng" and would settle it.
+4. **Five `tools/kaggle/*/kaggle_harness.py` bundles are gitignored** —
+   `mimo-cuda-rvq-309`, `moss-tts-quants`, `streaming-diarize-300`,
+   `whisper-ja-760M-convert`, `whisper-punc-308`. They exist only on the machine
+   that made them, so a fresh clone (and the CI checkout) has **no** bundled
+   fallback harness for those kernels — which is the exact failure
+   `check-kaggle-harness-sync.py` was written to prevent, and it cannot see it
+   because it only compares copies that are present. Either `git add -f` them or
+   teach the checker to fail on a kernel dir with no bundle.
+5. **English `that`/`read`/`used`/`object`/`console`/`use` need a POS tagger** —
+   already recorded below with the measurement that says a full spaCy port buys
+   0.34%. The cheap slice is a closed-class rule for `that` alone (~24 of the
+   ~32 residual tokens, no model).
+
+## OPEN follow-ups from #332 (Rust/Dart diarize ABI, landed 2026-08-05)
+
+The landed part: `DiarizeMethod::FoxNose` + options exposed in the Rust crate
+and Dart, and the real bug behind the report — the hand-maintained Rust and
+Dart mirrors of the APPEND-ONLY `crispasr_diarize_opts_abi` were never updated
+when #324 appended the FoxNose fields, so every `diarize_segments` call from
+those bindings had the C side read 24 bytes past the caller's allocation.
+Both mirrors now carry the 48-byte layout; `crispasr-sys` has a size/offset
+layout test, the flutter smoke test pins the `DiarizeMethod` indexes, and the
+c_api struct comment now lists every hand-written mirror to update on the next
+append.
+
+Still open from the issue's asks:
+
+1. ~~**`crispasr_session_output_sample_rate()` (+ channels getters).**~~
+   **DONE** (second #332 landing): `crispasr_session_output_sample_rate` /
+   `input_channels` / `output_channels` in the C ABI (per-backend rate table
+   mirroring the CLI adapters' `tts_sample_rate()`, 0 = no audio output),
+   wired through Rust / Ruby / JS / Java / C# (the surfaces that expose
+   `input_sample_rate`), pinned by `tests/test-session-abi-nulls.cpp` and
+   documented in `docs/bindings.md` §"Session audio-format getters".
+   **A new TTS backend must add its ctx to the getter's table** —
+   `docs/contributing.md` §5b.3 records the duty. Go / Dart / Python don't
+   expose `input_sample_rate` either; extend all four getters together there
+   if anyone asks.
+2. ~~**Same-benchmark DER for the pyannote+embedder path**~~ — **already
+   existed**; the note here originally claimed the pyannote path had no DER
+   on the shared benchmark, which was wrong. The cross-method table lives in
+   the #326 NOW section below and in `docs/diarization-speakers.md` "#326":
+   pyannote+embedder **7.81 %** vs foxnose **7.32 %** mean DER on the same 8
+   VoxConverse dev files (whisper-tiny segments, 0.25 s collar), with the
+   3.18 %-vs-7.32 % foxnose discrepancy explained there (own turns vs ASR
+   segments as speech regions). Nothing left to run for #332; the estimator
+   under-count remains #326's open accuracy item.
 
 ## NOW — #326 diarization: the count estimator is the last accuracy item
 
@@ -302,35 +941,32 @@ to counsel before it appears in a compliance claim.
    aside and configuring from clean.
 
 
-## OPEN follow-ups from #316 (kokoro G2P, landed 2026-07-28)
+## #316 Kokoro G2P — rounds 1 and 2 COMPLETE (2026-07-28 / 2026-08-05)
 
-- **Numbers: DONE for all four built-in G2Ps** (en `num2words_en.h`, de
-  `num2words_de.h` `ce7c8226`, fr+es `num2words_fr.h`/`num2words_es.h`
-  `ddb08ae1`). Every one of them used to phonemize `82` to the empty string and
-  drop it silently. Hermetic coverage in `tests/test-num2words-de.cpp` (55
-  assertions) and `tests/test-num2words-fr-es.cpp` (87).
-  Each language needed rules the others do not have, and two were caught only by
-  running the tables: **French** 80 000 came out "quatre-vingt**s** mille" (the
-  plural s must drop before a SCALE word, not just before another digit group),
-  and **Spanish** 21 000 came out "veintiuno mil" (`uno` apocopates before a
-  masculine noun and `mil` counts → "veintiún mil").
-  ⚠ Two deliberate limitations: German ordinals emit the citation form, so
-  "Am 1. Mai" reads "erste" where German inflects to "ersten" (case is not
-  recoverable inside a G2P); Spanish ordinals are lexical to décimo and fall back
-  to the cardinal above, rather than inventing "vigésimo primero" forms a TTS
-  voice has rarely been trained on.
-- **misaki's reduced vowels `ᵊ` / `ᵻ` are not modelled.** We emit plain `ə`/`ɪ`
-  where misaki reduces. Measured worth: exact whole-word phoneme match goes
-  58.3% → ~63% if handled. It is context-dependent (misaki uses both forms), so
-  it needs the rule, not a blanket substitution.
-- **The rest of the gap is dictionary-level**, not spelling: CMUdict stress
-  placement and unstressed-vowel choices vs misaki's lexicon (~190 stress
-  differences and ~130 ɪ/ə swaps over a 1508-word corpus). Closing it means
-  shipping misaki's lexicon, not more conversion rules.
-- Reproduce any of this with
-  `tools/` + `misaki` (pip): run both G2Ps over a word list and diff symbol
-  inventories — the invariant that matters is that we never emit a symbol
-  outside the model's vocab or outside the reference's inventory.
+_Both rounds archived to HISTORY.md (PLAN compaction 2026-08-05). Round 2 landed
+`619e74b6..4b875be0`, all six CI workflows green, reporter answered on the issue._
+
+Headline: English phoneme agreement with misaki **67.0% → 95.7%** (99.0% over
+aligned lines); German round-trip word accuracy **85.9% → 90.6%**; the reporter's
+own paragraph now byte-identical to misaki's output.
+
+**Still open** — carried into "OPEN 2026-08-05 — carried out of the #316 round-2
+work" above (fr/es unchecked, `--tie` dictionary regen, the German tied-alphabet
+listening test) plus the one long-standing English item:
+
+- **`that` / `read` / `used` / `by` / `am` / `object` / `console` / `use` need a
+  part-of-speech tag.** Measured rather than assumed: `python
+  tools/check_misaki_g2p_agreement.py --corpus <prose> --tagger-value` runs
+  misaki against itself with the tag withheld. The tagger moves 5.42% of its
+  tokens — but 90% of that is `in`, `a` and `I`, which `core/g2p_ctxwords.h`
+  already gets right with no tagger. **The genuinely tag-dependent remainder is
+  0.34%**, which is the entire return on porting spaCy's `en_core_web_sm`
+  (12 MB neural tok2vec + tagger). Everything else in misaki's `en.py` is
+  already ported. The cheap slice is a closed-class rule for `that` alone
+  (~24 of the ~32 tokens, no model).
+- **misaki's reduced vowels `ᵊ` / `ᵻ` are still not modelled** — we emit plain
+  `ə`/`ɪ` where misaki reduces. Context-dependent, so it needs the rule rather
+  than a blanket substitution.
 
 ## NOW — VAD + mel front-end parallelization campaign (#305 → fleet-wide)
 
@@ -565,6 +1201,45 @@ _Completed work archived to HISTORY.md (PLAN compaction 2026-07-17)._
 
 **Still open:** Upstream the ggml empty-key fix to ggml-org (outbound public PR, left for a human)
 
+**FIXED 2026-08-10 — the stb_vorbis SEGV `linux-fuzz-smoke` found.**
+`vorbis_deinit` walked `comment_list_length` entries of a NULL `comment_list`.
+`comment_list_length` is read straight from the file at
+`examples/stb_vorbis.c:3660` and set BEFORE the array is allocated, so the
+allocation-failure return one line later (an attacker-sized count makes
+`setup_malloc` return NULL) left the two out of step. Reachable from the public
+`crispasr_audio_load` on untrusted input.
+
+⚠ An earlier CrispASR patch had already hardened the SIBLING path here — the
+partially-filled array whose unassigned slots were freed as if valid — by
+zeroing the allocation. It could not help when the allocation never happened.
+Fixing the case you can see and leaving its neighbour is the recurring shape:
+the guard now lives in `vorbis_deinit` (defends every path in, present and
+future) rather than at the Nth caller, plus the length is reset on the error
+path so the struct's invariant holds.
+
+**Reproduced deterministically rather than waiting for the fuzzer.** The crash
+input is 102 hand-crafted bytes — an Ogg page carrying a Vorbis ident header
+and a comment header declaring `comment_list_length = 0x3FFFFFFF`. Kept as
+`tests/fuzz/regressions/ogg-huge-comment-count.ogg`, and the smoke-fuzz job now
+copies `tests/fuzz/regressions/` into its corpus, so every fixed crash becomes a
+deterministic gate instead of a coin flip. Before/after on matching builds: 2
+SEGV lines → 0.
+
+⚠ `libcrispasr` is a SHARED library — the fuzz harness picks it up by rpath, so
+"rebuild the harness" tests the new code with an old-looking binary. Rebuild the
+dylib when doing a before/after, or the control silently becomes a second copy
+of the experiment. (Cost me one invalid control here.)
+
+The job also now uploads the crashing input on failure. It previously kept only
+the stack trace, which for a stochastic job means the reproduction is gone.
+
+**Noted, not fixed:** on macOS the same input flows past stb_vorbis into the
+AudioToolbox fallback (`crispasr_at_decode` → `ExtAudioFileOpenURL`) and
+libFuzzer reports an out-of-memory there. That is a resource limit inside
+Apple's decoder on malformed input, not memory corruption, and that path does
+not exist on the Linux CI. Worth a size sanity-check before handing a file to
+AudioToolbox if anyone wants it.
+
 ## Diff-harness extensions (detail for "Ready to take" #5 and #6)
 
 Both validate the TTS port against the Python reference. Neither is claimed.
@@ -574,6 +1249,92 @@ Both validate the TTS port against the Python reference. Neither is claimed.
 **What:** Dump talker LLM logits at each generation step in both Python reference and C++ runtime, compare — validates the text-decoder input so the sampler is a faithful port over verified logits.
 
 **How:** (a) add `talker_logits_step_N` capture to the Python reference dumper (`tools/reference_backends/qwen3_tts.py`) via a `generate`-time hook; (b) add matching C++ stage to `crispasr_diff_main.cpp`; (c) run on the TTS diff harness.
+
+**C++ SIDE DONE 2026-08-10 (#337), and it settled the report.** Three levers,
+which only work together:
+`CRISPASR_QWEN3_TTS_GREEDY=1` (argmax), `CRISPASR_QWEN3_TTS_REPLAY_CODES=<file>`
+(16 codec ids per frame — teacher forcing), and
+`CRISPASR_QWEN3_TTS_DUMP_LOGITS=<dir>` (raw per-frame logits, before the
+repetition penalty and suppress mask).
+
+**Result: CPU vs Metal, fully pinned, worst cos 0.999870, mean 0.999940,
+0/49 argmax disagreements.** Given identical history the backends agree at
+every step, so the free-running divergence is entirely trajectory divergence
+seeded by ~1e-4 arithmetic. That is the rigorous version of the #337 verdict;
+the earlier free-running comparison suggested it but could not separate the two.
+
+⚠ **Partial teacher forcing is a trap.** Replaying codebook 0 alone leaves the
+15 residual codebooks sampled (`code_pred_generate_15` MUST sample — greedy
+there is documented to produce silent output), so the per-frame input embedding
+still diverges and the "teacher-forced" diff bottoms out at cos 0.849 — pure
+artefact. Pin all 16 or measure nothing.
+
+⚠ **Every per-synthesis dump must be tagged.** One `--tts` run generates twice
+(the utterance, then the spoken AI disclaimer). `talker_%04d.f32` and
+`generated_codes` were both frame-only names, so the disclaimer OVERWROTE the
+utterance's dumps and a directory held two utterances with no way to tell.
+Both now carry `_s%02d`. This produced one entirely bogus cross-backend table
+before it was spotted — the tell was `argmax_gpu[k] == argmax_cpu[k-2]`.
+
+**Python reference side DONE 2026-08-10.** `_hooks.capture_per_call()` written
+(the module referenced an `_iter_capture` that never existed) — one capture per
+call instead of first-call-only. `tools/reference_backends/qwen3_tts.py` now
+emits `talker_logits_step0..15` and, at last, `generated_codes`: that stage had
+been in DEFAULT_STAGES since the backend was written and was NEVER produced,
+because the ids only exist inside `generate_voice_clone` (the outer call returns
+audio). Captured by wrapping `tts.model.generate`.
+
+Verified by running it: 17 tensors, `generated_codes (19, 16) int32` — exactly
+the layout `CRISPASR_QWEN3_TTS_REPLAY_CODES` consumes — and
+`talker_logits_step0 (1, 147, 3072)` = the PREFILL, with steps 1+ the AR steps
+at `(1, 1, 3072)`. Note that indexing when diffing: step0 is not frame 0.
+
+⚠ **Env:** the shared conda base has transformers 5.x; upstream Qwen3-TTS pins
+4.57.3 and importing `qwen_tts` against 5.x dies on `check_model_inputs()`.
+Do NOT downgrade the base. `tools/reference_envs/qwen3-tts/requirements.txt`
+now scaffolds it; a `--system-site-packages` venv inherits torch and shadows
+only transformers. `qwen_tts` comes from the clone at `~/code/Qwen3-TTS` via
+PYTHONPATH, not pip.
+
+**Prep landed 2026-08-10:** `qwen3_tts_sum_frame_embed()` factors the 16-codebook
+embedding sum out of the AR loop so a harness entry point can build the SAME
+per-step talker input without a second copy — duplicating it is how a harness
+drifts from the runtime it checks, which is what #338 was. Verified
+output-neutral: PCM byte-identical before/after (the WAV bytes differ only in
+the C2PA/watermark metadata, which carries a per-run id — compare PCM, not the
+container, when checking a refactor here).
+
+**Still open, and here is the actual blocker.** A per-step talker input is
+NOT just the codec-embedding sum:
+
+    next_emb[step] = sum_{cb=0..15} embed_cb(frame[cb]) + trailing_text_hidden[step]
+
+The `trailing` term is prompt-derived state computed from the synth text inside
+the generate path. So a harness stage cannot simply prefill from the
+reference's `talker_inputs_embeds` and then step — it also needs `trailing`,
+which the reference does not currently dump and the runtime does not expose.
+That dependency is why this stage does not exist yet; it is not just wiring.
+
+Two ways forward, pick one before writing code:
+1. Dump `trailing_text_hidden` as a reference stage too, and pass it into a
+   `qwen3_tts_talker_logits_replay(embeds, n_tokens, codes16, n_frames,
+   trailing, n_trail)` entry point. Most faithful, and it makes the
+   dependency explicit in the archive.
+2. Have the runtime construct the whole prompt itself from the same text +
+   voice wav the reference used, and use the reference's
+   `talker_inputs_embeds` ONLY as a structural gate (cos ≈ 1 before trusting
+   any logits — the guide's input-alignment rule). Less plumbing, but it
+   assumes the two prompt builders agree, which is the thing being tested.
+
+Option 2's gate is worth having either way.
+
+The superseded note: `CRISPASR_QWEN3_TTS_DUMP_LOGITS=<dir>`
+writes raw per-frame talker logits (f32), dumped BEFORE the repetition penalty
+and the suppress mask so a diff isolates the forward from the sampling policy.
+It already paid for itself — it is what proved the reported "GPU miscompute"
+was cos 0.99992 at frame 0, i.e. ordinary backend arithmetic amplified by the
+AR loop. What remains is (a): the Python reference hook, which turns a
+cross-BACKEND comparison into a cross-IMPLEMENTATION one against the blueprint.
 
 **Test:** needs a TTS model (qwen3-tts or tada). 0.6B Q8_0 (941 MB) fits on VPS; TTS gen slow on CPU (~105x RTF) — use short "Hi." input, 2-3 frames.
 

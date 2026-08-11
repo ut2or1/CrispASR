@@ -94,6 +94,10 @@ namespace CrispASR
             IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string hotwords, float boost);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_set_sensitivity(
+            IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string preset);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_set_g2p_dict(
             IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string source);
 
@@ -240,6 +244,18 @@ namespace CrispASR
         // Whisper-family backends, 0 on error).
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_input_sample_rate(IntPtr s);
+
+        // #332: output-side counterparts. output_sample_rate is the rate of
+        // the PCM synthesize / speech_to_speech return (0 = no audio output);
+        // the channel getters are 1 (mono) for every current backend.
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_output_sample_rate(IntPtr s);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_input_channels(IntPtr s);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_output_channels(IntPtr s);
 
         // AI-content marking (EU AI Act Art. 50(2)) — the other half of
         // synthesize_raw. alpha <= 0 selects the reliably detectable default.

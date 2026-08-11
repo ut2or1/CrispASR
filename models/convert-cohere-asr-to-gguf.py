@@ -118,6 +118,10 @@ def main():
                         help="Store ALL weights as F32 instead of F16")
     parser.add_argument("--f32-encoder", action="store_true",
                         help="Store encoder weight matrices as F32, decoder as F16")
+    parser.add_argument("--supported-languages", default=None,
+                        help="Comma-separated ISO-639-1 codes, overriding config.json's "
+                             "`supported_languages`. Only needed for a checkpoint that "
+                             "omits the field — the released models all carry it.")
     args = parser.parse_args()
 
     sf_path = os.path.join(args.model_dir, "model.safetensors")
@@ -160,15 +164,37 @@ def main():
 
     vocab_size = header["transf_decoder._embedding.token_embedding.weight"]["shape"][0]  # 16384
 
+    # The model's own language whitelist. This CANNOT be recovered from the
+    # vocab: the Arabic finetune supports only {en, ar} yet ships the base
+    # tokenizer, so every `<|xx|>` token is present regardless. Without it the
+    # runtime has no way to reject a language the model was never trained on,
+    # and Cohere Transcribe answers a wrong language fluently instead of failing.
+    if args.supported_languages:
+        supported_languages = [c.strip().lower() for c in args.supported_languages.split(",") if c.strip()]
+    else:
+        supported_languages = [str(c).strip().lower() for c in cfg.get("supported_languages", [])]
+    if not supported_languages:
+        print("  WARNING: no `supported_languages` in config.json and no --supported-languages "
+              "override — the GGUF will carry no language whitelist and the runtime cannot "
+              "validate -l against this model.")
+
+    max_audio_clip_s = int(cfg.get("max_audio_clip_s", 35))
+
     print(f"  Encoder: {n_enc_layers} Conformer layers, d={enc_d}, heads={enc_heads}")
     print(f"  Decoder: {n_dec_layers} transformer layers, d={dec_d}, heads={dec_heads}")
     print(f"  Vocab:   {vocab_size}")
+    print(f"  Langs:   {', '.join(supported_languages) if supported_languages else '(none — see warning)'}")
+    print(f"  Window:  {max_audio_clip_s}s max audio clip")
 
     # --- GGUF writer ----------------------------------------------------------
     writer, GGMLQt = get_writer(args.output, "cohere-transcribe")
 
-    # Architecture metadata
-    writer.add_string ("general.architecture",             "cohere-transcribe")
+    # Architecture metadata. NOTE: GGUFWriter(path, arch) already writes
+    # `general.architecture`; writing it again here raised
+    # "ValueError: Duplicated key name 'general.architecture'" on gguf-py
+    # versions that reject duplicates. Older versions only warned and
+    # overwrote, which is why this survived unnoticed — the converter has
+    # never been run end-to-end on a strict version until now.
     writer.add_string ("general.name",                     "Cohere Transcribe 03-2026")
     writer.add_uint32 ("cohere_transcribe.vocab_size",     vocab_size)
     # encoder
@@ -191,6 +217,10 @@ def main():
     writer.add_uint32 ("cohere_transcribe.audio.n_fft",        512)
     writer.add_uint32 ("cohere_transcribe.audio.hop_length",   160)
     writer.add_uint32 ("cohere_transcribe.audio.win_length",   400)
+    writer.add_uint32 ("cohere_transcribe.audio.max_clip_s",   max_audio_clip_s)
+    # language whitelist (see the note where it is read from config.json)
+    if supported_languages:
+        writer.add_array("cohere_transcribe.supported_languages", supported_languages)
 
     # Tokenizer vocab
     print("Embedding tokenizer vocab...")

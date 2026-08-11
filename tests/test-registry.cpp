@@ -367,6 +367,24 @@ TEST_CASE("registry: cosyvoice3 short alias resolves via -tts fallback", "[unit]
     REQUIRE(e.filename == "cosyvoice3-llm-q4_k.gguf");
 }
 
+// #334: upstream ships a second talker (llm.rl.pt, RL-tuned). It is the same
+// engine with a different LLM GGUF, so the alias must resolve to the RL file
+// while pulling the SAME flow/HiFT/CAMPPlus/s3tok/voices companions — a copy
+// of the base row that forgot to swap `filename` would silently hand the user
+// the base talker under the RL name.
+TEST_CASE("registry: cosyvoice3-tts-rl swaps only the talker", "[unit][registry]") {
+    CrispasrRegistryEntry base;
+    CrispasrRegistryEntry rl;
+    REQUIRE(crispasr_registry_lookup("cosyvoice3-tts", base));
+    REQUIRE(crispasr_registry_lookup("cosyvoice3-tts-rl", rl));
+    REQUIRE(rl.filename == "cosyvoice3-llm-rl-q4_k.gguf");
+    REQUIRE(rl.filename != base.filename);
+    REQUIRE(rl.url != base.url);
+    // Companion (flow) is shared, not a second copy under a new name.
+    REQUIRE(rl.companion_filename == base.companion_filename);
+    REQUIRE(rl.companion_url == base.companion_url);
+}
+
 TEST_CASE("registry: dia has entry", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("dia", e));

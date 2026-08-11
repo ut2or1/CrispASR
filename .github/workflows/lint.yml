@@ -23,6 +23,24 @@ on:
       # README language drift check (issue #50)
       - 'README.md'
       - 'tools/check-readme-langs.py'
+      # LEARNINGS index drift: a new section shifts every cited line number
+      - 'LEARNINGS.md'
+      - 'docs/LEARNINGS-INDEX.md'
+      - 'tools/gen-learnings-index.py'
+      # Shell inside workflow run blocks. release.yml only executes on a tag
+      # push, so its first run IS the release — #339 shipped a literal \n into
+      # four jobs and cost every Linux tarball of v0.8.26.
+      - '.github/workflows/**'
+      - 'tools/check-workflow-run-blocks.py'
+      # OmniVoice prompt vocabularies: the generated headers must match their
+      # vendored sources. Neither is cosmetic — both are what the model is
+      # conditioned on (#13273).
+      - 'src/core/omnivoice_lang_table.h'
+      - 'src/core/omnivoice_instruct_table.h'
+      - 'third_party/omnivoice/lang_map.py'
+      - 'third_party/omnivoice/voice_design.py'
+      - 'tools/gen-omnivoice-lang-map.py'
+      - 'tools/gen-omnivoice-instruct-map.py'
       # Release-tooling consistency (release-consistency job). A version bump
       # touches NONE of the C++ paths above, so without these the check would
       # never run on the commits it exists to guard.
@@ -59,6 +77,24 @@ on:
       # README language drift check (issue #50)
       - 'README.md'
       - 'tools/check-readme-langs.py'
+      # LEARNINGS index drift: a new section shifts every cited line number
+      - 'LEARNINGS.md'
+      - 'docs/LEARNINGS-INDEX.md'
+      - 'tools/gen-learnings-index.py'
+      # Shell inside workflow run blocks. release.yml only executes on a tag
+      # push, so its first run IS the release — #339 shipped a literal \n into
+      # four jobs and cost every Linux tarball of v0.8.26.
+      - '.github/workflows/**'
+      - 'tools/check-workflow-run-blocks.py'
+      # OmniVoice prompt vocabularies: the generated headers must match their
+      # vendored sources. Neither is cosmetic — both are what the model is
+      # conditioned on (#13273).
+      - 'src/core/omnivoice_lang_table.h'
+      - 'src/core/omnivoice_instruct_table.h'
+      - 'third_party/omnivoice/lang_map.py'
+      - 'third_party/omnivoice/voice_design.py'
+      - 'tools/gen-omnivoice-lang-map.py'
+      - 'tools/gen-omnivoice-instruct-map.py'
       # Release-tooling consistency (release-consistency job). A version bump
       # touches NONE of the C++ paths above, so without these the check would
       # never run on the commits it exists to guard.
@@ -303,8 +339,45 @@ jobs:
         with:
           python-version: '3.11'
 
+      # BEFORE the network-dependent step on purpose: this check is hermetic, and
+      # a flaky HF call in a later step must not be able to stop it from running.
+      # docs/LEARNINGS-INDEX.md cites LEARNINGS.md line numbers, so ANY inserted
+      # section shifts them; an index that silently points at the wrong lesson is
+      # worse than no index, so this is a hard gate, not an advisory.
+      - name: Check LEARNINGS.md index is current
+        run: python tools/gen-learnings-index.py --check
+
+      # Also hermetic, also before the network step. release.yml is the least
+      # exercised code here — a tag push is its first execution — so its static
+      # shell errors have to be caught somewhere that runs on every commit.
+      - name: Lint shell in workflow run blocks
+        run: |
+          pip install --quiet pyyaml
+          python tools/check-workflow-run-blocks.py
+
+      # Also hermetic, and also before the network steps. The table is generated
+      # from third_party/omnivoice/lang_map.py, which is vendored precisely so
+      # this gate never needs the network — the ids in it decide what the model
+      # is conditioned on, so a hand-edit has to be caught (#13273).
+      - name: Check OmniVoice language table is current
+        run: python tools/gen-omnivoice-lang-map.py --check
+
+      - name: Check OmniVoice instruct table is current
+        run: python tools/gen-omnivoice-instruct-map.py --check
+
       - name: Install huggingface_hub
         run: pip install --quiet 'huggingface_hub>=0.20'
+
+      # Advisory only — prints a NOTE and exits 0 when upstream moves. Whether to
+      # take a new revision is a judgement call (a changed id for an existing
+      # language would alter what callers synthesise), so it must not auto-fail.
+      - name: Report OmniVoice upstream language-map drift
+        continue-on-error: true
+        run: python tools/gen-omnivoice-lang-map.py --check-upstream
+
+      - name: Report OmniVoice upstream instruct-map drift
+        continue-on-error: true
+        run: python tools/gen-omnivoice-instruct-map.py --check-upstream
 
       - name: Check README language columns vs HF cards
         env:

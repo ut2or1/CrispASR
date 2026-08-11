@@ -1932,7 +1932,7 @@ class Session:
             raise RuntimeError(f"set_speaker_id failed (rc={rc}) for backend {self.backend!r}")
 
     def set_instruct(self, instruct: str) -> None:
-        """Set the natural-language voice description (qwen3-tts VoiceDesign).
+        """Set the voice description / style instruct (qwen3-tts, parler, omnivoice).
 
         VoiceDesign generates speech in a voice **described by a
         natural-language instruction** — no reference WAV, no preset
@@ -1943,9 +1943,24 @@ class Session:
 
         Required for qwen3-tts VoiceDesign before
         :meth:`synthesize`. Re-callable; latest call wins. Raises if
-        the active backend isn't VoiceDesign.
+        the active backend has no instruct contract.
 
         Detect VoiceDesign via :meth:`is_voice_design`.
+
+        .. warning::
+           **omnivoice does not take free prose.** It was trained on a
+           closed 48-item vocabulary — a gender, age, pitch, style,
+           accent or Chinese dialect, comma-separated, at most one per
+           category — and the string reaches its prompt literally, so
+           anything else is rejected rather than ignored::
+
+               s.set_instruct("female, elderly, british accent")   # ok
+               s.set_instruct("a gruff pirate")                    # raises
+
+           Casing and separator width are normalised for you, and the
+           whole instruct is unified to the language of the text being
+           spoken (``"male, elderly"`` becomes ``男，老年`` for Chinese
+           text). See docs/tts.md for the full vocabulary.
         """
         if not hasattr(self._lib, "crispasr_session_set_instruct"):
             raise RuntimeError("set_instruct API not present in this libcrispasr build")
@@ -2370,6 +2385,38 @@ class Session:
         )
         if rc != 0:
             raise RuntimeError(f"set_fallback_thresholds failed (rc={rc})")
+
+    def set_sensitivity(self, preset: str) -> None:
+        """Apply a named bundle of the four decoder fallback thresholds.
+
+        One of "conservative", "balanced" (the shipped defaults, always a
+        no-op) or "aggressive"; "strict"/"default"/"loose" are aliases.
+        Mirrors the CLI's --sensitivity.
+
+        conservative tightens the entropy and logprob bars and LOWERS
+        no_speech_thold, so borderline audio is discarded rather than guessed
+        at -- fewer hallucinations, some marginal speech lost. aggressive does
+        the opposite: quiet or whispered audio still produces text.
+
+        The four thresholds interact (a decode is only retried when the
+        logprob AND no-speech bars are both crossed), which is why they move
+        as a set. A later set_fallback_thresholds() overrides this.
+
+        Raises ValueError for an unrecognised preset -- a typo is never
+        silently treated as "balanced".
+        """
+        if not hasattr(self._lib, "crispasr_session_set_sensitivity"):
+            return
+        self._lib.crispasr_session_set_sensitivity.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        self._lib.crispasr_session_set_sensitivity.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_sensitivity(self._handle, str(preset).encode("utf-8"))
+        if rc == -2:
+            raise ValueError(
+                f"unknown sensitivity preset {preset!r} "
+                "(expected: conservative, balanced, aggressive)"
+            )
+        if rc != 0:
+            raise RuntimeError(f"set_sensitivity failed (rc={rc})")
 
     def set_alt_n(self, n: int) -> None:
         """Set per-token top-N alternative-candidate capture for whisper greedy decode. 0 = off."""

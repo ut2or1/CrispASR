@@ -99,6 +99,18 @@ std::vector<float> resample_polyphase(const float* in, int n_in, int src_rate, i
     // sample `j` sits at upsampled position `j * L`. So the filter
     // tap index for input sample `j` contributing to output `i` is
     // `(i * M - j * L) + half_len` — must be in [0, total_len).
+    // Input-sample half-width of the filter. A tap exists for input `j`
+    // while |i*M - j*L| <= half_len, i.e. within half_len/L input samples of
+    // `j_center` — which is `num_zeros` only when L >= M (any upsample). For
+    // a downsample (M > L) `up` is M, so the filter spans num_zeros*M/L input
+    // samples and a fixed ±num_zeros window drops its outer taps: it cut the
+    // Kaiser window off mid-slope, costing DC gain and adding ripple
+    // (0.25 → 0.2495 ± 5.4e-4 at 24→16 kHz; the every-rate guard in
+    // tests/test-audio-resample.cpp is the regression). The `tap` bounds
+    // check below still discards anything genuinely outside the filter, so
+    // the +1 is only there to cover the phase offset.
+    const int j_span = half_len / L + 1;
+
     std::vector<float> out((size_t)n_out, 0.0f);
     for (int i = 0; i < n_out; i++) {
         const int64_t i_up = (int64_t)i * M;      // position in upsampled stream
@@ -106,8 +118,8 @@ std::vector<float> resample_polyphase(const float* in, int n_in, int src_rate, i
         const int phase_offset = (int)(i_up % L); // fractional component
         // Iterate over the input window that covers half_len upsampled
         // taps in each direction.
-        const int j_min = std::max(0, j_center - num_zeros);
-        const int j_max = std::min(n_in - 1, j_center + num_zeros + 1);
+        const int j_min = std::max(0, j_center - j_span);
+        const int j_max = std::min(n_in - 1, j_center + j_span);
         double s = 0.0;
         for (int j = j_min; j <= j_max; j++) {
             // Filter tap index for this (i, j) pair:
