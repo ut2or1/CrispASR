@@ -10,7 +10,8 @@
 
 namespace {
 constexpr int SR = 16000;
-parakeet_strategy_in mk(int secs, bool is_ja, bool chunk_explicit, int chunk_s, int thr, bool longform) {
+parakeet_strategy_in mk(int secs, bool is_ja, bool chunk_explicit, int chunk_s, int thr, bool longform,
+                        bool chunked_requested = false) {
     parakeet_strategy_in in;
     in.n_samples = secs * SR;
     in.sample_rate = SR;
@@ -19,7 +20,14 @@ parakeet_strategy_in mk(int secs, bool is_ja, bool chunk_explicit, int chunk_s, 
     in.chunk_seconds = chunk_s;
     in.stream_threshold_s = thr;
     in.longform_enabled = longform;
+    in.chunked_requested = chunked_requested;
     return in;
+}
+
+// What the orchestrator does: resolve the effective cap, then route.
+parakeet_strategy route(parakeet_strategy_in in, bool threshold_from_env = false) {
+    in.stream_threshold_s = parakeet_effective_single_pass_cap_s(in, threshold_from_env);
+    return parakeet_pick_strategy(in);
 }
 } // namespace
 
@@ -53,6 +61,99 @@ TEST_CASE("JA never takes the CHUNK_SEGMENTED branch", "[unit][parakeet-strategy
     // (is_ja gate) → falls to the length logic.
     REQUIRE(parakeet_pick_strategy(mk(8, true, true, 7, 12, false)) == parakeet_strategy::SINGLE_PASS);
     REQUIRE(parakeet_pick_strategy(mk(30, true, true, 7, 12, false)) == parakeet_strategy::STREAMED);
+}
+
+// ---- Issue #350: the chunked entry point must stay bounded ----
+
+TEST_CASE("chunked request with default length is sliced, not one full pass", "[unit][parakeet-strategy][issue-350]") {
+    // crispasr_session_transcribe_chunked(…, chunk_seconds = 0, …): "use
+    // per-model defaults". The 300 s cap made 30-300 s files ONE decode — the
+    // regression. Anything past the reliable window is LONGFORM now.
+    REQUIRE(route(mk(231, false, false, 0, 300, true, /*chunked=*/true)) == parakeet_strategy::LONGFORM);
+    REQUIRE(route(mk(60, false, false, 0, 300, true, true)) == parakeet_strategy::LONGFORM);
+    REQUIRE(route(mk(31, false, false, 0, 300, true, true)) == parakeet_strategy::LONGFORM);
+    // …and the slices are the reliable window, not the 300 s cap.
+    REQUIRE(parakeet_effective_single_pass_cap_s(mk(231, false, false, 0, 300, true, true), false) ==
+            kParakeetBoundedWindowS);
+}
+
+TEST_CASE("a chunked request short enough for one pass still takes it", "[unit][parakeet-strategy][issue-350]") {
+    REQUIRE(route(mk(11, false, false, 0, 300, true, true)) == parakeet_strategy::SINGLE_PASS);
+    REQUIRE(route(mk(30, false, false, 0, 300, true, true)) == parakeet_strategy::SINGLE_PASS);
+}
+
+TEST_CASE("no chunked request → the 300 s cap is untouched", "[unit][parakeet-strategy][issue-350]") {
+    REQUIRE(route(mk(231, false, false, 0, 300, true, /*chunked=*/false)) == parakeet_strategy::SINGLE_PASS);
+    REQUIRE(parakeet_effective_single_pass_cap_s(mk(231, false, false, 0, 300, true, false), false) == 300);
+}
+
+TEST_CASE("an explicit threshold or chunk length wins over the bounded cap", "[unit][parakeet-strategy][issue-350]") {
+    // CRISPASR_PARAKEET_STREAM_THRESHOLD=200 stays 200 even for a chunked call.
+    REQUIRE(parakeet_effective_single_pass_cap_s(mk(231, false, false, 0, 200, true, true), /*from_env=*/true) == 200);
+    REQUIRE(route(mk(231, false, false, 0, 200, true, true), true) == parakeet_strategy::LONGFORM);
+    // An explicit chunk length routes to CHUNK_SEGMENTED before any cap.
+    REQUIRE(route(mk(231, false, true, 20, 300, true, true)) == parakeet_strategy::CHUNK_SEGMENTED);
+    // Threshold 0 (always-streamed) is not "raised" to the bounded window.
+    REQUIRE(parakeet_effective_single_pass_cap_s(mk(231, false, false, 0, 0, false, true), false) == 0);
+    REQUIRE(route(mk(231, false, false, 0, 0, false, true)) == parakeet_strategy::STREAMED);
+}
+
+TEST_CASE("JA chunked request keeps the JA routing", "[unit][parakeet-strategy][issue-350]") {
+    // JA passes longform=false, so above its 12 s window it streams as before.
+    REQUIRE(route(mk(231, true, false, 0, 12, false, true)) == parakeet_strategy::STREAMED);
+    REQUIRE(route(mk(8, true, false, 0, 12, false, true)) == parakeet_strategy::SINGLE_PASS);
+}
+
+// ---- Issue #350: gap detection (the repair pass's decision) ----
+
+namespace {
+using iv = std::pair<int64_t, int64_t>;
+} // namespace
+
+TEST_CASE("a hole in the word timeline is found, ordinary pauses are not", "[unit][parakeet-strategy][issue-350]") {
+    // Words up to 100 cs, then nothing until 5000 cs, then words to 6000 cs.
+    const std::vector<iv> covered = {{0, 50}, {50, 100}, {5000, 5500}, {5500, 6000}};
+    const auto gaps = parakeet_find_gaps(covered, 0, 6000, /*min_gap*/ 300, /*slop*/ 30, /*max_window*/ 0);
+    REQUIRE(gaps.size() == 1);
+    CHECK(gaps[0].first == 100);
+    CHECK(gaps[0].second == 5000);
+
+    // The same timeline with a 2 s pause instead: below min_gap → no repair.
+    const std::vector<iv> paused = {{0, 50}, {50, 100}, {300, 500}};
+    CHECK(parakeet_find_gaps(paused, 0, 500, 300, 30, 3000).empty());
+}
+
+TEST_CASE("a long hole is split into reliable-window pieces", "[unit][parakeet-strategy][issue-350]") {
+    // 90 s hole, 30 s repair window → 3 pieces that tile it exactly.
+    const std::vector<iv> covered = {{0, 100}, {9100, 9200}};
+    const auto gaps = parakeet_find_gaps(covered, 0, 9200, 300, 30, 3000);
+    REQUIRE(gaps.size() == 3);
+    CHECK(gaps.front().first == 100);
+    CHECK(gaps.back().second == 9100);
+    for (size_t i = 0; i < gaps.size(); i++) {
+        CHECK(gaps[i].second - gaps[i].first <= 3000);
+        if (i)
+            CHECK(gaps[i].first == gaps[i - 1].second); // no seam left uncovered
+    }
+}
+
+TEST_CASE("gaps at the head and tail of the span count too", "[unit][parakeet-strategy][issue-350]") {
+    const std::vector<iv> covered = {{1000, 1100}};
+    const auto gaps = parakeet_find_gaps(covered, 0, 5000, 300, 30, 0);
+    REQUIRE(gaps.size() == 2);
+    CHECK(gaps[0] == iv{0, 1000});
+    CHECK(gaps[1] == iv{1100, 5000});
+}
+
+TEST_CASE("gap detection is safe on degenerate input", "[unit][parakeet-strategy][issue-350]") {
+    CHECK(parakeet_find_gaps({}, 0, 0, 300, 30, 3000).empty());       // empty span
+    CHECK(parakeet_find_gaps({}, 0, 5000, 0, 30, 3000).empty());      // min_gap 0 = off
+    CHECK(parakeet_find_gaps({}, 0, 5000, 300, 30, 3000).size() > 0); // no words at all → all gap
+    // Unsorted, overlapping input is normalized rather than trusted.
+    const std::vector<iv> messy = {{5000, 5500}, {0, 100}, {40, 60}};
+    const auto gaps = parakeet_find_gaps(messy, 0, 5500, 300, 30, 0);
+    REQUIRE(gaps.size() == 1);
+    CHECK(gaps[0] == iv{100, 5000});
 }
 
 // ---- Phase 2: memory policy ----

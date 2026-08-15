@@ -1516,7 +1516,7 @@ extern "C" void moss_tts_free(moss_tts_context* ctx) {
     if (ctx->kv_ctx)
         ggml_free(ctx->kv_ctx);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu)

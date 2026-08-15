@@ -152,7 +152,7 @@ surviving artifact. Applied on both the CLI and the session C-ABI.
 | `CRISPASR_TDT_BATCH` / `CRISPASR_RNNT_BATCH` | Batch the TDT / RNNT joint decode. |
 | `CRISPASR_RNNT_GGML_PERSTEP` | Per-step (vs. persistent-graph) ggml RNNT decode. |
 | `CRISPASR_NGRAM_LOOPFIX_OFF` | Disable the n-gram decode-loop breaker. |
-| `CRISPASR_GAP_FILL` / `_GAP_FILL_MIN_CS` | Gap-fill between segments (long audio). |
+| `CRISPASR_GAP_FILL` / `_GAP_FILL_MIN_CS` | Re-transcribe spans a first pass left empty (long audio); on by default for parakeet, threshold non-JA 300 cs / JA 100 cs. |
 
 ### G2P / phonemizer
 

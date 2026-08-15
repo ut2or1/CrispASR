@@ -1479,11 +1479,11 @@ void irodori_tts_free(struct irodori_tts_context* ctx) {
         return;
     ctx->dac_fc.free(); // FASTCONV baked-kernel buffer (on codec_backend)
     if (ctx->codec_buf)
-        ggml_backend_buffer_free(ctx->codec_buf);
+        core_gguf::release_weight_buffer(ctx->codec_buf);
     if (ctx->codec_ctx)
         ggml_free(ctx->codec_ctx);
     if (ctx->buf_weights)
-        ggml_backend_buffer_free(ctx->buf_weights);
+        core_gguf::release_weight_buffer(ctx->buf_weights);
     if (ctx->w_ctx)
         ggml_free(ctx->w_ctx);
     if (ctx->dit_galloc) // §243 persistent DiT graph

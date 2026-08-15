@@ -2844,7 +2844,7 @@ extern "C" int kokoro_load_voice_pack(struct kokoro_context* ctx, const char* pa
 
         // Replace any previously-loaded pack.
         if (ctx->vp.vp_buf_w)
-            ggml_backend_buffer_free(ctx->vp.vp_buf_w);
+            core_gguf::release_weight_buffer(ctx->vp.vp_buf_w);
         if (ctx->vp.vp_ctx_w)
             ggml_free(ctx->vp.vp_ctx_w);
         ctx->vp = std::move(vp);
@@ -2863,7 +2863,7 @@ extern "C" int kokoro_load_voice_pack(struct kokoro_context* ctx, const char* pa
     auto it = wl.tensors.find("voice.pack");
     if (it == wl.tensors.end() || !it->second) {
         fprintf(stderr, "kokoro: voice pack '%s' missing 'voice.pack' tensor\n", path);
-        ggml_backend_buffer_free(wl.buf);
+        core_gguf::release_weight_buffer(wl.buf);
         ggml_free(wl.ctx);
         return -1;
     }
@@ -3621,7 +3621,7 @@ extern "C" void kokoro_free(struct kokoro_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->vp.vp_buf_w)
-        ggml_backend_buffer_free(ctx->vp.vp_buf_w);
+        core_gguf::release_weight_buffer(ctx->vp.vp_buf_w);
     if (ctx->vp.vp_ctx_w)
         ggml_free(ctx->vp.vp_ctx_w);
     if (ctx->buf_perm)
@@ -3629,7 +3629,7 @@ extern "C" void kokoro_free(struct kokoro_context* ctx) {
     if (ctx->ctx_perm)
         ggml_free(ctx->ctx_perm);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)

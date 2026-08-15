@@ -123,9 +123,10 @@ std::string resolve_indextts_bigvgan(const std::string& model_spec, const std::s
         model_spec.compare(model_spec.size() - 5, 5, ".gguf") == 0) {
         return model_spec;
     }
-    return crispasr_cache::ensure_cached_file(
-        "indextts-bigvgan.gguf", "https://huggingface.co/cstr/indextts-1.5-GGUF/resolve/main/indextts-bigvgan.gguf",
-        quiet, "crispasr[diarize-embedder]", cache_dir);
+    return crispasr_managed_download("indextts-bigvgan.gguf",
+                                     "https://huggingface.co/cstr/indextts-1.5-GGUF/resolve/main/indextts-bigvgan.gguf",
+                                     "Apache-2.0 (see https://huggingface.co/IndexTeam/IndexTTS-1.5)", quiet,
+                                     "crispasr[diarize-embedder]", cache_dir);
 }
 
 } // namespace

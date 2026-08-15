@@ -804,7 +804,7 @@ extern "C" void lid_cld3_free(lid_cld3_context* ctx) {
     if (!ctx)
         return;
     if (ctx->buf)
-        ggml_backend_buffer_free(ctx->buf);
+        core_gguf::release_weight_buffer(ctx->buf);
     if (ctx->gctx)
         ggml_free(ctx->gctx);
     delete ctx;

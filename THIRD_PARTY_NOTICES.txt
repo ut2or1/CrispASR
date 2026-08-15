@@ -474,3 +474,47 @@ runtime and the clustering stack are independent implementations written from
 the published architecture and algorithms; the upstream packages are used only
 as measurement oracles by the reference dumper, never vendored or linked.
 
+────────────────────────────────────────────────────────────────────────────────
+Managed model-weight policy — additional Hugging Face sources
+────────────────────────────────────────────────────────────────────────────────
+
+The following supported downloads are conversions of the upstream model cards;
+their upstream terms apply to the weights and any redistribution of them:
+
+  NVIDIA Parakeet, Canary, FastConformer and FastPitch
+    CC-BY-4.0. Sources include:
+    https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
+    Attribution is required; commercial use is permitted by that license.
+
+  OuteAI/OuteTTS-0.3-1B
+    CC-BY-NC-SA-4.0 (non-commercial, ShareAlike):
+    https://huggingface.co/OuteAI/OuteTTS-0.3-1B
+
+  Kyutai Pocket TTS
+    CC-BY-4.0 with Hugging Face gated access and upstream acceptable-use
+    conditions, including restrictions on voice impersonation/cloning and
+    deceptive or harmful use:
+    https://huggingface.co/kyutai/pocket-tts
+
+  Facebook fastText language identification (LID-176)
+    CC-BY-NC-4.0 (non-commercial):
+    https://huggingface.co/facebook/fasttext-language-identification
+
+  LiquidAI LFM2.5-Audio
+    LFM Open License v1.0, with additional component notices described by the
+    upstream card:
+    https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B
+
+  Llama-based TTS weights (TADA, Orpheus and related variants)
+    These conversions contain or derive from Llama 3.2 materials. The Llama
+    3.2 Community License, attribution and acceptable-use terms apply; the
+    downstream GGUF card's Apache label does not remove those upstream terms.
+    Sources include:
+    https://huggingface.co/HumeAI/tada-3b-ml
+    https://huggingface.co/canopylabs/orpheus-3b-0.1-ft
+
+  FunASR / SenseVoice / Paraformer and Google Gemma derivatives
+    These remain subject to their upstream custom terms. CrispASR marks them
+    as restricted and requires an explicit acceptance tag before managed
+    auto-download; see the original model cards and licenses linked by the
+    respective entries in the model registry.

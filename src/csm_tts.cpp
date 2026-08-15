@@ -296,7 +296,7 @@ struct csm_tts_context {
         if (model.ctx_perm)
             ggml_free(model.ctx_perm);
         if (model.buf_w)
-            ggml_backend_buffer_free(model.buf_w);
+            core_gguf::release_weight_buffer(model.buf_w);
         if (model.ctx_w)
             ggml_free(model.ctx_w);
         if (backend && backend != backend_cpu)

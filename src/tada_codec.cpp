@@ -1052,7 +1052,7 @@ void tada_codec_free(struct tada_codec_context* ctx) {
     if (ctx->ctx_perm)
         ggml_free(ctx->ctx_perm);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->owns_backend) {

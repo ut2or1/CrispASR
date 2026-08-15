@@ -826,7 +826,7 @@ void piano_transcription_free(struct piano_transcription_ctx* ctx) {
     if (!ctx)
         return;
     if (ctx->w_buf)
-        ggml_backend_buffer_free(ctx->w_buf);
+        core_gguf::release_weight_buffer(ctx->w_buf);
     if (ctx->w_ctx)
         ggml_free(ctx->w_ctx);
     if (ctx->backend)

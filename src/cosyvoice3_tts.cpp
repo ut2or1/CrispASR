@@ -1249,26 +1249,26 @@ extern "C" void cosyvoice3_tts_free(struct cosyvoice3_tts_context* ctx) {
     if (ctx->cpu_gallocr)
         ggml_gallocr_free(ctx->cpu_gallocr);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->buf_w_cpu)
-        ggml_backend_buffer_free(ctx->buf_w_cpu);
+        core_gguf::release_weight_buffer(ctx->buf_w_cpu);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->flow.buf_w)
-        ggml_backend_buffer_free(ctx->flow.buf_w);
+        core_gguf::release_weight_buffer(ctx->flow.buf_w);
     if (ctx->flow.ctx_w)
         ggml_free(ctx->flow.ctx_w);
     ctx->hift.hift_fc.free(); // FASTCONV baked kernels (before the backend is freed)
     if (ctx->hift.buf_w)
-        ggml_backend_buffer_free(ctx->hift.buf_w);
+        core_gguf::release_weight_buffer(ctx->hift.buf_w);
     if (ctx->hift.ctx_w)
         ggml_free(ctx->hift.ctx_w);
     if (ctx->s3tok.buf_w)
-        ggml_backend_buffer_free(ctx->s3tok.buf_w);
+        core_gguf::release_weight_buffer(ctx->s3tok.buf_w);
     if (ctx->s3tok.ctx_w)
         ggml_free(ctx->s3tok.ctx_w);
     if (ctx->campplus.buf_w)
-        ggml_backend_buffer_free(ctx->campplus.buf_w);
+        core_gguf::release_weight_buffer(ctx->campplus.buf_w);
     if (ctx->campplus.ctx_w)
         ggml_free(ctx->campplus.ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)

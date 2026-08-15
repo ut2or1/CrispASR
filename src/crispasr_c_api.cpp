@@ -56,6 +56,7 @@
 #include "core/beam_decode.h"         // Shared autoregressive beam-search decode helper
 #include "core/greedy_decode.h"       // Shared autoregressive greedy decode helper
 #include "core/lang_names.h"          // Shared ISO-639-1 → English language-name map
+#include "core/tts_lang.h"            // Chatterbox cross-lingual clone predicate
 #include "core/ngram_loop_fix.h"      // core_ngram::fix_loops (issue #218, mirrors CLI adapters)
 #include "core/crispasr_c2pa.h"       // C2PA Content Credentials signing (shared with CLI; #260)
 #include "core/crispasr_wav_writer.h" // WAV container + AI-provenance INFO tag (interop floor)
@@ -1587,8 +1588,9 @@ struct crispasr_session {
     // from source_language, which for TTS already serves as the output-language
     // fallback when target_language is unset.
     std::string tts_reference_language;
-    bool punctuation = true; // canary/cohere per-call arg + post-process gate
-    bool translate = false;  // whisper sticky --translate (others: use src/tgt mismatch)
+    bool punctuation = true;              // canary/cohere per-call arg + post-process gate
+    bool translate = false;               // whisper sticky --translate (others: use src/tgt mismatch)
+    bool chatterbox_cfg_explicit = false; // preserve caller override over auto cross-lingual CFG
 
     // Acoustic language detected by the last transcribe (whisper only —
     // whisper_full_lang_id → whisper_lang_str, an ISO-639-1 code). Set on
@@ -5306,11 +5308,21 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             const char* e = getenv("CRISPASR_SESSION_UNIFIED_DISPATCH");
             return !(e && e[0] == '0'); // default on; only an explicit "0" disables
         }();
-        if (_unified) {
-            const bool is_ja = parakeet_vocab_is_japanese(s->parakeet_ctx) != 0;
+        const bool is_ja = parakeet_vocab_is_japanese(s->parakeet_ctx) != 0;
+        // The shared orchestrator owns the non-JA long-form repair from #350.
+        // Keep JA on the established slice/gap-fill path until that path is
+        // deliberately hoisted too; routing JA through the generic streamed
+        // branch loses the interior-content guarantee from issue #89.
+        if (_unified && !is_ja) {
             parakeet_orchestrate_opts oo;
             oo.chunk_seconds_explicit = s->parakeet_force_chunk_seconds > 0;
             oo.chunk_seconds = s->parakeet_force_chunk_seconds > 0 ? s->parakeet_force_chunk_seconds : 0;
+            // Issue #350: >= 0 means the caller came through
+            // crispasr_session_transcribe_chunked[_lang]; 0 is its documented
+            // "use per-model defaults", NOT "not chunked". Collapsing the two
+            // would route an explicitly chunked long-form request to one
+            // unbounded full-length pass.
+            oo.chunked_requested = s->parakeet_force_chunk_seconds >= 0;
             oo.chunk_overlap_seconds =
                 s->parakeet_force_overlap_seconds >= 0 ? (float)s->parakeet_force_overlap_seconds : 2.0f;
             oo.no_prints = false;
@@ -5483,7 +5495,6 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         // JA-model detection matches the CLI adapter (is_ja_model_). Issue #257:
         // detect by vocab CONTENT, not size — small-vocab English models
         // (parakeet-tdt-1.1b, vocab 1024) were misclassified as Japanese.
-        const bool is_ja = parakeet_vocab_is_japanese(s->parakeet_ctx) != 0;
         int chunk_s = 20;       // non-JA overlapping-window length (s)
         int overlap_s = 8;      // window overlap (s)
         int stream_chunk_s = 0; // JA streamed window (s); 0 = library per-model default
@@ -8735,6 +8746,16 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
 #endif
 #ifdef CA_HAVE_CHATTERBOX
     if (s->chatterbox_ctx) {
+        const std::string output_lang = !s->target_language.empty() ? s->target_language : s->source_language;
+        chatterbox_set_language((chatterbox_context*)s->chatterbox_ctx,
+                                (!output_lang.empty() && output_lang != "auto") ? output_lang.c_str() : nullptr);
+        if (!s->chatterbox_cfg_explicit && core_tts_lang::is_cross_lingual(output_lang, s->tts_reference_language)) {
+            chatterbox_set_cfg_weight((chatterbox_context*)s->chatterbox_ctx, 0.0f);
+        } else if (!s->chatterbox_cfg_explicit) {
+            // Sessions are persistent: restore the upstream default after a
+            // prior cross-lingual request.
+            chatterbox_set_cfg_weight((chatterbox_context*)s->chatterbox_ctx, 0.5f);
+        }
         return chatterbox_synthesize(s->chatterbox_ctx, text, out_n_samples);
     }
 #endif
@@ -11316,6 +11337,7 @@ CA_EXPORT int crispasr_session_set_cfg_weight(crispasr_session* s, float cfg_wei
 #ifdef CA_HAVE_CHATTERBOX
     if (s->chatterbox_ctx) {
         chatterbox_set_cfg_weight((chatterbox_context*)s->chatterbox_ctx, cfg_weight);
+        s->chatterbox_cfg_explicit = true;
         touched++;
     }
 #endif

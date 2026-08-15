@@ -1020,7 +1020,7 @@ int dia_tts_set_codec_path(struct dia_tts_context* ctx, const char* path) {
     if (!dia_load_dac_weights(m, wl.tensors, verbosity)) {
         fprintf(stderr, "dia_tts: failed to map DAC codec tensors\n");
         if (wl.buf)
-            ggml_backend_buffer_free(wl.buf);
+            core_gguf::release_weight_buffer(wl.buf);
         if (wl.ctx)
             ggml_free(wl.ctx);
         return -1;
@@ -2170,7 +2170,7 @@ void dia_tts_free(struct dia_tts_context* ctx) {
         ggml_backend_buffer_free(ctx->buf_output);
     }
     if (ctx->model.buf_w) {
-        ggml_backend_buffer_free(ctx->model.buf_w);
+        core_gguf::release_weight_buffer(ctx->model.buf_w);
     }
     if (ctx->model.ctx_w) {
         ggml_free(ctx->model.ctx_w);
@@ -2182,7 +2182,7 @@ void dia_tts_free(struct dia_tts_context* ctx) {
         ggml_free(ctx->model.ctx_perm);
     }
     if (ctx->model.buf_dac) {
-        ggml_backend_buffer_free(ctx->model.buf_dac);
+        core_gguf::release_weight_buffer(ctx->model.buf_dac);
     }
     if (ctx->model.ctx_dac) {
         ggml_free(ctx->model.ctx_dac);

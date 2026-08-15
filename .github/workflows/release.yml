@@ -296,7 +296,6 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_CUDA=ON \
             -DGGML_OPENBLAS=ON \
-            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=ON \
@@ -385,7 +384,6 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_CUDA=ON \
             -DGGML_OPENBLAS=ON \
-            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120a-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=ON \
@@ -473,7 +471,6 @@ jobs:
             -DCMAKE_C_COMPILER=hipcc \
             -DCMAKE_CXX_COMPILER=hipcc \
             -DAMDGPU_TARGETS="gfx906;gfx908;gfx90a;gfx1030;gfx1035;gfx1100;gfx1101;gfx1102;gfx1201" \
-            -DGGML_NATIVE=OFF \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=ON \
             -DCRISPASR_BUILD_SERVER=OFF \
@@ -561,7 +558,6 @@ jobs:
             -DCMAKE_C_COMPILER=hipcc \
             -DCMAKE_CXX_COMPILER=hipcc \
             -DAMDGPU_TARGETS="gfx906;gfx908;gfx90a;gfx1030;gfx1035;gfx1100;gfx1101;gfx1102;gfx1201" \
-            -DGGML_NATIVE=OFF \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
             -DCRISPASR_BUILD_SERVER=OFF \
@@ -658,7 +654,6 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_VULKAN=ON \
             -DGGML_OPENBLAS=ON \
-            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=ON \
             -DCRISPASR_BUILD_SERVER=OFF \
@@ -1486,8 +1481,6 @@ jobs:
             -DCRISPASR_BUILD_SERVER=OFF ^
             -DGGML_VULKAN=ON ^
             -DGGML_CUDA=OFF ^
-            -DGGML_NATIVE=OFF ^
-            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build-libs --config Release -j %NUMBER_OF_PROCESSORS% --target crispasr-lib
 
@@ -1587,7 +1580,6 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_CUDA=ON \
-            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
@@ -1682,8 +1674,6 @@ jobs:
             -DCRISPASR_BUILD_SERVER=OFF ^
             -DGGML_CUDA=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual" ^
-            -DGGML_NATIVE=OFF ^
-            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build-libs --config Release -j %NUMBER_OF_PROCESSORS% --target crispasr-lib
 
@@ -1743,12 +1733,10 @@ jobs:
           files: release/libcrispasr-windows-x86_64-cuda.tar.gz
           fail_on_unmatched_files: true
 
-  # ── Windows x86_64 shared libs + headers (CPU legacy SSE4.2) ─────────────────
-  # For dev hosts on pre-Haswell CPUs (Sandy/Ivy Bridge i5/i7-3xxx, AMD
-  # pre-Excavator). Same layout as build-libs-windows-x86_64 but built
-  # with -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF. Symptoms of
-  # using the wrong build on a legacy host: silent instant exit
-  # (STATUS_ILLEGAL_INSTRUCTION) with no error message.
+  # ── Windows x86_64 shared libs + headers (generic CPU legacy) ────────────────
+  # Generic x86-64/SSE2 floor for Westmere-era workstations and newer. Keep the
+  # full optional-ISA set controlled by CRISPASR_PORTABLE_CPU: GGML_NATIVE=OFF
+  # alone silently defaults AVX/BMI2 and is not portable (#261/#302).
   build-libs-windows-x86_64-cpu-legacy:
     if: ${{ !inputs.only || inputs.only == 'build-libs-windows-x86_64-cpu-legacy' }}
     runs-on: windows-latest
@@ -1758,7 +1746,7 @@ jobs:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
 
-      - name: Build (shared libs, CPU legacy SSE4.2)
+      - name: Build (shared libs, generic CPU legacy)
         run: |
           cmake -S . -B build-libs `
             -DCMAKE_BUILD_TYPE=Release `
@@ -1766,9 +1754,7 @@ jobs:
             -DCRISPASR_BUILD_TESTS=OFF `
             -DCRISPASR_BUILD_EXAMPLES=OFF `
             -DCRISPASR_BUILD_SERVER=OFF `
-            -DGGML_NATIVE=OFF `
-            -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF `
-            -DGGML_AVX=ON `
+            -DCRISPASR_PORTABLE_CPU=ON `
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build-libs --config Release -j $env:NUMBER_OF_PROCESSORS --target crispasr-lib
 
@@ -1868,10 +1854,10 @@ jobs:
           files: release/crispasr-windows-x86_64-cpu.zip
           fail_on_unmatched_files: true
 
-  # ── Windows CPU legacy (SSE4.2 — Sandy Bridge/2011+, no AVX2/FMA/F16C) ───────
-  # For CPUs that predate Haswell: Ivy Bridge (i5-3xxx, i7-3xxx), Sandy Bridge,
-  # AMD pre-Excavator. Symptoms of using the wrong build: silent instant exit
-  # (STATUS_ILLEGAL_INSTRUCTION) with no error message.
+  # ── Windows CPU legacy (generic x86-64/SSE2) ────────────────────────────────
+  # For Westmere-era workstations and newer. The old "SSE4.2" job actually set
+  # GGML_AVX=ON and left BMI2 to ggml's default, so it could still SIGILL on the
+  # machines its name promised to support (#261/#302).
   build-windows-cpu-legacy:
     if: ${{ !inputs.only || inputs.only == 'build-windows-cpu-legacy' }}
     runs-on: windows-latest
@@ -1886,9 +1872,7 @@ jobs:
           cmake -S . -B build `
             -DCMAKE_BUILD_TYPE=Release `
             -DBUILD_SHARED_LIBS=OFF `
-            -DGGML_NATIVE=OFF `
-            -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF `
-            -DGGML_AVX=ON `
+            -DCRISPASR_PORTABLE_CPU=ON `
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --config Release --target crispasr-cli crispasr-quantize -j $env:NUMBER_OF_PROCESSORS
 
@@ -1956,37 +1940,85 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_CUDA=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual" ^
-            -DGGML_NATIVE=OFF ^
-            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j %NUMBER_OF_PROCESSORS%
 
-      - name: Package (binary + DLLs + CUDA runtime)
+      - name: Package (complete and split CUDA assets)
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force release\crispasr-windows-x86_64-cuda | Out-Null
-          Copy-Item build\bin\crispasr.exe          release\crispasr-windows-x86_64-cuda\
-          Copy-Item build\bin\crispasr-quantize.exe release\crispasr-windows-x86_64-cuda\
-          Get-ChildItem build\bin\*.dll | Where-Object { $_.Name -notlike 'Catch2*' } |
-            Copy-Item -Destination release\crispasr-windows-x86_64-cuda\
-          Copy-Item "$env:CUDA_PATH\bin\cudart64_*.dll"   release\crispasr-windows-x86_64-cuda\ -ErrorAction SilentlyContinue
-          Copy-Item "$env:CUDA_PATH\bin\cublas64_*.dll"   release\crispasr-windows-x86_64-cuda\ -ErrorAction SilentlyContinue
-          Copy-Item "$env:CUDA_PATH\bin\cublasLt64_*.dll" release\crispasr-windows-x86_64-cuda\ -ErrorAction SilentlyContinue
-          Copy-Item LICENSE release\crispasr-windows-x86_64-cuda\
-          Copy-Item THIRD_PARTY_NOTICES.txt release\crispasr-windows-x86_64-cuda\
-          Compress-Archive -Path release\crispasr-windows-x86_64-cuda -DestinationPath release\crispasr-windows-x86_64-cuda.zip -CompressionLevel Optimal
+          $full = "release\crispasr-windows-x86_64-cuda"
+          $split = "release\crispasr-windows-x86_64-cuda-non-cuda"
+          $runtime = "release\cuda-runtime"
+          New-Item -ItemType Directory -Force $full, $split, $runtime | Out-Null
+
+          # Keep the complete archive as the one-click/self-contained install.
+          Copy-Item build\bin\crispasr.exe          $full\
+          Copy-Item build\bin\crispasr-quantize.exe $full\
+          $appDlls = Get-ChildItem build\bin\*.dll | Where-Object { $_.Name -notlike 'Catch2*' }
+          $appDlls | Copy-Item -Destination $full\
+
+          $cudaDlls = @(
+            Get-ChildItem "$env:CUDA_PATH\bin\cudart64_*.dll"
+            Get-ChildItem "$env:CUDA_PATH\bin\cublas64_*.dll"
+            Get-ChildItem "$env:CUDA_PATH\bin\cublasLt64_*.dll"
+          )
+          if ($cudaDlls.Count -ne 3) {
+            throw "Expected exactly three CUDA runtime DLLs (cudart, cublas, cublasLt), found $($cudaDlls.Count)"
+          }
+          $cudaDlls | Copy-Item -Destination $full
+          $cudaDlls | Copy-Item -Destination $runtime
+
+          Copy-Item LICENSE $full\
+          Copy-Item THIRD_PARTY_NOTICES.txt $full\
+          Compress-Archive -Path $full -DestinationPath release\crispasr-windows-x86_64-cuda.zip -CompressionLevel Optimal
+
+          # The split archive contains the executable and CrispASR DLLs, but
+          # deliberately omits the three CUDA runtime DLLs below. Users can
+          # install these beside the executable, or use the complete archive.
+          Copy-Item build\bin\crispasr.exe          $split\
+          Copy-Item build\bin\crispasr-quantize.exe $split\
+          $appDlls | Where-Object {
+            $_.Name -notmatch '^(cudart|cublas|cublasLt)64_.*\.dll$'
+          } | Copy-Item -Destination $split\
+          @'
+          This archive intentionally excludes the CUDA runtime DLLs.
+          For a self-contained install, use crispasr-windows-x86_64-cuda.zip.
+          For an incremental install, copy the three separate *64_*.dll release assets
+          into this directory: cudart64_*.dll, cublas64_*.dll, and cublasLt64_*.dll.
+          '@ | Set-Content $split\README-CUDA.txt
+          Copy-Item LICENSE $split\
+          Copy-Item THIRD_PARTY_NOTICES.txt $split\
+          Compress-Archive -Path $split -DestinationPath release\crispasr-windows-x86_64-cuda-non-cuda.zip -CompressionLevel Optimal
+
+          $hashLines = $cudaDlls | ForEach-Object {
+            $hash = (Get-FileHash (Join-Path $runtime $_.Name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          }
+          $hashLines | Set-Content release\crispasr-windows-x86_64-cuda-runtime-sha256.txt
 
       - uses: actions/upload-artifact@v4
         with:
           name: crispasr-windows-x86_64-cuda
           path: release/crispasr-windows-x86_64-cuda.zip
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-windows-x86_64-cuda-split
+          path: |
+            release/crispasr-windows-x86_64-cuda-non-cuda.zip
+            release/cuda-runtime/*.dll
+            release/crispasr-windows-x86_64-cuda-runtime-sha256.txt
+
       - name: Attach crispasr-windows-x86_64-cuda.zip to release
         if: inputs.tag != '' || startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
-          files: release/crispasr-windows-x86_64-cuda.zip
+          files: |
+            release/crispasr-windows-x86_64-cuda.zip
+            release/crispasr-windows-x86_64-cuda-non-cuda.zip
+            release/cuda-runtime/*.dll
+            release/crispasr-windows-x86_64-cuda-runtime-sha256.txt
           fail_on_unmatched_files: true
 
   # ── Windows Vulkan (dynamic, works on NVIDIA/AMD/Intel with a Vulkan driver) ─
@@ -2019,8 +2051,6 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_VULKAN=ON ^
             -DGGML_CUDA=OFF ^
-            -DGGML_NATIVE=OFF ^
-            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j %NUMBER_OF_PROCESSORS%
 

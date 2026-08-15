@@ -308,7 +308,7 @@ void beatrice_phone_free(beatrice_phone_context* c) {
     if (!c)
         return;
     if (c->buf_w)
-        ggml_backend_buffer_free(c->buf_w);
+        core_gguf::release_weight_buffer(c->buf_w);
     if (c->ctx_w)
         ggml_free(c->ctx_w);
     if (c->backend)

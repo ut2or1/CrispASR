@@ -2103,7 +2103,7 @@ void cohere_free(struct cohere_context* ctx) {
     if (ctx->kv_buf)
         ggml_backend_buffer_free(ctx->kv_buf);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->ggml_backend)
         ggml_backend_free(ctx->ggml_backend);
     if (ctx->ggml_backend_cpu && ctx->ggml_backend_cpu != ctx->ggml_backend)

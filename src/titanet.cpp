@@ -688,7 +688,7 @@ extern "C" void titanet_free(struct titanet_context* ctx) {
     if (ctx->weight_ctx)
         ggml_free(ctx->weight_ctx);
     if (ctx->buf)
-        ggml_backend_buffer_free(ctx->buf);
+        core_gguf::release_weight_buffer(ctx->buf);
     if (ctx->backend)
         ggml_backend_free(ctx->backend);
     delete ctx;

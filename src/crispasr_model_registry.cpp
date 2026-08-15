@@ -26,7 +26,7 @@ struct Entry {
     const char* companion_file; // optional extra file (e.g. tokenizer.bin, primary voice). NULL if none.
     const char* companion_url;
     const char* companion_size; // size of the companion file; NULL = falls back to approx_size
-    const char* license;        // NULL = permissive (MIT/Apache/etc.), non-NULL = printed to stderr on download
+    const char* license;        // NULL = permissive; otherwise SPDX-ish tag + source/license URL
 };
 
 // Extra companion files beyond the single inline `companion_file/url` slot.
@@ -87,16 +87,16 @@ constexpr Entry k_registry[] = {
     // redistribution requires attribution (see THIRD_PARTY_NOTICES.txt).
     {"wespeaker", "wespeaker-resnet34-lm.gguf",
      "https://huggingface.co/cstr/wespeaker-resnet34-lm-GGUF/resolve/main/wespeaker-resnet34-lm.gguf", "~24 MB",
-     nullptr, nullptr},
+     nullptr, nullptr, nullptr, "CC-BY-4.0 (weights; attribution required; see https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM)"},
     {"nemotron", "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
      "https://huggingface.co/cstr/nemotron-3.5-asr-streaming-0.6b-GGUF/resolve/main/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
      "~458 MB", nullptr, nullptr},
     {"parakeet", "parakeet-tdt-0.6b-v3-q4_k.gguf",
-     "https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF/resolve/main/parakeet-tdt-0.6b-v3-q4_k.gguf", "~467 MB", nullptr, nullptr},
+     "https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF/resolve/main/parakeet-tdt-0.6b-v3-q4_k.gguf", "~467 MB", nullptr, nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)"},
     {"canary", "canary-1b-v2-q4_k.gguf",
-     "https://huggingface.co/cstr/canary-1b-v2-GGUF/resolve/main/canary-1b-v2-q4_k.gguf", "~600 MB", nullptr, nullptr},
+     "https://huggingface.co/cstr/canary-1b-v2-GGUF/resolve/main/canary-1b-v2-q4_k.gguf", "~600 MB", nullptr, nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/nvidia/canary-1b-v2)"},
     {"canary-qwen", "canary-qwen-2.5b-q8_0.gguf",
-     "https://huggingface.co/cstr/canary-qwen-2.5b-GGUF/resolve/main/canary-qwen-2.5b-q8_0.gguf", "~4.1 GB", nullptr, nullptr},
+     "https://huggingface.co/cstr/canary-qwen-2.5b-GGUF/resolve/main/canary-qwen-2.5b-q8_0.gguf", "~4.1 GB", nullptr, nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/nvidia/canary-qwen-2.5b)"},
     // AutoArk-AI/ARK-ASR-3B: Whisper-RoPE encoder + Qwen2.5-3B decoder (19-lang).
     // NOTE: GGUF repo to be published (PLAN §ARK) — placeholder URL.
     {"ark-asr", "ark-asr-3b-q4_k.gguf",
@@ -107,13 +107,13 @@ constexpr Entry k_registry[] = {
     {"lfm2-audio", "lfm2-audio-1.5b-q5_k.gguf",
      "https://huggingface.co/cstr/lfm2-audio-1.5b-GGUF/resolve/main/lfm2-audio-1.5b-q5_k.gguf",
      "~1.6 GB", nullptr, nullptr, nullptr,
-     "LFM Open License v1.0 (commercial use OK under $10M revenue; see "
+     "lfm1.0 (commercial use threshold and attribution; see "
      "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B)"},
     // Japanese variant — Q5_K minimum (Q4_K produces 0 tokens on hybrid backbone).
     {"lfm2-audio", "lfm2-audio-1.5b-jp-q5_k.gguf",
      "https://huggingface.co/cstr/lfm2-audio-1.5b-jp-GGUF/resolve/main/lfm2-audio-1.5b-jp-q5_k.gguf",
      "~1.5 GB", nullptr, nullptr, nullptr,
-     "LFM Open License v1.0 (commercial use OK under $10M revenue; see "
+     "lfm1.0 (commercial use threshold and attribution; see "
      "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP)"},
     // gpt-omni/mini-omni2: Whisper-small + Qwen2-0.5B multimodal (ASR+TTS+S2S).
     // Q4_K is safe — identical ASR transcript to F16 on JFK 11s.
@@ -173,7 +173,7 @@ constexpr Entry k_registry[] = {
      // single-token "!-loop" on GPU. Q8_0 takes the MMQ/MMVQ path (per-block
      // scales, F32-range activations) so it's correct on CUDA too, and it's
      // ~half the download. Q8_0 is byte-identical to F16 on CPU/Metal.
-     "FunASR Model License v1.1 (commercial use OK with attribution; see "
+     "funasr-v1.1 (commercial use OK with attribution; see "
      "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512/blob/main/LICENSE)"},
     // Multilingual sibling — same architecture, 31 languages including
     // Korean, Vietnamese, Indonesian, Thai, Malay, Filipino, Arabic,
@@ -183,7 +183,7 @@ constexpr Entry k_registry[] = {
     {"fun-asr-mlt-nano", "funasr-mlt-nano-2512-f16.gguf",
      "https://huggingface.co/cstr/funasr-mlt-nano-GGUF/resolve/main/funasr-mlt-nano-2512-f16.gguf",
      "~1.98 GB", nullptr, nullptr, nullptr,
-     "FunASR Model License v1.1 (commercial use OK with attribution; see "
+     "funasr-v1.1 (commercial use OK with attribution; see "
      "https://huggingface.co/FunAudioLLM/Fun-ASR-MLT-Nano-2512/blob/main/LICENSE)"},
     // FunAudioLLM/SenseVoiceSmall: encoder-only multi-task ASR — same
     // SANM encoder body as Fun-ASR-Nano but with a CTC head emitting
@@ -196,7 +196,7 @@ constexpr Entry k_registry[] = {
     {"sensevoice", "sensevoice-small-q4_k.gguf",
      "https://huggingface.co/cstr/sensevoice-small-GGUF/resolve/main/sensevoice-small-q4_k.gguf",
      "~129 MB", nullptr, nullptr, nullptr,
-     "FunASR Model License v1.1 (commercial use OK with attribution; see "
+     "funasr-v1.1 (commercial use OK with attribution; see "
      "https://huggingface.co/FunAudioLLM/SenseVoiceSmall/blob/main/LICENSE)"},
     // F16 + Q8_0 lookups by canonical filename (auto-download resolver
     // still routes here when the user passes the explicit filename or
@@ -204,29 +204,29 @@ constexpr Entry k_registry[] = {
     {"sensevoice", "sensevoice-small-f16.gguf",
      "https://huggingface.co/cstr/sensevoice-small-GGUF/resolve/main/sensevoice-small-f16.gguf",
      "~448 MB", nullptr, nullptr, nullptr,
-     "FunASR Model License v1.1 (commercial use OK with attribution; see "
+     "funasr-v1.1 (commercial use OK with attribution; see "
      "https://huggingface.co/FunAudioLLM/SenseVoiceSmall/blob/main/LICENSE)"},
     {"sensevoice", "sensevoice-small-q8_0.gguf",
      "https://huggingface.co/cstr/sensevoice-small-GGUF/resolve/main/sensevoice-small-q8_0.gguf",
      "~240 MB", nullptr, nullptr, nullptr,
-     "FunASR Model License v1.1 (commercial use OK with attribution; see "
+     "funasr-v1.1 (commercial use OK with attribution; see "
      "https://huggingface.co/FunAudioLLM/SenseVoiceSmall/blob/main/LICENSE)"},
     // Paraformer-zh: NAR-ASR, 220M params, zh+en character-level.
     // Q4_K default — byte-identical transcript to F16, 3.4× smaller.
     {"paraformer", "paraformer-zh-q4_k.gguf",
      "https://huggingface.co/cstr/paraformer-zh-GGUF/resolve/main/paraformer-zh-q4_k.gguf",
      "~123 MB", nullptr, nullptr, nullptr,
-     "FunASR Model License (commercial use OK with attribution; see "
+     "funasr-v1.1 (commercial use OK with attribution; see "
      "https://huggingface.co/funasr/paraformer-zh)"},
     {"paraformer", "paraformer-zh-f16.gguf",
      "https://huggingface.co/cstr/paraformer-zh-GGUF/resolve/main/paraformer-zh-f16.gguf",
      "~421 MB", nullptr, nullptr, nullptr,
-     "FunASR Model License (commercial use OK with attribution; see "
+     "funasr-v1.1 (commercial use OK with attribution; see "
      "https://huggingface.co/funasr/paraformer-zh)"},
     {"paraformer", "paraformer-zh-q8_0.gguf",
      "https://huggingface.co/cstr/paraformer-zh-GGUF/resolve/main/paraformer-zh-q8_0.gguf",
      "~227 MB", nullptr, nullptr, nullptr,
-     "FunASR Model License (commercial use OK with attribution; see "
+     "funasr-v1.1 (commercial use OK with attribution; see "
      "https://huggingface.co/funasr/paraformer-zh)"},
     {"cohere", "cohere-transcribe-q4_k.gguf",
      "https://huggingface.co/cstr/cohere-transcribe-03-2026-GGUF/resolve/main/cohere-transcribe-q4_k.gguf", "~550 MB", nullptr, nullptr},
@@ -500,7 +500,7 @@ constexpr Entry k_registry[] = {
      "~2 MB"},
     {"fastconformer-ctc", "stt-en-fastconformer-ctc-large-q4_k.gguf",
      "https://huggingface.co/cstr/stt-en-fastconformer-ctc-large-GGUF/resolve/main/stt-en-fastconformer-ctc-large-q4_k.gguf",
-     "~83 MB", nullptr, nullptr},
+     "~83 MB", nullptr, nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/nvidia/stt_en_fastconformer_ctc_large)"},
     // FastConformer-CTC models double as compact CTC forced aligners
     // (-am <name>): the GGUF arch tag is canary-ctc, so crispasr_aligner's
     // default dispatch loads them directly. The *-aligner-* aliases below
@@ -909,12 +909,12 @@ constexpr Entry k_registry[] = {
     // filename + URL (Q4_K / Q5_K / Q8_0 / F16); `--tts-codec-quant Q`
     // substitutes the S3Gen companion; both repos publish F16 / Q8_0 /
     // Q4_K for both halves.
-    {"chatterbox", "chatterbox-t3-q8_0.gguf",
-     "https://huggingface.co/cstr/chatterbox-GGUF/resolve/main/chatterbox-t3-q8_0.gguf",
-     "~880 MB",
-     "chatterbox-s3gen-q8_0.gguf",
-     "https://huggingface.co/cstr/chatterbox-GGUF/resolve/main/chatterbox-s3gen-q8_0.gguf",
-     "~627 MB"},
+    {"chatterbox", "chatterbox-v3-t3-q8_0.gguf",
+     "https://huggingface.co/cstr/chatterbox-GGUF/resolve/main/chatterbox-v3-t3-q8_0.gguf",
+     "~610 MB",
+     "chatterbox-v3-s3gen-q8_0.gguf",
+     "https://huggingface.co/cstr/chatterbox-GGUF/resolve/main/chatterbox-v3-s3gen-q8_0.gguf",
+     "~349 MB"},
     // Chatterbox-Turbo: distilled GPT-2 T3 (24L) + 2-step meanflow S3Gen.
     // Different architecture from base — runtime keys off
     // `chatterbox.t3.arch` ("kartoffelbox" branch handles GPT-2 T3 for
@@ -973,7 +973,7 @@ constexpr Entry k_registry[] = {
      "dots-tts-soar-vocoder-f16.gguf",
      "https://huggingface.co/cstr/dots-tts-soar-GGUF/resolve/main/dots-tts-soar-vocoder-f16.gguf",
      "~345 MB"},
-    // Pocket TTS: Kyutai's 100M continuous-latent AR TTS (24 kHz, MIT/CC-BY-4.0).
+    // Pocket TTS: Kyutai's 100M continuous-latent AR TTS (CC-BY-4.0 plus gated-use conditions).
     // Generates continuous 32-dim float vectors at 12.5 Hz via one-step LSD,
     // decoded by Mimi VAE to 24 kHz PCM. Single GGUF, no codec companion.
     // Voice cloning via --voice ref.wav (requires the -f16 variant with Mimi encoder).
@@ -990,9 +990,9 @@ constexpr Entry k_registry[] = {
      "~870 MB",
      "indextts-bigvgan.gguf",
      "https://huggingface.co/cstr/indextts-1.5-GGUF/resolve/main/indextts-bigvgan.gguf",
-     "~112 MB"},
+     "~112 MB", "Apache-2.0 (see https://huggingface.co/IndexTeam/IndexTTS-1.5)"},
     // OuteTTS 0.3 1B: OLMo-1B LLM + WavTokenizer single-codebook VQ-GAN.
-    // 24 kHz output, CC BY 4.0 license. Voice cloning via --voice <speaker.json>.
+    // 24 kHz output, CC-BY-NC-SA-4.0 model license. Voice cloning via --voice <speaker.json>.
     // Two-file setup: OLMo talker (Q8_0, ~1.3 GB) + WavTokenizer decoder (~130 MB).
     // Also available: F16 (~2.4 GB), Q5_K (~820 MB). Q8_0 recommended.
     {"outetts", "outetts-0.3-1b-q8_0.gguf",
@@ -1180,8 +1180,8 @@ constexpr Entry k_registry[] = {
     {"lid-glotlid", "glotlid-f16.gguf",
      "https://huggingface.co/cstr/glotlid-GGUF/resolve/main/glotlid-f16.gguf", "~250 MB", nullptr, nullptr},
     // Facebook LID-176 — fastText hierarchical-softmax, 176 ISO 639-1.
-    // CC-BY-SA-3.0 (viral). ~63 MB F16. Pick only if you need its
-    // specific 176-label space and accept the SA obligation.
+    // CC-BY-NC-4.0 (non-commercial). ~63 MB F16. Pick only if you need its
+    // specific 176-label space and accept the non-commercial restriction.
     {"lid-fasttext176", "fasttext-lid176-f16.gguf",
      "https://huggingface.co/cstr/fasttext-lid176-GGUF/resolve/main/fasttext-lid176-f16.gguf",
      "~63 MB", nullptr, nullptr},
@@ -1467,6 +1467,8 @@ std::string replace_tail_filename(const std::string& url, const std::string& old
     return url.substr(0, pos) + new_name + url.substr(pos + old_name.size());
 }
 
+static std::string effective_license(const Entry& e);
+
 void fill(CrispasrRegistryEntry& out, const Entry& e, const std::string& preferred_quant) {
     const std::string filename = apply_quant_to_filename(e.filename, preferred_quant);
     out.backend = e.backend;
@@ -1482,7 +1484,42 @@ void fill(CrispasrRegistryEntry& out, const Entry& e, const std::string& preferr
         out.companion_url.clear();
         out.companion_approx_size.clear();
     }
-    out.license = e.license ? e.license : "";
+    out.license = effective_license(e);
+}
+
+// A few families have many quant/alias rows. Keep their license metadata
+// attached to the family as a defensive backstop, so a newly added quant row
+// cannot silently become an unlicensed download merely because its author
+// forgot the final Entry field. Explicit Entry metadata always wins.
+static std::string effective_license(const Entry& e) {
+    if (e.license)
+        return e.license;
+    const std::string b = e.backend ? e.backend : "";
+    if (b == "parakeet" || b == "parakeet-ja" || b.rfind("parakeet-", 0) == 0 || b == "canary" || b == "canary-qwen" ||
+        b.rfind("fastconformer-", 0) == 0)
+        return "CC-BY-4.0 (see the original NVIDIA model card)";
+    if (b == "fastpitch")
+        return "CC-BY-4.0 (see the original model card)";
+    if (b == "outetts")
+        return "CC-BY-NC-SA-4.0 (see https://huggingface.co/OuteAI/OuteTTS-0.3-1B)";
+    if (b == "pocket-tts")
+        return "pocket-tts-terms (CC-BY-4.0 plus gated-use conditions; see https://huggingface.co/kyutai/pocket-tts)";
+    if (b == "lid-fasttext176")
+        return "CC-BY-NC-4.0 (see https://huggingface.co/facebook/fasttext-language-identification)";
+    if (b == "gemma4-e2b" || b == "gemma4-e4b")
+        return "gemma-terms (see https://ai.google.dev/gemma/terms)";
+    if (b == "tada" || b == "tada-1b" || b == "tada-tts-1b")
+        return "llama3.2 (see https://huggingface.co/HumeAI/tada-3b-ml/blob/main/LICENSE)";
+    if (b.rfind("orpheus", 0) == 0)
+        return "llama3.2 (see https://huggingface.co/unsloth/orpheus-3b-0.1-ft)";
+    if (b.rfind("lex-au-orpheus", 0) == 0 || b.rfind("kartoffel-orpheus", 0) == 0 || b.rfind("kartoffelbox", 0) == 0)
+        return "llama3.2 (see the upstream Orpheus model card)";
+    if (b == "lfm2-audio")
+        return "lfm1.0 (commercial use threshold and attribution; see "
+               "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B)";
+    if (b == "funasr" || b == "fun-asr-mlt-nano" || b == "sensevoice" || b == "paraformer")
+        return "funasr-v1.1 (attribution required; see the original FunAudioLLM model card)";
+    return "";
 }
 
 const ExtraCompanion* find_extras(const char* backend) {
@@ -1539,9 +1576,13 @@ static std::string license_tag(const std::string& lic) {
 static bool license_requires_acceptance_tag(const std::string& tag) {
     if (tag.rfind("cc-by-nc", 0) == 0)
         return true;
+    if (tag.rfind("cc-by-sa", 0) == 0)
+        return true;
     if (tag.rfind("llama", 0) == 0)
         return true;
-    static const char* restricted[] = {"gemma", "qwen-research", "mistral-ai-research", "lfm1.0", "other", nullptr};
+    static const char* restricted[] = {"gemma",  "gemma-terms",  "qwen-research", "mistral-ai-research",
+                                       "lfm1.0", "lfm-open-1.0", "funasr-v1.1",   "pocket-tts-terms",
+                                       "other",  nullptr};
     for (const char** p = restricted; *p; ++p)
         if (tag == *p)
             return true;
@@ -1589,16 +1630,6 @@ static bool license_gate_allows_download(const CrispasrRegistryEntry& e, const s
     else
         fprintf(stderr, "  Notice:  review the upstream model card for the full licence terms.\n");
 
-    if (isatty(fileno(stdin))) {
-        fprintf(stderr, "Download %s (%s) and accept this licence? [y/N] ", e.filename.c_str(), e.approx_size.c_str());
-        fflush(stderr);
-        int c = fgetc(stdin);
-        if (c == 'y' || c == 'Y')
-            return true;
-        fprintf(stderr, "crispasr: declined — not downloading.\n");
-        return false;
-    }
-
     fprintf(stderr,
             "crispasr: refusing to download without explicit licence acceptance.\n"
             "  Pass --accept-license %s (or set CRISPASR_ACCEPT_LICENSE=%s).\n"
@@ -1609,10 +1640,13 @@ static bool license_gate_allows_download(const CrispasrRegistryEntry& e, const s
 
 void print_license_note(const CrispasrRegistryEntry& e, bool quiet) {
     if (!quiet && !e.license.empty()) {
-        if (license_is_nc(e.license)) {
+        if (license_tag(e.license).rfind("cc-by-nc", 0) == 0) {
             fprintf(stderr,
                     "crispasr: WARNING: %s is licensed %s — NON-COMMERCIAL USE ONLY.\n"
                     "  By loading this model you confirm you will not use it for commercial purposes.\n",
+                    e.filename.c_str(), e.license.c_str());
+        } else if (license_is_nc(e.license)) {
+            fprintf(stderr, "crispasr: WARNING: %s is licensed %s — review and comply with the upstream terms.\n",
                     e.filename.c_str(), e.license.c_str());
         } else {
             fprintf(stderr, "crispasr: note: %s is licensed %s\n", e.filename.c_str(), e.license.c_str());
@@ -1634,6 +1668,19 @@ bool crispasr_license_accepted(const std::string& license, const std::string& ac
     return license_accepted(license, accepted);
 }
 
+std::string crispasr_managed_download(const std::string& filename, const std::string& url, const std::string& license,
+                                      bool quiet, const char* label, const std::string& cache_dir_override,
+                                      const std::string& accepted_license) {
+    CrispasrRegistryEntry artifact;
+    artifact.filename = filename;
+    artifact.url = url;
+    artifact.license = license;
+    if (!license_gate_allows_download(artifact, accepted_license))
+        return {};
+    print_license_note(artifact, quiet);
+    return crispasr_cache::ensure_cached_file(filename, url, quiet, label, cache_dir_override);
+}
+
 bool crispasr_registry_lookup(const std::string& backend, CrispasrRegistryEntry& out,
                               const std::string& preferred_quant) {
     const Entry* e = find_by_backend(backend);
@@ -1650,7 +1697,7 @@ bool crispasr_registry_default_bundle(const std::string& backend, CrispasrRegist
 
     out = {};
     out.backend = e->backend;
-    out.license = e->license ? e->license : "";
+    out.license = effective_license(*e);
     out.requires_license_acceptance = crispasr_license_requires_acceptance(out.license);
     out.artifacts.push_back(
         {CrispasrRegistryArtifactKind::Primary, e->filename, e->url, e->approx_size ? e->approx_size : ""});
@@ -1688,6 +1735,7 @@ bool crispasr_registry_lookup_by_filename(const std::string& filename, CrispasrR
             out.companion_filename.clear();
             out.companion_url.clear();
             out.companion_approx_size.clear();
+            out.license = effective_license(row);
             return true;
         }
     }

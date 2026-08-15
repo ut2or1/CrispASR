@@ -17,7 +17,7 @@ per-backend porting detail (Per-model port notes + the family cross-reference).
 Reach for the topic groups when you are stuck on a *technique*, and the
 cross-reference when you already know which model you are touching.
 
-## Index by topic (276 lessons)
+## Index by topic (278 lessons)
 
 **Security & untrusted input** (2)
 
@@ -85,7 +85,7 @@ cross-reference when you already know which model you are touching.
 - L17453 — session-state fixes + moonshine CPU-only SOLVED
 - L17677 — Wyoming TTS marked nothing — FIXED 8f4197ec
 
-**Parity, the diff harness & ground truth** (36)
+**Parity, the diff harness & ground truth** (37)
 
 - L289 — The diff harness starts where its INPUT starts — check what it is fed before trusting parity
 - L516 — When a clone/zero-shot path misbehaves but the BAKED/preset path is clean, diff the two paths' DATA byte-for-byte — the difference IS the bug
@@ -123,6 +123,7 @@ cross-reference when you already know which model you are touching.
 - L14231 — A normalization stage amplifies upstream float error — input-align it before trusting its cos (§248 MBR)
 - L15369 — #333 madlad400 quants + T5 parity
 - L16241 — chatterbox hift_pcm(ref_mel) cos≈0.879 was a diff-harness layout bug (source_stft fed transposed), not a…
+- L17871 — Chatterbox Multilingual V3: checkpoint names, quant hashes, and a non-silent clone are not parity
 
 **ggml graphs, allocation & caching** (43)
 
@@ -291,7 +292,7 @@ cross-reference when you already know which model you are touching.
 - L14204 — `git apply --3way` STAGES its result — a later `git add X && git commit` sweeps it up
 - L16482 — CrispEmbed #31 WASM OCR e2e
 
-**Per-model port notes** (43)
+**Per-model port notes** (44)
 
 - L196 — A model's capability list cannot be inferred from its vocabulary — and forcing a fake list does not simulate having the capability
 - L2801 — Multi-stream token architecture (Mini-Omni2)
@@ -336,6 +337,7 @@ cross-reference when you already know which model you are touching.
 - L17301 — indextts long-ref crash FIXED
 - L17540 — TADA TTS time embedding bugs
 - L17588 — Four bugs that together caused empty/garbage transcripts; all patched in src/vibevoice.cpp +…
+- L17813 — "Verified byte-identical at 225 s" verified a clip, not a length — and a decoder that drops spans needs a repair pass, not a better cap
 
 ## Cross-reference by model / family
 
@@ -343,12 +345,12 @@ A section is listed when its heading names the family, or its body mentions it
 at least 3 times. Sections appear under several families; this is a
 lookup, not a partition.
 
-- **chatterbox** (25) — L2132, L2317, L5348, L5610, L5661, L5693, L5732, L5836, L5889, L5995, L6098, L6164, L6239, L6287, L8436, L9223, L12848, L13896, L14285, L14345, L14804, L15593, L16203, L16241, L16797
+- **chatterbox** (26) — L2132, L2317, L5348, L5610, L5661, L5693, L5732, L5836, L5889, L5995, L6098, L6164, L6239, L6287, L8436, L9223, L12848, L13896, L14285, L14345, L14804, L15593, L16203, L16241, L16797, L17871
 - **cosyvoice3** (9) — L516, L8830, L12848, L13896, L14345, L15222, L15455, L16414, L16442
 - **vibevoice** (14) — L441, L1592, L2499, L5067, L5836, L8347, L12699, L12734, L12777, L13453, L14909, L14929, L15160, L17588
 - **tada** (9) — L922, L1295, L1639, L1689, L1703, L12848, L13111, L15837, L17540
 - **whisper** (22) — L116, L1808, L2786, L3586, L3770, L3843, L3979, L4486, L5427, L7398, L7766, L12610, L14468, L14974, L15017, L15083, L15525, L16073, L16414, L17170, L17230, L17346
-- **parakeet / TDT** (16) — L649, L1808, L1841, L2910, L3843, L4189, L6287, L8281, L10599, L10684, L11724, L13282, L14425, L14468, L15525, L17346
+- **parakeet / TDT** (17) — L649, L1808, L1841, L2910, L3843, L4189, L6287, L8281, L10599, L10684, L11724, L13282, L14425, L14468, L15525, L17346, L17813
 - **moss** (13) — L376, L572, L1064, L1266, L1441, L1447, L1738, L1763, L1788, L2910, L14088, L14843, L14861
 - **firered** (9) — L1233, L4395, L4486, L5067, L5234, L6098, L13229, L14974, L15017
 - **funasr / sensevoice / SANM** (2) — L8830, L11094

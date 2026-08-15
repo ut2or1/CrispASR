@@ -467,6 +467,68 @@ catch_discover_tests(test-gguf-bounds
     PROPERTIES LABELS "unit"
 )
 
+# ─── test-gguf-release — contract of core_gguf::release_weight_buffer ──────────
+# The entry point that frees a weight buffer AND unmaps the host region behind
+# it. These cases need no GPU: the CPU mmap path, the legacy alloc+copy path
+# (which registers no mapping and must still be released cleanly), repeat calls
+# and the null handle.
+add_executable(test-gguf-release test-gguf-release.cpp)
+target_include_directories(test-gguf-release PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-gguf-release PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+    ggml
+)
+catch_discover_tests(test-gguf-release
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-gguf-mapping-released — the weight mmap must not outlive the model ───
+# Asks the kernel which regions still name the weight file after the weights
+# are freed. Exact rather than a footprint threshold, so there is nothing to
+# settle and nothing to poll. The zero-copy leg self-skips where no device
+# advertises buffer_from_host_ptr.
+add_executable(test-gguf-mapping-released test-gguf-mapping-released.cpp)
+target_include_directories(test-gguf-mapping-released PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-gguf-mapping-released PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+    ggml
+)
+catch_discover_tests(test-gguf-mapping-released
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-crisp-audio-mapping-released — the same oracle, one step out ─────────
+# crisp_audio takes its weight buffer from core_gguf::load_weights and owns it
+# from there, so the release has to happen in crisp_audio_free(). Drives the
+# public C API on a synthetic one-layer tower and asks the kernel which regions
+# still name the GGUF. The GPU legs self-skip where no device advertises
+# buffer_from_host_ptr; the CPU leg runs everywhere.
+add_executable(test-crisp-audio-mapping-released test-crisp-audio-mapping-released.cpp)
+target_include_directories(test-crisp-audio-mapping-released PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-crisp-audio-mapping-released PRIVATE
+    Catch2::Catch2WithMain
+    crisp_audio
+    crispasr-lib
+    ggml
+)
+catch_discover_tests(test-crisp-audio-mapping-released
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
 # ─── test-gguf-split-alloc — regression guard for issue #276 ───────────────────
 # Verifies load_weights_split() correctly partitions tensors across GPU/CPU
 # backend buffers, respects the is_gpu predicate, and that free_weights cleans
@@ -504,6 +566,19 @@ if(CRISPASR_BUILD_EXAMPLES)
             ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/vibevoice-quant-carveout.gguf)
     set_tests_properties(test-vibevoice-quant-carveout PROPERTIES
         LABELS "unit;gh;regression-171"
+        TIMEOUT 120)
+endif()
+
+# Chatterbox Multilingual V3: Q4 must retain enough precision in the native
+# voice tokenizer and AR sampling head. The script creates its own tiny GGUF,
+# so this exercises the real quantizer without downloading model weights.
+if(CRISPASR_BUILD_EXAMPLES)
+    add_test(NAME test-chatterbox-quant-carveout
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test-chatterbox-quant-carveout.sh
+            $<TARGET_FILE:crispasr-quantize>
+            ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test-chatterbox-quant-carveout PROPERTIES
+        LABELS "unit;gh;chatterbox;regression-348"
         TIMEOUT 120)
 endif()
 
@@ -1290,6 +1365,9 @@ target_include_directories(test-moss-audio PRIVATE
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/examples
 )
+target_compile_definitions(test-moss-audio PRIVATE
+    SAMPLES_DIR="${PROJECT_SOURCE_DIR}/samples"
+)
 target_link_libraries(test-moss-audio PRIVATE
     Catch2::Catch2WithMain
     moss_audio
@@ -1299,6 +1377,23 @@ catch_discover_tests(test-moss-audio
     PROPERTIES
         LABELS live
         SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-moss-audio-valid-meta — hermetic (no model) valid-frame metadata (issue #344)
+add_executable(test-moss-audio-valid-meta
+    test-moss-audio-valid-meta.cpp
+)
+target_include_directories(test-moss-audio-valid-meta PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-moss-audio-valid-meta PRIVATE
+    Catch2::Catch2WithMain
+    moss_audio
+)
+catch_discover_tests(test-moss-audio-valid-meta
+    TEST_SPEC "[moss-audio-valid-meta]"
+    PROPERTIES
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
@@ -1336,6 +1431,26 @@ target_link_libraries(test-parakeet-ja-longform PRIVATE
 )
 catch_discover_tests(test-parakeet-ja-longform
     TEST_SPEC "[parakeet-ja-longform]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test - parakeet-longform — issue #350 regression guard (non-JA 30-300 s)
+add_executable(test-parakeet-longform
+    test_parakeet_longform_live.cpp
+)
+target_include_directories(test-parakeet-longform PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-parakeet-longform PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+catch_discover_tests(test-parakeet-longform
+    TEST_SPEC "[parakeet-longform]"
     PROPERTIES
         LABELS live
         SKIP_RETURN_CODE 4
@@ -4436,6 +4551,20 @@ add_test(NAME test-release-workflow
 set_tests_properties(test-release-workflow PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 30)
+
+# Configure-level guard for the #261/#302 portable CPU contract. The cache is
+# the only authoritative proof that every optional ggml x86 ISA stayed OFF;
+# source-text checks cannot catch a newly-defaulted ggml option. Bash is not a
+# baseline dependency on Windows, where test-release-workflow still guards all
+# release-job call sites.
+if(UNIX)
+    add_test(NAME test-portable-cpu-config
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-portable-cpu-config.sh
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test-portable-cpu-config PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 60)
+endif()
 
 # ─── test_diarized_json — Catch2 unit tests for the diarized_json formatter
 # (issue #206) and max_len display segment splitting (issue #205).

@@ -2850,12 +2850,12 @@ void dots_tts_free(struct dots_tts_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
 
     if (ctx->voc.buf_w)
-        ggml_backend_buffer_free(ctx->voc.buf_w);
+        core_gguf::release_weight_buffer(ctx->voc.buf_w);
     if (ctx->voc.ctx_w)
         ggml_free(ctx->voc.ctx_w);
 

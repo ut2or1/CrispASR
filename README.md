@@ -169,7 +169,7 @@ quick-start commands and engine selection guidance.
 | **melotts** | [`myshell-ai/MeloTTS`](https://github.com/myshell-ai/MeloTTS) EN_V2 | VITS2 (6L transformer + SDP/DP + transformer coupling flow + HiFi-GAN); 44.1 kHz, 102 MB + 52 MB BERT Q4_K companion (154 MB total); neural G2P; 4 EN speakers ([more](docs/architecture.md#melotts)) | en | MIT |
 | **piper** | [`rhasspy/piper`](https://github.com/rhasspy/piper) community voices | VITS (6L transformer + SDP + 4-block coupling flow + HiFi-GAN); 22 kHz mono, 30 MB F16 per voice; built-in G2P for EN/DE/FR/ES (`--g2p-dict`) | 30+ langs (built-in + espeak dlopen) | MIT |
 | **kokoro** | [`hexgrad/Kokoro-82M`](https://huggingface.co/hexgrad/Kokoro-82M) + German backbones | StyleTTS2 / iSTFTNet (82M); per-voice GGUF ([more](docs/architecture.md#kokoro)) | en, es, fr, hi, it, ja, pt, zh, de | Apache-2.0 |
-| **orpheus** | [`Orpheus-3B-FT`](https://huggingface.co/cstr/orpheus-3b-0.1-ft-GGUF) + [`SNAC 24 kHz`](https://huggingface.co/cstr/snac-24khz-GGUF) | Llama-3.2-3B + SNAC RVQ codec; 8 speakers ([more](docs/architecture.md#orpheus)) | en, de | Llama / MIT |
+| **orpheus** | [`Orpheus-3B-FT`](https://huggingface.co/cstr/orpheus-3b-0.1-ft-GGUF) + [`SNAC 24 kHz`](https://huggingface.co/cstr/snac-24khz-GGUF) | Llama-3.2-3B + SNAC RVQ codec; 8 speakers ([more](docs/architecture.md#orpheus)) | en, de | Llama 3.2 Community License / MIT |
 | **chatterbox** | [`cstr/chatterbox-GGUF`](https://huggingface.co/cstr/chatterbox-GGUF) + turbo/kartoffelbox/lahgtna variants | T3 AR + S3Gen flow-matching ([more](docs/architecture.md#chatterbox--chatterbox-turbo--kartoffelbox-turbo--lahgtna-chatterbox)) | 23 multilingual; separate Arabic (`lahgtna-chatterbox`) and German turbo (`kartoffelbox-turbo`) fine-tunes | MIT |
 | **indextts** | [`cstr/indextts-1.5-GGUF`](https://huggingface.co/cstr/indextts-1.5-GGUF) | GPT-2 AR (24L/1280d) + Conformer conditioning + BigVGAN vocoder; voice cloning via reference audio | zh, en | Apache-2.0 |
 | **voxcpm2-tts** | [`cstr/voxcpm2-GGUF`](https://huggingface.co/cstr/voxcpm2-GGUF) | Tokenizer-free CFM diffusion AR (TSLM + RALM + LocDiT) at 48 kHz native; zero-shot + voice cloning via `--voice <wav>` | 30 languages | Apache-2.0 |
@@ -184,9 +184,9 @@ quick-start commands and engine selection guidance.
 | **fastpitch** | [`cstr/fastpitch-en-GGUF`](https://huggingface.co/cstr/fastpitch-en-GGUF) | NVIDIA FastPitch 60M: non-autoregressive parallel TTS — 6L encoder + duration/pitch predictors + 6L decoder + HiFi-GAN at 22 kHz; deterministic, single forward pass ([more](docs/architecture.md#fastpitch)) | en | CC-BY-4.0 |
 | **bananamind-tts** | `Banaxi-Tech/BananaMind-TTS-V2.1-Preview` | BananaMind-TTS 13M: Tacotron-lite char-level encoder (Conv+BN+BiLSTM) + AR GRU decoder with location-sensitive attention + postnet + HiFi-GAN at 22 kHz; fixed voice per locale ([more](docs/architecture.md#bananamind-tts)) | en, de | Apache-2.0 |
 | **parler-tts** | [`cstr/parler-tts-mini-v1.1-GGUF`](https://huggingface.co/cstr/parler-tts-mini-v1.1-GGUF) | Parler TTS Mini v1.1 (~900M): T5 encoder + MusicGen decoder + DAC 44.1 kHz; prompt-conditioned (describe voice in text via `--instruct`) | en | Apache-2.0 |
-| **outetts** | [`cstr/outetts-0.3-1b-GGUF`](https://huggingface.co/cstr/outetts-0.3-1b-GGUF) | OLMo-1B talker + WavTokenizer single-codebook VQ-GAN at 24 kHz; voice cloning via speaker profile JSON (`--voice <speaker.json>`) | en | CC-BY-4.0 |
-| **pocket-tts** | [`cstr/pocket-tts-GGUF`](https://huggingface.co/cstr/pocket-tts-GGUF) | Kyutai Pocket TTS 100M: continuous-latent AR at 12.5 Hz + one-step LSD flow + Mimi VAE 24 kHz; voice cloning via ref audio ([more](docs/architecture.md#pocket-tts)) | en | MIT / CC-BY-4.0 |
-| **tada** | [`cstr/tada-tts-1b-GGUF`](https://huggingface.co/cstr/tada-tts-1b-GGUF) + `HumeAI/tada-3b-ml` | Llama-3.2 1B/3B backbone + per-token FM diffusion head + TADA codec at 24 kHz; 1:1 text-to-acoustic alignment; default prompt via `tada-ref.gguf`, custom voices via `--voice <tada-ref.gguf>` built with `models/convert-tada-ref-to-gguf.py` ([more](docs/architecture.md#tada)) | en | — |
+| **outetts** | [`cstr/outetts-0.3-1b-GGUF`](https://huggingface.co/cstr/outetts-0.3-1b-GGUF) | OLMo-1B talker + WavTokenizer single-codebook VQ-GAN at 24 kHz; voice cloning via speaker profile JSON (`--voice <speaker.json>`) | en | CC-BY-NC-SA-4.0 |
+| **pocket-tts** | [`cstr/pocket-tts-GGUF`](https://huggingface.co/cstr/pocket-tts-GGUF) | Kyutai Pocket TTS 100M: continuous-latent AR at 12.5 Hz + one-step LSD flow + Mimi VAE 24 kHz; voice cloning via ref audio ([more](docs/architecture.md#pocket-tts)) | en | CC-BY-4.0 + gated-use conditions |
+| **tada** | [`cstr/tada-tts-1b-GGUF`](https://huggingface.co/cstr/tada-tts-1b-GGUF) + `HumeAI/tada-3b-ml` | Llama-3.2 1B/3B backbone + per-token FM diffusion head + TADA codec at 24 kHz; 1:1 text-to-acoustic alignment; default prompt via `tada-ref.gguf`, custom voices via `--voice <tada-ref.gguf>` built with `models/convert-tada-ref-to-gguf.py` ([more](docs/architecture.md#tada)) | en | Llama 3.2 Community License |
 
 <details>
 <summary><b>TTS feature matrix</b></summary>
@@ -285,7 +285,7 @@ Work with all backends.
 | **truecaser&#8209;de** | German truecasing (simple) | Statistical word-frequency (71K entries, 1.7 MB) | German | MIT | `--truecase-model auto` |
 | **CLD3** | Text language ID | Embedding-bag → FC + ReLU → softmax (~1.5 MB F32) | 109 ISO 639-1 | Apache-2.0 | [`cstr/cld3-GGUF`](https://huggingface.co/cstr/cld3-GGUF) |
 | **GlotLID-V3** | Text language ID | fastText supervised, flat softmax | 2102 ISO 639-3 + script | Apache-2.0 | [`cstr/glotlid-GGUF`](https://huggingface.co/cstr/glotlid-GGUF) |
-| **LID-176** | Text language ID | fastText supervised, hierarchical softmax | 176 ISO 639-1 | CC-BY-SA-3.0 | [`cstr/fasttext-lid176-GGUF`](https://huggingface.co/cstr/fasttext-lid176-GGUF) |
+| **LID-176** | Text language ID | fastText supervised, hierarchical softmax | 176 ISO 639-1 | CC-BY-NC-4.0 | [`cstr/fasttext-lid176-GGUF`](https://huggingface.co/cstr/fasttext-lid176-GGUF) |
 
 ### Audio codecs
 
@@ -514,13 +514,13 @@ one binary — the dispatcher picks by `general.architecture`:
 |---|---:|---:|---|---|
 | **CLD3** (Google compact language detector v3) | 109 ISO 639-1 | **440 KB** | Apache-2.0 | [`cstr/cld3-GGUF`](https://huggingface.co/cstr/cld3-GGUF) |
 | **GlotLID-V3** (cis-lmu fastText) | 2102 ISO 639-3 + script | 250 MB | Apache-2.0 | [`cstr/glotlid-GGUF`](https://huggingface.co/cstr/glotlid-GGUF) |
-| **LID-176** (Facebook fastText) | 176 ISO 639-1 | 63 MB | CC-BY-SA-3.0¹ | [`cstr/fasttext-lid176-GGUF`](https://huggingface.co/cstr/fasttext-lid176-GGUF) |
+| **LID-176** (Facebook fastText) | 176 ISO 639-1 | 63 MB | CC-BY-NC-4.0¹ | [`cstr/fasttext-lid176-GGUF`](https://huggingface.co/cstr/fasttext-lid176-GGUF) |
 
-¹ LID-176 is **CC-BY-SA-3.0 (viral)** — redistributors of the GGUF
-inherit ShareAlike. CLD3 + GlotLID-V3 are Apache-2.0 with no such
-constraint. Pick CLD3 for the smallest, fastest path; GlotLID for
-maximum coverage (low-resource languages); LID-176 only if you need
-its specific 176-label space and accept the SA obligation.
+¹ LID-176 is **CC-BY-NC-4.0** — non-commercial use only. CLD3 +
+GlotLID-V3 are Apache-2.0 with no such constraint. Pick CLD3 for the
+smallest, fastest path; GlotLID for maximum coverage (low-resource
+languages); LID-176 only if you need its specific 176-label space and
+accept its non-commercial terms.
 
 **Standalone CLI** — auto-routes by GGUF arch, with auto-download:
 

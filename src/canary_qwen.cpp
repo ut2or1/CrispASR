@@ -1332,9 +1332,9 @@ extern "C" void canary_qwen_free(struct canary_qwen_context* ctx) {
     ctx->model.pw_q8.free();
     ctx->model.qkv_fused.free();
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.buf_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_cpu);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)

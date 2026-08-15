@@ -216,7 +216,7 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     // NOT sufficient (mirrors CrispEmbed).
     const bool restricted = !match.license.empty() && crispasr_license_requires_acceptance(match.license);
     const bool accepted = restricted && crispasr_license_accepted(match.license, accepted_license);
-    if (restricted && !accepted && !isatty(fileno(stdin))) {
+    if (restricted && !accepted) {
         fprintf(stderr, "  Refusing: pass --accept-license %s (or set CRISPASR_ACCEPT_LICENSE).\n",
                 crispasr_license_tag(match.license).c_str());
         return effective_model_arg;

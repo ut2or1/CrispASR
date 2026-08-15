@@ -1814,7 +1814,7 @@ extern "C" void voxtral_tts_free(voxtral_tts_context* ctx) {
     if (ctx->kv_ctx)
         ggml_free(ctx->kv_ctx);
     if (ctx->buf)
-        ggml_backend_buffer_free(ctx->buf);
+        core_gguf::release_weight_buffer(ctx->buf);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)

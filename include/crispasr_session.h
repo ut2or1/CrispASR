@@ -247,6 +247,13 @@ CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe(crispa
 // non-JA window length / the JA streamed window. `overlap_seconds < 0`
 // uses the default. For non-Parakeet backends the chunk params are inert
 // and this behaves exactly like crispasr_session_transcribe[_lang].
+//
+// 0.8.29+ (issue #350): `chunk_seconds = 0` is "per-model defaults", NOT
+// "no chunking" — reaching this entry point at all is a request for bounded
+// long-form, so the non-JA single-pass cap drops from 300 s to the decoder's
+// reliable ~30 s window for this call. Between 0.8.24 and 0.8.28 the unified
+// dispatch collapsed the two, and such a call took ONE full-length decode
+// that silently dropped whole spans of speech.
 CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe_chunked_lang(
     crispasr_session* s, const float* pcm, int n_samples, int chunk_seconds, int overlap_seconds, const char* language);
 CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe_chunked(crispasr_session* s, const float* pcm,

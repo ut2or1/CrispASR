@@ -573,10 +573,11 @@ extern "C" void omniasr_free(struct omniasr_context* ctx) {
         ggml_backend_sched_free(ctx->sched);
     if (ctx->weight_ctx)
         ggml_free(ctx->weight_ctx);
-    if (ctx->buf)
-        ggml_backend_buffer_free(ctx->buf);
-    if (ctx->buf_cpu)
-        ggml_backend_buffer_free(ctx->buf_cpu);
+    // Weight buffers come from core_gguf::load_weights, so on a zero-copy
+    // backend they carry a host mmap the backend does not own. Release them
+    // through the loader rather than ggml_backend_buffer_free().
+    core_gguf::release_weight_buffer(ctx->buf);
+    core_gguf::release_weight_buffer(ctx->buf_cpu);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
         ggml_backend_free(ctx->backend_cpu);
     if (ctx->backend)

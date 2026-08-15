@@ -664,7 +664,7 @@ void lfm2_audio_free(lfm2_audio_context* ctx) {
     if (!ctx)
         return;
     if (ctx->detok.buf)
-        ggml_backend_buffer_free(ctx->detok.buf);
+        core_gguf::release_weight_buffer(ctx->detok.buf);
     if (ctx->detok.ctx)
         ggml_free(ctx->detok.ctx);
     if (ctx->sched)
@@ -676,7 +676,7 @@ void lfm2_audio_free(lfm2_audio_context* ctx) {
     ctx->model.pw_q8.free();
     ctx->model.qkv_fused.free();
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend)

@@ -1,5 +1,12 @@
 # CrispASR — Pending work
 
+## CLAIMED 2026-08-13 — PR #347 GGUF weight-mapping release review
+
+Worktree: `.claude/worktrees/review-pr-352`.
+Review PR #352 end to end, validate that its long-form routing and gap repair
+do not regress any language path, add targeted unit/live coverage where needed,
+and merge or improve the change after local/SSD validation.
+
 ## Start here
 
 Live work only. Completed threads move to `HISTORY.md`; technical deep-dives to
@@ -10,6 +17,46 @@ Live work only. Completed threads move to `HISTORY.md`; technical deep-dives to
 to main before you start**. Several agents run here at once; a claim that lands
 with the work is a claim that did nothing. Delete it when the work lands, or if
 it goes stale for more than a day.
+
+## CLAIMED 2026-08-13 — #350 parakeet non-JA long-form drops whole spans
+
+Worktree: `.claude/worktrees/crisp-asr-issue-filing-0ca183`.
+Two defects behind one symptom on parakeet-tdt-0.6b-v3 (30-300 s, non-JA):
+the unified dispatch read `chunk_seconds = 0` (documented "per-model defaults")
+as "not chunked" and ran an explicitly chunked session call as one unbounded
+pass; and the TDT decoder drops whole spans past ~30 s at any routing, so no
+cap alone fixes it. Fix = a `chunked_requested` flag that caps such calls at
+the reliable window, plus a shared gap-fill repair pass over holes in the word
+timeline. Reporter's clip: 66 % → 95 % coverage (CLI), 66 % → 100 % (session
+chunked API); jfk×21 regression guard added.
+
+## CLAIMED 2026-08-13 — #344 MOSS valid-frame metadata review and validation
+
+Worktree: `.claude/worktrees/fix-344-moss-valid-frame-metadata`.
+Audit PR #345, verify the additive C ABI and failure contracts, and run the
+hermetic plus available model-backed/live tests before deciding whether any
+changes are needed.
+
+## CLAIMED 2026-08-13 — #337 Qwen3-TTS HIP prefill divergence (second pass)
+
+Worktree: `.claude/worktrees/fix-337-qwen3-tts-hip`.
+The first-pass single-backend allocator fix was disproven on RX 7900 XTX:
+the reporter confirms it is byte-identical to the scheduler path and CPU-vs-HIP
+full-frame replay still diverges at prefill. Reproduce with the diff harness,
+bisect the first divergent talker tensor/op under identical teacher-forced
+history, then fix and validate on the real HIP path via the Kaggle regime.
+
+## CLAIMED 2026-08-13 — #344 MOSS valid-frame metadata in stable C ABI
+
+Worktree: `.claude/worktrees/fix-344-moss-valid-frame-metadata`
+(branch `fix/344-moss-valid-frame-metadata`).
+Additive MOSS encoder/tap/adapter valid-frame metadata for the downstream
+MOSS-Music-8B-Thinking feature pipeline: `moss_audio_plan_chunks`,
+`moss_audio_compute_mel_meta` (preserves pre-pad `T_mel_actual` — never inferred
+from padded zeros/floor), and `moss_audio_run_encoder_meta` (existing chunk loop
+reused, caller-allocated per-chunk valid counts, adapter output dim reported from
+GGUF weights, fail-closed llm_hidden vs adapter-row check). Existing
+`moss_audio_*` symbols unchanged. Hermetic CPU test + live differential test.
 
 ## LANDED 2026-08-10 — voxtral-tts pre-tokenizer parity (c69ac61b, from #338)
 

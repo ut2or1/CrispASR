@@ -9,6 +9,7 @@
 #include "core/asr_segment_group.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -204,6 +205,210 @@ std::vector<parakeet_seg> transcribe_longform(parakeet_context* ctx, const float
     return out;
 }
 
+// Normalize a word for boundary-dedup comparison: lowercase + drop ASCII
+// punctuation. Non-ASCII bytes (JA / accented text) are kept verbatim. Mirrors
+// parakeet_norm_word in the session merge path.
+std::string norm_word(const std::string& s) {
+    std::string o;
+    for (unsigned char c : s) {
+        if (c < 0x80) {
+            if (std::isalnum(c))
+                o += (char)std::tolower(c);
+        } else {
+            o += (char)c;
+        }
+    }
+    return o;
+}
+
+// Issue #350: re-transcribe the spans the first pass left empty and merge the
+// recovered words back. The TDT decoder silently drops whole sections of long
+// audio — a 230 s file came back with a contiguous 45 s hole that decodes
+// verbatim when handed to the same model on its own. A length cap alone cannot
+// rule that out (it is not a hard threshold), so repair what the timeline shows
+// is missing, whichever strategy produced it.
+//
+// This is the non-JA generalisation of the #89 gap-fill: same trigger (a span
+// >= min_gap with no words), same guards (recovered words are kept only if they
+// land in the hole and nothing already covers them), so a pass that dropped
+// nothing is left EXACTLY as it was — including its text, which is only rebuilt
+// when a word is actually inserted.
+//
+// Deliberately NOT a reuse of the two #89 implementations
+// (examples/cli/crispasr_gap_fill.h's crispasr_gap_fill_slice; the
+// transcribe_ja_sliced lambda in crispasr_c_api.cpp): those are JA-only in
+// practice (gated on vad_slice_cap / the legacy inline path), live above this
+// library layer on CLI/session segment types, and probe each gap as ONE window
+// via the full backend dispatch — re-entrant from here, and wrong for holes
+// longer than the reliable window. This one calls parakeet_transcribe_ex
+// directly and splits long holes (parakeet_find_gaps carries the shared,
+// unit-tested interval arithmetic).
+//
+// `min_gap_cs` is deliberately coarser than the #89 JA default (1 s): a 1-2 s
+// hole in a non-JA transcript is an ordinary pause far more often than a drop,
+// and handing the decoder a pause makes it invent a filler ("Um", "M"). The
+// spans this defect produces are whole sentences. CRISPASR_GAP_FILL_MIN_CS
+// overrides it; CRISPASR_GAP_FILL=0 turns the repair off entirely.
+//
+// Returns the number of words recovered.
+int gap_fill_segments(parakeet_context* ctx, const float* samples, int n_samples, int64_t t_offset_cs,
+                      std::vector<parakeet_seg>& segs, int repair_window_s, int64_t min_gap_cs, bool no_prints) {
+    const int SR = 16000;
+    if (getenv("CRISPASR_GAP_FILL") && atoi(getenv("CRISPASR_GAP_FILL")) == 0)
+        return 0;
+    if (const char* e = getenv("CRISPASR_GAP_FILL_MIN_CS"))
+        min_gap_cs = std::max((int64_t)30, (int64_t)atoi(e));
+    // The repair reasons entirely in word timestamps, and rebuilds a changed
+    // segment's text from its word list. A segment carrying text but no words
+    // (a decode that produced no timings) would lose that text, so leave the
+    // whole result alone rather than half-repair it.
+    for (const auto& s : segs)
+        if (s.words.empty() && !s.text.empty())
+            return 0;
+    constexpr int64_t kCoverSlopCs = 30; // pauses this short stay part of one run
+    constexpr int64_t kEdgePadCs = 20;   // decode a little around the hole for context
+    constexpr int kMaxRounds = 2;
+
+    const int64_t span_t0 = t_offset_cs;
+    const int64_t span_t1 = t_offset_cs + (int64_t)((double)n_samples / SR * 100.0);
+    const int64_t max_window_cs = (int64_t)std::max(2, repair_window_s) * 100;
+
+    int total = 0;
+    for (int round = 0; round < kMaxRounds; ++round) {
+        std::vector<std::pair<int64_t, int64_t>> covered;
+        std::vector<std::pair<int64_t, std::string>> seam; // (t0, normalized) of every kept word
+        for (const auto& s : segs)
+            for (const auto& w : s.words) {
+                covered.push_back({w.t0, std::max(w.t1, w.t0 + 1)});
+                seam.push_back({w.t0, norm_word(w.text)});
+            }
+        const auto gaps = parakeet_find_gaps(covered, span_t0, span_t1, min_gap_cs, kCoverSlopCs, max_window_cs);
+        if (gaps.empty())
+            break;
+        // Same merged view the gap search used, to reject a recovered word that
+        // duplicates one the first pass already emitted next to the hole.
+        std::sort(covered.begin(), covered.end());
+        std::vector<std::pair<int64_t, int64_t>> merged;
+        for (auto& iv : covered) {
+            if (!merged.empty() && iv.first <= merged.back().second + kCoverSlopCs)
+                merged.back().second = std::max(merged.back().second, iv.second);
+            else
+                merged.push_back({iv.first, std::max(iv.second, iv.first + 1)});
+        }
+
+        int recovered = 0;
+        std::vector<bool> dirty(segs.size(), false);
+        for (const auto& g : gaps) {
+            const int64_t win0_cs = std::max(span_t0, g.first - kEdgePadCs);
+            const int64_t win1_cs = std::min(span_t1, g.second + kEdgePadCs);
+            const int w0 = std::max(0, (int)((win0_cs - t_offset_cs) * SR / 100));
+            const int w1 = std::min(n_samples, (int)((win1_cs - t_offset_cs) * SR / 100));
+            if (w1 - w0 < SR / 4) // < 0.25 s is not worth a decode
+                continue;
+            parakeet_result* r = parakeet_transcribe_ex(ctx, samples + w0, w1 - w0, win0_cs);
+            if (!r)
+                continue;
+            parakeet_seg got = result_to_seg(r, win0_cs);
+            parakeet_result_free(r);
+
+            for (auto& w : got.words) {
+                const int64_t mid = (w.t0 + w.t1) / 2;
+                if (mid < g.first - kCoverSlopCs || mid >= g.second + kCoverSlopCs)
+                    continue; // context word from outside the hole
+                bool dup = false;
+                for (const auto& iv : merged)
+                    if (mid >= iv.first && mid < iv.second) {
+                        dup = true;
+                        break;
+                    }
+                if (dup)
+                    continue;
+                // Seam guard: the repair window re-hears the speech either side
+                // of the hole, and the decoder times a boundary word a few
+                // hundred ms earlier there — which lands it INSIDE the hole and
+                // doubles it ("...and And the target..."). Drop a recovered word
+                // that repeats a kept word within kSeamCs. Only pairs that
+                // straddle the seam are compared, so a genuine "the the" inside
+                // one decode is left alone.
+                constexpr int64_t kSeamCs = 50;
+                bool seam_dup = false;
+                for (const auto& sw : seam)
+                    if (llabs(sw.first - w.t0) < kSeamCs && sw.second == norm_word(w.text)) {
+                        seam_dup = true;
+                        break;
+                    }
+                if (seam_dup)
+                    continue;
+                // Attach to the segment this timestamp belongs in (the last one
+                // starting at or before it), so LONGFORM / CHUNK_SEGMENTED keep
+                // their segmentation instead of growing a trailing blob.
+                size_t si = 0;
+                bool placed = false;
+                for (size_t i = 0; i < segs.size(); ++i)
+                    if (segs[i].t0 <= w.t0) {
+                        si = i;
+                        placed = true;
+                    }
+                if (!placed && segs.empty()) {
+                    segs.push_back(parakeet_seg());
+                    dirty.push_back(false);
+                    si = 0;
+                }
+                dirty[si] = true;
+                seam.push_back({w.t0, norm_word(w.text)}); // guard the next window's edge too
+                std::vector<parakeet_seg::token> keep;
+                for (auto& tk : got.tokens)
+                    if (tk.t0 >= w.t0 && tk.t0 <= w.t1)
+                        keep.push_back(tk);
+                for (auto& tk : keep)
+                    segs[si].tokens.push_back(std::move(tk));
+                segs[si].words.push_back(std::move(w));
+                ++recovered;
+            }
+        }
+        if (recovered == 0)
+            break;
+        total += recovered;
+        if (!no_prints)
+            fprintf(stderr, "crispasr[parakeet]: gap-fill recovered %d word(s) the first pass dropped\n", recovered);
+        // Re-sort and rebuild only the segments a word was inserted into. Text
+        // is regenerated from the word list, so a segment nothing landed in
+        // keeps the decoder's own detokenized string byte for byte.
+        for (size_t i = 0; i < segs.size(); ++i) {
+            if (!dirty[i])
+                continue;
+            parakeet_seg& s = segs[i];
+            std::stable_sort(s.words.begin(), s.words.end(),
+                             [](const parakeet_seg::word& a, const parakeet_seg::word& b) { return a.t0 < b.t0; });
+            std::stable_sort(s.tokens.begin(), s.tokens.end(),
+                             [](const parakeet_seg::token& a, const parakeet_seg::token& b) { return a.t0 < b.t0; });
+            std::string text;
+            for (const auto& w : s.words) {
+                if (w.text.empty())
+                    continue;
+                if (!text.empty()) {
+                    const unsigned char prev_last = (unsigned char)text.back();
+                    const unsigned char cur_first = (unsigned char)w.text[0];
+                    // CJK boundaries take no space (>= 0xE0 lead byte = 3-byte
+                    // UTF-8); latin words carry a leading space from the
+                    // tokenizer already.
+                    if (cur_first != ' ' && prev_last != ' ' && prev_last < 0xE0 && cur_first < 0xE0)
+                        text += ' ';
+                }
+                text += w.text;
+            }
+            if (!text.empty() && text[0] == ' ')
+                text.erase(0, 1);
+            s.text = std::move(text);
+            if (!s.words.empty()) {
+                s.t0 = s.words.front().t0;
+                s.t1 = s.words.back().t1;
+            }
+        }
+    }
+    return total;
+}
+
 } // namespace
 
 std::vector<parakeet_seg> parakeet_transcribe_segments(parakeet_context* ctx, const float* samples, int n_samples,
@@ -228,15 +433,23 @@ std::vector<parakeet_seg> parakeet_transcribe_segments(parakeet_context* ctx, co
             return out;
         out = split_result_to_segs(rc, t_offset_cs, seg_seconds);
         parakeet_result_free(rc);
+        // Issue #350: CHUNK_SEGMENTED bounds the ENCODER but still runs one TDT
+        // decode over the concatenation, so it drops spans like any other single
+        // decode (measured 88 % coverage where per-slice paths reach 93-94 %).
+        gap_fill_segments(ctx, samples, n_samples, t_offset_cs, out, kParakeetBoundedWindowS, kParakeetGapFillMinCs,
+                          opts.no_prints);
         return out;
     }
 
-    int stream_threshold_s = is_ja ? 12 : 300;
+    int stream_threshold_s = is_ja ? kParakeetBoundedWindowJaS : 300;
     bool longform_enabled = !is_ja;
     int stream_chunk_s = 0;
     int stream_overlap_s = 2;
-    if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_THRESHOLD"))
+    bool threshold_from_env = false;
+    if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_THRESHOLD")) {
         stream_threshold_s = std::max(0, atoi(e));
+        threshold_from_env = true;
+    }
     if (const char* e = getenv("CRISPASR_PARAKEET_LONGFORM"))
         longform_enabled = atoi(e) != 0;
     if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_CHUNK"))
@@ -252,6 +465,11 @@ std::vector<parakeet_seg> parakeet_transcribe_segments(parakeet_context* ctx, co
     sin.chunk_seconds = opts.chunk_seconds;
     sin.stream_threshold_s = stream_threshold_s;
     sin.longform_enabled = longform_enabled;
+    sin.chunked_requested = opts.chunked_requested;
+    // Issue #350: a chunked-entry-point caller that left the length to the
+    // per-model default gets the bounded cap, not the 300 s single-pass one.
+    stream_threshold_s = parakeet_effective_single_pass_cap_s(sin, threshold_from_env);
+    sin.stream_threshold_s = stream_threshold_s;
     parakeet_strategy strat = parakeet_pick_strategy(sin);
 
     // Phase 2: proactive encoder memory policy. When single-pass is chosen but
@@ -288,8 +506,18 @@ std::vector<parakeet_seg> parakeet_transcribe_segments(parakeet_context* ctx, co
         }
     }
 
-    if (strat == parakeet_strategy::LONGFORM)
-        return transcribe_longform(ctx, samples, n_samples, t_offset_cs, stream_threshold_s * SR);
+    // Issue #350: JA is left alone — it has its own #89 machinery (VAD/energy
+    // slices capped at 12 s plus a 1 s-threshold gap-fill) on the paths that
+    // drive it, and none of this issue's measurements cover it.
+    const bool repair = !is_ja;
+
+    if (strat == parakeet_strategy::LONGFORM) {
+        out = transcribe_longform(ctx, samples, n_samples, t_offset_cs, stream_threshold_s * SR);
+        if (repair)
+            gap_fill_segments(ctx, samples, n_samples, t_offset_cs, out, kParakeetBoundedWindowS, kParakeetGapFillMinCs,
+                              opts.no_prints);
+        return out;
+    }
 
     parakeet_result* r = nullptr;
     if (strat == parakeet_strategy::SINGLE_PASS) {
@@ -315,5 +543,8 @@ std::vector<parakeet_seg> parakeet_transcribe_segments(parakeet_context* ctx, co
         return out;
     out.push_back(result_to_seg(r, t_offset_cs));
     parakeet_result_free(r);
+    if (repair)
+        gap_fill_segments(ctx, samples, n_samples, t_offset_cs, out, kParakeetBoundedWindowS, kParakeetGapFillMinCs,
+                          opts.no_prints);
     return out;
 }

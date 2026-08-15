@@ -232,7 +232,7 @@ void rvc_svc_free(rvc_svc_context* ctx) {
     if (!ctx)
         return;
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend)

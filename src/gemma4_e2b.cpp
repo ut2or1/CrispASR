@@ -2716,9 +2716,9 @@ extern "C" void gemma4_e2b_free(struct gemma4_e2b_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf_w)
-        ggml_backend_buffer_free(ctx->model.buf_w);
+        core_gguf::release_weight_buffer(ctx->model.buf_w);
     if (ctx->model.buf_w_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_w_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_w_cpu);
     if (ctx->model.ctx_w)
         ggml_free(ctx->model.ctx_w);
     if (ctx->backend_cpu)

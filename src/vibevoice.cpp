@@ -473,13 +473,13 @@ extern "C" void vibevoice_free(struct vibevoice_context* ctx) {
     if (ctx->ctx_perm)
         ggml_free(ctx->ctx_perm);
     if (ctx->voice.buf)
-        ggml_backend_buffer_free(ctx->voice.buf);
+        core_gguf::release_weight_buffer(ctx->voice.buf);
     if (ctx->voice.ctx)
         ggml_free(ctx->voice.ctx);
     if (ctx->buf)
-        ggml_backend_buffer_free(ctx->buf);
+        core_gguf::release_weight_buffer(ctx->buf);
     if (ctx->buf_cpu)
-        ggml_backend_buffer_free(ctx->buf_cpu);
+        core_gguf::release_weight_buffer(ctx->buf_cpu);
     if (ctx->weight_ctx)
         ggml_free(ctx->weight_ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)

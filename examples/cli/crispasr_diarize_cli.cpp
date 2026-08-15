@@ -9,6 +9,7 @@
 #include "crispasr_diarize_cli.h"
 #include "crispasr_cache.h"
 #include "crispasr_diarize_internal.h"
+#include "crispasr_model_registry.h"
 #include "crispasr_speaker_cluster.h"
 #include "crispasr_speaker_embedder.h"
 #include "crispasr_subprocess.h"
@@ -298,10 +299,11 @@ bool apply_sherpa(const std::vector<float>& mono, int64_t slice_t0_cs, std::vect
 std::string resolve_pyannote_model(const whisper_params& params) {
     std::string mp = params.sherpa_segment_model;
     if (mp.empty() || mp == "auto") {
-        mp = crispasr_cache::ensure_cached_file(
+        mp = crispasr_managed_download(
             "pyannote-seg-3.0.gguf",
             "https://huggingface.co/cstr/pyannote-v3-segmentation-GGUF/resolve/main/pyannote-seg-3.0.gguf",
-            params.no_prints, "crispasr[diarize]", params.cache_dir);
+            "other (see https://huggingface.co/cstr/pyannote-v3-segmentation-GGUF)", params.no_prints,
+            "crispasr[diarize]", params.cache_dir, params.accept_license);
     }
     if (mp.size() < 5 || mp.compare(mp.size() - 5, 5, ".gguf") != 0)
         return {}; // not GGUF → caller can fall back to sherpa subprocess
@@ -314,6 +316,18 @@ std::string resolve_pyannote_model(const whisper_params& params) {
 std::string resolve_foxnose_embedder(const whisper_params& params) {
     std::string mp = params.diarize_embedder;
     if (mp.empty() || mp == "auto") {
+        CrispasrRegistryEntry entry;
+        if (crispasr_registry_lookup("wespeaker", entry)) {
+            if (crispasr_license_requires_acceptance(entry.license) &&
+                !crispasr_license_accepted(entry.license, params.accept_license)) {
+                fprintf(stderr,
+                        "crispasr[diarize]: refusing restricted WeSpeaker weights without --accept-license %s\n",
+                        crispasr_license_tag(entry.license).c_str());
+                return {};
+            }
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr[diarize]: weights license: %s\n", entry.license.c_str());
+        }
         mp = crispasr_cache::ensure_cached_file(
             "wespeaker-resnet34-lm.gguf",
             "https://huggingface.co/cstr/wespeaker-resnet34-lm-GGUF/resolve/main/wespeaker-resnet34-lm.gguf",

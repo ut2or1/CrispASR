@@ -535,9 +535,9 @@ extern "C" void kugelaudio_free(struct kugelaudio_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->buf)
-        ggml_backend_buffer_free(ctx->buf);
+        core_gguf::release_weight_buffer(ctx->buf);
     if (ctx->buf_cpu)
-        ggml_backend_buffer_free(ctx->buf_cpu);
+        core_gguf::release_weight_buffer(ctx->buf_cpu);
     if (ctx->weight_ctx)
         ggml_free(ctx->weight_ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)

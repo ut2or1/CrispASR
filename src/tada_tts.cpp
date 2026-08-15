@@ -2332,7 +2332,7 @@ int tada_load_prompt(struct tada_context* ctx, const char* path) {
 
     // Clean up
     if (wl.buf)
-        ggml_backend_buffer_free(wl.buf);
+        core_gguf::release_weight_buffer(wl.buf);
     if (wl.ctx)
         ggml_free(wl.ctx);
 
@@ -3583,7 +3583,7 @@ void tada_free(struct tada_context* ctx) {
     if (ctx->kv_ctx)
         ggml_free(ctx->kv_ctx);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)

@@ -770,7 +770,7 @@ extern "C" void pyannote_seg_free(struct pyannote_seg_context* ctx) {
     if (!ctx)
         return;
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->model.backend)

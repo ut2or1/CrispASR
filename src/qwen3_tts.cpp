@@ -1602,9 +1602,37 @@ static float* run_talker_kv_dynamic(qwen3_tts_context* c, const float* embeds, i
     const double t_build0 = bench ? now_ms() : 0.0;
     ggml_cgraph* gf = build_graph_talker_kv(c, n_past, n_tokens);
     const double t_build1 = bench ? now_ms() : 0.0;
-    ggml_backend_sched_reset(c->sched);
-    if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
-        return nullptr;
+    // The talker graph starts with an unweighted RMSNorm.  With a GPU + CPU
+    // scheduler, ggml can place that leading op and its input on CPU because
+    // no model weight has selected the GPU yet, then copy the result into the
+    // first GPU matmul.  That cross-backend activation is wrong on HIP (and
+    // has also been observed on other GPU backends), corrupting the prefill
+    // before the first sampled frame.  Run the complete talker graph through
+    // a single-backend allocator so the input, weightless norm, KV writes and
+    // all following ops stay together.
+    //
+    // Keep the scheduler arm as an explicit A/B escape hatch.  It is useful
+    // for bisecting backend changes, but is not the default GPU path because
+    // it is the source of the frame-0 corruption in #337.
+    const bool use_direct =
+        !crispasr_env::get("CRISPASR_QWEN3_TTS_TALKER_SCHED") && !ggml_backend_is_cpu(c->backend) && c->kv_k &&
+        c->kv_k->buffer &&
+        ggml_backend_buffer_get_type(c->kv_k->buffer) == ggml_backend_get_default_buffer_type(c->backend);
+    ggml_gallocr_t direct_alloc = nullptr;
+    ggml_backend_sched_t sched = c->sched;
+    if (use_direct) {
+        direct_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(c->backend));
+        if (!direct_alloc || !ggml_gallocr_alloc_graph(direct_alloc, gf)) {
+            fprintf(stderr, "qwen3_tts: direct talker graph allocation failed\n");
+            if (direct_alloc)
+                ggml_gallocr_free(direct_alloc);
+            return nullptr;
+        }
+    } else {
+        ggml_backend_sched_reset(sched);
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            return nullptr;
+        }
     }
     const double t_alloc1 = bench ? now_ms() : 0.0;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inputs_embeds"), embeds, 0,
@@ -1616,18 +1644,22 @@ static float* run_talker_kv_dynamic(qwen3_tts_context* c, const float* embeds, i
                                 mask.size() * sizeof(ggml_fp16_t));
     }
     qwen3_prof_state prof_state;
-    if (prof) {
-        ggml_backend_sched_set_eval_callback(c->sched, qwen3_prof_eval_cb, &prof_state);
+    if (prof && !use_direct) {
+        ggml_backend_sched_set_eval_callback(sched, qwen3_prof_eval_cb, &prof_state);
     }
-    if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
-        if (prof) {
-            ggml_backend_sched_set_eval_callback(c->sched, nullptr, nullptr);
+    const ggml_status compute_status =
+        use_direct ? ggml_backend_graph_compute(c->backend, gf) : ggml_backend_sched_graph_compute(sched, gf);
+    if (compute_status != GGML_STATUS_SUCCESS) {
+        if (prof && !use_direct) {
+            ggml_backend_sched_set_eval_callback(sched, nullptr, nullptr);
         }
         fprintf(stderr, "qwen3_tts: talker compute failed\n");
+        if (direct_alloc)
+            ggml_gallocr_free(direct_alloc);
         return nullptr;
     }
-    if (prof) {
-        ggml_backend_sched_set_eval_callback(c->sched, nullptr, nullptr);
+    if (prof && !use_direct) {
+        ggml_backend_sched_set_eval_callback(sched, nullptr, nullptr);
     }
     const double t_compute1 = bench ? now_ms() : 0.0;
     ggml_tensor* out = ggml_graph_get_tensor(gf, "logits");
@@ -1657,6 +1689,8 @@ static float* run_talker_kv_dynamic(qwen3_tts_context* c, const float* embeds, i
             count = 0;
         }
     }
+    if (direct_alloc)
+        ggml_gallocr_free(direct_alloc);
     if (prof) {
         static qwen3_prof_state sum_prof;
         static int count = 0;
@@ -6482,7 +6516,7 @@ extern "C" int qwen3_tts_load_voice_pack(struct qwen3_tts_context* ctx, const ch
     }
 
     if (ctx->vp_buf_w) {
-        ggml_backend_buffer_free(ctx->vp_buf_w);
+        core_gguf::release_weight_buffer(ctx->vp_buf_w);
     }
     if (ctx->vp_ctx_w) {
         ggml_free(ctx->vp_ctx_w);
@@ -7094,6 +7128,15 @@ static bool qwen3_tts_generate_codes_ar(qwen3_tts_context* ctx, const char* text
     std::vector<float> next_emb_row_buf(d);
     std::vector<float> next_emb(d, 0.0f);
     for (frame = 0; frame < max_frames; frame++) {
+        // In replay mode, stop before evaluating a probe frame beyond the
+        // supplied teacher-forcing trajectory.  Checking after the forward
+        // pass dumped one extra logits file, making a complete replay look
+        // like an off-by-one parity failure.
+        if (!replay_codes.empty() && (size_t)(frame + 1) * 16 > replay_codes.size())
+            break;
+        if (!replay_tokens.empty() && frame >= (int)replay_tokens.size())
+            break;
+
         // #337 bisection instrumentation, mirroring glm_ocr's *_DUMP_LOGITS.
         // Dumped BEFORE the repetition penalty and the suppress mask, so a
         // cross-backend diff isolates the talker FORWARD from the sampling
@@ -7148,26 +7191,8 @@ static bool qwen3_tts_generate_codes_ar(qwen3_tts_context* ctx, const char* text
         }
         int cb0;
         if (!replay_codes.empty()) {
-            if ((size_t)(frame + 1) * 16 > replay_codes.size()) {
-                if (dbg)
-                    fprintf(stderr, "qwen3_tts: replay-codes list exhausted at frame %d\n", frame);
-                free(logits);
-                logits = nullptr;
-                free(past_hidden);
-                past_hidden = nullptr;
-                break;
-            }
             cb0 = replay_codes[(size_t)frame * 16];
         } else if (!replay_tokens.empty()) {
-            if (frame >= (int)replay_tokens.size()) {
-                if (dbg)
-                    fprintf(stderr, "qwen3_tts: replay list exhausted at frame %d\n", frame);
-                free(logits);
-                logits = nullptr;
-                free(past_hidden);
-                past_hidden = nullptr;
-                break;
-            }
             cb0 = replay_tokens[(size_t)frame];
         } else {
             cb0 = top_k_sample(logits, (int)hp.vocab_size, talker_top_k, talker_temp, &rng);
@@ -7861,7 +7886,7 @@ extern "C" void qwen3_tts_free(struct qwen3_tts_context* ctx) {
         ggml_free(ctx->cp_cpu_ctx);
     }
     if (ctx->codec.buf_w) {
-        ggml_backend_buffer_free(ctx->codec.buf_w);
+        core_gguf::release_weight_buffer(ctx->codec.buf_w);
     }
     if (ctx->codec.ctx_w) {
         ggml_free(ctx->codec.ctx_w);
@@ -7879,13 +7904,13 @@ extern "C" void qwen3_tts_free(struct qwen3_tts_context* ctx) {
         ggml_free(ctx->codec.ctx_conv32);
     }
     if (ctx->vp_buf_w) {
-        ggml_backend_buffer_free(ctx->vp_buf_w);
+        core_gguf::release_weight_buffer(ctx->vp_buf_w);
     }
     if (ctx->vp_ctx_w) {
         ggml_free(ctx->vp_ctx_w);
     }
     if (ctx->buf_w) {
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     }
     if (ctx->ctx_w) {
         ggml_free(ctx->ctx_w);

@@ -11,6 +11,17 @@
 
 set(TARGET crispasr-cli)
 
+# The CLI records consent hashes even when C2PA signing is disabled.  Its
+# header therefore uses the shared SHA-256 shim independently of
+# crispasr_enable_c2pa(), which only configures the optional signing library.
+set(_crispasr_c2pa_audio_include "${CMAKE_SOURCE_DIR}/third_party/c2pa-audio/src")
+if (NOT EXISTS "${_crispasr_c2pa_audio_include}/sha256.h")
+    message(FATAL_ERROR
+        "The c2pa-audio submodule is required by the CLI consent record "
+        "(missing ${_crispasr_c2pa_audio_include}/sha256.h). Initialize submodules with: "
+        "git submodule update --init --recursive")
+endif()
+
 add_executable(${TARGET}
     cli.cpp
     crispasr_backend.cpp
@@ -319,7 +330,10 @@ endif()
 set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME crispasr)
 
 # httplib.h is in the server example directory
-target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/server)
+target_include_directories(${TARGET} PRIVATE
+    ${CMAKE_SOURCE_DIR}/examples/server
+    ${_crispasr_c2pa_audio_include}
+)
 
 include(DefaultTargetOptions)
 

@@ -414,9 +414,9 @@ struct chatterbox_s3gen_context {
         if (ctx_w)
             ggml_free(ctx_w);
         if (buf_w)
-            ggml_backend_buffer_free(buf_w);
+            core_gguf::release_weight_buffer(buf_w);
         if (buf_cpu_w)
-            ggml_backend_buffer_free(buf_cpu_w);
+            core_gguf::release_weight_buffer(buf_cpu_w);
         if (backend && backend != backend_cpu)
             ggml_backend_free(backend);
         if (backend_cpu)

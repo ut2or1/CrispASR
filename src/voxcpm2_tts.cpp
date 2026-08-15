@@ -6839,7 +6839,7 @@ void voxcpm2_free(struct voxcpm2_context* ctx) {
         ctx->gpu_ggml_ctx = nullptr;
     }
     if (ctx->weight_buf) {
-        ggml_backend_buffer_free(ctx->weight_buf);
+        core_gguf::release_weight_buffer(ctx->weight_buf);
         ctx->weight_buf = nullptr;
     }
     if (ctx->ggml_ctx) {

@@ -347,15 +347,21 @@ static const ggml_backend_buffer_i mmap_buffer_iface = {
 // every weight — the kokoro Metal gibberish-audio regression.
 //
 // Instead we hand the inner buffer back as-is and track the mmap region
-// in this static side-map. When the buffer is freed elsewhere (model
-// shutdown) the inner backend's free callback releases its device-side
-// reference, but the host mmap stays mapped — Metal's
-// `newBufferWithBytesNoCopy:options:deallocator:nil` doesn't own the
-// host pages, so there's no MTLBuffer-side teardown that could munmap.
-// We deliberately leak the mmap; on macOS the kernel can still evict
-// file-backed pages under pressure (they're not anonymous), and process
-// exit reclaims everything. Address-space-wise this costs nothing past
-// the model's working set, which we'd be holding anyway.
+// in this static side-map. The inner backend's free callback releases its
+// device-side reference but cannot touch the host mapping — Metal's
+// `newBufferWithBytesNoCopy:options:deallocator:nil` doesn't own the host
+// pages, and `buffer_from_host_ptr` has no deallocator parameter through
+// which a backend could take ownership of them. Releasing the mapping is
+// therefore the loader's job, and `release_weight_buffer()` below is where
+// it happens: it frees the backend buffer and then unmaps the region the
+// side-map recorded for it.
+//
+// The mapping is `MAP_PRIVATE | PROT_READ|PROT_WRITE` (see MappedFile's
+// `writable` parameter, needed by backends that fold weights in place after
+// load), so every page privatizes on first read and the resident pages are
+// dirty and anonymous. They can be compressed or swapped, never dropped —
+// which is why holding them costs real memory for the life of the process
+// rather than page cache the kernel can reclaim.
 struct gpu_mmap_handle {
     void* base = nullptr;
     size_t size = 0;
@@ -371,6 +377,64 @@ static gpu_mmap_handle lookup_gpu_mmap(ggml_backend_buffer_t buf) {
     std::lock_guard<std::mutex> lk(g_gpu_mmap_mu);
     auto it = g_gpu_mmap.find(buf);
     return it != g_gpu_mmap.end() ? it->second : gpu_mmap_handle{};
+}
+// Look the region up and remove the entry in one critical section. Splitting
+// this into a lookup followed by an erase would let a second release of the
+// same buffer read the entry before the first erased it and unmap twice; it
+// would also race a concurrent load whose fresh buffer landed on the same
+// address after the free. A default-constructed handle means no entry, which
+// is the ordinary case for the CPU mmap path and the legacy alloc+copy path.
+static gpu_mmap_handle take_gpu_mmap(ggml_backend_buffer_t buf) {
+    std::lock_guard<std::mutex> lk(g_gpu_mmap_mu);
+    auto it = g_gpu_mmap.find(buf);
+    if (it == g_gpu_mmap.end())
+        return gpu_mmap_handle{};
+    const gpu_mmap_handle h = it->second;
+    g_gpu_mmap.erase(it);
+    return h;
+}
+
+static void unmap_region(void* base, size_t size) {
+    if (!base || size == 0)
+        return;
+#if defined(_WIN32)
+    (void)size;
+    UnmapViewOfFile(base);
+#else
+    ::munmap(base, size);
+#endif
+}
+
+// Issue #276 overflow chunks. A partition larger than the 1.5 GiB chunk limit
+// is allocated as several backend buffers; only the first goes into
+// WeightLoad::buf / ::buf_cpu, and the rest were left for the caller to free
+// out of WeightLoad::split_bufs. Every one of the eighteen backends that calls
+// load_weights_split() moves buf and buf_cpu into its own model struct and
+// drops the vector, so those chunks were freed by nobody. An obligation that
+// no caller has ever honoured belongs somewhere else.
+//
+// The overflow chunks are therefore owned here, keyed to the first buffer of
+// their own partition, and released with it. split_bufs still lists them so a
+// caller can see how a load was partitioned, but it is no longer a set of
+// handles the caller must free.
+static std::mutex g_split_mu;
+static std::map<ggml_backend_buffer_t, std::vector<ggml_backend_buffer_t>> g_split_extra;
+
+static void register_split_extra(ggml_backend_buffer_t primary, const std::vector<ggml_backend_buffer_t>& extra) {
+    if (!primary || extra.empty())
+        return;
+    std::lock_guard<std::mutex> lk(g_split_mu);
+    auto& slot = g_split_extra[primary];
+    slot.insert(slot.end(), extra.begin(), extra.end());
+}
+static std::vector<ggml_backend_buffer_t> take_split_extra(ggml_backend_buffer_t primary) {
+    std::lock_guard<std::mutex> lk(g_split_mu);
+    auto it = g_split_extra.find(primary);
+    if (it == g_split_extra.end())
+        return {};
+    std::vector<ggml_backend_buffer_t> extra = std::move(it->second);
+    g_split_extra.erase(it);
+    return extra;
 }
 
 // Issue #94 (chatterbox-turbo segfault during init on macOS / Apple
@@ -617,8 +681,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
             }
             // Bounds check failed — release the mmap buffer and fall through to
             // the legacy alloc+copy path below.
-            ggml_backend_buffer_free(out.buf);
-            out.buf = nullptr;
+            release_weight_buffer(out.buf);
         }
         // mmap failed or bounds check failed — fall through to the legacy
         // alloc + copy path. Functionally equivalent, just with more RSS.
@@ -640,10 +703,12 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
     // pierces the iface abstraction and casts `buffer->context` straight
     // to its `ggml_metal_buffer_t` — wrapping made Metal read garbage
     // and emit "tensor 'X' buffer is nil" for every weight (kokoro
-    // gibberish-audio regression). The mmap region is registered in
-    // g_gpu_mmap and deliberately leaked when the buffer is freed: Metal
-    // doesn't own the pages (deallocator=nil), and on macOS file-backed
-    // pages can still be evicted under pressure. Process exit cleans up.
+    // gibberish-audio regression). The mmap region is instead recorded in
+    // g_gpu_mmap against the buffer, and release_weight_buffer() unmaps it
+    // after freeing that buffer. Metal does not own the pages
+    // (deallocator=nil) and `buffer_from_host_ptr` offers no way to hand it
+    // ownership, so the caller must release through that entry point rather
+    // than through ggml_backend_buffer_free().
     if (mmap_loader_enabled() && !ggml_backend_is_cpu(backend)) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         ggml_backend_dev_props props{};
@@ -733,10 +798,12 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
                         }
                     }
                     if (!bounds_ok) {
-                        out.buf = nullptr;
-                        // inner is registered in g_gpu_mmap and deliberately
-                        // leaked (same as the normal teardown path).
-                        // Fall through to legacy path.
+                        // Release before falling through to the legacy path.
+                        // Abandoning `inner` here would leak both the backend
+                        // buffer and the whole-file mapping registered for it,
+                        // and the failure that reaches this branch is a
+                        // truncated or crafted GGUF — attacker-reachable.
+                        release_weight_buffer(out.buf);
                     } else {
                         for (ggml_tensor* t = ggml_get_first_tensor(out.ctx); t; t = ggml_get_next_tensor(out.ctx, t)) {
                             out.tensors[ggml_get_name(t)] = t;
@@ -804,8 +871,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
         if (!fp) {
             fprintf(stderr, "%s: cannot open '%s' for fread fallback\n", tag, path);
             gguf_free(gctx);
-            ggml_backend_buffer_free(out.buf);
-            out.buf = nullptr;
+            release_weight_buffer(out.buf);
             ggml_free(out.ctx);
             out.ctx = nullptr;
             return false;
@@ -847,8 +913,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
         if (!load_ok) {
             fprintf(stderr, "%s: legacy loader failed — model file may be truncated or corrupt\n", tag);
             gguf_free(gctx);
-            ggml_backend_buffer_free(out.buf);
-            out.buf = nullptr;
+            release_weight_buffer(out.buf);
             ggml_free(out.ctx);
             out.ctx = nullptr;
             return false;
@@ -872,8 +937,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
                         "(off=%zu + nbytes=%zu > file_size=%zu) — file truncated?\n",
                         tag, ggml_get_name(t), data_off + off, nbytes, mf.size);
                 gguf_free(gctx);
-                ggml_backend_buffer_free(out.buf);
-                out.buf = nullptr;
+                release_weight_buffer(out.buf);
                 ggml_free(out.ctx);
                 out.ctx = nullptr;
                 return false;
@@ -900,18 +964,33 @@ bool load_weights_filtered(const char* path, ggml_backend_t backend, IncludeTens
     return load_weights_impl(path, backend, include_tensor, user, model_tag, out);
 }
 
+void release_weight_buffer(ggml_backend_buffer_t& buf) {
+    if (!buf)
+        return;
+    // Take the entry before the free, not after: between a free and a later
+    // erase, a concurrent load could receive a new buffer at the same address
+    // and register it, and the erase would then drop a live mapping's record.
+    const gpu_mmap_handle h = take_gpu_mmap(buf);
+    // Overflow chunks of the same partition (issue #276) are released with it.
+    for (ggml_backend_buffer_t extra : take_split_extra(buf))
+        ggml_backend_buffer_free(extra);
+    // Free the backend buffer first. Metal's shared-storage MTLBuffer is a
+    // view onto these pages, so unmapping them while the buffer is alive would
+    // leave the GPU addressing unmapped memory. Freeing first inherits ggml's
+    // existing caller contract — ggml_metal_buffer_free already vm_deallocates
+    // the host pages of a buffer it owns, so "no work referencing this buffer
+    // may still be in flight" is a precondition every caller already meets.
+    ggml_backend_buffer_free(buf);
+    buf = nullptr;
+    unmap_region(h.base, h.size);
+}
+
 void free_weights(WeightLoad& wl) {
-    if (wl.buf) {
-        ggml_backend_buffer_free(wl.buf);
-        wl.buf = nullptr;
-    }
-    if (wl.buf_cpu) {
-        ggml_backend_buffer_free(wl.buf_cpu);
-        wl.buf_cpu = nullptr;
-    }
-    // Issue #276: free any overflow chunk buffers from split allocation.
-    for (auto* b : wl.split_bufs)
-        ggml_backend_buffer_free(b);
+    // Issue #276: the overflow chunks in split_bufs are released with the
+    // primary buffer of their partition, so freeing them again here would be
+    // a double free. Clearing the vector drops the now-dangling handles.
+    release_weight_buffer(wl.buf);
+    release_weight_buffer(wl.buf_cpu);
     wl.split_bufs.clear();
     if (wl.ctx) {
         ggml_free(wl.ctx);
@@ -1001,7 +1080,17 @@ bool load_weights_split(const char* path, ggml_backend_t gpu_backend, ggml_backe
     // than that need to be split across multiple backend buffers. We chunk
     // tensors into groups of <= 1.5 GiB each and allocate one buffer per
     // chunk; the 1.5 GiB limit leaves headroom for alignment padding.
-    static constexpr size_t max_alloc_chunk = (size_t)1536 * 1024 * 1024; // 1.5 GiB
+    //
+    // CRISPASR_GGUF_MAX_ALLOC_CHUNK (bytes) lowers the limit. A driver with a
+    // tighter cap than AMD's is the field use; the test use is that reaching
+    // the chunked path otherwise costs a multi-gigabyte allocation, so without
+    // this the branch that produces overflow buffers has no coverage at all.
+    size_t max_alloc_chunk = (size_t)1536 * 1024 * 1024; // 1.5 GiB
+    if (const char* v = std::getenv("CRISPASR_GGUF_MAX_ALLOC_CHUNK")) {
+        const long long parsed = std::atoll(v);
+        if (parsed > 0)
+            max_alloc_chunk = (size_t)parsed;
+    }
 
     auto round_up = [](size_t n, size_t a) { return (n + a - 1) & ~(a - 1); };
     auto bind_partition = [&](ggml_backend_t be, const std::vector<ggml_tensor*>& tensors,
@@ -1051,8 +1140,8 @@ bool load_weights_split(const char* path, ggml_backend_t gpu_backend, ggml_backe
             ggml_backend_buffer_t buf = ggml_backend_alloc_buffer(be, chunk.aligned_total);
             if (!buf) {
                 fprintf(stderr, "%s: failed to allocate %zu MiB backend buffer\n", tag, chunk.aligned_total / 1048576);
-                for (auto* b : out_bufs)
-                    ggml_backend_buffer_free(b);
+                for (auto& b : out_bufs)
+                    release_weight_buffer(b);
                 out_bufs.clear();
                 return false;
             }
@@ -1076,25 +1165,28 @@ bool load_weights_split(const char* path, ggml_backend_t gpu_backend, ggml_backe
         return false;
     }
     if (!bind_partition(cpu_backend, cpu_tensors, cpu_bufs)) {
-        for (auto* b : gpu_bufs)
-            ggml_backend_buffer_free(b);
+        for (auto& b : gpu_bufs)
+            release_weight_buffer(b);
         gguf_free(gctx);
         ggml_free(out.ctx);
         out.ctx = nullptr;
         return false;
     }
 
-    // First buffer of each partition goes into the canonical fields;
-    // any overflow chunks go into split_bufs for lifetime management.
+    // First buffer of each partition goes into the canonical fields; the
+    // overflow chunks are owned by this loader and released with the primary
+    // buffer of their own partition. split_bufs lists them for inspection.
     if (!gpu_bufs.empty()) {
         out.buf = gpu_bufs[0];
-        for (size_t i = 1; i < gpu_bufs.size(); i++)
-            out.split_bufs.push_back(gpu_bufs[i]);
+        const std::vector<ggml_backend_buffer_t> extra(gpu_bufs.begin() + 1, gpu_bufs.end());
+        register_split_extra(out.buf, extra);
+        out.split_bufs.insert(out.split_bufs.end(), extra.begin(), extra.end());
     }
     if (!cpu_bufs.empty()) {
         out.buf_cpu = cpu_bufs[0];
-        for (size_t i = 1; i < cpu_bufs.size(); i++)
-            out.split_bufs.push_back(cpu_bufs[i]);
+        const std::vector<ggml_backend_buffer_t> extra(cpu_bufs.begin() + 1, cpu_bufs.end());
+        register_split_extra(out.buf_cpu, extra);
+        out.split_bufs.insert(out.split_bufs.end(), extra.begin(), extra.end());
     }
 
     // Copy tensor data from the file. Use mmap when available for zero-

@@ -789,7 +789,7 @@ extern "C" void canary_ctc_free(struct canary_ctc_context* ctx) {
     if (ctx->model.ctx_f32)
         ggml_free(ctx->model.ctx_f32);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)

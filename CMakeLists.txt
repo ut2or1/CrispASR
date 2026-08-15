@@ -112,6 +112,9 @@ option(CRISPASR_ALL_WARNINGS_3RD_PARTY "crispasr: enable all compiler warnings i
 # build
 option(CRISPASR_FATAL_WARNINGS  "crispasr: enable -Werror flag"               OFF)
 option(CRISPASR_USE_SYSTEM_GGML "crispasr: use system-installed GGML library" OFF)
+option(CRISPASR_PORTABLE_CPU
+       "crispasr: compile bundled ggml-cpu for generic x86-64 (no optional ISA)"
+       OFF)
 
 # sanitizers
 option(CRISPASR_SANITIZE_THREAD    "crispasr: enable thread sanitizer"    OFF)
@@ -205,6 +208,45 @@ set(GGML_SANITIZE_ADDRESS   ${CRISPASR_SANITIZE_ADDRESS})
 set(GGML_SANITIZE_UNDEFINED ${CRISPASR_SANITIZE_UNDEFINED})
 set(GGML_ALL_WARNINGS       ${CRISPASR_ALL_WARNINGS})
 set(GGML_FATAL_WARNINGS     ${CRISPASR_FATAL_WARNINGS})
+
+# #261/#302: GPU inference still enumerates and initializes ggml-cpu before it
+# selects CUDA/Vulkan. A GPU artifact whose CPU helper was compiled for AVX2 or
+# BMI2 therefore raises SIGILL at model startup on older workstations, before
+# the server's runtime ISA diagnostic can run. `GGML_NATIVE=OFF` is NOT enough:
+# in a normal build it makes ggml's INS_ENB default true, silently enabling
+# SSE4.2/AVX/AVX2/BMI2 and friends. Keep the portable contract in one CMake
+# option so release jobs cannot omit one of the growing set of ggml ISA knobs.
+# This is the generic x86-64/SSE2 floor; non-x86 builds simply leave irrelevant
+# cache entries disabled.
+if (CRISPASR_PORTABLE_CPU)
+    if (CRISPASR_USE_SYSTEM_GGML)
+        message(FATAL_ERROR
+            "CRISPASR_PORTABLE_CPU cannot control a system-installed ggml; "
+            "use the bundled submodule or provide a baseline-built ggml")
+    endif()
+
+    foreach(_ggml_isa
+            NATIVE
+            SSE42
+            AVX
+            AVX_VNNI
+            AVX2
+            FMA
+            F16C
+            BMI2
+            AVX512
+            AVX512_VBMI
+            AVX512_VNNI
+            AVX512_BF16
+            AMX_TILE
+            AMX_INT8
+            AMX_BF16)
+        set(GGML_${_ggml_isa} OFF CACHE BOOL
+            "Disabled by CRISPASR_PORTABLE_CPU" FORCE)
+    endforeach()
+    message(STATUS
+        "CRISPASR_PORTABLE_CPU=ON: ggml-cpu uses the generic x86-64 baseline")
+endif()
 
 # §232: Enable tinyBLAS/llamafile GEMM by default — ~15-29% faster CPU encoder
 # matmuls across all backends. transcribe.cpp forces this ON; ggml defaults OFF.

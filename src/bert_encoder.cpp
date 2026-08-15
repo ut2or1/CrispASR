@@ -449,7 +449,7 @@ extern "C" void bert_encoder_free(struct bert_encoder_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->w_buf)
-        ggml_backend_buffer_free(ctx->w_buf);
+        core_gguf::release_weight_buffer(ctx->w_buf);
     if (ctx->w_ctx)
         ggml_free(ctx->w_ctx);
     if (ctx->backend_cpu)

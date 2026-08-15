@@ -2718,7 +2718,7 @@ void zonos_tts_free(struct zonos_tts_context* ctx) {
     if (ctx->dac_ctx_perm)
         ggml_free(ctx->dac_ctx_perm);
     if (ctx->dac_buf_w)
-        ggml_backend_buffer_free(ctx->dac_buf_w);
+        core_gguf::release_weight_buffer(ctx->dac_buf_w);
     if (ctx->dac_ctx_w)
         ggml_free(ctx->dac_ctx_w);
     if (ctx->kv_buf)
@@ -2726,7 +2726,7 @@ void zonos_tts_free(struct zonos_tts_context* ctx) {
     if (ctx->kv_ctx)
         ggml_free(ctx->kv_ctx);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend_cpu)

@@ -6,6 +6,54 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #348 Chatterbox Multilingual V3 parity port — shipped 2026-08-13
+
+PR #354 landed as a six-commit rebase at `278e3fbf`. The port pins the exact
+upstream code and model revisions, converts separate V3 T3 and S3Gen F16 GGUFs,
+and quantizes them with Q8 floors for the sensitive S3 tokenizer projection and
+T3 speech head. Published F16/Q8/Q4 artifacts are paired explicitly in the
+registry; the published German/JFK Python `-ref.gguf` is the release oracle.
+
+The canonical Q4 native diff passed 32 stages with zero failures and two
+intentional skips. A generated reference/clone/baseline loop transcribed the
+complete German target and measured TitaNet `cos(C,R)=0.792725` over
+`cos(B,R)=0.431873`. The Kaggle P100/SM60 release gate reproduced all tensor
+names, shapes, types, and provenance; passed the same 32/0/2 CPU-oracle to CUDA
+diff; produced finite, non-silent audio in all 23 supported languages; returned
+nonempty ASR in the nine-language roundtrip subset; and independently measured
+`cos(C,R)=0.769132` over `cos(B,R)=0.491945`. The merged head passed every
+required GitHub check, including 1,605 Linux unit assertions and static analysis.
+
+## #302 Pascal Windows GPU startup regression — fixed 2026-08-13
+
+The v0.8.28 Windows CUDA and Vulkan OmniVoice packages could terminate during
+startup with `0xC000001D` on an older HP Z800 host with a Quadro P5000.  The
+Pascal CUDA architecture was present. GPU startup still registers ggml-cpu,
+and the Z800's likely Westmere Xeon generation has SSE4.2 but no AVX. However,
+the same AVX2/FMA/F16C/BMI2 release baseline worked for this reporter in v0.8.23,
+so treating that baseline alone as the regression was too broad.
+
+The release-to-release delta identified ggml commit `dd2aaf04`: it moved a new
+UE4M3 lookup-table fill into unconditional `ggml_cpu_init()`. That made GPU-only
+startup execute newly compiled CPU work even though only NVFP4 CPU dot products
+consume the table. Fork commit `4d9a5c3d` makes initialization thread-safe and
+lazy at the two real consumers (x86 and ARM NVFP4 dot products), with
+`GGML_CPU_EAGER_UE4M3_LUT=1` preserving the old path for A/B diagnosis.
+
+An initial containment change put every GPU artifact on a generic x86-64
+baseline. It was superseded before release: CUDA, HIP, and Vulkan artifacts keep
+their optimized CPU helpers, while only explicitly legacy/portable artifacts
+use `CRISPASR_PORTABLE_CPU`. Thus the one suspected startup operation is gated
+without imposing a global CPU performance regression. Exact confirmation still
+requires the reporter's exception address; the ProcDump/WinDbg recipe is in
+`docs/windows-illegal-instruction-dumps.md`.
+
+The dedicated Kaggle P100 acceptance kernel built the containment commit for
+`sm_60`, confirmed all 15 ISA switches were off, started the persistent OmniVoice server
+with a WAV clone, synthesized 4.759 seconds on CUDA, and round-tripped it through
+Whisper base as `The quick brown fox jumps over the lazy dog.` (1.0 word
+overlap).  This proves the full Pascal CUDA path rather than only compilation.
+
 ## WhisperJAV port — post-decode text hardening (§W1–W7), archived from PLAN.md 2026-08-09
 
 Landed `3d64e7c5..48ae0c41`, all on `main`. Originated from a user report on

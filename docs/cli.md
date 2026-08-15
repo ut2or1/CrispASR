@@ -416,6 +416,14 @@ multilingual / v3 / EN models behave very differently:
   (5 min → 75 words), and the dispatcher chunk-30 + LCS-merge fallback, which
   duplicated a phrase at every 30 s boundary (token-id-exact LCS can't cancel
   the divergent re-transcription of the overlap).
+
+  On some recordings a stretch of speech in the middle of a long file can
+  still come out missing from the transcript, with no error (#350). To catch
+  this, any stretch of 3 s or more where nothing was transcribed is
+  automatically transcribed again and the recovered words merged back in. When
+  the transcript was already complete this changes nothing and adds no time.
+  `CRISPASR_GAP_FILL=0` turns it off; `CRISPASR_GAP_FILL_MIN_CS` tunes it
+  (see below).
 - **JA-only (vocab ≤ 4096):** the bidirectional encoder is numerically unstable
   when attention spans the whole utterance — codec-level perturbations as small
   as 0.3 % RMS flipped the encoder output std by ~14 % on the #89 clip, driving
@@ -444,8 +452,8 @@ multilingual / v3 / EN models behave very differently:
 | `CRISPASR_PARAKEET_STREAM_THRESHOLD` | non-JA 300, JA 12 | Single-pass cap (seconds). Audio ≤ this gets one full-attention pass; `0` disables single-pass entirely (always streamed). |
 | `CRISPASR_PARAKEET_VAD_SLICE_CAP` | non-JA 0, JA 12 | Max VAD slice duration (seconds); longer slices are re-split at energy minima before decoding. `0` = no cap. |
 | `CRISPASR_PARAKEET_ATT_CONTEXT` | unset | `"L,R"` switches the encoder to rel_pos_local_attn with that window (encoder frames, 1 = 80 ms) — NeMo's `change_attention_model` equivalent. `"-1,-1"` forces full attention. |
-| `CRISPASR_GAP_FILL` | 1 (bounded-window backends only) | Second pass re-transcribing spans ≥1 s the first pass left empty inside a slice; recovered words are merged back. `0` disables. |
-| `CRISPASR_GAP_FILL_MIN_CS` | 100 | Gap-fill trigger threshold in centiseconds (100 = 1.0 s of missing speech). |
+| `CRISPASR_GAP_FILL` | 1 | Automatically re-transcribe any stretch of audio the transcript left empty and merge the recovered words back. `0` disables. |
+| `CRISPASR_GAP_FILL_MIN_CS` | non-JA 300, JA 100 | Smallest empty stretch that triggers gap-fill, in centiseconds (300 = 3.0 s). Lower values catch shorter drops but may re-transcribe normal pauses, occasionally adding filler words. |
 | `CRISPASR_PARAKEET_LONGFORM` | non-JA 1, JA 0 | `1` = silence-split single-pass above the cap; `0` = streamed fallback above the cap. |
 | `CRISPASR_PARAKEET_INTERNAL_CHUNKING` | non-JA on, JA off | `0` = revert to the dispatcher's chunk-30 + overlap-save + LCS-merge path (A/B). |
 | `CRISPASR_PARAKEET_STREAM_CHUNK` | 0 (auto: 8 JA / 30 non-JA) | Streamed-path encoder chunk size (seconds). |
@@ -453,7 +461,7 @@ multilingual / v3 / EN models behave very differently:
 | `CRISPASR_PARAKEET_VRAM_BUDGET_MB` | 0 (off) | Proactive memory policy: if single-pass full attention's estimated O(T²) rel-pos bias exceeds this, use the streamed (bounded-window) encoder *before* allocating — avoids the OOM spike on small GPUs. 0 = disabled (single-pass as before; the reactive OOM fallback still backstops). |
 | `CRISPASR_PARAKEET_MEM_POLICY` | `auto` | `auto` honours the VRAM budget; `single`/`streamed` force that path; `off` disables the proactive check (reactive-only). |
 | `CRISPASR_PARAKEET_MEM_COEFF` | 8.0 | O(T²) estimate coefficient. Default calibrated so a ~4 min clip (T≈2800, 8 heads) estimates ~1.9 GiB, matching a measured CUDA allocation. |
-| `CRISPASR_SESSION_UNIFIED_DISPATCH` | 0 | `1` routes the session/bindings parakeet path through the shared CLI orchestration (improvements Phase 1) instead of the legacy inline copy. Default off until parity-flipped. |
+| `CRISPASR_SESSION_UNIFIED_DISPATCH` | 1 | No effect on the CLI. `0` makes the session/bindings API use its older parakeet code path instead of the one shared with the CLI — for troubleshooting comparisons only. |
 
 CLI escape hatches (no env needed): `--chunk-seconds N` forces the dispatcher's
 N-second chunk + merge; `--vad` forces the VAD path.
@@ -960,8 +968,8 @@ CLD3 is the smallest+fastest option (440 KB F16, 109 langs, Apache-2.0)
 but inherits CLD3's known short-input quirks (`"Hello world"` lands on
 `ky 0.72` consistently — too short to disambiguate; the C++ port
 faithfully reproduces upstream's `pycld3` behaviour). GlotLID-V3 covers
-the most languages (2102 ISO 639-3 + script). LID-176 is **CC-BY-SA-3.0
-(viral)** — pick CLD3 or GlotLID for non-SA distribution.
+the most languages (2102 ISO 639-3 + script). LID-176 is **CC-BY-NC-4.0
+(non-commercial)** — pick CLD3 or GlotLID for commercial distribution.
 
 ## Diarization
 
@@ -1420,6 +1428,24 @@ int open0  = crispasr_session_tab_string_open_midi(s, 0);  // for capo/transpose
 until the next call or session close.
 
 ### Model and licence
+
+#### Managed model downloads
+
+CrispASR records the upstream licence for every managed registry artifact and
+prints it when the artifact is loaded. Restricted terms (including Llama,
+Gemma, FunASR, CC-BY-NC/SA, Pocket TTS and other custom licences) require an
+exact acceptance tag before auto-download:
+
+```bash
+crispasr --backend tada -m auto --auto-download \
+  --accept-license llama3.2 -f input.wav
+```
+
+`--accept-license all` is also supported. This is an explicit acknowledgement
+gate, not a technical enforcement mechanism: downstream distributors remain
+responsible for carrying the upstream licence, attribution, acceptable-use and
+non-commercial terms. Explicit local paths and caller-supplied URLs are not
+managed downloads and are left under the caller's control.
 
 Weights are **CC BY 4.0** from the EGSet12 record
 (<https://zenodo.org/records/11406378>) — commercial use permitted,

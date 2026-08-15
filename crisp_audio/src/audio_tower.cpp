@@ -684,8 +684,12 @@ void crisp_audio_free(struct crisp_audio_context* ctx) {
 #endif
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
-    if (ctx->model_buf)
-        ggml_backend_buffer_free(ctx->model_buf);
+    // model_buf came from core_gguf::load_weights, so on a device advertising
+    // buffer_from_host_ptr it is a view onto a host mmap the backend does not
+    // own. ggml_backend_buffer_free() alone would leave the weight file mapped
+    // for the life of the process. The release entry point takes the loader's
+    // side-map entry and unmaps; it no-ops on a null handle and nulls ours.
+    core_gguf::release_weight_buffer(ctx->model_buf);
     if (ctx->model_ctx)
         ggml_free(ctx->model_ctx);
     if (ctx->backend_cpu)
