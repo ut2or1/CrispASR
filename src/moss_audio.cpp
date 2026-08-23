@@ -1594,6 +1594,7 @@ static float* moss_audio_run_llm_prefill_with_deepstack(moss_audio_context* ctx,
 
 #include "core/bpe.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/ggml_cpu_backend.h"
 
 extern "C" int moss_audio_tokenize(struct moss_audio_context* ctx, const char* text, int32_t* out_tokens,
                                    int max_tokens) {
@@ -2267,12 +2268,12 @@ extern "C" struct moss_audio_context* moss_audio_init_from_file(const char* path
     ctx->model_path = path_model;
 
     // Backend selection
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
     // #215 resolved: the native-Vulkan segfault was a use-after-free in the
     // encoder graph cached across invocations (see moss_audio_run_encoder);
@@ -2283,8 +2284,8 @@ extern "C" struct moss_audio_context* moss_audio_init_from_file(const char* path
         if (force_cpu && force_cpu[0] == '1')
             ctx->backend = ctx->backend_cpu;
     }
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     // Encoder attention path (issue #215). On Vulkan the encoder uses the manual
     // soft_max_ext attention rather than flash_attn_ext (avoids the FA split-k /

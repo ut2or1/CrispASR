@@ -57,6 +57,7 @@
 #include <numeric>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -420,13 +421,13 @@ extern "C" struct mimo_tokenizer_context* mimo_tokenizer_init_from_file(const ch
     core_gguf::free_metadata(gctx);
 
     // ---- Backends ----
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "mimo_tokenizer: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
@@ -567,7 +568,7 @@ extern "C" void mimo_tokenizer_set_n_threads(struct mimo_tokenizer_context* ctx,
         return;
     ctx->n_threads = n_threads;
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, n_threads);
 }
 
 // ===========================================================================

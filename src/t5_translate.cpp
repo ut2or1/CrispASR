@@ -18,7 +18,7 @@
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (§232 t5 GPU path)
 #include "core/crispasr_env.h"
 #if defined(GGML_USE_METAL)
-#include "ggml-metal.h" // ggml_backend_is_metal (§232 CUDA/Vulkan-default gate)
+#include "ggml-metal.h" // core_cpu_backend::is_metal(§232 CUDA/Vulkan-default gate)
 #endif
 
 #include "ggml-backend.h"
@@ -37,6 +37,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `T5_TRANSLATE_BENCH=1` for per-stage timings.
@@ -1081,7 +1082,7 @@ extern "C" struct t5_translate_context* t5_translate_init_from_file(const char* 
     //     identical en->de output, 2.13x wall (slow OpenBLAS baseline). On M1
     //     (Accelerate) neutral — launch-bound (LEARNING 34) — so Metal stays CPU
     //     unless forced. Mirrors LEARNING 34's is_metal gate.
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     const char* gpu_env = std::getenv("CRISPASR_T5_GPU");
     const bool force_gpu = gpu_env && std::atoi(gpu_env) != 0;
     const bool force_cpu = gpu_env && std::atoi(gpu_env) == 0;
@@ -1091,7 +1092,7 @@ extern "C" struct t5_translate_context* t5_translate_init_from_file(const char* 
         if (gpu) {
             bool is_metal = false;
 #if defined(GGML_USE_METAL)
-            is_metal = ggml_backend_is_metal(gpu);
+            is_metal = core_cpu_backend::is_metal(gpu);
 #endif
             if (!is_metal || force_gpu) {
                 c->backend = gpu;

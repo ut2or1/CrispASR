@@ -83,8 +83,20 @@ public:
         // auto-ran FireRedPunc over it (#308's audit item, found while fixing
         // #300): the capitaliser turned "And" into "ANd" and a second full stop
         // landed on text that already ended in one ("country..").
-        uint32_t caps = CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_FLASH_ATTN | CAP_TTS |
-                        CAP_DIARIZE | CAP_PUNCTUATION_NATIVE;
+        // CAP_TEMPERATURE intentionally NOT declared (#369). It was, and it was
+        // a claim with nothing behind it: `params.temperature` is never plumbed
+        // into vibevoice_context, and the ASR decode is a plain argmax over the
+        // logits — no temperature, no top-p, no sampling of any kind. The
+        // reporter of #369 spent time establishing from outside that `-tp 0.8`
+        // with different `--seed` values returns character-identical output,
+        // which is exactly what warn_unsupported() would have told them for
+        // free. Dropping the cap makes `--temperature` print "unsupported by
+        // this backend" instead of being silently ignored. Re-declare it only
+        // together with a decode path that actually reads the value — cf.
+        // crispasr_backend_gemma4_e2b.cpp, "so CAP_TEMPERATURE is real, not
+        // just a claim". CAP_BEAM_SEARCH was already, correctly, absent.
+        uint32_t caps =
+            CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD | CAP_FLASH_ATTN | CAP_TTS | CAP_DIARIZE | CAP_PUNCTUATION_NATIVE;
         if (allow_generic_no_voice_)
             caps |= CAP_VOICE_CLONING;
         return caps;
@@ -145,6 +157,11 @@ public:
             vv_pcm = pcm24_buf.data();
             vv_n = (int)pcm24_buf.size();
         }
+        // ASR is greedy, so --seed only matters when the acoustic posterior is
+        // being sampled (CRISPASR_VIBEVOICE_ASR_SAMPLE=1). It was never plumbed
+        // through the transcribe path at all, which is part of why the knob
+        // looked inert from outside (#369).
+        vibevoice_set_seed(ctx_, (uint32_t)params.seed);
         const char* context = params.context.empty() ? nullptr : params.context.c_str();
         char* text = vibevoice_transcribe_with_context(ctx_, vv_pcm, vv_n, context);
         if (!text)
@@ -167,7 +184,14 @@ public:
         // CRISPASR_VIBEVOICE_RAW_TRANSCRIPT=1 restores the pre-#300 behaviour
         // (one segment, raw model output) for anyone parsing the blob themselves.
         if (!crispasr_env::truthy("CRISPASR_VIBEVOICE_RAW_TRANSCRIPT")) {
-            for (const auto& u : core_vibevoice::parse(raw)) {
+            const std::vector<core_vibevoice::Utterance> utts = core_vibevoice::parse(raw);
+            for (const auto& u : utts) {
+                // The model's own non-speech markers are not transcript text.
+                // Dropped rather than emitted so an SRT never carries a literal
+                // "[Silence]" over speech, and so the CLI's non-silent-audio
+                // warning can fire (#369).
+                if (core_vibevoice::is_non_speech_marker(u.text))
+                    continue;
                 std::string t = u.text;
                 while (!t.empty() && (unsigned char)t.front() <= ' ')
                     t.erase(t.begin());
@@ -202,6 +226,12 @@ public:
                 out.push_back(std::move(seg));
             }
             if (!out.empty())
+                return out;
+            // The blob DID parse; it just carried nothing but non-speech. Return
+            // empty so the caller reports no transcript — falling through here
+            // would hand back the raw JSON, which is how "[Silence]" reached the
+            // user's transcript in the first place.
+            if (!utts.empty())
                 return out;
             // Nothing parsed — the model answered in prose, or the decode was
             // cut before the first complete object. Fall through and hand back

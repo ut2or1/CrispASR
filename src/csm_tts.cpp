@@ -62,6 +62,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===================================================================
 // Hyperparameters
@@ -1044,13 +1045,13 @@ extern "C" struct csm_tts_context* csm_tts_init_from_file(const char* path_model
     }
 
     // Backend
-    c->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    c->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!c->backend)
-        c->backend = ggml_backend_cpu_init();
-    c->backend_cpu = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(c->backend_cpu, c->n_threads);
-    if (ggml_backend_is_cpu(c->backend))
-        ggml_backend_cpu_set_n_threads(c->backend, c->n_threads);
+        c->backend = core_cpu_backend::init();
+    c->backend_cpu = core_cpu_backend::init();
+    core_cpu_backend::set_n_threads(c->backend_cpu, c->n_threads);
+    if (core_cpu_backend::is_cpu(c->backend))
+        core_cpu_backend::set_n_threads(c->backend, c->n_threads);
 
     // Pass 1: metadata
     {
@@ -1158,9 +1159,9 @@ extern "C" void csm_tts_set_seed(struct csm_tts_context* ctx, uint64_t seed) {
 extern "C" void csm_tts_set_n_threads(struct csm_tts_context* ctx, int n_threads) {
     if (ctx) {
         ctx->n_threads = n_threads > 0 ? n_threads : 4;
-        if (ggml_backend_is_cpu(ctx->backend))
-            ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        if (core_cpu_backend::is_cpu(ctx->backend))
+            core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     }
 }
 

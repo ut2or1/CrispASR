@@ -28,6 +28,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `FASTPITCH_BENCH=1` for per-stage timings.
@@ -331,13 +332,13 @@ static fastpitch_tts_context* load_model(const char* path, fastpitch_tts_params 
 
     // ── Init backends ──
 
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "fastpitch: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads);
 
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)

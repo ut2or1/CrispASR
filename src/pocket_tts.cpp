@@ -53,6 +53,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ── SentencePiece tokenizer ───────────────────────────────────────
 // The GGUF stores tokenizer.ggml.tokens + tokenizer.ggml.scores arrays
@@ -2975,13 +2976,13 @@ struct pocket_tts_context* pocket_tts_init_from_file(const char* path_model, str
     core_gguf::free_metadata(meta);
 
     // ── Init backends ──
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "pocket_tts: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads);
 
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)

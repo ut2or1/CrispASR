@@ -83,6 +83,7 @@ extern int crispasr_session_set_cfg_weight(struct CrispasrSession* s, float cfg_
 extern int crispasr_session_set_tts_noise_temp(struct CrispasrSession* s, float noise_temp);
 extern int crispasr_session_set_exaggeration(struct CrispasrSession* s, float exaggeration);
 extern int crispasr_session_set_max_speech_tokens(struct CrispasrSession* s, int n);
+extern int crispasr_session_set_min_speech_tokens(struct CrispasrSession* s, int n);
 extern int crispasr_session_set_length_scale(struct CrispasrSession* s, float scale);
 extern int crispasr_session_set_best_of(struct CrispasrSession* s, int n);
 extern int crispasr_session_set_beam_size(struct CrispasrSession* s, int n);
@@ -546,6 +547,14 @@ static VALUE rb_session_set_max_speech_tokens(VALUE self, VALUE handle, VALUE n)
     int rc = crispasr_session_set_max_speech_tokens(s, NUM2INT(n));
     if (rc != 0 && rc != -2)
         rb_raise(rb_eRuntimeError, "set_max_speech_tokens failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_min_speech_tokens(VALUE self, VALUE handle, VALUE n) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_min_speech_tokens(s, NUM2INT(n));
+    if (rc != 0 && rc != -2)
+        rb_raise(rb_eRuntimeError, "set_min_speech_tokens failed (rc=%d)", rc);
     return Qnil;
 }
 
@@ -1908,6 +1917,7 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "set_tts_noise_temp", rb_session_set_tts_noise_temp, 2);
     rb_define_singleton_method(mSession, "set_exaggeration", rb_session_set_exaggeration, 2);
     rb_define_singleton_method(mSession, "set_max_speech_tokens", rb_session_set_max_speech_tokens, 2);
+    rb_define_singleton_method(mSession, "set_min_speech_tokens", rb_session_set_min_speech_tokens, 2);
     rb_define_singleton_method(mSession, "set_length_scale", rb_session_set_length_scale, 2);
     rb_define_singleton_method(mSession, "set_best_of", rb_session_set_best_of, 2);
     rb_define_singleton_method(mSession, "set_beam_size", rb_session_set_beam_size, 2);

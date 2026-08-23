@@ -34,6 +34,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `SILERO_LID_BENCH=1` for per-stage timings.
@@ -777,12 +778,12 @@ extern "C" struct silero_lid_context* silero_lid_init(const char* gguf_path, int
     auto* ctx = new silero_lid_context();
     ctx->n_threads = n_threads > 0 ? n_threads : 4;
 
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
     if (silero_use_legacy()) {
         // The legacy forward dereferences tensor->data directly, so weights
@@ -792,7 +793,7 @@ extern "C" struct silero_lid_context* silero_lid_init(const char* gguf_path, int
         ctx->backend = ctx->backend_cpu;
     } else {
         ctx->backend = crispasr_init_gpu_backend();
-        if (ctx->backend && ggml_backend_is_cpu(ctx->backend)) {
+        if (ctx->backend && core_cpu_backend::is_cpu(ctx->backend)) {
             // CPU-only build: drop the duplicate instance so the sched uses
             // the one with n_threads configured.
             ggml_backend_free(ctx->backend);

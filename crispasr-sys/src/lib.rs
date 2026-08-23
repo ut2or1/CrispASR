@@ -552,6 +552,26 @@ extern "C" {
         out_text: *mut *mut c_char,
         out_n_samples: *mut c_int,
     ) -> *mut f32;
+    // Source separation (#359). Stereo interleaved PCM in at the model's own
+    // rate (44100 Hz for htdemucs / mel-band-roformer); returns the stem count.
+    // Stem buffers are owned by the session and valid only until the next
+    // separate() call or close, so a safe wrapper must copy them out.
+    pub fn crispasr_session_separate(
+        s: *mut CrispasrSession,
+        pcm_stereo: *const f32,
+        n_samples: c_int,
+    ) -> c_int;
+    pub fn crispasr_session_separate_n_stems(s: *mut CrispasrSession) -> c_int;
+    pub fn crispasr_session_separate_stem_name(
+        s: *mut CrispasrSession,
+        stem_idx: c_int,
+    ) -> *const c_char;
+    pub fn crispasr_session_separate_stem(
+        s: *mut CrispasrSession,
+        stem_idx: c_int,
+        out_n_samples: *mut c_int,
+    ) -> *const f32;
+    pub fn crispasr_session_separate_sample_rate(s: *mut CrispasrSession) -> c_int;
     // UNMARKED synthesis (no watermark/disclosure). Hard-refused unless
     // `crispasr_session_accept_marking_responsibility` was called first. Returns
     // malloc'd f32 PCM (free with `crispasr_pcm_free`); null on refusal/failure.
@@ -686,6 +706,7 @@ extern "C" {
         exaggeration: c_float,
     ) -> c_int;
     pub fn crispasr_session_set_max_speech_tokens(s: *mut CrispasrSession, n: c_int) -> c_int;
+    pub fn crispasr_session_set_min_speech_tokens(s: *mut CrispasrSession, n: c_int) -> c_int;
     pub fn crispasr_session_set_length_scale(s: *mut CrispasrSession, scale: c_float) -> c_int;
     pub fn crispasr_session_set_best_of(s: *mut CrispasrSession, n: c_int) -> c_int;
     pub fn crispasr_session_set_beam_size(s: *mut CrispasrSession, n: c_int) -> c_int;
@@ -1039,6 +1060,222 @@ extern "C" {
     ) -> c_float;
 }
 
+// =========================================================================
+// Chat / LLM FFI — mirrors include/crispasr_chat.h
+// =========================================================================
+//
+// Text in, text out over the private `crispasr-llama-core` (vendored
+// llama.cpp) built unconditionally into libcrispasr, so these symbols are
+// always present — no build flag gates them. Only POD structs and one
+// opaque handle cross the boundary.
+
+/// Opaque handle returned by `crispasr_chat_open`. Free with
+/// `crispasr_chat_close`.
+#[repr(C)]
+pub struct CrispasrChatSession(c_void);
+
+/// The one error code on the chat ABI with a stable, documented meaning:
+/// a registered abort callback stopped the run. Every other non-zero
+/// `CrispasrChatError::code` is a diagnostic aid — read `message`.
+pub const CRISPASR_CHAT_ERR_ABORTED: i32 = 40;
+
+/// Out-parameter for every chat entry point that can fail (may be null).
+/// Left untouched on success; on failure `code` is non-zero and `message`
+/// holds a NUL-terminated diagnostic.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CrispasrChatError {
+    pub code: i32,
+    pub message: [c_char; 256],
+}
+
+impl Default for CrispasrChatError {
+    fn default() -> Self {
+        Self {
+            code: 0,
+            message: [0; 256],
+        }
+    }
+}
+
+/// One turn of a conversation. `role` is "system", "user", "assistant" or
+/// "tool"; both pointers must stay valid for the duration of the call.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CrispasrChatMessage {
+    pub role: *const c_char,
+    pub content: *const c_char,
+}
+
+/// Per-session, model-level open params. Fill via
+/// [`crispasr_chat_open_params_default`] before overriding fields — the C
+/// side reads every one of them.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CrispasrChatOpenParams {
+    pub n_threads: c_int,
+    pub n_threads_batch: c_int,
+    /// Context window in tokens; 0 = the model's own default.
+    pub n_ctx: c_int,
+    pub n_batch: c_int,
+    pub n_ubatch: c_int,
+    /// -1 = offload all layers, 0 = CPU only.
+    pub n_gpu_layers: c_int,
+    pub use_mmap: bool,
+    pub use_mlock: bool,
+    pub embeddings: bool,
+    /// Overrides the template baked into the GGUF; null reads
+    /// `tokenizer.chat_template` from the model. Copied by the callee.
+    pub chat_template: *const c_char,
+}
+
+impl Default for CrispasrChatOpenParams {
+    fn default() -> Self {
+        Self {
+            n_threads: 0,
+            n_threads_batch: 0,
+            n_ctx: 0,
+            n_batch: 0,
+            n_ubatch: 0,
+            n_gpu_layers: 0,
+            use_mmap: false,
+            use_mlock: false,
+            embeddings: false,
+            chat_template: std::ptr::null(),
+        }
+    }
+}
+
+/// Per-call, sampler-level generate params. Fill via
+/// [`crispasr_chat_generate_params_default`] before overriding fields.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CrispasrChatGenerateParams {
+    pub max_tokens: c_int,
+    /// 0.0 = greedy (short-circuits the rest of the sampler chain).
+    pub temperature: c_float,
+    pub top_k: c_int,
+    pub top_p: c_float,
+    pub min_p: c_float,
+    pub repeat_penalty: c_float,
+    pub repeat_last_n: c_int,
+    /// 0xFFFFFFFF = random.
+    pub seed: u32,
+    /// Array of `n_stop` NUL-terminated stop strings; null = none.
+    pub stop: *const *const c_char,
+    pub n_stop: usize,
+    /// Prefill the prompt but suppress assistant generation.
+    pub prefill_only: bool,
+}
+
+impl Default for CrispasrChatGenerateParams {
+    fn default() -> Self {
+        Self {
+            max_tokens: 0,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 0.0,
+            min_p: 0.0,
+            repeat_penalty: 0.0,
+            repeat_last_n: 0,
+            seed: 0,
+            stop: std::ptr::null(),
+            n_stop: 0,
+            prefill_only: false,
+        }
+    }
+}
+
+/// Fired once per detokenised UTF-8 chunk during a streaming generate. The
+/// chunk pointer is valid only for the duration of the call.
+/// `Option<...>` so a null pointer clears the callback (C `NULL`).
+pub type CrispasrChatOnToken =
+    Option<unsafe extern "C" fn(utf8_chunk: *const c_char, user: *mut c_void)>;
+
+/// Abort hook. Returns **true to continue**, false to abort — the
+/// `whisper_encoder_begin_callback` convention on the ASR surface, and the
+/// opposite of ggml's own. Called on the generating thread before each
+/// prompt batch and each sampled token, and (CPU backend only) from inside
+/// a running compute graph, so it must be cheap and non-blocking. It must
+/// not re-enter the session that registered it — the session mutex is held.
+pub type CrispasrChatAbortCallback = Option<unsafe extern "C" fn(user: *mut c_void) -> bool>;
+
+extern "C" {
+    // --- Params ---
+    pub fn crispasr_chat_open_params_default(out: *mut CrispasrChatOpenParams);
+    pub fn crispasr_chat_generate_params_default(out: *mut CrispasrChatGenerateParams);
+
+    // --- Session lifecycle ---
+    pub fn crispasr_chat_open(
+        model_path: *const c_char,
+        params: *const CrispasrChatOpenParams,
+        err: *mut CrispasrChatError,
+    ) -> *mut CrispasrChatSession;
+    pub fn crispasr_chat_close(s: *mut CrispasrChatSession);
+    pub fn crispasr_chat_reset(s: *mut CrispasrChatSession, err: *mut CrispasrChatError) -> i32;
+
+    // --- Generation ---
+    /// Returns a malloc'd UTF-8 string (free with
+    /// [`crispasr_chat_string_free`]) or null on failure / abort.
+    pub fn crispasr_chat_generate(
+        s: *mut CrispasrChatSession,
+        messages: *const CrispasrChatMessage,
+        n_messages: usize,
+        params: *const CrispasrChatGenerateParams,
+        err: *mut CrispasrChatError,
+    ) -> *mut c_char;
+
+    /// 0 on clean completion (including stop-sequence / EOG termination),
+    /// [`CRISPASR_CHAT_ERR_ABORTED`] when the abort callback stopped it,
+    /// other non-zero on failure.
+    pub fn crispasr_chat_generate_stream(
+        s: *mut CrispasrChatSession,
+        messages: *const CrispasrChatMessage,
+        n_messages: usize,
+        params: *const CrispasrChatGenerateParams,
+        on_token: CrispasrChatOnToken,
+        user: *mut c_void,
+        err: *mut CrispasrChatError,
+    ) -> i32;
+
+    /// Register `cb` on the session (null clears it). Takes the session
+    /// lock, so calling it during a generation blocks rather than
+    /// cancelling — register before starting one.
+    pub fn crispasr_chat_set_abort_callback(
+        s: *mut CrispasrChatSession,
+        cb: CrispasrChatAbortCallback,
+        user: *mut c_void,
+    );
+
+    // --- Introspection ---
+    pub fn crispasr_chat_template_name(s: *mut CrispasrChatSession) -> *const c_char;
+    pub fn crispasr_chat_n_ctx(s: *mut CrispasrChatSession) -> i32;
+
+    /// Prompt tokens a FRESH session prefills for `messages` — chat
+    /// template, BOS, and the trailing generation prompt included.
+    /// Negative on failure, with `err` filled.
+    pub fn crispasr_chat_count_tokens(
+        s: *mut CrispasrChatSession,
+        messages: *const CrispasrChatMessage,
+        n_messages: usize,
+        err: *mut CrispasrChatError,
+    ) -> i32;
+
+    /// Approximate working set in bytes for a GGUF chat model on disk, or
+    /// 0 when it could not be estimated (`err` filled).
+    pub fn crispasr_chat_memory_estimate(
+        model_path: *const c_char,
+        params: *const CrispasrChatOpenParams,
+        err: *mut CrispasrChatError,
+    ) -> usize;
+
+    pub fn crispasr_chat_string_free(s: *mut c_char);
+
+    /// Canonical EU AI Act Art. 50(1) "you are talking to an AI" wording.
+    /// Static string — never null, never freed.
+    pub fn crispasr_chat_ai_disclosure_text() -> *const c_char;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1060,5 +1297,33 @@ mod tests {
         );
         assert_eq!(offset_of!(CrispasrDiarizeOptsAbi, min_speakers), 32);
         assert_eq!(offset_of!(CrispasrDiarizeOptsAbi, num_speakers), 40);
+    }
+
+    // Same guard for the hand-maintained mirrors of the POD structs in
+    // include/crispasr_chat.h. Values are what the C compiler reports for
+    // that header on a 64-bit target; the trailing `bool` in each params
+    // struct is what makes the tail padding easy to get wrong.
+    #[test]
+    fn chat_abi_layout() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(size_of::<CrispasrChatError>(), 260);
+        assert_eq!(offset_of!(CrispasrChatError, message), 4);
+
+        assert_eq!(size_of::<CrispasrChatMessage>(), 16);
+        assert_eq!(offset_of!(CrispasrChatMessage, content), 8);
+
+        assert_eq!(size_of::<CrispasrChatOpenParams>(), 40);
+        assert_eq!(offset_of!(CrispasrChatOpenParams, n_gpu_layers), 20);
+        assert_eq!(offset_of!(CrispasrChatOpenParams, use_mmap), 24);
+        assert_eq!(offset_of!(CrispasrChatOpenParams, use_mlock), 25);
+        assert_eq!(offset_of!(CrispasrChatOpenParams, embeddings), 26);
+        assert_eq!(offset_of!(CrispasrChatOpenParams, chat_template), 32);
+
+        assert_eq!(size_of::<CrispasrChatGenerateParams>(), 56);
+        assert_eq!(offset_of!(CrispasrChatGenerateParams, seed), 28);
+        assert_eq!(offset_of!(CrispasrChatGenerateParams, stop), 32);
+        assert_eq!(offset_of!(CrispasrChatGenerateParams, n_stop), 40);
+        assert_eq!(offset_of!(CrispasrChatGenerateParams, prefill_only), 48);
     }
 }

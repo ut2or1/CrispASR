@@ -1213,6 +1213,7 @@ extern "C" const char* higgs_stt_token_text(higgs_stt_context* ctx, int id) {
 #include "core/beam_decode.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/ngram_loop_fix.h"   // core_ngram::fix_loops (shared with moss-transcribe)
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1326,15 +1327,15 @@ extern "C" higgs_stt_context* higgs_stt_init_from_file(const char* path, higgs_s
 
     // Try GPU backend first (Metal, CUDA, Vulkan...), fall back to CPU.
     // crispasr_init_gpu_backend() picks the highest-priority available backend.
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu) {
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     }
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     }
 
     if (!higgs_stt_load_model(ctx->model, ctx->vocab, path, ctx->backend, ctx->backend_cpu)) {

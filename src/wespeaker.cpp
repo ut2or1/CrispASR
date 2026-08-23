@@ -68,6 +68,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Env gates
@@ -511,7 +512,7 @@ extern "C" struct wespeaker_context* wespeaker_init_from_file(const char* path_m
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : nullptr;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
@@ -519,7 +520,7 @@ extern "C" struct wespeaker_context* wespeaker_init_from_file(const char* path_m
     // ran at ggml's default no matter what the caller asked for — and any
     // attempt to run several contexts at once oversubscribed the machine by
     // that default factor.
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     if (params.verbosity > 0)
         fprintf(stderr, "wespeaker: backend = %s\n", ggml_backend_name(ctx->backend));
 
@@ -547,13 +548,13 @@ extern "C" struct wespeaker_context* wespeaker_init_worker(struct wespeaker_cont
     ctx->n_threads = src->n_threads;
     ctx->model = src->model; // shares ctx/buf/tensors — see owns_model
     ctx->owns_model = false;
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         delete ctx;
         return nullptr;
     }
     ctx->backend = ctx->backend_cpu;
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     ctx->compute_meta.resize(src->compute_meta.size());
     return ctx;
 }

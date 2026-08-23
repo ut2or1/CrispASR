@@ -145,6 +145,13 @@ float* parakeet_encode(struct parakeet_context* ctx, const float* samples, int n
 struct parakeet_result* parakeet_decode_frames(struct parakeet_context* ctx, const float* enc_frames, int T_enc,
                                                int d_model, int64_t t_offset_cs);
 
+// 1 when parakeet_decode_frames() runs its predictor/joint as ggml graphs on
+// ctx->backend (CUDA/Vulkan default), 0 when it uses the cblas CPU path
+// (CPU + Metal default). Callers that want to overlap encode and decode on
+// separate threads MUST NOT do so when this returns 1 — both would drive the
+// same ggml backend and scheduler concurrently.
+int parakeet_decode_uses_backend(struct parakeet_context* ctx);
+
 // Hyper-parameters needed by callers (frame duration for stamping etc.)
 int parakeet_frame_dur_cs(struct parakeet_context* ctx); // centiseconds per encoder frame
 int parakeet_n_mels(struct parakeet_context* ctx);

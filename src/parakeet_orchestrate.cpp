@@ -11,11 +11,15 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -148,10 +152,19 @@ int find_silence_cut(const float* s, int n, int target, int window, int sr) {
     return best_pos;
 }
 
-// Silence-split single-pass longform (mirrors the adapter's transcribe_longform).
-std::vector<parakeet_seg> transcribe_longform(parakeet_context* ctx, const float* samples, int n_samples,
-                                              int64_t t_offset_cs, int cap_samples) {
-    std::vector<parakeet_seg> out;
+// One silence-split longform window. The boundaries depend only on the PCM, so
+// the whole plan can be computed up front — which is what lets the encoder run
+// ahead of the decoder (see transcribe_longform).
+struct lf_window {
+    int ext_s, ext_e;          // encoder input range (window ± 2 s context)
+    int64_t ext_t0;            // absolute start of ext_s, centiseconds
+    int64_t left_cs, right_cs; // keep words with left_cs <= t0 < right_cs
+};
+
+// Reproduces the original serial loop's window sequence exactly.
+std::vector<lf_window> plan_longform_windows(const float* samples, int n_samples, int64_t t_offset_cs,
+                                             int cap_samples) {
+    std::vector<lf_window> plan;
     const int SR = 16000;
     const int search = 5 * SR;
     const int ctxs = 2 * SR;
@@ -165,44 +178,16 @@ std::vector<parakeet_seg> transcribe_longform(parakeet_context* ctx, const float
             if (end <= pos)
                 end = std::min(n_samples, pos + cap_samples);
         }
-        const int ext_s = std::max(0, pos - ctxs);
-        const int ext_e = std::min(n_samples, end + ctxs);
-        const int64_t ext_t0 = t_offset_cs + (int64_t)((double)ext_s / SR * 100.0);
-        const int64_t left_cs = (pos == 0) ? INT64_MIN : t_offset_cs + (int64_t)((double)pos / SR * 100.0);
-        const int64_t right_cs = (end == n_samples) ? INT64_MAX : t_offset_cs + (int64_t)((double)end / SR * 100.0);
-
-        parakeet_result* r = parakeet_transcribe_ex(ctx, samples + ext_s, ext_e - ext_s, ext_t0);
-        if (r) {
-            parakeet_seg full = result_to_seg(r, ext_t0);
-            parakeet_result_free(r);
-
-            parakeet_seg seg;
-            seg.t0 = left_cs == INT64_MIN ? full.t0 : left_cs;
-            seg.t1 = seg.t0;
-            std::string text;
-            for (auto& w : full.words) {
-                if (w.t0 >= left_cs && w.t0 < right_cs) {
-                    if (!text.empty())
-                        text += ' ';
-                    text += w.text;
-                    seg.words.push_back(std::move(w));
-                }
-            }
-            for (auto& tk : full.tokens) {
-                if (tk.t0 >= left_cs && tk.t0 < right_cs)
-                    seg.tokens.push_back(std::move(tk));
-            }
-            seg.text = std::move(text);
-            if (!seg.words.empty()) {
-                seg.t0 = seg.words.front().t0;
-                seg.t1 = seg.words.back().t1;
-            }
-            if (!seg.text.empty() || !seg.words.empty())
-                out.push_back(std::move(seg));
-        }
+        lf_window w;
+        w.ext_s = std::max(0, pos - ctxs);
+        w.ext_e = std::min(n_samples, end + ctxs);
+        w.ext_t0 = t_offset_cs + (int64_t)((double)w.ext_s / SR * 100.0);
+        w.left_cs = (pos == 0) ? INT64_MIN : t_offset_cs + (int64_t)((double)pos / SR * 100.0);
+        w.right_cs = (end == n_samples) ? INT64_MAX : t_offset_cs + (int64_t)((double)end / SR * 100.0);
+        plan.push_back(w);
         pos = end;
     }
-    return out;
+    return plan;
 }
 
 // Normalize a word for boundary-dedup comparison: lowercase + drop ASCII
@@ -409,7 +394,247 @@ int gap_fill_segments(parakeet_context* ctx, const float* samples, int n_samples
     return total;
 }
 
+// Trim one window's decode to its non-overlapping span and append it. Shared by
+// the serial and pipelined paths so both produce byte-identical segments.
+// Consumes `r` (frees it).
+void append_window_seg(parakeet_result* r, const lf_window& w, std::vector<parakeet_seg>& out) {
+    if (!r)
+        return;
+    parakeet_seg full = result_to_seg(r, w.ext_t0);
+    parakeet_result_free(r);
+
+    parakeet_seg seg;
+    seg.t0 = w.left_cs == INT64_MIN ? full.t0 : w.left_cs;
+    seg.t1 = seg.t0;
+    std::string text;
+    for (auto& word : full.words) {
+        if (word.t0 >= w.left_cs && word.t0 < w.right_cs) {
+            if (!text.empty())
+                text += ' ';
+            text += word.text;
+            seg.words.push_back(std::move(word));
+        }
+    }
+    for (auto& tk : full.tokens) {
+        if (tk.t0 >= w.left_cs && tk.t0 < w.right_cs)
+            seg.tokens.push_back(std::move(tk));
+    }
+    seg.text = std::move(text);
+    if (!seg.words.empty()) {
+        seg.t0 = seg.words.front().t0;
+        seg.t1 = seg.words.back().t1;
+    }
+    if (!seg.text.empty() || !seg.words.empty())
+        out.push_back(std::move(seg));
+}
+
+// Silence-split single-pass longform (mirrors the adapter's transcribe_longform).
+//
+// The windows are independent: each is encoded from raw PCM and the merge is a
+// pure timestamp filter. The encoder runs on ctx->backend (GPU) and the TDT
+// decoder on the CPU (cblas), so running them strictly in sequence left one of
+// the two idle at all times — measured 0.42 cores on an 11.2 min file, with the
+// stage sum equal to wall time (encoder 67 %, decode 32 %).
+//
+// So: a producer thread encodes window N+1 while this thread decodes window N.
+// Order is preserved (single producer, single consumer, FIFO), and the queue is
+// bounded so at most two encoder buffers are resident (~4.5 MB each at 90 s).
+//
+// Safety: the two threads touch DISJOINT parakeet_context state — the encoder
+// owns sched/compute_meta/cached_enc_*, the decoder owns pred_w/joint_w and
+// reads the model. That stops being true when the decoder is itself a ggml
+// graph on ctx->backend (CUDA/Vulkan default), so pipelining is disabled when
+// parakeet_decode_uses_backend() says so. CRISPASR_PARAKEET_PIPELINE=0/1
+// forces it off/on.
+std::vector<parakeet_seg> transcribe_longform(parakeet_context* ctx, const float* samples, int n_samples,
+                                              int64_t t_offset_cs, int cap_samples) {
+    std::vector<parakeet_seg> out;
+    const std::vector<lf_window> plan = plan_longform_windows(samples, n_samples, t_offset_cs, cap_samples);
+    if (plan.empty())
+        return out;
+
+    bool pipeline = plan.size() > 1 && parakeet_decode_uses_backend(ctx) == 0;
+    if (const char* e = getenv("CRISPASR_PARAKEET_PIPELINE"))
+        pipeline = atoi(e) != 0 && plan.size() > 1;
+
+    if (!pipeline) {
+        for (const auto& w : plan)
+            append_window_seg(parakeet_transcribe_ex(ctx, samples + w.ext_s, w.ext_e - w.ext_s, w.ext_t0), w, out);
+        return out;
+    }
+
+    struct enc_item {
+        float* buf = nullptr; // malloc'd by parakeet_encode; nullptr = encode failed
+        int T_enc = 0;
+        int d_model = 0;
+    };
+
+    std::deque<enc_item> q;
+    std::mutex m;
+    std::condition_variable cv_full, cv_empty;
+    size_t produced = 0;
+    const size_t kQueueCap = 2;
+
+    std::thread producer([&] {
+        for (const auto& w : plan) {
+            enc_item it;
+            it.buf = parakeet_encode(ctx, samples + w.ext_s, w.ext_e - w.ext_s, &it.T_enc, &it.d_model);
+            std::unique_lock<std::mutex> lk(m);
+            cv_full.wait(lk, [&] { return q.size() < kQueueCap; });
+            q.push_back(it);
+            ++produced;
+            cv_empty.notify_one();
+        }
+    });
+
+    for (size_t i = 0; i < plan.size(); ++i) {
+        enc_item it;
+        {
+            std::unique_lock<std::mutex> lk(m);
+            cv_empty.wait(lk, [&] { return !q.empty(); });
+            it = q.front();
+            q.pop_front();
+            cv_full.notify_one();
+        }
+        if (!it.buf)
+            continue; // encode failed for this window; keep going, order intact
+        append_window_seg(parakeet_decode_frames(ctx, it.buf, it.T_enc, it.d_model, plan[i].ext_t0), plan[i], out);
+        free(it.buf);
+    }
+
+    producer.join();
+    return out;
+}
+
+struct resolved_strategy {
+    parakeet_strategy strat = parakeet_strategy::SINGLE_PASS;
+    int stream_threshold_s = 300;                     // single-pass cap
+    int longform_window_s = kParakeetLongformWindowS; // LONGFORM piece size
+    int stream_chunk_s = 0;
+    int stream_overlap_s = 2;
+};
+
+// Single source of truth for "which long-audio route does this input take", and
+// with what window. Split out of parakeet_transcribe_segments() so the cap and
+// the LONGFORM window can be reasoned about (and overridden) independently.
+// `quiet` suppresses the memory-policy notice for predicate-only callers.
+resolved_strategy resolve_strategy(parakeet_context* ctx, int n_samples, bool is_ja,
+                                   const parakeet_orchestrate_opts& opts, bool quiet) {
+    const int SR = 16000;
+    resolved_strategy rs;
+    // Single-pass cap. JA keeps its own 12 s cap (issue #89 — the JA models
+    // degenerate past their trained window); non-JA keeps the historical 300 s
+    // so mid-length audio stays on the seamless single-pass path.
+    rs.stream_threshold_s = is_ja ? kParakeetBoundedWindowJaS : 300;
+    bool longform_enabled = !is_ja;
+    bool threshold_from_env = false;
+    if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_THRESHOLD")) {
+        rs.stream_threshold_s = std::max(0, atoi(e));
+        threshold_from_env = true;
+    }
+    if (const char* e = getenv("CRISPASR_PARAKEET_LONGFORM"))
+        longform_enabled = atoi(e) != 0;
+    if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_CHUNK"))
+        rs.stream_chunk_s = std::max(2, atoi(e));
+    if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_OVERLAP"))
+        rs.stream_overlap_s = std::max(0, atoi(e));
+
+    parakeet_strategy_in sin;
+    sin.n_samples = n_samples;
+    sin.sample_rate = SR;
+    sin.is_ja = is_ja;
+    sin.chunk_seconds_explicit = opts.chunk_seconds_explicit;
+    sin.chunk_seconds = opts.chunk_seconds;
+    sin.stream_threshold_s = rs.stream_threshold_s;
+    sin.longform_enabled = longform_enabled;
+    sin.chunked_requested = opts.chunked_requested;
+    // Issue #350: a chunked-entry-point caller that left the length to the
+    // per-model default gets the bounded cap, not the 300 s single-pass one.
+    rs.stream_threshold_s = parakeet_effective_single_pass_cap_s(sin, threshold_from_env);
+    sin.stream_threshold_s = rs.stream_threshold_s;
+
+    // LONGFORM window — independent of the cap (see kParakeetLongformWindowS).
+    // Clamped to the effective cap so a lowered CRISPASR_PARAKEET_STREAM_THRESHOLD
+    // still shrinks the windows exactly as it did before the two were split.
+    if (const char* e = getenv("CRISPASR_PARAKEET_LONGFORM_WINDOW"))
+        rs.longform_window_s = std::max(4, atoi(e));
+    if (rs.stream_threshold_s > 0)
+        rs.longform_window_s = std::min(rs.longform_window_s, rs.stream_threshold_s);
+
+    rs.strat = parakeet_pick_strategy(sin);
+
+    // Phase 2: proactive encoder memory policy. When single-pass is chosen but
+    // its estimated O(T^2) rel-pos bias would exceed a user-set VRAM budget,
+    // switch to the streamed (bounded-window) encoder BEFORE allocating —
+    // instead of allocate → OOM → reactive fallback. Opt-in: default budget 0
+    // = disabled → single-pass as before (the reactive fallback still backstops).
+    //   CRISPASR_PARAKEET_MEM_POLICY = auto (default) | off | single | streamed
+    //   CRISPASR_PARAKEET_VRAM_BUDGET_MB : budget (MiB); 0/unset = disabled
+    //   CRISPASR_PARAKEET_MEM_COEFF : O(T^2) estimate coefficient (default 8.0)
+    if (rs.strat == parakeet_strategy::SINGLE_PASS) {
+        const char* pol = getenv("CRISPASR_PARAKEET_MEM_POLICY");
+        const bool mode_off = pol && strcmp(pol, "off") == 0;
+        const bool mode_force_single = pol && strcmp(pol, "single") == 0;
+        const bool mode_force_streamed = pol && strcmp(pol, "streamed") == 0;
+        if (mode_force_streamed) {
+            rs.strat = parakeet_strategy::STREAMED;
+        } else if (!mode_off && !mode_force_single) {
+            double budget = 0.0, coeff = 8.0;
+            if (const char* e = getenv("CRISPASR_PARAKEET_VRAM_BUDGET_MB"))
+                budget = atof(e);
+            if (const char* e = getenv("CRISPASR_PARAKEET_MEM_COEFF"))
+                coeff = atof(e);
+            const int T_enc = parakeet_est_enc_frames(ctx, n_samples);
+            const int H = parakeet_n_heads(ctx);
+            if (!parakeet_singlepass_fits_budget(T_enc, H, budget, coeff)) {
+                if (!opts.no_prints && !quiet)
+                    fprintf(stderr,
+                            "crispasr[parakeet]: single-pass est %.0f MiB > budget %.0f MiB (T=%d, H=%d); "
+                            "using streamed encoding (set CRISPASR_PARAKEET_MEM_POLICY=single to force)\n",
+                            parakeet_est_singlepass_peak_mb(T_enc, H, coeff), budget, T_enc, H);
+                rs.strat = parakeet_strategy::STREAMED;
+            }
+        }
+    }
+    return rs;
+}
+
 } // namespace
+
+int parakeet_repair_segments(parakeet_context* ctx, const float* samples, int n_samples, int64_t t_offset_cs,
+                             std::vector<parakeet_seg>& segs, bool no_prints) {
+    if (!ctx || !samples || n_samples <= 0)
+        return 0;
+    // Same constants the SINGLE_PASS branch of parakeet_transcribe_segments()
+    // passes, so a split pass repairs identically to a whole one.
+    return gap_fill_segments(ctx, samples, n_samples, t_offset_cs, segs, kParakeetBoundedWindowS, kParakeetGapFillMinCs,
+                             no_prints);
+}
+
+bool parakeet_slice_is_single_pass(parakeet_context* ctx, int n_samples, bool is_ja,
+                                   const parakeet_orchestrate_opts& opts) {
+    if (!ctx || n_samples <= 0)
+        return false;
+    // The simulated-OOM hook makes single-pass fail on purpose; the split path
+    // has no streamed retry of its own, so leave those runs on transcribe().
+    if (getenv("CRISPASR_PARAKEET_SIMULATE_ENCODE_OOM"))
+        return false;
+    return resolve_strategy(ctx, n_samples, is_ja, opts, /*quiet=*/true).strat == parakeet_strategy::SINGLE_PASS;
+}
+
+std::vector<parakeet_seg> parakeet_decode_frames_to_segments(parakeet_context* ctx, const float* enc_frames, int T_enc,
+                                                             int d_model, int64_t t_offset_cs) {
+    std::vector<parakeet_seg> out;
+    if (!ctx || !enc_frames || T_enc <= 0)
+        return out;
+    parakeet_result* r = parakeet_decode_frames(ctx, enc_frames, T_enc, d_model, t_offset_cs);
+    if (!r)
+        return out;
+    // Same tail as the SINGLE_PASS branch of parakeet_transcribe_segments().
+    out.push_back(result_to_seg(r, t_offset_cs));
+    parakeet_result_free(r);
+    return out;
+}
 
 std::vector<parakeet_seg> parakeet_transcribe_segments(parakeet_context* ctx, const float* samples, int n_samples,
                                                        int64_t t_offset_cs, bool is_ja,
@@ -441,78 +666,21 @@ std::vector<parakeet_seg> parakeet_transcribe_segments(parakeet_context* ctx, co
         return out;
     }
 
-    int stream_threshold_s = is_ja ? kParakeetBoundedWindowJaS : 300;
-    bool longform_enabled = !is_ja;
-    int stream_chunk_s = 0;
-    int stream_overlap_s = 2;
-    bool threshold_from_env = false;
-    if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_THRESHOLD")) {
-        stream_threshold_s = std::max(0, atoi(e));
-        threshold_from_env = true;
-    }
-    if (const char* e = getenv("CRISPASR_PARAKEET_LONGFORM"))
-        longform_enabled = atoi(e) != 0;
-    if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_CHUNK"))
-        stream_chunk_s = std::max(2, atoi(e));
-    if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_OVERLAP"))
-        stream_overlap_s = std::max(0, atoi(e));
-
-    parakeet_strategy_in sin;
-    sin.n_samples = n_samples;
-    sin.sample_rate = SR;
-    sin.is_ja = is_ja;
-    sin.chunk_seconds_explicit = opts.chunk_seconds_explicit;
-    sin.chunk_seconds = opts.chunk_seconds;
-    sin.stream_threshold_s = stream_threshold_s;
-    sin.longform_enabled = longform_enabled;
-    sin.chunked_requested = opts.chunked_requested;
-    // Issue #350: a chunked-entry-point caller that left the length to the
-    // per-model default gets the bounded cap, not the 300 s single-pass one.
-    stream_threshold_s = parakeet_effective_single_pass_cap_s(sin, threshold_from_env);
-    sin.stream_threshold_s = stream_threshold_s;
-    parakeet_strategy strat = parakeet_pick_strategy(sin);
-
-    // Phase 2: proactive encoder memory policy. When single-pass is chosen but
-    // its estimated O(T^2) rel-pos bias would exceed a user-set VRAM budget,
-    // switch to the streamed (bounded-window) encoder BEFORE allocating —
-    // instead of allocate → OOM → reactive fallback. Opt-in: default budget 0
-    // = disabled → single-pass as before (the reactive fallback still backstops).
-    //   CRISPASR_PARAKEET_MEM_POLICY = auto (default) | off | single | streamed
-    //   CRISPASR_PARAKEET_VRAM_BUDGET_MB : budget (MiB); 0/unset = disabled
-    //   CRISPASR_PARAKEET_MEM_COEFF : O(T^2) estimate coefficient (default 8.0)
-    if (strat == parakeet_strategy::SINGLE_PASS) {
-        const char* pol = getenv("CRISPASR_PARAKEET_MEM_POLICY");
-        const bool mode_off = pol && strcmp(pol, "off") == 0;
-        const bool mode_force_single = pol && strcmp(pol, "single") == 0;
-        const bool mode_force_streamed = pol && strcmp(pol, "streamed") == 0;
-        if (mode_force_streamed) {
-            strat = parakeet_strategy::STREAMED;
-        } else if (!mode_off && !mode_force_single) {
-            double budget = 0.0, coeff = 8.0;
-            if (const char* e = getenv("CRISPASR_PARAKEET_VRAM_BUDGET_MB"))
-                budget = atof(e);
-            if (const char* e = getenv("CRISPASR_PARAKEET_MEM_COEFF"))
-                coeff = atof(e);
-            const int T_enc = parakeet_est_enc_frames(ctx, n_samples);
-            const int H = parakeet_n_heads(ctx);
-            if (!parakeet_singlepass_fits_budget(T_enc, H, budget, coeff)) {
-                if (!opts.no_prints)
-                    fprintf(stderr,
-                            "crispasr[parakeet]: single-pass est %.0f MiB > budget %.0f MiB (T=%d, H=%d); "
-                            "using streamed encoding (set CRISPASR_PARAKEET_MEM_POLICY=single to force)\n",
-                            parakeet_est_singlepass_peak_mb(T_enc, H, coeff), budget, T_enc, H);
-                strat = parakeet_strategy::STREAMED;
-            }
-        }
-    }
+    const resolved_strategy rs = resolve_strategy(ctx, n_samples, is_ja, opts, /*quiet=*/false);
+    const parakeet_strategy strat = rs.strat;
+    const int stream_chunk_s = rs.stream_chunk_s;
+    const int stream_overlap_s = rs.stream_overlap_s;
 
     // Issue #350: JA is left alone — it has its own #89 machinery (VAD/energy
     // slices capped at 12 s plus a 1 s-threshold gap-fill) on the paths that
-    // drive it, and none of this issue's measurements cover it.
+    // drive it, and none of that issue's measurements cover it.
     const bool repair = !is_ja;
 
+    // The LONGFORM piece size is the WINDOW, not the single-pass cap. The two
+    // are independent: the window is a throughput knob, gap_fill_segments is
+    // what makes coverage robust.
     if (strat == parakeet_strategy::LONGFORM) {
-        out = transcribe_longform(ctx, samples, n_samples, t_offset_cs, stream_threshold_s * SR);
+        out = transcribe_longform(ctx, samples, n_samples, t_offset_cs, rs.longform_window_s * SR);
         if (repair)
             gap_fill_segments(ctx, samples, n_samples, t_offset_cs, out, kParakeetBoundedWindowS, kParakeetGapFillMinCs,
                               opts.no_prints);

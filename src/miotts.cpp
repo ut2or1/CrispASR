@@ -32,6 +32,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ── Hyperparameters ─────────────────────────────────────────────────
 
@@ -531,7 +532,7 @@ miotts_context* miotts_init_from_file(const char* path_model, miotts_context_par
     c->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 
     // Create scheduler. CPU-only on this VPS.
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     {
         ggml_backend_t backends[2] = {c->backend, c->backend_cpu};
         int n_be = (c->backend && c->backend != c->backend_cpu) ? 2 : 1;

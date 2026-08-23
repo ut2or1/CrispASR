@@ -23,6 +23,7 @@
 #include <thread>
 #include <vector>
 #include "core/crispasr_env.h"
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -280,8 +281,8 @@ extern "C" struct marblenet_vad_context* marblenet_vad_init(const char* path) {
     gguf_free(gctx);
 
     // Load weights
-    ctx->backend = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(ctx->backend, 4);
+    ctx->backend = core_cpu_backend::init();
+    core_cpu_backend::set_n_threads(ctx->backend, 4);
 
     struct gguf_init_params gp2 = {true, &m.ctx_w};
     gguf_context* gctx2 = gguf_init_from_file(path, gp2);

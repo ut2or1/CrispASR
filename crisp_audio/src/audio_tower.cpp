@@ -47,6 +47,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -633,13 +634,13 @@ struct crisp_audio_context* crisp_audio_init_from_file(const char* gguf_path, co
             ctx->backend = ggml_backend_dev_init(gdev, nullptr);
     }
     if (!ctx->backend) {
-        ctx->backend = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
     }
-    ctx->backend_cpu = ggml_backend_is_cpu(ctx->backend) ? nullptr : ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::is_cpu(ctx->backend) ? nullptr : core_cpu_backend::init();
     if (ctx->backend_cpu) {
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     } else {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     }
 
     if (!load_model(*ctx, gguf_path, eff)) {

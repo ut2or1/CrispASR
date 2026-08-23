@@ -427,11 +427,11 @@ RegistryBundle? registryDefaultBundle(String backend, {DynamicLibrary? lib}) {
   final info = lib.lookupFunction<
       Int32 Function(Pointer<Utf8>, Pointer<Uint8>, Int32, Pointer<Uint8>,
           Int32, Pointer<Int32>),
-      int Function(Pointer<Utf8>, Pointer<Uint8>, int, Pointer<Uint8>,
-          int, Pointer<Int32>)>(infoSymbol);
+      int Function(Pointer<Utf8>, Pointer<Uint8>, int, Pointer<Uint8>, int,
+          Pointer<Int32>)>(infoSymbol);
   try {
-    final count = info(backendPtr, canonicalBuf, 256, licenseBuf, 1024,
-        requiresAcceptancePtr);
+    final count = info(
+        backendPtr, canonicalBuf, 256, licenseBuf, 1024, requiresAcceptancePtr);
     if (count == 0) return null;
     if (count < 0) {
       throw StateError('Default registry bundle lookup failed (rc=$count).');
@@ -452,8 +452,7 @@ RegistryBundle? registryDefaultBundle(String backend, {DynamicLibrary? lib}) {
         final rc = artifactFn(backendPtr, index, kindPtr, filenameBuf, 256,
             urlBuf, 2048, sizeBuf, 64);
         if (rc != 0 || kindPtr.value < 0 || kindPtr.value > 2) {
-          throw StateError(
-              'Default registry bundle artifact $index failed '
+          throw StateError('Default registry bundle artifact $index failed '
               '(rc=$rc, kind=${kindPtr.value}).');
         }
         artifacts.add(RegistryArtifact(
@@ -2791,13 +2790,13 @@ class CrispasrSession {
             : null;
     // #300: native per-segment speaker label; probe like the others so a
     // newer package keeps working against an older dylib.
-    final segSpkFn =
-        _lib.providesSymbol('crispasr_session_result_segment_speaker')
-            ? _lib.lookupFunction<
-                Pointer<Utf8> Function(Pointer<Void>, Int32),
-                Pointer<Utf8> Function(Pointer<Void>,
-                    int)>('crispasr_session_result_segment_speaker')
-            : null;
+    final segSpkFn = _lib
+            .providesSymbol('crispasr_session_result_segment_speaker')
+        ? _lib.lookupFunction<
+            Pointer<Utf8> Function(Pointer<Void>, Int32),
+            Pointer<Utf8> Function(
+                Pointer<Void>, int)>('crispasr_session_result_segment_speaker')
+        : null;
     final nWords = _lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
         int Function(Pointer<Void>, int)>('crispasr_session_result_n_words');
     final wordText = _lib.lookupFunction<
@@ -3615,6 +3614,20 @@ class CrispasrSession {
     }
   }
 
+  /// Floor on generated audio length (MOSS TTS). Units are codec frames at 12.5 Hz (80 ms each), so n=25 floors at ~2 s. Other backends no-op (rc=-2).
+  void setMinSpeechTokens(int n) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_min_speech_tokens')) return;
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Int32),
+        int Function(
+            Pointer<Void>, int)>('crispasr_session_set_min_speech_tokens');
+    final rc = fn(_handle, n);
+    if (rc != 0 && rc != -2) {
+      throw Exception('setMinSpeechTokens failed (rc=$rc)');
+    }
+  }
+
   /// Per-phoneme length-scale / speaking-rate scalar for TTS
   /// backends with a duration model. Honoured by kokoro today
   /// (PLAN #88); other backends silently no-op. 1.0 = upstream
@@ -4075,8 +4088,7 @@ class CrispasrSession {
       throw UnsupportedError(
           'speaker-identity API not available in this libcrispasr build');
     }
-    final fn = _lib.lookupFunction<
-        Int32 Function(Pointer<Void>, Pointer<Utf8>),
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>),
         int Function(Pointer<Void>, Pointer<Utf8>)>(
       'crispasr_session_set_speaker_identity',
     );
@@ -4096,12 +4108,12 @@ class CrispasrSession {
 
   void acceptMarkingResponsibility([String attestation = '']) {
     if (_closed) throw StateError('CrispasrSession is closed');
-    if (!_lib.providesSymbol('crispasr_session_accept_marking_responsibility')) {
+    if (!_lib
+        .providesSymbol('crispasr_session_accept_marking_responsibility')) {
       throw UnsupportedError(
           'marking-attestation API not available in this libcrispasr build');
     }
-    final fn = _lib.lookupFunction<
-        Int32 Function(Pointer<Void>, Pointer<Utf8>),
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>),
         int Function(Pointer<Void>, Pointer<Utf8>)>(
       'crispasr_session_accept_marking_responsibility',
     );
@@ -4648,6 +4660,40 @@ class CrispasrSession {
     return fn(_handle);
   }
 
+  /// Sample rate (Hz) this backend expects for input PCM.
+  ///
+  /// [speechToSpeech] and the other PCM entry points want audio at the
+  /// backend's native rate, and it varies by backend — so telling callers to
+  /// resample without giving them a way to ask the rate is not actionable
+  /// (issue #321).
+  ///
+  /// Returns 0 on a dylib that predates the symbol, matching
+  /// [separateSampleRate]: a capability probe that never throws.
+  int get inputSampleRate {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_input_sample_rate')) {
+      return 0;
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_input_sample_rate');
+    return fn(_handle);
+  }
+
+  /// Sample rate (Hz) of PCM this backend returns — what [speechToSpeech]
+  /// and [synthesize] hand back. 24 kHz for conversational S2S, 48 kHz for
+  /// Sidon and VoxCPM2 AudioVAE.
+  ///
+  /// Returns 0 on a dylib that predates the symbol.
+  int get outputSampleRate {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_output_sample_rate')) {
+      return 0;
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_output_sample_rate');
+    return fn(_handle);
+  }
+
   /// Set hotwords for contextual biasing.
   ///
   /// [hotwords] is a comma-separated list of words/phrases. For CTC/TDT
@@ -4695,15 +4741,15 @@ class CrispasrSession {
     if (!_lib.providesSymbol('crispasr_session_set_sensitivity')) {
       return;
     }
-    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>),
-        int Function(Pointer<Void>, Pointer<Utf8>)>(
-        'crispasr_session_set_sensitivity');
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Utf8>),
+        int Function(
+            Pointer<Void>, Pointer<Utf8>)>('crispasr_session_set_sensitivity');
     final p = preset.toNativeUtf8();
     try {
       final rc = fn(_handle, p);
       if (rc == -2) {
-        throw ArgumentError(
-            'unknown sensitivity preset "$preset" '
+        throw ArgumentError('unknown sensitivity preset "$preset" '
             '(expected: conservative, balanced, aggressive)');
       }
       if (rc != 0) throw Exception('setSensitivity failed (rc=$rc)');
@@ -5894,13 +5940,12 @@ List<SessionSegment> drainStreamedSegments({String? libPath}) {
           : null;
   // #300: native per-segment speaker label; probe like the others so a
   // newer package keeps working against an older dylib.
-  final segSpkFn =
-      lib.providesSymbol('crispasr_session_result_segment_speaker')
-          ? lib.lookupFunction<
-              Pointer<Utf8> Function(Pointer<Void>, Int32),
-              Pointer<Utf8> Function(Pointer<Void>,
-                  int)>('crispasr_session_result_segment_speaker')
-          : null;
+  final segSpkFn = lib.providesSymbol('crispasr_session_result_segment_speaker')
+      ? lib.lookupFunction<
+          Pointer<Utf8> Function(Pointer<Void>, Int32),
+          Pointer<Utf8> Function(
+              Pointer<Void>, int)>('crispasr_session_result_segment_speaker')
+      : null;
 
   final out = <SessionSegment>[];
   for (var i = 0; i < nSegs; i++) {

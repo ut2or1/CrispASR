@@ -43,7 +43,7 @@
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (§232 dia GPU path)
 #include "core/crispasr_env.h"
 #if defined(GGML_USE_METAL)
-#include "ggml-metal.h" // ggml_backend_is_metal (§232 Metal-only GPU default)
+#include "ggml-metal.h" // core_cpu_backend::is_metal(§232 Metal-only GPU default)
 #endif
 
 #include <algorithm>
@@ -56,6 +56,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `DIA_BENCH=1` for per-stage timings.
@@ -574,7 +575,7 @@ static bool dia_kv_cache_init(dia_kv_cache& cache, const dia_model& m) {
         ggml_format_name(cache.cross_v_l[i], "cache_cross_v_l%d", i);
     }
 
-    cache.buf = ggml_backend_alloc_ctx_tensors_from_buft(cache.ctx, ggml_backend_cpu_buffer_type());
+    cache.buf = ggml_backend_alloc_ctx_tensors_from_buft(cache.ctx, core_cpu_backend::buffer_type());
     if (!cache.buf)
         return false;
     ggml_backend_buffer_clear(cache.buf, 0);
@@ -841,7 +842,7 @@ struct dia_tts_context* dia_tts_init_from_file(const char* path_model, struct di
     //     build_dia_decoder_embedding), so those backends fall back to CPU until a
     //     Kaggle CUDA re-run confirms the fix. Mirrors LEARNING 34's
     //     ggml_backend_is_metal gate (here Metal is the *validated* one).
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     const char* gpu_env = crispasr_env::get("CRISPASR_DIA_TTS_GPU");
     const bool force_gpu = gpu_env && std::atoi(gpu_env) != 0;
     const bool force_cpu = gpu_env && std::atoi(gpu_env) == 0;
@@ -851,7 +852,7 @@ struct dia_tts_context* dia_tts_init_from_file(const char* path_model, struct di
         if (gpu) {
             bool is_metal = false;
 #if defined(GGML_USE_METAL)
-            is_metal = ggml_backend_is_metal(gpu);
+            is_metal = core_cpu_backend::is_metal(gpu);
 #endif
             if (is_metal || force_gpu) {
                 ctx->backend = gpu;

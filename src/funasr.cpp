@@ -36,6 +36,7 @@
 #include <unordered_map>
 #include <vector>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -441,7 +442,7 @@ static bool funasr_load_model(funasr_model& model, funasr_vocab& vocab, const ch
         const char* s = crispasr_env::get("CRISPASR_FUNASR_LLM_CPU");
         return s && *s && *s != '0';
     }();
-    if (!ggml_backend_is_cpu(backend) && cpu_backend && force_llm_cpu) {
+    if (!core_cpu_backend::is_cpu(backend) && cpu_backend && force_llm_cpu) {
         auto is_gpu = [](const char* name, void*) -> bool { return std::strncmp(name, "funasr.", 7) == 0; };
         if (!core_gguf::load_weights_split(path, backend, cpu_backend, is_gpu, nullptr, "funasr", wl))
             return false;
@@ -1311,14 +1312,17 @@ static bool funasr_kv_init(funasr_context* ctx, int max_ctx) {
     ggml_backend_t kv_backend = (ctx->model.buf_cpu)
                                     ? ctx->backend_cpu
                                     : core_attn::kv_backend_from_env(ctx->backend, ctx->backend_cpu, "funasr");
-    ctx->kv_buf = ggml_backend_alloc_buffer(kv_backend, kbytes + vbytes);
+    // #367: size and place via ggml, not ggml_nbytes() arithmetic. CUDA's
+    // get_alloc_size() pads a quantized row up to MATRIX_ROW_PADDING (512),
+    // and these KV rows are head_dim wide (128), so each q8_0 tensor needs
+    // 408 bytes more than nbytes — the hand-sized buffer came up short and
+    // ggml_backend_tensor_alloc aborted. f16 is not quantized, so this only
+    // ever fired with CRISPASR_KV_QUANT set, and only on CUDA.
+    ctx->kv_buf = ggml_backend_alloc_ctx_tensors(ctx->kv_ctx, kv_backend);
     if (!ctx->kv_buf) {
         std::fprintf(stderr, "funasr: failed to allocate kv buffer\n");
         return false;
     }
-    char* base = (char*)ggml_backend_buffer_get_base(ctx->kv_buf);
-    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_k, base);
-    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_v, base + kbytes);
     // Zero-fill the KV cache. On CUDA, ggml_backend_alloc_buffer does not
     // zero memory (cudaMalloc). If the graph scheduler reads a KV slot
     // before the corresponding ggml_cpy writes it (aliasing-based race in
@@ -2081,14 +2085,14 @@ extern "C" funasr_context* funasr_init_from_file(const char* path, funasr_contex
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     if (!funasr_load_model(ctx->model, ctx->vocab, path, ctx->backend, ctx->backend_cpu)) {
         delete ctx;

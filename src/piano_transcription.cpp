@@ -32,6 +32,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ─── Hyperparameters ────────────────────────────────────────────────────────
 
@@ -750,7 +751,7 @@ struct piano_transcription_ctx* piano_transcription_init_from_file(const char* p
     core_gguf::free_metadata(meta);
 
     // Pass 2: load weights
-    ctx->backend = ggml_backend_cpu_init();
+    ctx->backend = core_cpu_backend::init();
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path, ctx->backend, "piano", wl)) {
         ggml_backend_free(ctx->backend);

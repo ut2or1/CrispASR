@@ -17,6 +17,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 namespace crispasr_diff {
 
@@ -77,7 +78,7 @@ bool Ref::load(const std::string& path) {
 
     // The archive can be loaded onto the CPU backend — these tensors
     // never participate in compute, we just read them back to float.
-    impl_->backend = ggml_backend_cpu_init();
+    impl_->backend = core_cpu_backend::init();
     if (!impl_->backend) {
         fprintf(stderr, "crispasr_diff: failed to init CPU backend\n");
         delete impl_;

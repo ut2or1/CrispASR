@@ -331,6 +331,45 @@ endif()
 # with "install FILES given no DESTINATION" (#298). Including it here is
 # idempotent with the later include in the install section.
 include(GNUInstallDirs)
+# ---------------------------------------------------------------------------
+# Backend link shims (#355)
+#
+# Every per-model library links `ggml-cuda` / `ggml-metal` under `if(GGML_CUDA)`
+# / `if(GGML_METAL)`. Nothing in this tree calls ggml_backend_cuda_init() or its
+# Metal twin directly — the link exists so a STATIC build keeps the backend's
+# object files, since backends register themselves from static initialisers and
+# a linker that sees no referenced symbol drops them (#316).
+#
+# It is also why the shipped CUDA binary carries libcuda.so.1 as a hard
+# DT_NEEDED and exits 127 on a host without the NVIDIA driver, before
+# ggml_backend_init_best() can fall back to CPU (#355).
+#
+# With GGML_BACKEND_DL the backends are MODULE libraries, dlopen'd at runtime by
+# ggml_backend_load_all() — which this tree already calls. CMake refuses a
+# MODULE_LIBRARY as a link target, and it must not be linked anyway: the whole
+# point is that a missing backend is a runtime no-op rather than a load-time
+# abort. So route the link sites through interface targets that are empty in a
+# DL build and the real backend otherwise.
+add_library(crispasr_link_ggml_metal INTERFACE)
+add_library(crispasr_link_ggml_cuda INTERFACE)
+add_library(crispasr_link_ggml_vulkan INTERFACE)
+# ggml-cpu is a MODULE under DL too — the CPU backend is dlopen'd like any
+# other, which is what makes the fallback work when CUDA is absent. The call
+# sites go through src/core/ggml_cpu_backend.h.
+add_library(crispasr_link_ggml_cpu INTERFACE)
+if(NOT GGML_BACKEND_DL)
+    if(GGML_METAL)
+        target_link_libraries(crispasr_link_ggml_metal INTERFACE ggml-metal)
+    endif()
+    if(GGML_CUDA)
+        target_link_libraries(crispasr_link_ggml_cuda INTERFACE ggml-cuda)
+    endif()
+    if(GGML_VULKAN)
+        target_link_libraries(crispasr_link_ggml_vulkan INTERFACE ggml-vulkan)
+    endif()
+    target_link_libraries(crispasr_link_ggml_cpu INTERFACE ggml-cpu)
+endif()
+
 add_subdirectory(src)
 
 # ---------------------------------------------------------------------------

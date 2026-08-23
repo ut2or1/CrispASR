@@ -26,6 +26,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // One roformer Attention sub-block (§251b-1). NOTE the bias asymmetry, which
 // is not a transcription slip: to_qkv and to_out are bias-free, to_gates has a
@@ -393,7 +394,7 @@ extern "C" struct beat_this_context* beat_this_init(const char* model_path, int 
     ctx->log_multiplier = core_gguf::kv_f32(gctx, "beat-this.log_multiplier", 1000.0f);
     core_gguf::free_metadata(gctx);
 
-    ctx->backend = ggml_backend_cpu_init();
+    ctx->backend = core_cpu_backend::init();
     if (!ctx->backend) {
         delete ctx;
         return nullptr;

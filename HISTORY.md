@@ -6,6 +6,246 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #375 canary "repeated phrases" — two real bugs, neither where the bisect pointed, fixed 2026-08-19
+
+A reporter's canary quality regressed after an upgrade: phrases repeated a few
+times before recognition continued, on every quantization, CUDA and CPU alike.
+Their bisect window turned out wrong (they later withdrew it), but chasing it
+methodically surfaced **two real, independent defects**, both fixed the same day:
+
+**1. glint's AAC-LC decoder mis-decoded every real-world `.aac` to ~17 dB SNR**
+(bitrate-independent — 96k and 192k both). It parsed and DISCARDED
+`window_shape` (sine synthesis against the KBD analysis windows ffmpeg/Apple/fdk
+emit on most frames breaks MDCT perfect reconstruction) and its TNS decode was
+wrong five ways (skipped on short windows entirely, no `tns_max_bands` clamp,
+direction ignored, one filter max, hardcoded 4-bit dequant). Invisible to every
+glint gate because the roundtrip tests own both sides of the contract — glint's
+own encoder emits neither KBD nor short-window TNS. Fixed upstream (glint
+`77738f3`, 17.7→67.3 dB at 16 kHz), synced in-tree (`0e5d1344`), gated by a
+red-verified foreign-decode SNR floor (old decoder 16.4 dB FAIL). Found because
+"all quants + all backends identical" is an **input-path signature** — compute
+bugs vary by backend — and because the window's WAV-only probes could not rule
+out formats whose ROUTING changed.
+
+**2. The reporter's actual bug: canary's long-form chunking was parakeet
+machinery wearing a canary comment.** `canary_transcribe_streamed` split ALL
+audio into 8 s chunks / 2 s overlap over a globally-normalized mel and merged
+seams with an LCS prefix-drop + word-snap + splice-punctuation heuristics; the
+comment cited NeMo's `FrameBatchMultiTaskAED` — which actually joins
+NON-overlapping chunks with `" ".join`, and canary-1b-v2's shipped
+`.transcribe()` does something else again: dynamic 30..40 s RAW-WAVEFORM chunks
+(size maximizing the last chunk), 1 s overlap, per-chunk normalization, and
+`lcs_alignment_merge_buffer` anchoring the seam in token space. Ported exactly
+(`core/canary_chunk_merge.h`, `8219b429`), pinned by unit vectors generated
+from the nemo 2.7.3 Python functions, old path kept behind
+`CRISPASR_CANARY_LEGACY_STREAM=1`. The reporter's 12 s sample reproduces
+byte-for-byte under the legacy gate and transcribes cleanly on the new default;
+jfk_x12 (quote ×12) went from "ask not Ask not"-riddled to 12 clean
+repetitions; decoded-output acceptance vs NeMo itself (Kaggle,
+`tools/kaggle/canary-blueprint-ref/`): word similarity 1.000 / 1.000 / 0.982 on
+132 s / 59 s / 594 s clips, q4_k vs bf16. Also fixed en route: the session
+C-ABI had single-passed ALL audio — and single-pass past the 40 s trained
+window EOSes early (a 59 s file lost everything after ~45 s), so chunking is
+REQUIRED for long audio, not just nicer.
+
+The trap that cost two prior sessions: a "reproduction" of the symptom on main
+that was never diffed against the good commit on the same file (the seam
+artifacts predated the window), and a file-path-scoped search ("the only canary
+commit in the window") that by construction cannot see cross-cutting changes.
+
+## #369 VibeVoice-ASR Korean language flip — five defects, merged 2026-08-19
+
+A reporter showed `vibevoice-bitnet` losing Korean entirely on borderline audio
+(answering in Italian, Vietnamese, Thai) while Microsoft's demo Space kept it on
+the same clips, and later that audio.cpp's q8_0 transcribed a file our full model
+failed. Five real defects came out of it. **Two of them were mine to begin with:
+the reference I measured against, and the conclusion I published from it.**
+
+**The language flip was the missing -25 dBFS input normalisation.** Upstream and
+audio.cpp normalise before the sigma-VAE encoders (`VibeVoiceASRFrontend::normalize`,
+`target_dB_FS`); our ASR path did not — the helper existed, wired only into TTS
+voice cloning. Bisected on Kaggle against the full 7B q4_k on the reporter's
+`ko-mic-cue-lost.wav`: current main EXACT, prompt+resampler rolled back still
+EXACT, normalisation rolled back **Thai**, everything rolled back **Thai** — and
+"Thai" is precisely what the reporter measured at q4_k and q8_0. One flag
+reproduces and removes it.
+
+⚠ I had already shipped that fix and reported it to the issue as a no-op, because
+I measured it on the BITNET checkpoint — the only one that fit on the dev Mac.
+BitNet is wrong on those clips whatever you do to the input, so that arm had no
+headroom and "still broken" was the only answer it could return. An arm that
+fails under every condition cannot discriminate a fix from a no-op.
+
+**BitNet was getting the 7B's prompt.** VibeASR.cpp's `utils/prompt_builder.h`
+says, in a comment, that `"text"` format is the 1.5B's ("…please transcribe it.")
+and `"json"` the 7B's ("…with these keys: …"), and it defaults to text. Ours came
+from microsoft/VibeVoice's PYTHON processor, which only targets the 7B, so every
+checkpoint got the JSON form. Two of three real Korean clips went straight to
+EXACT and `ko-mic-cue-lost` kept its language for the first time. Found by
+READING the reference runtime after every numerical avenue had been eliminated —
+weights equal to upstream's I2_S to 2 values in 13.76 M, sigma-VAE at cos
+0.999926, LM storage (TQ2_0/Q8_0/F16) character-identical, and BitNet's per-token
+`activation_quant` implemented and measured immaterial.
+
+**The prompt's hardcoded ids did not match their own comment.** They read
+`"seconds audio, please transcribe it with"` and decoded to
+`" configuration audio,thonPEND itiz"` — the word "transcribe" was absent from
+every transcription this project ever produced. Six wrong tokens in 107,
+confirmed against three independent implementations. Nothing had ever turned the
+ids back into text; `tests/test-vibevoice-asr-prompt.cpp` now does, against a
+vocabulary slice read out of the shipped GGUF.
+
+**The audio loader resampled with linear interpolation.** `read_audio_data()`
+asked miniaudio for the target rate, so every conversion ran through
+`ma_resample_algorithm_linear`. A 10 kHz tone decoded to 16 kHz — above Nyquist,
+must vanish — survived at **-10.3 dB** and folded to 6 kHz, inside the speech
+band; 48 -> 16 kHz measured cos 0.702 against soxr. That hit every backend on any
+44.1/48 kHz file. Now decodes at the file's own rate and resamples with the
+Kaiser sinc already in the tree (`CRISPASR_HQ_RESAMPLE=0` restores the old path).
+
+**`[Silence]` reached the transcript.** It is a Content value the MODEL emits; it
+appears nowhere in this codebase. Passing it through put the literal string in
+SRTs over non-silent speech AND suppressed the "no text produced" warning, which
+is gated on there being no text. The subtle half was the fallback: both consumers
+treated "no segments" as "not a transcript blob" and handed back the raw JSON, so
+filtering alone would have printed the whole object.
+
+Also: exact-erf GELU where `ACT2FN["gelu"]` is erf and ggml_gelu is the tanh
+approximation (cosine cannot see it — 0.999926 vs 0.999927 — the NORM can:
+494.188 -> 494.320 against 494.319); `GGML_PREC_F32` on the ASR attention as
+audio.cpp sets, measured identical on P100 so consistency insurance rather than a
+fix; a false `CAP_TEMPERATURE` that suppressed the warning telling the reporter
+`-tp` was unwired; and `--seed` never plumbed into transcribe at all.
+
+**The reference was the other thing I got wrong.** `tools/reference_backends/vibevoice.py`
+reimplemented the sigma-VAE in PyTorch "matching the C++ graph step by step" — a
+shape that cannot falsify the runtime's assumptions. It had F.silu where upstream
+has GELU, which made every ConvNeXt stage look like the divergence and nearly got
+the correct runtime "fixed" to match; after that, the resampler kept the number
+wrong. Rebuilt on upstream's own `TokenizerEncoder`, with identical 24 kHz input
+the runtime reads **cos 0.999926** at `speech_features`. There was never an
+acoustic-conditioning gap; the 0.83 / 0.95 / 0.97 figures published to the issue
+are withdrawn.
+
+Kernels: `tools/kaggle/vibevoice-369-fullmodel`, `tools/kaggle/vibeasr-bitnet-lm-precision`.
+Commits `b6efe1de`, `ac4aa478`, `e68664c7`, `26076da0`, `23107227`, `824c934d`,
+`3b1bc0b2`, `0627047b`, `51b99d1b`.
+
+---
+
+## ark-asr empty transcripts, and a diff harness that could not see it — merged 2026-08-18
+
+`ark_asr.cpp` built the prompt as `<|user|><|begin_of_audio|>…<|end_of_audio|><|assistant|>`,
+omitting the text instruction upstream's `ArkAsrProcessor` always sends. Every ark
+decode therefore ran on a prompt the model was never trained on. Off-distribution
+the step-1 argmax is `<im_end>`; the #253 hack bans that on step 1 (upstream never
+does), so it emitted the runner-up "." and stopped at step 2, and "." trims to
+empty — "no text produced for N s of non-silent audio". Because the model was
+merely marginal rather than broken, any perturbation tipped it, so the symptom
+tracked the KV cache dtype and the audio length non-monotonically and looked
+q8_0-specific on one clip. It was not: the default f16 cache failed too.
+
+Six previously-empty cases now transcribe (1 → 17/20/21/21/43/43 tokens);
+previously-working paths are byte-identical. Also landed upstream's
+`bad_words_ids`, its `asr_block_token_id_from` (ids ≥ 151670 were emittable and
+are never valid ASR output), and `ark_asr_set_ask()` reaching transcription at
+all — it had been spliced only into a function the transcribe path never calls,
+so the CLI's language steering had never once run.
+
+The harness that should have caught it could not. `tools/reference_backends/arkasr.py`
+built the same promptless prompt, so the reference and the runtime shared one wrong
+assumption and `first_logits` reported cos 0.988 by comparing our mistake against
+itself. Fixing only the runtime made that number FALL to 0.449, which reads as a
+regression and is the exact opposite. With a correctly-dumped reference it is
+0.9944 (jfk) / 0.9967 (fleurs_en). The dumper was wrong in four independent ways
+in total: missing instruction, missing `audios.to(dtype)` (so nothing could be
+dumped at the default bf16), no `gguf` dependency to write an archive, and a bf16
+default that manufactures a false `audio_embeds` failure.
+
+Three things that looked like bugs and were not, each closed by measurement:
+German transcribing as English (upstream translates that clip too, near
+word-for-word, confirmed by running its own forward pass on the same bytes);
+`audio_embeds` cos 0.94 (bf16 reference rounding — f32 gives 0.9985, and the
+worst frames MOVE between references, which a real port bug would not do);
+`first_logits` 0.449 (the stale reference).
+
+Alongside: `kv_dtype_parse` accepted only f16/f32/q8_0/q4_0 and silently served
+F16 for everything else, so any narrowing table over q4_1/q5_0/q5_1 was measuring
+f16 while saying otherwise; `tests/test-kv-quant-roundtrip.cpp` gives the
+quantised KV cache its first coverage. #366 (kyutai) keyed its language warning to
+the backend rather than the loaded checkpoint — now derived from LM layer count,
+verified on BOTH models since "the warning stopped appearing" looks identical
+whether the detection was fixed or simply broken.
+
+## #355-#360 community issue sweep — 2026-08-16
+
+Five open issues worked end to end. #360 (`f57b65a2`): the TTS speech-token
+floor was reachable only from `/v1/audio/speech` — no CLI flag, no session ABI,
+no binding — while its `max` sibling was on all ten surfaces; now on all ten
+plus `--tts-min-speech-tokens`, with the units documented (MOSS codec frames at
+12.5 Hz) and confirmed live at 1.92 s → 4.08 s for floor=49. #359
+(`9831b40e`): source separation was bound in Python and Dart but not Rust or
+Go, so a Rust caller reaching for htdemucs found only `speech_to_speech`;
+`separate()` added to both, live on mel-band-roformer. #358: answered with
+measured concurrency (serialised, FIFO) and warm-server RTF 1.09. #355
+(`2eb54888`): confirmed against the shipped binary, documented the artifact
+matrix; the graceful-degradation fix needs `GGML_BACKEND_DL`, which is a
+406-site refactor across 104 files, so it stays open. #337: no AMD hardware, so
+bounded rather than fixed — the length trigger does not reproduce on Metal at
+T=419.
+
+## #343 / #361 / #362 docs TOC and the chat ABI bindings — merged 2026-08-16
+
+Three community PRs. #343 (Juste-Leo2) adds a TOC and section links to
+`docs/tts.md` and fixes a dead anchor in `cli.md`; merged at `8da6a531`, taking
+main's corrected outetts / pocket-tts licence strings over the branch's older
+text. #361 and #362 (mculbert) make the `crispasr_chat_*` C ABI cancellable,
+countable and safe to tear down, then bind it from Python, Go, Java, Dart and
+Rust; #362 is a superset of #361, merged at `f9de92b2` and `f409a5b2`.
+
+#361 fixed three paths that aborted the host process (a prompt over `n_batch`,
+`memory_estimate` on every model, and `close` under load) and made shared-prefix
+KV reuse actually reachable. Verified here on a different model than the
+author's, with the close-wait guard red-verified by deletion.
+
+`462d8a6d` then closed the CI gap the bindings landed with — five bindings, one
+compiled — via a text-level drift check over the header, plus path filters and
+the orphaned Python suite. See LEARNINGS.md.
+
+## #353 parakeet long-form throughput — merged 2026-08-16
+
+PR #353 (davideme) decouples the LONGFORM window (new `kParakeetLongformWindowS`
+= 90 s) from the 300 s single-pass cap and overlaps encode with decode, both
+across long-form windows and across dispatcher slices. Reported 2.1-2.3x
+long-form throughput on an M1 Pro with WER unchanged or better; CI fully green.
+
+`e33eba8c` then fixed three defects the split path carried: a SIGABRT from the
+#89 gap-fill re-entering `be.transcribe()` on the consumer thread mid-pipeline
+(two threads on one ggml scheduler), five CLI flags silently dropped because the
+split pair skipped `transcribe()`'s sticky-parameter prologue, and issue #350's
+span repair skipped because it skipped the epilogue. Gating conditions moved
+into one pure predicate with a red-verified guard; the PR's byte-identity and
+26/26-slice pipelining both preserved. See LEARNINGS.md for why splitting a
+function drops its prologue and epilogue.
+
+## #356 gap-fill recoveries emitted inside the segment they came from — fixed 2026-08-15
+
+Reported downstream as SubtitleEdit/subtitleedit#13548: on a 634 s Japanese file
+18 of 289 SRT cues started before the previous cue ended, jumping backwards by up
+to 10.5 s. The #89 gap-fill second pass appended each recovery to the slice's
+segment list and sorted by `t0`, but the first pass emits one segment whose
+sparse words straddle the hole, so its span enclosed every recovery.
+
+PR #357 (niksedk) split the covering segment at each recovery; `308cddfb` then
+replaced its clamp fallback with a merge for the interleaved case, which the
+clamp left both non-monotone and word-stranding; `4edb2e10` added the
+unconditional time-order guard the issue asked for, and `9f1bddbb` wired that
+guard into the session C ABI as well (its first pass covered the CLI and server
+arms only). Verified live on
+parakeet-tdt-0.6b-ja-q8_0 over a 240 s clip: 4 backward cues (worst 11.36 s)
+before, 0 after, with the character multiset unchanged. See LEARNINGS.md for
+why a guard written against segment spans passed the buggy list.
+
 ## #348 Chatterbox Multilingual V3 parity port — shipped 2026-08-13
 
 PR #354 landed as a six-commit rebase at `278e3fbf`. The port pins the exact

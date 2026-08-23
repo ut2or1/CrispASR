@@ -1359,6 +1359,7 @@ extern "C" const char* qwen3_asr_token_text(qwen3_asr_context* ctx, int id) {
 // model gets them for free.
 #include "core/bpe.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1490,15 +1491,15 @@ extern "C" qwen3_asr_context* qwen3_asr_init_from_file(const char* path, qwen3_a
 
     // Try GPU backend first (Metal, CUDA, Vulkan...), fall back to CPU.
     // crispasr_init_gpu_backend() picks the highest-priority available backend.
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu) {
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     }
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     }
 
     if (!qwen3_asr_load_model(ctx->model, ctx->vocab, path, ctx->backend, ctx->backend_cpu)) {
@@ -1857,18 +1858,31 @@ extern "C" bool qwen3_asr_kv_init(qwen3_asr_context* ctx, int max_ctx) {
     ggml_set_name(ctx->kv_k, "kv_k");
     ggml_set_name(ctx->kv_v, "kv_v");
 
-    const size_t kbytes = ggml_nbytes(ctx->kv_k);
-    const size_t vbytes = ggml_nbytes(ctx->kv_v);
     // PLAN #69b: optional KV-on-CPU spill for long-context / tight-VRAM users.
     ggml_backend_t kv_backend = core_attn::kv_backend_from_env(ctx->backend, ctx->backend_cpu, "qwen3_asr");
-    ctx->kv_buf = ggml_backend_alloc_buffer(kv_backend, kbytes + vbytes);
+
+    // Let ggml size and place both tensors (#367).
+    //
+    // This used to allocate ggml_nbytes(k) + ggml_nbytes(v) and hand-place the
+    // second at base + kbytes. That is wrong for any backend whose
+    // get_alloc_size() exceeds nbytes, and CUDA's does for quantized types: it
+    // pads a row up to MATRIX_ROW_PADDING (512). Our KV rows are head_dim=128
+    // wide, so 128 % 512 != 0 and each q8_0 tensor needs 408 bytes more than
+    // nbytes — the buffer was 816 bytes short, the last tensor ran past its
+    // end, and ggml_backend_tensor_alloc aborted:
+    //
+    //   GGML_ASSERT(... addr + get_alloc_size(...) <= base + get_size(...))
+    //
+    // f16 is not quantized, so it was never padded and never crashed — which is
+    // why this only ever appeared with CRISPASR_KV_QUANT=q8_0, and only on CUDA.
+    // ggml_backend_alloc_ctx_tensors does the sizing, padding and alignment.
+    ctx->kv_buf = ggml_backend_alloc_ctx_tensors(ctx->kv_ctx, kv_backend);
     if (!ctx->kv_buf) {
         fprintf(stderr, "qwen3_asr: failed to allocate kv buffer\n");
         return false;
     }
-    char* base = (char*)ggml_backend_buffer_get_base(ctx->kv_buf);
-    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_k, base);
-    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_v, base + kbytes);
+    const size_t kbytes = ggml_nbytes(ctx->kv_k);
+    const size_t vbytes = ggml_nbytes(ctx->kv_v);
     ctx->kv_max_ctx = max_ctx;
     ctx->kv_n_used = 0;
 

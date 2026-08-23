@@ -63,6 +63,7 @@ static bool nemotron_force_scalar() {
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `NEMOTRON_BENCH=1` for per-stage timings.
@@ -1664,12 +1665,12 @@ struct nemotron_emitted_token {
 // = per-step path. Returns whether to use ggml, and builds `gdec` when so.
 // Shared by every nemotron decode variant (greedy, beam, maes).
 static bool nemotron_init_ggml_decoder(nemotron_context* ctx, core_rnnt_ggml::Decoder& gdec) {
-    bool ggml_dec = !ggml_backend_is_cpu(ctx->backend);
+    bool ggml_dec = !core_cpu_backend::is_cpu(ctx->backend);
     // ggml decode wins on CUDA/Vulkan (slow CPU BLAS: P100 5-12x) but LOSES on
     // Metal, where Apple Accelerate cblas beats the small-matmul GPU decode (M1
     // parakeet total ~16x cblas vs ~11x ggml). Default OFF on Metal (LEARNINGS 34).
 #if defined(GGML_USE_METAL)
-    if (ggml_dec && ggml_backend_is_metal(ctx->backend))
+    if (ggml_dec && core_cpu_backend::is_metal(ctx->backend))
         ggml_dec = false;
 #endif
     if (const char* e = crispasr_env::get("CRISPASR_NEMOTRON_GGML_DECODE"))
@@ -2370,7 +2371,7 @@ extern "C" struct nemotron_context* nemotron_init_from_file(const char* path_mod
 
     // Backend selection — use crispasr_init_gpu_backend() for portable GPU init
     ctx->backend = nullptr;
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
 
     if (params.use_gpu) {
         ctx->backend = crispasr_init_gpu_backend();

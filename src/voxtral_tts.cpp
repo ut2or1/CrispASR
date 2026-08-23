@@ -55,6 +55,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ---------------------------------------------------------------------------
 // Hyperparameters
@@ -574,7 +575,7 @@ extern "C" voxtral_tts_context* voxtral_tts_init_from_file(const char* path_mode
     core_gguf::free_metadata(gctx);
 
     // Load weights
-    ggml_backend_t be = ggml_backend_cpu_init();
+    ggml_backend_t be = core_cpu_backend::init();
     ctx->backend_cpu = be;
     if (params.use_gpu) {
         ggml_backend_t gpu = crispasr_init_gpu_backend();
@@ -587,7 +588,7 @@ extern "C" voxtral_tts_context* voxtral_tts_init_from_file(const char* path_mode
         ctx->backend = be;
 
     if (ctx->backend_cpu && params.n_threads > 0)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads);
 
     // FM_STEPS: experimental Euler ODE step-count override (default 8). See header.
     ctx->fm_flow_steps = env_int("CRISPASR_VOXTRAL_TTS_FM_STEPS", VTTS_FLOW_STEPS);

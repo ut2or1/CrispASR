@@ -43,6 +43,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1239,20 +1240,20 @@ struct irodori_tts_context* irodori_tts_init_from_file(const char* path_model, s
     // Initialize backends. use_gpu picks the best GPU (Metal/CUDA/Vulkan);
     // graphs are single-backend gallocr, so weights load onto the compute
     // backend directly. CRISPASR_IRODORI_CPU=1 forces CPU regardless.
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         std::fprintf(stderr, "[irodori] failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
     const bool force_cpu = [] {
         const char* e = std::getenv("CRISPASR_IRODORI_CPU");
         return e && *e && *e != '0';
     }();
     ctx->backend = (params.use_gpu && !force_cpu) ? crispasr_init_gpu_backend() : nullptr;
-    if (ctx->backend && ggml_backend_is_cpu(ctx->backend)) {
+    if (ctx->backend && core_cpu_backend::is_cpu(ctx->backend)) {
         ggml_backend_free(ctx->backend); // CPU-only build: keep the threaded instance
         ctx->backend = nullptr;
     }

@@ -93,10 +93,14 @@ _D = "Process, triage & documentation discipline"
 
 # Heading-prefix -> topic, for the ones the keyword rules misfile.
 OVERRIDES = {
+    "One red job hides every job behind it": _D,
+    "A reference that shares the runtime's assumption": _P,
     "A positional arg landing on the WRONG parameter": _D,
     "Two writers on one output field": _M,
     "A feature has ~8 front-ends": _M,
     "Regression transcripts need WER tolerance": _P,
+    "A guard has to assert the property the CONSUMER reads": _P,
+    "Splitting a path in half drops its prologue and its epilogue": _M,
     "Deterministic DROPOUT of whole words/tokens": _P,
     "A converter that embeds a tokenizer MUST embed the merges": "Tokenizers, prompts, language & text",
     "A gate that ANDs": _M,

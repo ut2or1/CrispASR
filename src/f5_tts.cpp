@@ -29,6 +29,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include "core/utf8.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/crispasr_env.h"
@@ -49,6 +50,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -130,6 +132,32 @@ struct f5_bench_stage {
 };
 
 // ── Hyperparameters ──────────────────────────────────────────────
+
+// Text length for the duration estimate: CODEPOINTS by default, bytes under
+// CRISPASR_F5_TEXT_LEN_BYTES=1.
+//
+// Upstream F5-TTS uses `len(text.encode("utf-8"))` — bytes — on both sides of
+// the rate, and so does our reference dumper
+// (tools/reference_backends/f5_tts.py:259). Byte/byte cancels when reference
+// and target share a script, so upstream only misbehaves when they differ; our
+// no-ref-text branch was worse still, pairing a 13 chars/sec constant with a
+// byte count, so Devanagari or CJK inflated ~3x and the ODE solve ran for
+// minutes (#372).
+//
+// Codepoints are the better default, so that is the default. The gate exists so
+// the exact upstream arithmetic stays reachable: `crispasr-diff f5-tts` compares
+// against a reference that is deliberately STILL on bytes, because a reference
+// that adopted our change could no longer disagree with us. Same reasoning and
+// same shape as CRISPASR_F5_DURATION_CLAMP=0 further down.
+static size_t f5_text_len(const char* s) {
+    static const bool s_bytes = []() {
+        const char* e = crispasr_env::get("CRISPASR_F5_TEXT_LEN_BYTES");
+        return e && e[0] == '1';
+    }();
+    if (!s)
+        return 0;
+    return s_bytes ? std::strlen(s) : core_utf8::length(s);
+}
 
 struct f5_hparams {
     int dim = 1024;
@@ -2102,13 +2130,13 @@ struct f5_tts_context* f5_tts_init_from_file(const char* path_model, struct f5_t
     ctx->speed = params.speed;
 
     // Initialize backends
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "f5_tts: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads);
 
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
@@ -2384,9 +2412,9 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
         float ref_secs = (float)ref_T / mel_fps;
         ref_text_len = std::max(1, (int)(ref_secs * 13.0f));
     } else {
-        ref_text_len = (int)ref_text.size();
+        ref_text_len = (int)f5_text_len(ref_text.c_str());
     }
-    int gen_text_len = (int)strlen(text);
+    int gen_text_len = (int)f5_text_len(text);
     // Per-char speech rate derived from the reference (mel frames per char).
     // #294: the guard here must be ASYMMETRIC. Under-estimating the rate makes
     // `duration` too short and TRUNCATES the generated speech (drops the tail of

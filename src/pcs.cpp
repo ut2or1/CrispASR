@@ -39,6 +39,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ---------------------------------------------------------------------------
 // SentencePiece tokenizer (greedy longest-match, same as fireredpunc SP path)
@@ -308,8 +309,8 @@ static bool pcs_load(pcs_context& ctx, const char* path) {
     // the ONNX/onnxruntime CPU reference without GPU float-noise on borderline logits).
     ctx.backend = std::getenv("PCS_FORCE_CPU") ? nullptr : crispasr_init_gpu_backend();
     if (!ctx.backend)
-        ctx.backend = ggml_backend_cpu_init();
-    ctx.backend_cpu = ggml_backend_cpu_init();
+        ctx.backend = core_cpu_backend::init();
+    ctx.backend_cpu = core_cpu_backend::init();
 
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path, ctx.backend, "pcs", wl))

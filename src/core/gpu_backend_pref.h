@@ -14,7 +14,7 @@
 // Empty or null = auto (same as ggml_backend_init_best).
 
 #include "ggml-backend.h"
-#include "ggml-cpu.h"                    // ggml_backend_cpu_init() for the `--gpu-backend cpu` short-circuit
+#include "ggml-cpu.h"                    // core_cpu_backend::init() for the `--gpu-backend cpu` short-circuit
 #include "metal_pipeline_cache_policy.h" // cap on the ggml-metal MTLBinaryArchive open cost (PLAN #88)
 
 #include <cctype>
@@ -23,6 +23,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include "core/ggml_cpu_backend.h"
 
 namespace crispasr_gpu_pref {
 
@@ -93,13 +94,13 @@ inline ggml_backend_t crispasr_init_gpu_backend() {
     if (!pref.empty() && ci_starts_with("cpu", pref.c_str()) && pref.size() <= 3) {
         const char* legacy = std::getenv("CRISPASR_GPU_PREF_CPU_LEGACY");
         if (!(legacy && legacy[0] && legacy[0] != '0')) {
-            // ggml_backend_cpu_init(), NOT ggml_backend_dev_by_type(...CPU):
+            // core_cpu_backend::init(), NOT ggml_backend_dev_by_type(...CPU):
             // the registry lookup enumerates every registered device, which
             // constructs the Metal device as a side effect (measured on
             // CrispEmbed: it still ran ggml_metal_device_init and cost
             // ~29 ms). The direct constructor touches no registry, so nothing
             // GPU is created.
-            ggml_backend_t cpu = ggml_backend_cpu_init();
+            ggml_backend_t cpu = core_cpu_backend::init();
             if (cpu) {
                 fprintf(stderr, "%s: --gpu-backend cpu — using the CPU backend, no GPU device initialised\n", __func__);
                 return cpu;

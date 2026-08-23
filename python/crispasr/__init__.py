@@ -2,6 +2,9 @@
 
 from ._binding import (
     AlignedWord,
+    ChatAborted,
+    ChatMessage,
+    ChatSession,
     CrispASR,
     DiarizeMethod,
     DiarizeSegment,
@@ -38,6 +41,9 @@ from ._binding import (
 
 __all__ = [
     "AlignedWord",
+    "ChatAborted",
+    "ChatMessage",
+    "ChatSession",
     "CrispASR",
     "DiarizeMethod",
     "DiarizeSegment",
@@ -71,4 +77,4 @@ __all__ = [
     "watermark_embed",
     "watermark_load_model",
 ]
-__version__ = "0.8.28"
+__version__ = "0.8.29"

@@ -16,6 +16,7 @@
 #include "vibevoice.h"
 #include "core/attention.h"
 #include "core/bpe.h"
+#include "core/vibevoice_asr_prompt.h"
 #include "core/conv.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
@@ -41,6 +42,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `VIBEVOICE_BENCH=1` for per-stage timings.
@@ -316,15 +318,15 @@ extern "C" struct vibevoice_context* vibevoice_init_from_file(const char* path_m
     // Backend selection: GPU first, CPU fallback. The scheduler requires
     // a CPU backend to be present as the final backend when the primary
     // backend is Metal/CUDA/Vulkan.
-    ctx->backend = hp.d_lm > 0 ? (params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init())
-                               : ggml_backend_cpu_init();
+    ctx->backend = hp.d_lm > 0 ? (params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init())
+                               : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads > 0 ? params.n_threads : 4);
-    if (ctx->backend && ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, params.n_threads > 0 ? params.n_threads : 4);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads > 0 ? params.n_threads : 4);
+    if (ctx->backend && core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, params.n_threads > 0 ? params.n_threads : 4);
     if (!ctx->backend) {
         delete ctx;
         return nullptr;
@@ -605,7 +607,28 @@ static ggml_tensor* build_block1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor
     h = ggml_mul_mat(ctx, ffn_up_w, h); // [C, C_ffn] @ [C, T] → [C_ffn, T]
     if (ffn_up_b)
         h = ggml_add(ctx, h, ffn_up_b);
-    h = ggml_gelu(ctx, h);
+    // GELU, per upstream: vibevoice/modular/modular_vibevoice_tokenizer.py, class
+    // FFN — `self.gelu = ACT2FN["gelu"]`, applied between linear1 and linear2.
+    //
+    // Do not "fix" this to SiLU. Our own reference dumper
+    // (tools/reference_backends/vibevoice.py::_block1d) used F.silu, so a
+    // per-layer diff blamed every ConvNeXt stage and swapping this to silu
+    // raised speech_features parity 0.83 -> 0.98 against that dumper — while
+    // turning a correct Korean transcript into fluent Vietnamese. The parity
+    // number was measuring agreement with our own mistake; the transcript was
+    // measuring the truth. The dumper was fixed instead.
+    // GELU_ERF, not ggml_gelu: transformers' ACT2FN["gelu"] is GELUActivation,
+    // i.e. the exact erf form, while ggml_gelu is the tanh approximation.
+    // 0xShug0/audio.cpp independently picks GeluApproximation::ExactErf in the
+    // same block. The two differ by up to 4.1e-4 per element, which compounds
+    // through 26 ConvNeXt blocks. CRISPASR_VIBEVOICE_GELU_TANH=1 restores the
+    // approximation for A/B; gelu_erf is implemented on CPU, Metal, CUDA and
+    // Vulkan, so this costs no portability.
+    static const bool gelu_tanh = [] {
+        const char* v = getenv("CRISPASR_VIBEVOICE_GELU_TANH");
+        return v && v[0] == '1';
+    }();
+    h = gelu_tanh ? ggml_gelu(ctx, h) : ggml_gelu_erf(ctx, h);
     h = ggml_mul_mat(ctx, ffn_down_w, h); // [C_ffn, C] @ [C_ffn, T] → [C, T]
     if (ffn_down_b)
         h = ggml_add(ctx, h, ffn_down_b);
@@ -623,6 +646,9 @@ static ggml_tensor* build_block1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor
 // Build ggml graph for one σ-VAE tokenizer encoder (acoustic or semantic).
 // prefix: "at_enc" for acoustic, "st_enc" for semantic
 // Input: [1, T] mono audio → Output: [vae_dim, T_out] mean
+// Defined below; used by the per-layer encoder taps.
+static void vibevoice_dump_f32(const char* dir, const char* name, const float* data, size_t n);
+
 static ggml_cgraph* build_tokenizer_encoder_graph(vibevoice_context* ctx, const char* prefix, int n_samples) {
     auto& hp = ctx->model.hp;
     auto& ts = ctx->model.tensors;
@@ -648,6 +674,11 @@ static ggml_cgraph* build_tokenizer_encoder_graph(vibevoice_context* ctx, const 
 
     ggml_tensor* h = inp;
 
+    // Opt-in: mark every per-layer intermediate as a graph output so it can be
+    // read back. Off by default — marking outputs blocks buffer reuse and costs
+    // memory, which is exactly why the values are otherwise clobbered.
+    const bool dump_layers = crispasr_env::get("CRISPASR_VIBEVOICE_DUMP_DIR") != nullptr;
+
     // Downsample layers + stages
     // ratios are REVERSED in the encoder: config [8,5,5,4,2,2] → encoder [2,2,4,5,5,8]
     std::vector<int> ratios(hp.encoder_ratios.rbegin(), hp.encoder_ratios.rend());
@@ -663,6 +694,18 @@ static ggml_cgraph* build_tokenizer_encoder_graph(vibevoice_context* ctx, const 
             int stride = (si == 0) ? 1 : ratios[si - 1]; // stem has stride 1
             h = build_causal_conv1d(ctx0, h, ds_w, ds_b, stride);
         }
+        // Per-layer taps for localising an encoder divergence (#369): the
+        // stage API bottoms out at the encoder OUTPUT, so a cos 0.83 there says
+        // nothing about which of the 7 downsample layers or their blocks caused
+        // it. set_output is mandatory, not decoration — without it ggml reuses
+        // the buffer and a later layer overwrites what you meant to read.
+        if (dump_layers) {
+            char dn[64];
+            snprintf(dn, sizeof(dn), "enc_ds_%d", si);
+            ggml_set_name(h, dn);
+            ggml_set_output(h);
+            ggml_build_forward_expand(gf, h);
+        }
 
         // Stage blocks
         int n_blocks = (si < (int)hp.encoder_depths.size()) ? hp.encoder_depths[si] : 3;
@@ -675,6 +718,13 @@ static ggml_cgraph* build_tokenizer_encoder_graph(vibevoice_context* ctx, const 
                               G(std::string(base) + ".ffn_ln.weight"), G(std::string(base) + ".ffn.up.weight"),
                               G(std::string(base) + ".ffn.up.bias"), G(std::string(base) + ".ffn.down.weight"),
                               G(std::string(base) + ".ffn.down.bias"), G(std::string(base) + ".ffn_gamma"));
+        }
+        if (dump_layers) {
+            char sn[64];
+            snprintf(sn, sizeof(sn), "enc_stage_%d", si);
+            ggml_set_name(h, sn);
+            ggml_set_output(h);
+            ggml_build_forward_expand(gf, h);
         }
     }
 
@@ -767,6 +817,22 @@ static std::vector<float> run_encoder_stage_one_call(vibevoice_context* ctx, con
         fprintf(stderr, "vibevoice: %s compute failed\n", prefix);
         return {};
     }
+    // Write the per-layer taps (see the dump_layers note in the graph builder).
+    // Prefixed by encoder so at_enc and st_enc do not overwrite each other.
+    if (const char* dd = crispasr_env::get("CRISPASR_VIBEVOICE_DUMP_DIR")) {
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+            ggml_tensor* t = ggml_graph_node(gf, i);
+            const char* nm = ggml_get_name(t);
+            if (!nm || (strncmp(nm, "enc_ds_", 7) != 0 && strncmp(nm, "enc_stage_", 10) != 0))
+                continue;
+            const size_t n = ggml_nelements(t);
+            std::vector<float> buf(n);
+            ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+            char full[160];
+            snprintf(full, sizeof(full), "%s_%s", prefix, nm);
+            vibevoice_dump_f32(dd, full, buf.data(), n);
+        }
+    }
     ggml_tensor* out = ggml_graph_get_tensor(gf, "encoder_out");
     int vae_dim = (int)out->ne[0];
     int T = (int)out->ne[1];
@@ -796,8 +862,39 @@ static std::vector<float> run_encoder_stage_one_call(vibevoice_context* ctx, con
 // computed analytically, since build_causal_conv1d's stride-alignment
 // right-padding makes an exact closed-form frame count fragile to derive
 // across all 7 stages.
+// Upstream normalises the waveform to -25 dBFS RMS before the sigma-VAE
+// encoders (VibeVoice's documented default; the reference dump's `audio_norm`
+// stage measures exactly 10^(-25/20) = 0.0562 RMS). We had the helper —
+// vibevoice_normalize_ref_pcm in vibevoice_wav_ref.h, commented "matches
+// Microsoft's default" — but its ONLY call site was the TTS voice-cloning path.
+// ASR transcription fed the encoders whatever level the recording happened to
+// have.
+//
+// A sigma-VAE encoder is not scale-invariant, so that is not cosmetic. Measured
+// against upstream on a 6 s Korean clip: identical waveform (cos 0.9995) at
+// -21.9 dBFS instead of -25.0, and speech_features came out at cos 0.82.
+//
+// It also makes transcription LEVEL-DEPENDENT, which matches the field report
+// in #369: six takes of one sentence by one speaker spanning -20.9 to -26.0
+// dBFS, some transcribing correctly and some losing the language entirely.
+//
+// Normalising here covers all three ASR entry points (run_acoustic_encoder,
+// run_semantic_encoder, encode_speech) at one place. The TTS path normalises
+// before it gets here, and RMS normalisation is idempotent, so it is unaffected.
+// Disable with CRISPASR_VIBEVOICE_NO_INPUT_NORM=1 to compare against the old
+// behaviour.
 static std::vector<float> run_encoder_stage(vibevoice_context* ctx, const char* prefix, const float* samples,
                                             int n_samples, int* out_T, int* out_vae_dim) {
+    std::vector<float> normalized;
+    static const bool s_no_norm = []() {
+        const char* e = std::getenv("CRISPASR_VIBEVOICE_NO_INPUT_NORM");
+        return e && e[0] == '1';
+    }();
+    if (!s_no_norm && n_samples > 0) {
+        normalized.assign(samples, samples + n_samples);
+        vibevoice_normalize_ref_pcm(normalized);
+        samples = normalized.data();
+    }
     const int max_chunk = vibevoice_encoder_max_chunk_samples();
     const int left_ctx = vibevoice_encoder_left_context_samples();
     const int n_chunks = (n_samples + max_chunk - 1) / max_chunk;
@@ -954,7 +1051,7 @@ static std::vector<float> run_token_embedding_lookup(vibevoice_context* ctx, con
             // Pin to the weight's backend: host-resident weight + GPU main
             // backend would otherwise hit the no-auto-copy sched rule.
             e1.be = (it->second->buffer && ggml_backend_buffer_is_host(it->second->buffer) &&
-                     !ggml_backend_is_cpu(ctx->backend))
+                     !core_cpu_backend::is_cpu(ctx->backend))
                         ? ctx->backend_cpu
                         : ctx->backend;
             size_t mem1 = 16 * ggml_tensor_overhead() + ggml_graph_overhead();
@@ -1126,6 +1223,70 @@ extern "C" float* vibevoice_run_connector(struct vibevoice_context* ctx, const c
     return out;
 }
 
+// ── BitNet activation quantization (#369) ───────────────────────────────────
+//
+// TQ2_0 gives us BitNet's WEIGHTS; it is a ternary container, not BitNet's
+// inference. b1.58's forward has two halves and we only ever implemented one:
+//
+//     weights      s = 1/mean(|w|); round(w*s).clamp(-1,1)/s      <- the converter
+//     activations  s = 127/max(|x|) PER TOKEN; round(x*s).clamp/s <- was missing
+//
+// The model was TRAINED with quantized activations, so feeding it unquantized
+// ones is a divergence rather than an improvement — the same shape of mistake as
+// handing a sigma-VAE its mean instead of a sample.
+//
+// ⚠ CPU-ONLY, and opt-in for that reason. ggml has no row-wise absmax, so this
+// goes through ggml_map_custom1, which no GPU backend implements — enabling it
+// on a GPU build drags those nodes onto the CPU. It exists to MEASURE whether
+// the missing half matters (CRISPASR_VIBEVOICE_BITNET_ACT_QUANT=1). If it does,
+// the answer is real kernels in the ggml fork, not this.
+//
+// The reference returns the DEQUANTIZED value (divided back by the scale), so
+// this is a pure element-wise rounding of x and needs no custom matmul.
+static void vibevoice_bitnet_act_quant_cb(ggml_tensor* dst, const ggml_tensor* a, int ith, int nth, void* ud) {
+    (void)ud;
+    const int64_t ne0 = a->ne[0]; // features of one token
+    const int64_t nrows = ggml_nrows(a);
+    for (int64_t r = ith; r < nrows; r += nth) {
+        const float* src = (const float*)((const char*)a->data + r * a->nb[1]);
+        float* out = (float*)((char*)dst->data + r * dst->nb[1]);
+        float amax = 0.0f;
+        for (int64_t i = 0; i < ne0; i++) {
+            const float v = fabsf(src[i]);
+            if (v > amax)
+                amax = v;
+        }
+        if (amax < 1e-5f) // clamp_(min=1e-5), as the reference does
+            amax = 1e-5f;
+        const float scale = 127.0f / amax;
+        for (int64_t i = 0; i < ne0; i++) {
+            float q = roundf(src[i] * scale);
+            if (q > 127.0f)
+                q = 127.0f;
+            if (q < -128.0f)
+                q = -128.0f;
+            out[i] = q / scale;
+        }
+    }
+}
+
+static bool vibevoice_bitnet_act_quant_enabled() {
+    static const bool on = [] {
+        const char* v = crispasr_env::get("CRISPASR_VIBEVOICE_BITNET_ACT_QUANT");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+static ggml_tensor* vibevoice_aq(ggml_context* ctx, ggml_tensor* x) {
+    if (!vibevoice_bitnet_act_quant_enabled())
+        return x;
+    return ggml_map_custom1(ctx, x, vibevoice_bitnet_act_quant_cb, GGML_N_TASKS_MAX, nullptr);
+}
+
+// Defined below, next to the MT19937 it shares with the TTS diffusion sampler.
+static void vibevoice_sample_acoustic_posterior(std::vector<float>& at_mean, uint32_t seed, int verbosity);
+
 extern "C" float* vibevoice_encode_speech(struct vibevoice_context* ctx, const float* samples, int n_samples,
                                           int* n_frames, int* d_lm) {
     if (!ctx || !samples || n_samples <= 0)
@@ -1141,6 +1302,32 @@ extern "C" float* vibevoice_encode_speech(struct vibevoice_context* ctx, const f
         fprintf(stderr, "vibevoice: frame mismatch at=%d st=%d\n", T_at, T_st);
         return nullptr;
     }
+    // Upstream's ASR path does NOT feed the acoustic encoder's mean to the
+    // connector — it SAMPLES the sigma-VAE posterior first
+    // (modeling_vibevoice_asr.py:
+    //   audio_tokens = encoder_output.sample(dist_type=std_dist_type)[0]
+    // with std_dist_type='gaussian' and fix_std=0.5, i.e.
+    //   value = fix_std / 0.8                    -> 0.625
+    //   std   = randn(batch) * value             -> ONE scalar per clip
+    //   x     = mean + std * randn_like(mean)
+    // ). 0xShug0/audio.cpp does the same (sample_vibevoice_acoustic_latents_
+    // gaussian, speech_encoder.cpp). We have always used the mean, which is the
+    // std=0 draw.
+    //
+    // Opt-in, because it is a real divergence but not one that fixes anything
+    // measurable here (#369): on the five Korean fixtures in that issue it
+    // changes the wrong answers into different wrong answers and leaves the
+    // right ones right. It also makes output seed-dependent, which the mean
+    // path is not. CRISPASR_VIBEVOICE_ASR_SAMPLE=1 enables it.
+    //
+    // Distribution-faithful, not bit-identical to torch: torch's CPU normal_
+    // generator would have to be reimplemented to reproduce a given seed's
+    // draw, and nothing here needs that.
+    if (const char* sv = crispasr_env::get("CRISPASR_VIBEVOICE_ASR_SAMPLE")) {
+        if (sv[0] == '1')
+            vibevoice_sample_acoustic_posterior(at_mean, ctx->params.seed, ctx->params.verbosity);
+    }
+
     auto at_feat = run_connector_stage(ctx, "at_conn", at_mean.data(), T_at, vd_at);
     auto st_feat = run_connector_stage(ctx, "se_conn", st_mean.data(), T_st, vd_st);
     if (at_feat.empty() || st_feat.empty())
@@ -1276,35 +1463,52 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "vibevoice: speech features combined: [%d, %d]\n", T_audio, hp.d_lm);
 
-    // 5. Build prompt matching the current HF VibeVoice ASR processor:
-    // <|im_start|>system ... <|im_end|>
-    // <|im_start|>user
-    // <|object_ref_start|><|box_start|>×N<|object_ref_end|>
-    // This is a X.XX seconds audio, please transcribe it with these keys: ...
-    // <|im_end|>\n
-    // <|im_start|>assistant\n   (add_generation_prompt=True)
-    const int AUDIO_BOS = 151646;   // <|object_ref_start|>
-    const int AUDIO_TOKEN = 151648; // <|box_start|>
-    const int AUDIO_EOS = 151647;   // <|object_ref_end|>
-    const int EOS_TOKEN = 151643;
-    const int IM_START = 151644;
-    const int IM_END = 151645;
+    // 5. Build prompt matching upstream's VibeVoice-ASR processor. The token
+    // tables live in core/vibevoice_asr_prompt.h with their expected text and a
+    // decode-them-back unit test — see the header for why (#369: the old inline
+    // table had four wrong ids and the comment described the intent, so the
+    // model was asked to transcribe with the word "transcribe" missing).
+    namespace vvp = core_vibevoice_asr_prompt;
+    const int AUDIO_BOS = vvp::AUDIO_BOS;
+    const int AUDIO_TOKEN = vvp::AUDIO_PAD;
+    const int AUDIO_EOS = vvp::AUDIO_EOS;
+    const int EOS_TOKEN = vvp::EOS;
+    const int IM_END = vvp::IM_END; // decode stop, below
 
-    // System prompt from transformers/models/vibevoice_asr/convert_vibevoice_asr_to_hf.py
-    std::vector<int> system_tokens = {
-        IM_START, 8948,   198,                                         // <|im_start|>system\n
-        2610,     525,    264,  10950,    17847, 429, 1356, 55136,     // You are a helpful assistant that transcribes
-        7699,     1946,   1119, 1467,     2550,  304, 4718, 3561,  13, // audio input into text output in JSON format.
-        198,      IM_END, 198,  IM_START, 872,   198                   // \n<|im_end|>\n<|im_start|>user\n
-    };
-    // After audio placeholder tokens, no --context:
-    // "\nThis is a XX.XX seconds audio, please transcribe it with these keys: Start time, End time, Speaker ID, Content<|im_end|>\n"
-    // With --context (matches microsoft/VibeVoice's `context_info` handling in
-    // vibevoice_asr_processor.py):
-    // "\nThis is a XX.XX seconds audio, with extra info: {context}\n\nPlease transcribe it with these keys: ...<|im_end|>\n"
+    // CRISPASR_VIBEVOICE_ASR_PROMPT:
+    //   (unset)              fixed prompt (default)
+    //   legacy               the exact pre-#369 prompt, for A/B
+    //   no-assistant-header  upstream's literal token sequence — see below
+    const char* prompt_mode_env = crispasr_env::get("CRISPASR_VIBEVOICE_ASR_PROMPT");
+    const std::string prompt_mode = prompt_mode_env ? prompt_mode_env : "";
+    const bool legacy_prompt = prompt_mode == "legacy";
+    // Upstream's prompt stops at "<|im_end|>\n": VibeVoiceASRProcessor accepts
+    // add_generation_prompt and never forwards it, and audio.cpp passes false.
+    // We keep the "<|im_start|>assistant\n" generation prompt anyway, because
+    // MEASURED on this checkpoint the upstream form generates ZERO tokens — the
+    // first sampled token after "<|im_end|>\n" is itself a stop token, so the
+    // model ends the document instead of answering. Pre-seeding the assistant
+    // turn is what the model would have had to emit next in any case.
+    const bool assistant_header = prompt_mode != "no-assistant-header";
+    // JSON-keys instruction for the 7B, plain text for the 1.5B — the split
+    // Microsoft's own runtime makes (VibeASR.cpp utils/prompt_builder.h: "text"
+    // format is the 1.5B, "json" the 7B, and it defaults to text). We had sent
+    // every checkpoint the 7B form because ours came from the PYTHON processor,
+    // which only targets the 7B. Keyed on d_lm rather than the backend alias so
+    // it follows the weights: 1536 = 1.5B (incl. vibevoice-asr-bitnet),
+    // 3584 = 7B. CRISPASR_VIBEVOICE_ASR_PROMPT=json|text forces either.
+    const bool plain_prompt = legacy_prompt           ? false
+                              : prompt_mode == "text" ? true
+                              : prompt_mode == "json" ? false
+                                                      : (hp.d_lm <= 2048);
+
+    std::vector<int> system_tokens = vvp::system_user_header();
+    if (legacy_prompt) {
+        // The pre-#369 system block carried a stray "\n" before <|im_end|>.
+        system_tokens.insert(system_tokens.begin() + 20, vvp::NEWLINE);
+    }
+
     float dur = n_samples / 24000.0f;
-    // Duration is inserted as plain text before tokenization by the HF
-    // processor. For Qwen2.5 digits and '.' map to stable single-char ids.
     char dur_str[16];
     snprintf(dur_str, sizeof(dur_str), "%.2f", dur);
 
@@ -1323,71 +1527,35 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
 
     std::vector<int> suffix_tokens;
     if (!context_trimmed.empty()) {
-        // No hardcoded token array for arbitrary context text — tokenize at
-        // runtime with the same dual-path (real BPE merges if the GGUF has
-        // `tokenizer.ggml.merges`, else the vocab-rank approximation) already
-        // used for VibeVoice TTS text (see vibevoice_synthesize()).
-        //
-        // The two text lines are tokenized separately (rather than one string
-        // with embedded "\n"/"\n\n") because tokenize_simple()/
-        // tokenize_text_bpe_vocab_rank() treat space/tab/newline runs purely
-        // as word separators and never emit a newline token — feeding it the
-        // whole string with embedded newlines silently drops the leading \n
-        // (matching the no-context path's token 198) and the blank line
-        // before "Please transcribe" (PR #223 review). The structural
-        // newlines are inserted explicitly below instead.
-        auto tokenize_line = [&](const std::string& s) {
-            return !m.merge_rank.empty() ? core_bpe::tokenize_simple(m.token_to_id, m.merge_rank, s)
-                                         : tokenize_text_bpe_vocab_rank(m, s);
-        };
-        std::string line1 = "This is a " + std::string(dur_str) + " seconds audio, with extra info: " + context_trimmed;
-        std::string line2 = "Please transcribe it with these keys: Start time, End time, Speaker ID, Content";
-
-        suffix_tokens.push_back(198); // \n
-        auto line1_tokens = tokenize_line(line1);
-        suffix_tokens.insert(suffix_tokens.end(), line1_tokens.begin(), line1_tokens.end());
-
-        // Blank line ("\n\n"): use the vocab's single merged double-newline
-        // token if present (real BPE would likely merge it), else two \n.
-        std::string double_nl = core_bpe::bytes_to_unicode("\n\n", 2);
-        auto dnl_it = m.token_to_id.find(double_nl);
-        if (dnl_it != m.token_to_id.end())
-            suffix_tokens.push_back(dnl_it->second);
-        else {
-            suffix_tokens.push_back(198);
-            suffix_tokens.push_back(198);
-        }
-
-        auto line2_tokens = tokenize_line(line2);
-        suffix_tokens.insert(suffix_tokens.end(), line2_tokens.begin(), line2_tokens.end());
+        // Only the user's own text needs a runtime BPE pass; everything around
+        // it is a fixed template and comes from the verified tables. Tokenize
+        // it with a leading space so it merges the way upstream's single-string
+        // `... extra info: {context}` does.
+        suffix_tokens = vvp::suffix_context_head(dur_str);
+        const std::string spaced = " " + context_trimmed;
+        auto ctx_ids = !m.merge_rank.empty() ? core_bpe::tokenize_simple(m.token_to_id, m.merge_rank, spaced)
+                                             : tokenize_text_bpe_vocab_rank(m, spaced);
+        suffix_tokens.insert(suffix_tokens.end(), ctx_ids.begin(), ctx_ids.end());
+        const auto tail = plain_prompt ? vvp::suffix_context_tail_plain() : vvp::suffix_context_tail();
+        suffix_tokens.insert(suffix_tokens.end(), tail.begin(), tail.end());
 
         if (ctx->params.verbosity >= 1)
             fprintf(stderr, "vibevoice: context injected: %zu tokens for %zu-char context string\n",
                     suffix_tokens.size(), context_trimmed.size());
-    } else {
-        std::vector<int> dur_tokens;
-        for (const char* p = dur_str; *p; p++) {
-            if (*p >= '0' && *p <= '9')
-                dur_tokens.push_back(15 + (*p - '0'));
-            else if (*p == '.')
-                dur_tokens.push_back(13);
-        }
-        suffix_tokens = {
-            198,                 // \n
-            1986, 374, 264, 220, // This is a<space>
-        };
-        suffix_tokens.insert(suffix_tokens.end(), dur_tokens.begin(), dur_tokens.end());
-        std::vector<int> suffix_mid = {
-            6546, 7699, 11, 4587, 38840, 432, 449,   1493,           // seconds audio, please transcribe it with these
-            6894, 25,                                                // keys:
+    } else if (legacy_prompt) {
+        suffix_tokens = vvp::suffix_head(dur_str);
+        const int legacy_mid[] = {
+            6546, 7699, 11, 4587, 38840, 432, 449,   1493, // (decodes to " configuration audio,thonPEND itiz these")
+            6894, 25,                                      // keys:
             5145, 882,  11, 3972, 882,   11,  29073, 3034, 11, 8883, // Start time, End time, Speaker ID, Content
         };
-        suffix_tokens.insert(suffix_tokens.end(), suffix_mid.begin(), suffix_mid.end());
+        suffix_tokens.insert(suffix_tokens.end(), std::begin(legacy_mid), std::end(legacy_mid));
+    } else if (plain_prompt) {
+        suffix_tokens = vvp::suffix_no_context_plain(dur_str);
+    } else {
+        suffix_tokens = vvp::suffix_no_context(dur_str);
     }
-    std::vector<int> suffix_tail = {
-        IM_END, 198,         // <|im_end|>\n
-        IM_START, 77091, 198 // <|im_start|>assistant\n (add_generation_prompt=True)
-    };
+    const auto suffix_tail = vvp::prompt_tail(assistant_header);
     suffix_tokens.insert(suffix_tokens.end(), suffix_tail.begin(), suffix_tail.end());
 
     // Build full token sequence
@@ -1519,13 +1687,17 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
                 int Lk = n_past + T_cur;
 
                 // Q, K, V projections with bias
-                ggml_tensor* Q = ggml_mul_mat(ctx0, q_w, cur);
+                // BitNet quantizes the INPUT of every projection, so q/k/v share a
+                // single quantization of `cur` — what one activation_quant()
+                // ahead of three BitLinears does.
+                ggml_tensor* cur_q = vibevoice_aq(ctx0, cur);
+                ggml_tensor* Q = ggml_mul_mat(ctx0, q_w, cur_q);
                 if (q_b)
                     Q = ggml_add(ctx0, Q, q_b);
-                ggml_tensor* K = ggml_mul_mat(ctx0, k_w, cur);
+                ggml_tensor* K = ggml_mul_mat(ctx0, k_w, cur_q);
                 if (k_b)
                     K = ggml_add(ctx0, K, k_b);
-                ggml_tensor* V = ggml_mul_mat(ctx0, v_w, cur);
+                ggml_tensor* V = ggml_mul_mat(ctx0, v_w, cur_q);
                 if (v_b)
                     V = ggml_add(ctx0, V, v_b);
 
@@ -1563,12 +1735,36 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
                 // Permute Q for flash-attn: [hd, T, nh]
                 Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
 
-                // Flash attention (native GQA)
+                // Flash attention (native GQA).
+                //
+                // GGML_PREC_F32 is set explicitly, matching 0xShug0/audio.cpp
+                // (`attention_precision = GGML_PREC_F32` in its Qwen decoder) and
+                // the fp32 softmax/accumulation of the PyTorch reference.
+                //
+                // On CPU this is a NO-OP and was verified as one: ggml's
+                // ggml_compute_forward_flash_attn_ext dispatches GGML_PREC_DEFAULT
+                // and GGML_PREC_F32 to the same F32-accumulator kernel. It bites on
+                // GPU — ggml-metal-device.m branches on `fa_prec == GGML_PREC_F32`,
+                // and CUDA/Vulkan likewise pick an F16-accumulation path otherwise.
+                //
+                // That asymmetry matches the one thing #369's reporter could not
+                // explain: their Windows/Vulkan run and my macOS/CPU run agreed
+                // character-for-character on the file that keeps its language cue
+                // and diverged on the one that loses it. F16 accumulation is
+                // exactly where backend kernels differ, and only a knife-edge
+                // input surfaces it. CRISPASR_VIBEVOICE_ATTN_PREC=default restores
+                // ggml's default for A/B.
+                static const bool attn_prec_f32 = [] {
+                    const char* v = crispasr_env::get("CRISPASR_VIBEVOICE_ATTN_PREC");
+                    return !(v && strcmp(v, "default") == 0);
+                }();
                 ggml_tensor* attn_out =
                     ggml_flash_attn_ext(ctx0, Q, Kfull, Vfull, causal_mask, kvp.attn_scale, 0.0f, 0.0f);
+                if (attn_prec_f32)
+                    ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
 
                 attn_out = ggml_reshape_2d(ctx0, attn_out, hp.d_lm, T_cur);
-                attn_out = ggml_mul_mat(ctx0, o_w, attn_out);
+                attn_out = ggml_mul_mat(ctx0, o_w, vibevoice_aq(ctx0, attn_out));
 
                 cur = ggml_add(ctx0, residual, attn_out);
             }
@@ -1577,9 +1773,22 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
             residual = cur;
             cur = ggml_rms_norm(ctx0, cur, 1e-6f);
             cur = ggml_mul(ctx0, cur, G(std::string(p) + ".ffn_ln.weight"));
-            ggml_tensor* ffn =
-                core_ffn::swiglu(ctx0, cur, G(std::string(p) + ".ffn.gate.weight"),
-                                 G(std::string(p) + ".ffn.up.weight"), G(std::string(p) + ".ffn.down.weight"));
+            ggml_tensor* gate_w = G(std::string(p) + ".ffn.gate.weight");
+            ggml_tensor* up_w = G(std::string(p) + ".ffn.up.weight");
+            ggml_tensor* down_w = G(std::string(p) + ".ffn.down.weight");
+            ggml_tensor* ffn = nullptr;
+            if (vibevoice_bitnet_act_quant_enabled()) {
+                // swiglu() inlined so down_proj's input is quantized too. It is a
+                // BitLinear like the other six, and covering only the easy call
+                // sites would make a null result meaningless.
+                ggml_tensor* cur_q = vibevoice_aq(ctx0, cur);
+                ggml_tensor* gate = ggml_mul_mat(ctx0, gate_w, cur_q);
+                ggml_tensor* up = ggml_mul_mat(ctx0, up_w, cur_q);
+                ggml_tensor* mlp = ggml_mul(ctx0, ggml_silu(ctx0, gate), up);
+                ffn = ggml_mul_mat(ctx0, down_w, vibevoice_aq(ctx0, mlp));
+            } else {
+                ffn = core_ffn::swiglu(ctx0, cur, gate_w, up_w, down_w);
+            }
             cur = ggml_add(ctx0, residual, ffn);
         }
 
@@ -2062,6 +2271,47 @@ static void fill_gaussian_noise(float* data, int n, uint32_t seed) {
     mt19937_state rng;
     mt19937_seed(rng, seed);
     fill_gaussian_noise(data, n, rng);
+}
+
+// Upstream's ASR path does NOT hand the acoustic encoder's mean to the
+// connector — it SAMPLES the sigma-VAE posterior first
+// (modeling_vibevoice_asr.py:
+//     audio_tokens = encoder_output.sample(dist_type=std_dist_type)[0]
+//  with std_dist_type='gaussian' and fix_std=0.5, i.e.
+//     value = fix_std / 0.8                  -> 0.625
+//     std   = randn(batch) * value           -> ONE scalar for the whole clip
+//     x     = mean + std * randn_like(mean)
+// ). 0xShug0/audio.cpp does the same, in
+// sample_vibevoice_acoustic_latents_gaussian(). We have always used the mean,
+// which is the std = 0 draw.
+//
+// Opt-in (CRISPASR_VIBEVOICE_ASR_SAMPLE=1), because it is a genuine divergence
+// that fixes nothing measurable and costs determinism. Measured on the five
+// Korean fixtures of #369 (bitnet embed-q8, CPU, default seed): four come back
+// character-identical to the mean path, and the fifth (`flip-en`, already
+// wrong) becomes a different wrong English sentence. Seeds 1 and 7 on that file
+// give two further wrong English sentences. No file recovers its language cue,
+// and no correct file is broken.
+//
+// Uses the same MT19937 as the TTS diffusion noise, so a given --seed
+// reproduces its draw; the stream matches torch.manual_seed()'s, though the
+// per-element consumption order is not claimed to be bit-identical to torch's
+// randn_like.
+static void vibevoice_sample_acoustic_posterior(std::vector<float>& at_mean, uint32_t seed, int verbosity) {
+    if (at_mean.empty())
+        return;
+    const float fix_std = 0.5f; // acoustic_tokenizer_config.fix_std
+    mt19937_state rng;
+    mt19937_seed(rng, seed ? seed : 42u);
+    float scalar_std = 0.0f;
+    fill_gaussian_noise(&scalar_std, 1, rng);
+    scalar_std *= fix_std / 0.8f;
+    std::vector<float> noise(at_mean.size());
+    fill_gaussian_noise(noise.data(), (int)noise.size(), rng);
+    for (size_t i = 0; i < at_mean.size(); i++)
+        at_mean[i] += scalar_std * noise[i];
+    if (verbosity >= 1)
+        fprintf(stderr, "vibevoice: acoustic posterior sampled (std=%.4f, seed=%u)\n", scalar_std, seed ? seed : 42u);
 }
 
 // ── Sinusoidal timestep embedding ───────────────────────────────────────────

@@ -5,6 +5,7 @@
 #include "grammar-parser.h"
 #include "whisper_params.h"       // struct whisper_params (shared with crispasr_*)
 #include "crispasr_backend.h"     // crispasr_run_backend() dispatch entry point
+#include "crispasr_cpu_isa.h"     // fail-fast on build-vs-host ISA mismatch (#380)
 #include "crispasr_diagnostics.h" // --version / --diagnostics + verbose banner (#31)
 #include "crispasr_consent_record.h"
 #include "crispasr_diarize_cli.h"      // crispasr_apply_diarize / pyannote cache (#107)
@@ -610,6 +611,14 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         // Also drive the native-knob path (f5 ode_steps, chatterbox cfm_steps),
         // which reads tts_num_steps; previously only vibevoice honoured this.
         params.tts_num_steps = params.tts_steps;
+    } else if (arg == "--tts-min-speech-tokens") {
+        // #360: the floor was reachable ONLY from /v1/audio/speech — no CLI
+        // flag, no session ABI, no binding — while every other TTS knob has at
+        // least the CLI. Units are the backend's AR decode step (MOSS: codec
+        // frames at 12.5 Hz, so 80 ms each), not samples and not milliseconds.
+        params.tts_min_speech_tokens = std::stoi(ARGV_NEXT);
+        if (params.tts_min_speech_tokens < 0)
+            params.tts_min_speech_tokens = 0;
     } else if (arg == "--tts-cfg-scale") {
         params.tts_cfg_scale = std::stof(ARGV_NEXT);
         if (params.tts_cfg_scale < 0.0f)
@@ -715,6 +724,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.chat_n_ctx = std::stoi(ARGV_NEXT);
     } else if (arg == "--chat-gpu-layers") {
         params.chat_n_gpu_layers = std::stoi(ARGV_NEXT);
+    } else if (arg == "--separate-model") {
+        params.separate_model = ARGV_NEXT;
     } else if (arg == "--g2p-dict") {
         params.g2p_dict = ARGV_NEXT;
     } else if (arg == "--tts-trim-silence") {
@@ -1394,10 +1405,13 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "                                                 [--align-format srt|json|plain] [--align-output f])\n"
             "             --align-only              standalone CTC forced alignment (issue #217)\n"
             "                                                 (-am <aligner.gguf> -f <audio> --ref-text \"text\"\n"
-            "                                                 or --text-file <file.txt|file.srt>)\n"
+            "                                                 or --text-file <file.txt|.srt|.json|->)\n"
+            "                                                 --text-file - reads from stdin (auto-detects format);\n"
+            "                                                 .json accepts CrispASR --output-json transcription\n"
+            "                                                 -m/--backend, --vad, --max-len are unused here\n"
             "             --align-granularity G     [auto   ] align-only output units: auto|word|segment\n"
-            "                                                 (segment = re-timed input SRT cues / .txt lines;\n"
-            "                                                 auto = segment for .srt input, word otherwise)\n");
+            "                                                 (segment = re-timed input cues/segments;\n"
+            "                                                 auto = segment for .srt/.json, word otherwise)\n");
     fprintf(stderr,
             "             --codec-model FNAME      codec / companion GGUF (defaults to sibling/cache/registry)\n");
     fprintf(stderr, "             --codec-quant Q          [%-7s] preferred quant for registry companion resolution\n",
@@ -1431,10 +1445,17 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "             --chat-gpu-layers N      [%-7d] server: GPU layers for the chat model "
             "(-1 = all, 0 = CPU only)\n",
             params.chat_n_gpu_layers);
+    fprintf(stderr, "             --separate-model PATH    server: enable POST /v1/audio/separation backed by "
+                    "this GGUF (htdemucs or mel-band-roformer; independent of --model)\n");
     fprintf(stderr,
             "             --tts-steps N            [%-7d] diffusion/ODE steps (vibevoice 10-20; irodori 40; "
             "chatterbox/f5/tada)\n",
             params.tts_steps);
+    fprintf(stderr,
+            "             --tts-min-speech-tokens N [%-6d] floor on generated audio length (moss-tts, "
+            "moss-tts-local). Units are the backend's AR decode step, NOT samples or ms: one codec frame, "
+            "12.5 Hz on the shipped models, so 80 ms each and N=25 floors at ~2 s. -1 = model default\n",
+            params.tts_min_speech_tokens);
     fprintf(
         stderr,
         "             --tts-cfg-scale X        [%-7s] TTS CFG guidance scale (vibevoice/chatterbox/f5/tada/irodori; "
@@ -2363,6 +2384,31 @@ int main(int argc, char** argv) {
     // hitting #31 get a complete capture in the same log block.
     if (params.verbose) {
         crispasr_print_full_diagnostics(stderr);
+    }
+
+    // #380 (and #261/#374 before it): if this binary's ggml kernels emit
+    // instructions the host CPU lacks (e.g. the AVX2+FMA release zip on a
+    // pre-2013 CPU), the first compute op dies with an illegal-instruction
+    // fault that Windows swallows — the user sees the banner and then
+    // nothing. Fail fast with the actual fix instead. Every backend runs
+    // some ops on the CPU backend even in GPU mode, so there is no safe way
+    // to continue; CRISPASR_IGNORE_CPU_ISA=1 overrides for experts.
+    {
+        const crispasr_cpu_isa::IsaCheck isa = crispasr_cpu_isa::check();
+        if (isa.checked && !isa.ok) {
+            const char* ov = getenv("CRISPASR_IGNORE_CPU_ISA");
+            fprintf(stderr,
+                    "error: this build was compiled for %s, but this CPU lacks: %s (%s).\n"
+                    "       Running it would crash with an illegal instruction at the first\n"
+                    "       compute step. Use the '-legacy' release artifact instead (e.g.\n"
+                    "       crispasr-windows-x86_64-cpu-legacy.zip — generic x86-64 baseline\n"
+                    "       for CPUs without AVX2/FMA), or build from source on this machine.\n",
+                    isa.required.c_str(), isa.missing.c_str(), isa.host_note.c_str());
+            if (!(ov && ov[0] == '1')) {
+                return 1;
+            }
+            fprintf(stderr, "warning: CRISPASR_IGNORE_CPU_ISA=1 set — continuing anyway.\n");
+        }
     }
 
     if (params.use_gpu) {

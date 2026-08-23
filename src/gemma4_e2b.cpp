@@ -33,6 +33,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `GEMMA4_E2B_BENCH=1` for per-stage timings.
@@ -1805,13 +1806,13 @@ extern "C" struct gemma4_e2b_context* gemma4_e2b_init_from_file(const char* path
     // Use CPU for weights — the LLM decoder can use ggml_backend_sched
     // to auto-copy to GPU for batched matmuls, and the audio conformer
     // uses single-graph execution.
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "gemma4_e2b: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
@@ -2732,7 +2733,7 @@ extern "C" void gemma4_e2b_set_n_threads(struct gemma4_e2b_context* ctx, int n_t
     if (ctx && n_threads > 0) {
         ctx->n_threads = n_threads;
         if (ctx->backend_cpu)
-            ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+            core_cpu_backend::set_n_threads(ctx->backend_cpu, n_threads);
     }
 }
 

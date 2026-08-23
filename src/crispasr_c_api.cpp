@@ -18,9 +18,11 @@
 #include "core/bpe.h"
 #include "core/asr_segment_group.h" // issue #257: output-segment grouping (parakeet --chunk-seconds)
 #include "core/audio_chunking.h"    // fix/session-long-audio: energy-minima slicing for session auto-chunk
+#include "core/tts_ref_cache.h"     // #334: reuse the CLI-side reference-transcript cache
 #include "session_autochunk.h"      // fix/session-long-audio: pure auto-chunk applicability decision
 #include "core/asr_sensitivity.h"   // §W7 sensitivity presets
 #include "core/ngram_loop_fix.h"
+#include "core/asr_time_order.h"
 #include "core/segment_hygiene.h" // §W2/§W5/§W6 opt-in segment cleanup    // fix/session-long-audio: collapse decode loops in merged chunks (issue #218)
 #include "parakeet_orchestrate.h" // improvements Phase 1: shared parakeet transcribe orchestration
 #include "core/gpu_backend_pref.h" // crispasr_set_gpu_backend_pref (#214)
@@ -756,6 +758,14 @@ CA_EXPORT int crispasr_vad_segments(const char* vad_model_path, const float* pcm
 //
 //   -1  bad arguments
 //   -2  allocation failed
+//   -3  the VAD model could not be loaded
+//
+// -3 exists because 0 and "the model never loaded" were the same answer.
+// crispasr_compute_vad_slices takes an `out_load_failed` flag for exactly this
+// reason — it was added after a failed VAD download was reported as success for
+// years — and this wrapper was dropping it, so a missing or unreadable model
+// returned 0 slices and every binding read that as "this audio has no speech".
+// A caller cannot tell those apart from the outside, so the ABI has to.
 CA_EXPORT int crispasr_vad_slices(const char* vad_model_path, const float* pcm, int n_samples, int sample_rate,
                                   float threshold, int min_speech_ms, int min_silence_ms, int speech_pad_ms,
                                   float max_chunk_duration_s, int n_threads, float** out_spans) {
@@ -783,8 +793,11 @@ CA_EXPORT int crispasr_vad_slices(const char* vad_model_path, const float* pcm, 
     if (n_threads > 0)
         opts.n_threads = n_threads;
 
+    bool load_failed = false;
     std::vector<crispasr_audio_slice> slices =
-        crispasr_compute_vad_slices(pcm, n_samples, sample_rate, vad_model_path, opts);
+        crispasr_compute_vad_slices(pcm, n_samples, sample_rate, vad_model_path, opts, &load_failed);
+    if (load_failed)
+        return -3; // distinct from 0 = loaded fine, found no speech
     const int n = (int)slices.size();
     if (n == 0)
         return 0;
@@ -1617,6 +1630,11 @@ struct crispasr_session {
     // one. Only effective when temperature > 0. Default 1 (no resampling).
     int best_of = 1;
     int max_new_tokens = 0;
+    // #360: floor on generated audio length for the MOSS TTS backends, applied
+    // at the synth-params site the way `language` is. -1 = leave the model's
+    // own default (0 = no floor). Not a runtime setter because moss exposes
+    // none; the CLI does the same thing with params.tts_min_speech_tokens.
+    int tts_min_speech_tokens = -1;
     float frequency_penalty = 0.0f;
     float temperature = 0.0f; // 0 = greedy / backend default
     uint64_t seed = 0;        // 0 = time-based
@@ -4755,6 +4773,13 @@ static void apply_session_punc_model(crispasr_session* s, crispasr_session_resul
 static void apply_session_hygiene(crispasr_session_result* r, bool include_merge) {
     if (!r || r->segments.empty())
         return;
+    // Issue #356: the same time-order check the CLI runs inside
+    // merge_segments() and the server runs after its slice-append loop. It sits
+    // ABOVE the env gate below on purpose — the hygiene stages are opt-in, but a
+    // transcript that comes back out of order is a bug on every configuration,
+    // and this is the one place every session result passes through. Reports
+    // only; reordering here would hide the producing bug.
+    core_time_order::warn_if_backward(r->segments, "session transcribe");
     auto hy = core_seg_hygiene::config_from_env();
     if (!include_merge)
         hy.merge.enabled = false;
@@ -5710,8 +5735,12 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         if (s->beam_size > 1)
             canary_set_beam_size(s->canary_ctx, s->beam_size);
         canary_set_max_new_tokens(s->canary_ctx, s->max_new_tokens); // #292
-        canary_result* cr =
-            canary_transcribe_ex(s->canary_ctx, pcm, n_samples, src.c_str(), tgt.c_str(), s->punctuation, 0);
+        // Same routing as the CLI adapter: canary_transcribe_streamed follows
+        // the canary-1b-v2 dynamic-chunking blueprint and single-passes any
+        // audio that fits one 40 s chunk, so short-audio behavior is
+        // unchanged while long audio no longer runs past the trained window.
+        canary_result* cr = canary_transcribe_streamed(s->canary_ctx, pcm, n_samples, src.c_str(), tgt.c_str(),
+                                                       s->punctuation, 0, 0, -1);
         if (!cr) {
             delete r;
             return nullptr;
@@ -6513,7 +6542,13 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             for (const auto& t : toks)
                 tok_texts.push_back(t.text);
             const std::vector<std::vector<int>> tok_of = core_vibevoice::assign_tokens(utts, tok_texts);
+            // The blob parsed as a transcript. Recorded BEFORE the filter so a
+            // response carrying only non-speech markers reports "no speech"
+            // rather than falling through to the raw JSON blob (#369).
+            parsed = !utts.empty();
             for (size_t u = 0; u < utts.size(); u++) {
+                if (core_vibevoice::is_non_speech_marker(utts[u].text))
+                    continue;
                 std::string t = utts[u].text;
                 while (!t.empty() && (unsigned char)t.front() <= ' ')
                     t.erase(t.begin());
@@ -6548,7 +6583,6 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
                     seg_toks.push_back(toks[(size_t)idx]);
                 seg.words = emit_words_from_tokens(seg_toks);
                 r->segments.push_back(std::move(seg));
-                parsed = true;
             }
         }
         if (!parsed) {
@@ -8026,8 +8060,43 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
         // is consumed at synthesize time by cosyvoice3_tts_synth_from_wav.
         s->cosyvoice3_voice = path;
         s->cosyvoice3_ref_text = ref_text_or_null ? ref_text_or_null : "";
-        if (ends_with_wav(path) && s->cosyvoice3_ref_text.empty())
+        if (ends_with_wav(path) && s->cosyvoice3_ref_text.empty()) {
+            // #334: the CLI auto-transcribes a reference clip when --ref-text is
+            // omitted and caches the result beside the WAV. That cache is
+            // library-side (core/tts_ref_cache.h) and mtime-validated against
+            // the clip, so the session can reuse it even though it cannot run
+            // ASR itself — the CLI helper builds a second CrispasrBackend,
+            // which this layer has no access to.
+            //
+            // So: a clip already prepared through the CLI now clones through
+            // the session API too, instead of failing on a transcript that has
+            // in fact already been computed and is sitting next to the file.
+            const std::string cache_path = crispasr_ref_cache::path_for(path, crispasr_ref_cache::kCv3RefTextSuffix);
+            std::vector<uint32_t> shape;
+            std::vector<uint8_t> payload;
+            if (!crispasr_ref_cache::disabled() &&
+                crispasr_ref_cache::load(cache_path, path, crispasr_ref_cache::kCv3RefTextSuffix, shape, payload) &&
+                !payload.empty()) {
+                s->cosyvoice3_ref_text.assign((const char*)payload.data(), payload.size());
+                fprintf(stderr, "crispasr[cosyvoice3-tts]: using cached ref transcript '%s': '%s'\n",
+                        cache_path.c_str(), s->cosyvoice3_ref_text.c_str());
+                return 0;
+            }
+            // Still nothing. Say what to do — a bare -2 was the trap #334's
+            // reporter hit from the other direction, and a transcript that does
+            // not match the clip is worse than no transcript at all.
+            fprintf(stderr,
+                    "crispasr[cosyvoice3-tts]: cloning from '%s' needs a transcript of that clip, and none "
+                    "was given.\n"
+                    "  Pass the exact transcript as the ref_text argument, or run the clip through the CLI "
+                    "once\n"
+                    "  (crispasr --backend cosyvoice3-tts --voice %s ...) which transcribes it and caches the\n"
+                    "  result at '%s' for this API to reuse.\n"
+                    "  An approximate transcript is worse than none: the talker infers the speaker's rate from\n"
+                    "  it and will rush or truncate the line (#334).\n",
+                    path, path, cache_path.c_str());
             return -2; // WAV cloning needs a reference transcription
+        }
         return 0;
     }
 #endif
@@ -8642,6 +8711,8 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
 #ifdef CA_HAVE_MOSS_TTS
     if (s->moss_tts_ctx) {
         moss_tts_synth_params p = moss_tts_synth_default_params();
+        if (s->tts_min_speech_tokens >= 0)
+            p.min_audio_frames = s->tts_min_speech_tokens;
         const std::string tts_lang = !s->target_language.empty() ? s->target_language : s->source_language;
         std::string lang_en;
         if (!tts_lang.empty() && tts_lang != "auto") {
@@ -8668,6 +8739,8 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
 #ifdef CA_HAVE_MOSS_TTS_LOCAL
     if (s->moss_tts_local_ctx) {
         moss_tts_local_synth_params p = moss_tts_local_synth_default_params();
+        if (s->tts_min_speech_tokens >= 0)
+            p.min_audio_frames = s->tts_min_speech_tokens;
         const std::string tts_lang = !s->target_language.empty() ? s->target_language : s->source_language;
         std::string lang_en;
         if (!tts_lang.empty() && tts_lang != "auto") {
@@ -11394,6 +11467,40 @@ CA_EXPORT int crispasr_session_set_max_speech_tokens(crispasr_session* s, int n)
 #ifdef CA_HAVE_CHATTERBOX
     if (s->chatterbox_ctx) {
         chatterbox_set_max_speech_tokens((chatterbox_context*)s->chatterbox_ctx, n);
+        touched++;
+    }
+#endif
+    return touched > 0 ? 0 : -2;
+}
+
+// Issue #360: floor on generated audio length, the counterpart to
+// set_max_speech_tokens. Reachable from the CLI (--tts-min-speech-tokens) and
+// from /v1/audio/speech ("min_speech_tokens") since they landed, but never
+// from the session ABI — so every binding was missing it while its `max`
+// sibling was present, which is what the reporter noticed.
+//
+// UNITS: the backend's own AR decode step, NOT samples and NOT milliseconds.
+// For the MOSS TTS backends that is one audio-codec frame, and the shipped
+// models run the codec at sampling_rate / downsample_rate = 24000 / 1920 =
+// 12.5 Hz, so one frame is 80 ms and n = 25 is a 2 s floor. Implemented by
+// masking the audio-delay/end token until n frames have been emitted, so it
+// bounds the DECODE, not the returned buffer.
+//
+// Returns -2 when the loaded backend has no such knob, like every other
+// optional setter here.
+CA_EXPORT int crispasr_session_set_min_speech_tokens(crispasr_session* s, int n) {
+    if (!s)
+        return -1;
+    int touched = 0;
+#ifdef CA_HAVE_MOSS_TTS
+    if (s->moss_tts_ctx) {
+        s->tts_min_speech_tokens = n;
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_MOSS_TTS_LOCAL
+    if (s->moss_tts_local_ctx) {
+        s->tts_min_speech_tokens = n;
         touched++;
     }
 #endif

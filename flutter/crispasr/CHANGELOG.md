@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.8.29
+
+* **Dart binding**: `inputSampleRate` and `outputSampleRate` are now bound
+  (#321). They had been added to the five bindings that lacked
+  `speechToSpeech`, which skipped the three that already had it — so Dart kept
+  s2s while never gaining the getter that says what rate to feed it. Both
+  return 0 on a dylib that predates the symbol, matching `separateSampleRate`.
+* **Chat**: cancellation and prompt-token counting are bound, plus four defects
+  fixed in the Dart chat surface (#361, #362). A session now waits for its
+  in-flight calls before freeing, so tearing one down mid-generation is safe.
+* `--diarize-method pyannote` never worked out of the box: the managed download
+  for its segmentation model was tagged with the licence string `"other"`, which
+  the registry treats as restricted, so it refused to fetch and produced no
+  speaker turns. It is MIT and ungated.
+* Diarization now returns speaker labels through `verbose_json`, which
+  previously dropped them entirely, and embeds segments across workers
+  (1.6–2.0x on the embed stage).
+* Parakeet long-form dropped whole spans of 30–300 s audio (#350) and could
+  emit segments out of time order (#356); both fixed, and long-form throughput
+  is 2.1x (#353).
+* Every GGUF load leaked its weight mapping — `MAP_PRIVATE` with write
+  permission, so merely reading the weights privatized the pages.
+* CosyVoice3 cloning works through the session API when the reference clip has
+  been prepared once through the CLI (#334).
+* Windows CUDA packages now ship in split form, without the three NVIDIA
+  runtime DLLs (#342) — 296 MB instead of 873 MB for the dev-lib package.
+* There is a Dart binding CI job, so this package is compiled on every push.
+
 ## 0.8.28
 
 * **HIP/ROCm on Linux**: first release since 0.8.25 with a

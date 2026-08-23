@@ -68,6 +68,36 @@ TEST_CASE("the sibling it bundles is present everywhere too", "[setter-parity]")
     }
 }
 
+TEST_CASE("issue #360: set_min_speech_tokens reaches every wrapper", "[setter-parity]") {
+    // Reported as "set_min_speech_tokens not exposed in libraries". It was
+    // worse than that: the floor was reachable from exactly ONE surface,
+    // /v1/audio/speech, which parsed "min_speech_tokens" into a whisper_params
+    // field the CLI had no flag for and the session ABI never read. Its `max`
+    // sibling was on all ten wrappers, which is the asymmetry the reporter saw.
+    for (const char* rel : kSurfaces) {
+        INFO("surface: " << rel);
+        const std::string src = slurp(rel);
+        REQUIRE(src.find("crispasr_session_set_min_speech_tokens") != std::string::npos);
+    }
+}
+
+TEST_CASE("issue #360: the max sibling stays on every wrapper too", "[setter-parity]") {
+    // The pair is only comprehensible together; pin both so neither can drift
+    // back out. This list was "intentionally narrow" and neither was in it.
+    for (const char* rel : kSurfaces) {
+        INFO("surface: " << rel);
+        const std::string src = slurp(rel);
+        REQUIRE(src.find("crispasr_session_set_max_speech_tokens") != std::string::npos);
+    }
+}
+
+TEST_CASE("issue #360: the CLI and the server can both set the floor", "[setter-parity]") {
+    const std::string cli = slurp("examples/cli/cli.cpp");
+    REQUIRE(cli.find("--tts-min-speech-tokens") != std::string::npos);
+    const std::string srv = slurp("examples/cli/crispasr_server.cpp");
+    REQUIRE(srv.find("min_speech_tokens") != std::string::npos);
+}
+
 TEST_CASE("C# does not swallow the unknown-preset return code", "[setter-parity]") {
     // Session.cs's Check() helper treats rc == -2 as SUCCESS, because for most
     // setters -2 means "this backend doesn't support the knob". For

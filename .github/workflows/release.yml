@@ -162,10 +162,22 @@ jobs:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
 
+      # Same live-download flakiness as build-wasm.yml: cache the toolchain and
+      # retry once. A 503 here would fail a RELEASE, so the retry matters more.
       - name: Setup emsdk
+        id: emsdk
         uses: mymindstorm/setup-emsdk@v14
+        continue-on-error: true
         with:
           version: 6.0.2  # 6.0.3 regressed WASM ISel (voxtral_tts crash); pin last-good
+          actions-cache-folder: emsdk-6.0.2
+
+      - name: Setup emsdk (retry)
+        if: steps.emsdk.outcome == 'failure'
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.2
+          actions-cache-folder: emsdk-6.0.2
 
       - name: Build WASM (all backends)
         run: ./build-wasm.sh --clean
@@ -217,6 +229,7 @@ jobs:
         run: |
           cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
               -DGGML_OPENBLAS=ON \
+              -DGGML_NATIVE=OFF \
               -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON \
               -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
               -DCRISPASR_OPUS_FETCH=ON
@@ -291,10 +304,16 @@ jobs:
 
       - name: Build
         run: |
+          # §355: build with GGML_BACKEND_DL so ggml-cuda is a dlopen'd plugin.
+          # The main binary has NO DT_NEEDED for libcuda/libcudart — if the CUDA
+          # driver is absent, ggml-cuda.so simply fails to load and the CPU
+          # backend is used instead (the "CPU fallback" the project advertises).
           cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON \
             -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_BACKEND_DL=ON \
             -DGGML_CUDA=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DGGML_OPENBLAS=ON \
             -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
@@ -308,10 +327,13 @@ jobs:
           mkdir -p release/crispasr-linux-x86_64-cuda
           cp build/bin/crispasr release/crispasr-linux-x86_64-cuda/
           cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-cuda/
+          # §355: bundle ggml backend shared libs (ggml-cuda.so, ggml-cpu.so, etc.)
+          # so the main binary can dlopen them from $ORIGIN at runtime.
+          for so in build/bin/libggml*.so* build/bin/libcrispasr*.so*; do
+            [ -f "$so" ] && cp -P "$so" release/crispasr-linux-x86_64-cuda/
+          done
           bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64-cuda || true
-          # Self-contained: rewrite RUNPATH to $ORIGIN (v0.8.25 shipped a leaked
-          # /home/runner/... path, and crispasr-quantize had no $ORIGIN at all, so it
-          # could not find its own bundled libc2pa_c.so) and copy in the non-system
+          # Self-contained: rewrite RUNPATH to $ORIGIN and copy in the non-system
           # dependency closure — libopenblas AND libgomp, per CrispASR #296.
           # CUDA's own libraries are the user's toolkit, not ours — the same
           # contract libcudart and libcublas have always had here. Declaring the
@@ -323,6 +345,9 @@ jobs:
             bash scripts/bundle-linux-runtime.sh release/crispasr-linux-x86_64-cuda
           # Then assert it: any DT_NEEDED that is neither bundled nor base-system
           # means the loader dies before main() and the process exits 127 silently.
+          # §355: with GGML_BACKEND_DL the main binary no longer DT_NEEDs CUDA
+          # libs at all — ggml-cuda.so does, but it is dlopen'd, not link-loaded.
+          # The --allow list covers ggml-cuda.so's own deps (still in the dir).
           python3 scripts/check-bundled-deps.py release/crispasr-linux-x86_64-cuda \
             --allow 'libcuda.so.*' --allow 'libcudart.so.*' --allow 'libcublas*.so.*' --allow 'libnv*.so.*'
           # Ship the licence text with the binaries. Every Windows, Android and
@@ -379,10 +404,13 @@ jobs:
 
       - name: Build
         run: |
+          # §355: GGML_BACKEND_DL — same rationale as the CUDA 12 leg above.
           cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON \
             -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_BACKEND_DL=ON \
             -DGGML_CUDA=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DGGML_OPENBLAS=ON \
             -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120a-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
@@ -396,27 +424,16 @@ jobs:
           mkdir -p release/crispasr-linux-x86_64-cuda13
           cp build/bin/crispasr release/crispasr-linux-x86_64-cuda13/
           cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-cuda13/
+          # §355: bundle ggml backend shared libs for dlopen
+          for so in build/bin/libggml*.so* build/bin/libcrispasr*.so*; do
+            [ -f "$so" ] && cp -P "$so" release/crispasr-linux-x86_64-cuda13/
+          done
           bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64-cuda13 || true
-          # Self-contained: rewrite RUNPATH to $ORIGIN (v0.8.25 shipped a leaked
-          # /home/runner/... path, and crispasr-quantize had no $ORIGIN at all, so it
-          # could not find its own bundled libc2pa_c.so) and copy in the non-system
-          # dependency closure — libopenblas AND libgomp, per CrispASR #296.
-          # CUDA's own libraries are the user's toolkit, not ours — the same
-          # contract libcudart and libcublas have always had here. Declaring the
-          # directory rather than naming sonames keeps a future libcusolver or
-          # libcufft (hundreds of MB each, and not on the name list) out of the
-          # tarball, and EXTRA_RPATH makes them findable through our own RUNPATH.
           CRISPASR_BUNDLE_HOST_DIRS=/usr/local/cuda \
           CRISPASR_BUNDLE_EXTRA_RPATH=/usr/local/cuda/lib64 \
             bash scripts/bundle-linux-runtime.sh release/crispasr-linux-x86_64-cuda13
-          # Then assert it: any DT_NEEDED that is neither bundled nor base-system
-          # means the loader dies before main() and the process exits 127 silently.
           python3 scripts/check-bundled-deps.py release/crispasr-linux-x86_64-cuda13 \
             --allow 'libcuda.so.*' --allow 'libcudart.so.*' --allow 'libcublas*.so.*' --allow 'libnv*.so.*'
-          # Ship the licence text with the binaries. Every Windows, Android and
-          # libcrispasr artifact already did; no CLI tarball did, and these bundle
-          # third-party shared libraries (libgomp, and libomp on HIP) whose terms
-          # require the notice to travel with them.
           cp LICENSE release/crispasr-linux-x86_64-cuda13/
           cp THIRD_PARTY_NOTICES.txt release/crispasr-linux-x86_64-cuda13/
           cd release && tar czf crispasr-linux-x86_64-cuda13.tar.gz crispasr-linux-x86_64-cuda13/
@@ -467,6 +484,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_HIP=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCMAKE_PREFIX_PATH=/opt/rocm \
             -DCMAKE_C_COMPILER=hipcc \
             -DCMAKE_CXX_COMPILER=hipcc \
@@ -554,6 +572,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_HIP=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCMAKE_PREFIX_PATH=/opt/rocm \
             -DCMAKE_C_COMPILER=hipcc \
             -DCMAKE_CXX_COMPILER=hipcc \
@@ -653,6 +672,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_VULKAN=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DGGML_OPENBLAS=ON \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=ON \
@@ -1238,6 +1258,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_OPENBLAS=ON \
+            -DGGML_NATIVE=OFF \
             -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON \
             -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCRISPASR_BUILD_TESTS=OFF \
@@ -1480,6 +1501,7 @@ jobs:
             -DCRISPASR_BUILD_EXAMPLES=OFF ^
             -DCRISPASR_BUILD_SERVER=OFF ^
             -DGGML_VULKAN=ON ^
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
             -DGGML_CUDA=OFF ^
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build-libs --config Release -j %NUMBER_OF_PROCESSORS% --target crispasr-lib
@@ -1580,6 +1602,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_CUDA=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
@@ -1706,31 +1729,69 @@ jobs:
                 Copy-Item -Destination "$OUT\ggml\src\Release\"
             }
           }
-          # CUDA runtime DLLs — bundled so the tarball is self-contained
-          # on Windows hosts that haven't added CUDA bin to PATH.
-          Copy-Item "$env:CUDA_PATH\bin\cudart64_*.dll"   "$OUT\bin\" -ErrorAction SilentlyContinue
-          Copy-Item "$env:CUDA_PATH\bin\cublas64_*.dll"   "$OUT\bin\" -ErrorAction SilentlyContinue
-          Copy-Item "$env:CUDA_PATH\bin\cublasLt64_*.dll" "$OUT\bin\" -ErrorAction SilentlyContinue
           Copy-Item include\crispasr.h "$OUT\include\"
           Get-ChildItem ggml\include\*.h -ErrorAction SilentlyContinue |
             Copy-Item -Destination "$OUT\ggml\include\"
           Copy-Item LICENSE "$OUT\"
           Copy-Item THIRD_PARTY_NOTICES.txt "$OUT\"
+
+          # Split archive first, before the CUDA runtime DLLs go in — #342.
+          # This is the largest asset in the release, so it is the one where a
+          # slow connection hurts most. The CUDA runtime changes far less often
+          # than we cut releases, so re-downloading it every time is waste.
+          $SPLIT = "release\libcrispasr-windows-x86_64-cuda-non-cuda"
+          Copy-Item $OUT $SPLIT -Recurse
+          @'
+          This archive intentionally excludes the CUDA runtime DLLs.
+          For a self-contained install, use libcrispasr-windows-x86_64-cuda.tar.gz.
+          For an incremental install, copy the three separate *64_*.dll release assets
+          into bin\: cudart64_*.dll, cublas64_*.dll, and cublasLt64_*.dll.
+
+          They are published once per release alongside
+          crispasr-windows-x86_64-cuda-runtime-sha256.txt, and are the same files
+          the CLI package uses - both are built against CUDA 12.8.0, so one copy
+          serves both. Verify with that manifest before reusing an older download.
+          '@ | Set-Content "$SPLIT\README-CUDA.txt"
+
+          # CUDA runtime DLLs — bundled so the tarball is self-contained
+          # on Windows hosts that haven't added CUDA bin to PATH.
+          Copy-Item "$env:CUDA_PATH\bin\cudart64_*.dll"   "$OUT\bin\" -ErrorAction SilentlyContinue
+          Copy-Item "$env:CUDA_PATH\bin\cublas64_*.dll"   "$OUT\bin\" -ErrorAction SilentlyContinue
+          Copy-Item "$env:CUDA_PATH\bin\cublasLt64_*.dll" "$OUT\bin\" -ErrorAction SilentlyContinue
+
+          # -ErrorAction SilentlyContinue above means a wrong CUDA_PATH would
+          # produce a silently CPU-only "cuda" package. Fail loudly instead.
+          $bundled = @(Get-ChildItem "$OUT\bin\cudart64_*.dll","$OUT\bin\cublas64_*.dll","$OUT\bin\cublasLt64_*.dll" -ErrorAction SilentlyContinue)
+          if ($bundled.Count -ne 3) {
+            throw "Expected exactly three CUDA runtime DLLs (cudart, cublas, cublasLt) in $OUT\bin, found $($bundled.Count)"
+          }
+          if (Get-ChildItem "$SPLIT\bin\cudart64_*.dll","$SPLIT\bin\cublas64_*.dll","$SPLIT\bin\cublasLt64_*.dll" -ErrorAction SilentlyContinue) {
+            throw "The split archive must not contain CUDA runtime DLLs"
+          }
+
           cd release
           tar -czf libcrispasr-windows-x86_64-cuda.tar.gz libcrispasr-windows-x86_64-cuda
-          Get-Item libcrispasr-windows-x86_64-cuda.tar.gz | Format-List Name,Length
+          tar -czf libcrispasr-windows-x86_64-cuda-non-cuda.tar.gz libcrispasr-windows-x86_64-cuda-non-cuda
+          Get-Item libcrispasr-windows-x86_64-cuda.tar.gz,libcrispasr-windows-x86_64-cuda-non-cuda.tar.gz | Format-List Name,Length
 
       - uses: actions/upload-artifact@v4
         with:
           name: libcrispasr-windows-x86_64-cuda
           path: release/libcrispasr-windows-x86_64-cuda.tar.gz
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libcrispasr-windows-x86_64-cuda-split
+          path: release/libcrispasr-windows-x86_64-cuda-non-cuda.tar.gz
+
       - name: Attach libcrispasr-windows-x86_64-cuda.tar.gz to release
         if: inputs.tag != '' || startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
-          files: release/libcrispasr-windows-x86_64-cuda.tar.gz
+          files: |
+            release/libcrispasr-windows-x86_64-cuda.tar.gz
+            release/libcrispasr-windows-x86_64-cuda-non-cuda.tar.gz
           fail_on_unmatched_files: true
 
   # ── Windows x86_64 shared libs + headers (generic CPU legacy) ────────────────
@@ -1939,6 +2000,7 @@ jobs:
           cmake -S . -B build -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_CUDA=ON ^
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual" ^
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j %NUMBER_OF_PROCESSORS%
@@ -2050,6 +2112,7 @@ jobs:
           cmake -S . -B build -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_VULKAN=ON ^
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
             -DGGML_CUDA=OFF ^
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j %NUMBER_OF_PROCESSORS%

@@ -27,6 +27,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `FIREREDPUNC_BENCH=1` for per-stage timings.
@@ -395,13 +396,13 @@ static bool fireredpunc_load(fireredpunc_context& ctx, const char* path) {
     const char* punc_backend = getenv("FIREREDPUNC_BACKEND");
     const bool force_cpu = punc_backend && strcmp(punc_backend, "cpu") == 0;
     const bool force_gpu = punc_backend && strcmp(punc_backend, "gpu") == 0;
-    ctx.backend = (force_cpu && !force_gpu) ? ggml_backend_cpu_init() : crispasr_init_gpu_backend();
+    ctx.backend = (force_cpu && !force_gpu) ? core_cpu_backend::init() : crispasr_init_gpu_backend();
     if (!ctx.backend)
-        ctx.backend = ggml_backend_cpu_init();
+        ctx.backend = core_cpu_backend::init();
     // Always have a separate CPU backend on hand for ggml_backend_sched
     // to fall back to (issue #68). Even though the primary backend is
     // CPU here, we keep the two-backend shape uniform.
-    ctx.backend_cpu = ggml_backend_cpu_init();
+    ctx.backend_cpu = core_cpu_backend::init();
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path, ctx.backend, "fireredpunc", wl))
         return false;

@@ -44,6 +44,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 namespace {
 
@@ -3069,7 +3070,7 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
     // norm precision plumbing that hasn't been audited yet. Default is
     // therefore T3 GPU + S3Gen CPU: correct output, ~most of the GPU
     // speedup (T3 AR loop is the slow stage).
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     if (!c->backend_cpu) {
         fprintf(stderr, "chatterbox: failed to init CPU backend\n");
         delete c;
@@ -3091,7 +3092,7 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
             cb_threads = std::max(c->n_threads, std::min(8, hw > 0 ? hw : 4));
         }
         c->n_threads = cb_threads;
-        ggml_backend_cpu_set_n_threads(c->backend_cpu, cb_threads);
+        core_cpu_backend::set_n_threads(c->backend_cpu, cb_threads);
         if (params.verbosity >= 1)
             fprintf(stderr, "chatterbox: CPU backend threads=%d\n", cb_threads);
     }

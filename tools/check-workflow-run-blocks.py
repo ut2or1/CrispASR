@@ -90,7 +90,38 @@ def main() -> int:
                       f"did you mean a line continuation?\n    {line.strip()[:110]}")
                 problems += 1
 
-            # (2) the shell must at least parse
+            # (2) PowerShell here-string delimiters must start their line.
+            #
+            # `@'` and `'@` are only recognised at column 0; indent either and
+            # PowerShell fails to parse the whole script. That is easy to get
+            # wrong here because the indentation you see in the YAML is not what
+            # PowerShell sees — the block scalar strips the common prefix first,
+            # so a delimiter looks indented in the file and is fine, or lines up
+            # with its neighbours and is not. The same #339 argument applies:
+            # release.yml runs only on a tag push, so its first execution is the
+            # release, and a parse error there costs the assets that job builds.
+            # Nothing else covers this — check (3) skips every non-bash shell.
+            if shell in ("pwsh", "powershell"):
+                depth = 0
+                for i, line in enumerate(body.splitlines(), 1):
+                    s = line.strip()
+                    # A closing delimiter may be followed by a pipeline on the
+                    # same line (`'@ | Set-Content x`); an opening one may not.
+                    opens = s in ("@'", '@"')
+                    closes = s.startswith("'@") or s.startswith('"@')
+                    if not (opens or closes):
+                        continue
+                    if line[:1] not in ("@", "'", '"'):
+                        print(f"{where}: line {i}: PowerShell here-string delimiter is "
+                              f"indented; it must start the line or the script will not parse"
+                              f"\n    {s[:110]}")
+                        problems += 1
+                    depth += opens - closes
+                if depth != 0:
+                    print(f"{where}: unbalanced PowerShell here-string (depth {depth})")
+                    problems += 1
+
+            # (3) the shell must at least parse
             if shell in NON_BASH or (not shell and "windows" in runs_on):
                 continue
             checked += 1

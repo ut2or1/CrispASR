@@ -2,7 +2,7 @@
 
 **One C++ binary, 54 ASR backends + 52 TTS engines + multilingual text translation, zero Python dependencies.**
 
-CrispASR started as a fork of [whisper.cpp](https://github.com/ggml-org/whisper.cpp) and extends that base into a **unified speech engine** called `crispasr`, backed by full ggml C++ runtimes for major open-weights ASR *and* TTS architectures. One build, one binary, one consistent CLI — pick the backend at the command line or let CrispASR auto-detect it from your GGUF file. See [Text-to-Speech](#text-to-speech-tts) for the TTS side.
+CrispASR started as a fork of [whisper.cpp](https://github.com/ggml-org/whisper.cpp) and extends that base into a **unified speech engine** called `crispasr`, backed by full ggml C++ runtimes for major open-weights ASR *and* TTS architectures. One build, one binary, one consistent CLI — pick the backend at the command line or let CrispASR auto-detect it from your GGUF file. See [Text-to-Speech](#text-to-speech-models) for the TTS side.
 
 ```console
 $ crispasr -m ggml-base.en.bin          -f samples/jfk.wav                    # OpenAI Whisper
@@ -36,7 +36,7 @@ live transcription + TTS + language detection, auto-deployed from `hf-space/`.
 
 - [Supported backends](#supported-backends) — [ASR](#asr-backends) + [TTS](#text-to-speech-models) + [translation](#translation) + [post-processing](#post-processing-models) + [music & audio analysis](#music--audio-analysis)
 - [Feature matrix](#feature-matrix)
-- [Install & build](#install--build) — quick install (full guide in [docs/install.md](docs/install.md))
+- [Install & build](#install--build) — quick install (full guide in [docs/install.md](docs/install.md)); **[which prebuilt Linux tarball to download](docs/install.md#prebuilt-linux-tarballs--which-one-to-download-355)** — the `-cuda` / `-hip` / `-vulkan` builds require the matching GPU driver and do **not** fall back to CPU
 - [Quick start — ASR](#quick-start)
 - [**Text-to-Speech (TTS)**](docs/tts.md) — 51 engines: Kokoro, Qwen3-TTS, VibeVoice, dots.tts, Orpheus, Chatterbox, IndexTTS, Irodori, VoxCPM2, CosyVoice3, CSM, Dia, Zonos, Bark, Piper, MeloTTS, and more
 - [Streaming & live transcription](docs/streaming.md)
@@ -153,7 +153,7 @@ crispasr -m models/voxcpm2-vae-f32.gguf -f input.wav --s2s \
 ### Text-to-Speech models
 
 Synthesis backends, driven by the `--tts` flag and a `--tts-output PATH.wav`.
-See the dedicated [Text-to-Speech](#text-to-speech-tts) section below for
+See the dedicated [Text-to-Speech](#text-to-speech-models) section below for
 quick-start commands and engine selection guidance.
 
 | Backend | Models | Architecture | Languages | License |
@@ -586,7 +586,7 @@ and the `scripts/dev-build.sh` wrapper.
 
 ## Quick start
 
-ASR examples below; for TTS see the [Text-to-Speech](#text-to-speech-tts) section.
+ASR examples below; for TTS see the [Text-to-Speech](#text-to-speech-models) section.
 
 ### Whisper (historical path, byte-identical to upstream whisper.cpp)
 
@@ -920,7 +920,7 @@ HF_TOKEN=hf_xxx crispasr -m auto --backend gemma4-e2b -f audio.wav
 ```
 
 The server has its own auth env: `CRISPASR_API_KEYS` (see
-[Server mode](#server-mode-persistent-model-http-api)).
+[Server mode](docs/server.md)).
 
 <details>
 <summary><b>Per-backend debug / bench / dump-dir env vars (developer)</b></summary>
@@ -929,7 +929,7 @@ These are useful when porting a new backend or chasing a regression.
 The `*_BENCH=1` toggles emit per-stage timings even without `-v`; the
 `*_DEBUG=1` toggles emit per-step diagnostic prints; the `*_DUMP_DIR=`
 paths write per-stage F32 tensors for diff-testing against a PyTorch
-reference (see [Debug a new backend against PyTorch ground truth](#debug-a-new-backend-against-pytorch-ground-truth)).
+reference (see [Debug a new backend against PyTorch ground truth](docs/contributing.md#debug-a-new-backend-against-pytorch-ground-truth)).
 
 | Env var | Purpose |
 | --- | --- |

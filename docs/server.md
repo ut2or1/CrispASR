@@ -159,7 +159,7 @@ stage that fails to load or produce its output then returns **HTTP 400** with
 an `{"error": {...}}` body instead of a degraded `200`. A stage that ran and
 legitimately produced nothing (VAD detected no speech) stays a success. This
 mirrors the CLI's `--strict-pipeline` family (see
-[`cli.md`](cli.md#strict-pipeline--require-aux-stages-to-succeed-strict-pipeline-311));
+[`cli.md`](cli.md#strict-pipeline--require-aux-stages-to-succeed---strict-pipeline-311));
 the strict decision is shared code (`crispasr_strict.h`), so the two front-ends
 cannot drift.
 
@@ -551,6 +551,42 @@ audio is watermarked by default, same as TTS (process-level opt-out via
 | `POST /v1/voices` (multipart upload for runtime provisioning) | **Done** — gated on `consent_attestation` (see above). Disk quota and content-type validation still pending. |
 | `DELETE /v1/voices/{name}` | **Done**. |
 | Native-backend `speed` (duration knobs vs server-side resample) | Pending — backend-by-backend. |
+
+## Source separation endpoint (§381)
+
+`POST /v1/audio/separation` runs source separation on uploaded audio and
+returns one WAV per stem. Requires a secondary model loaded at startup via
+`--separate-model` (independent of the primary ASR/TTS model).
+
+```bash
+crispasr --server -m parakeet-q4_k.gguf \
+  --separate-model mel-band-roformer-vocals-f16.gguf
+```
+
+```bash
+# Separate all stems:
+curl http://localhost:8080/v1/audio/separation \
+  -F "file=@song.wav" -o stems.bin -D -
+# Content-Type: multipart/mixed (one WAV per stem)
+
+# Select specific stems:
+curl http://localhost:8080/v1/audio/separation \
+  -F "file=@song.wav" -F "stems=vocals" -o vocals.wav
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `file` | (required) | Audio file upload (multipart). Decoded to stereo at the model's native rate (44100 Hz). |
+| `stems` | `all` | Comma-separated stem subset to return (e.g. `vocals,drums`). |
+
+Response is `multipart/mixed` with one `audio/wav` part per selected stem
+(stereo 16-bit PCM). Each part carries
+`Content-Disposition: attachment; filename="<stem>.wav"`. No AI-provenance
+tag — the audio is the user's own.
+
+Returns `503` when `--separate-model` is not configured, `400` for
+missing/invalid audio or a `stems` filter matching nothing, `500` on
+backend failure.
 
 ## Translation endpoint
 

@@ -25,6 +25,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -623,12 +624,12 @@ extern "C" struct wavtok_decoder_ctx* wavtok_decoder_init_from_file(const char* 
     }
 
     // Backend
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     if (!c->backend_cpu) {
         delete c;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(c->backend_cpu, params.n_threads);
+    core_cpu_backend::set_n_threads(c->backend_cpu, params.n_threads);
     c->backend = c->backend_cpu; // decoder is small, CPU is fine
 
     // Pass 2: weights

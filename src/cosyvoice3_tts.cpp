@@ -66,6 +66,7 @@
 #include <sys/stat.h> // #334 clone-voice cache key (size + mtime)
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -572,14 +573,17 @@ bool cv3_kv_init(cosyvoice3_tts_context* ctx, int max_ctx) {
     const size_t kbytes = ggml_nbytes(ctx->kv_k);
     const size_t vbytes = ggml_nbytes(ctx->kv_v);
     ggml_backend_t kv_backend = core_attn::kv_backend_from_env(ctx->backend, ctx->backend_cpu, "cosyvoice3_tts");
-    ctx->kv_buf = ggml_backend_alloc_buffer(kv_backend, kbytes + vbytes);
+    // #367: size and place via ggml, not ggml_nbytes() arithmetic. CUDA's
+    // get_alloc_size() pads a quantized row up to MATRIX_ROW_PADDING (512),
+    // and these KV rows are head_dim wide (128), so each q8_0 tensor needs
+    // 408 bytes more than nbytes — the hand-sized buffer came up short and
+    // ggml_backend_tensor_alloc aborted. f16 is not quantized, so this only
+    // ever fired with CRISPASR_KV_QUANT set, and only on CUDA.
+    ctx->kv_buf = ggml_backend_alloc_ctx_tensors(ctx->kv_ctx, kv_backend);
     if (!ctx->kv_buf) {
         fprintf(stderr, "cosyvoice3_tts: failed to alloc KV buffer (%zu bytes)\n", kbytes + vbytes);
         return false;
     }
-    char* base = (char*)ggml_backend_buffer_get_base(ctx->kv_buf);
-    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_k, base);
-    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_v, base + kbytes);
     ggml_backend_buffer_clear(ctx->kv_buf, 0);
     ctx->kv_max_ctx = max_ctx;
     if (ctx->params.verbosity >= 1) {
@@ -1053,13 +1057,13 @@ extern "C" struct cosyvoice3_tts_context* cosyvoice3_tts_init_from_file(const ch
     gguf_free(gctx);
 
     // ---- Backend init ----
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "cosyvoice3_tts: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     // The original diff-validation implementation pinned every CosyVoice3
     // stage to CPU even when the caller requested GPU execution.  Besides the
     // AR LLM, the flow estimator runs 22 transformer blocks twice for every
@@ -1097,12 +1101,12 @@ extern "C" struct cosyvoice3_tts_context* cosyvoice3_tts_init_from_file(const ch
             ctx->backend = ctx->backend_cpu;
         }
     }
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     }
     if (params.verbosity >= 1) {
-        fprintf(stderr, "cosyvoice3_tts: using %s backend: %s\n", ggml_backend_is_cpu(ctx->backend) ? "CPU" : "GPU",
-                ggml_backend_name(ctx->backend));
+        fprintf(stderr, "cosyvoice3_tts: using %s backend: %s\n",
+                core_cpu_backend::is_cpu(ctx->backend) ? "CPU" : "GPU", ggml_backend_name(ctx->backend));
     }
 
     // ---- Weight pass ----
@@ -1283,7 +1287,7 @@ extern "C" void cosyvoice3_tts_set_n_threads(struct cosyvoice3_tts_context* ctx,
         return;
     ctx->n_threads = n_threads > 0 ? n_threads : 4;
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 }
 
 extern "C" void cosyvoice3_tts_set_seed(struct cosyvoice3_tts_context* ctx, uint64_t seed) {
@@ -5380,7 +5384,7 @@ bool cv3_load_voice_bundle_from_file(const char* path, std::vector<cv3_voice>& v
     }
     gguf_free(gctx);
 
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_t backend = core_cpu_backend::init();
     if (!backend)
         return false;
     core_gguf::WeightLoad wl;

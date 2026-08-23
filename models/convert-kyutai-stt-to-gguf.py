@@ -124,6 +124,18 @@ def main():
     writer.add_uint32("kyutai.num_heads", config["num_heads"])  # 16
     writer.add_uint32("kyutai.num_layers", config["num_layers"])  # 16
     writer.add_uint32("kyutai.context", config["context"])  # 750
+
+    # Languages the checkpoint was trained on (#366). Nothing in the weights
+    # says this, and CrispASR used to warn "English-only model" for every
+    # kyutai-stt GGUF — including stt-1b-en_fr, which is the DEFAULT model the
+    # registry downloads and does support French. Write it down so the runtime
+    # does not have to infer it from layer count.
+    langs = config.get("languages")
+    if not langs:
+        # Upstream configs do not carry this, so derive it from the checkpoint
+        # that is being converted: the 1B is en+fr, the 2.6B is English-only.
+        langs = ["en"] if config["num_layers"] >= 48 else ["en", "fr"]
+    writer.add_array("kyutai.languages", list(langs))
     writer.add_float32("kyutai.max_period", config["max_period"])  # 100000
     writer.add_float32("kyutai.hidden_scale", config["hidden_scale"])  # 4.125
     writer.add_uint32("kyutai.existing_text_padding_id", config["existing_text_padding_id"])  # 3

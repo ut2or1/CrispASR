@@ -50,6 +50,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 namespace {
 
@@ -373,13 +374,13 @@ extern "C" struct orpheus_context* orpheus_init_from_file(const char* path_model
     }
 
     // Backend selection.
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     if (!c->backend_cpu) {
         fprintf(stderr, "orpheus: failed to init CPU backend\n");
         delete c;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(c->backend_cpu, c->n_threads);
+    core_cpu_backend::set_n_threads(c->backend_cpu, c->n_threads);
     c->backend = params.use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
     if (!c->backend) {
         c->backend = c->backend_cpu;
@@ -453,7 +454,7 @@ extern "C" void orpheus_set_n_threads(struct orpheus_context* ctx, int n_threads
     }
     ctx->n_threads = n_threads > 0 ? n_threads : 1;
     if (ctx->backend_cpu) {
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     }
 }
 

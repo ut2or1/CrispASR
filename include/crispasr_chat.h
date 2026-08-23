@@ -12,11 +12,22 @@
 //   server pattern is one session per worker thread; multiple sessions
 //   over one process are fully supported.
 //
+//   `crispasr_chat_close` is the exception, and the one call meant to be
+//   made from another thread: it waits for every call already inside the
+//   session to return before it frees anything. See its own note below for
+//   what that does and does not promise.
+//
 // Memory
 // ------
 //   The KV cache persists across `crispasr_chat_generate` calls inside
 //   one session, so multi-turn chats don't re-prefill the full history.
 //   Use `crispasr_chat_reset` to flush.
+//
+//   Reuse depends on the caller passing the WHOLE conversation in
+//   `messages` on every call, not just the new turn: the session compares
+//   the templated prompt against the tokens it already holds and decodes
+//   only what is new. Passing just the latest turn is not wrong — it
+//   simply shares no prefix, so every call re-prefills from scratch.
 //
 // Strings out of this ABI come from malloc — free with
 // `crispasr_chat_string_free`.
@@ -77,6 +88,11 @@ extern "C" {
 // Every entry point that can fail accepts a `crispasr_chat_error*` (may be
 // NULL). On success the struct is left untouched. On failure `code` is
 // set non-zero and `message` carries a short null-terminated diagnostic.
+//
+// `CRISPASR_CHAT_ERR_ABORTED` (below) is the one code with a stable,
+// documented meaning — a caller has to tell a cancellation apart from a
+// fault. Every other non-zero value is a diagnostic aid, not a contract:
+// read `message`, don't switch on the number.
 typedef struct crispasr_chat_error {
     int32_t code;
     char message[256];
@@ -128,7 +144,7 @@ typedef struct crispasr_chat_generate_params {
     float min_p;           // 0.0 = disabled               (default: 0.05)
     float repeat_penalty;  // 1.0 = disabled               (default: 1.1)
     int32_t repeat_last_n; // -1 = ctx size, 0 = disabled  (default: 64)
-    uint32_t seed;         // RNG seed; 0 = random         (default: 0)
+    uint32_t seed;         // 0xFFFFFFFF = random          (default: 0, fixed)
 
     // Stop sequences: NULL = none. Generation halts (output is truncated
     // BEFORE the match) the first time any of these substrings appears
@@ -156,6 +172,35 @@ CRISPASR_CHAT_API crispasr_chat_session_t crispasr_chat_open(const char* model_p
                                                              crispasr_chat_error* err);
 
 // Free the session and its KV cache. Safe to call with NULL.
+//
+// THE CALLER MUST ORDER THIS AGAINST EVERY OTHER CALL ON THE SAME HANDLE.
+// Like `fclose` and `llama_free`, this is not a synchronisation point: it is
+// undefined behaviour for a call on `s` to be entered unordered with respect
+// to the close, and no amount of checking inside this library can change
+// that, because the check itself lives in the memory being freed. Keep the
+// handle behind your own lock, or set it aside so nothing can reach it, and
+// close it after that. Every binding shipped with CrispASR does exactly this,
+// and it is where the real lifetime safety comes from.
+//
+// What this call adds, on top of that, is the one thing the caller cannot do
+// for itself: it waits for calls that are ALREADY RUNNING inside the session.
+// A generation holds the session for as long as it decodes, so a caller that
+// wants to shut down mid-answer would otherwise have to choose between
+// blocking its own shutdown path and freeing the context out from under a
+// running `llama_decode`. Instead this retires the handle, waits for every
+// admitted call to stop touching session state, and only then frees.
+//
+// A call that reaches the session while the close is waiting is declined with
+// a non-zero `code`; the two accessors that report a NULL session as
+// "nothing here" (`_template_name`, `_n_ctx`) answer the same way. Treat that
+// as a diagnostic for a caller that has ALREADY broken the ordering rule
+// above, not as a guarantee — a call descheduled just before it reaches the
+// session can be freed out from under instead, and a second close racing the
+// first can end up on destroyed locks. Both are the same use-after-free the
+// rule exists to prevent. Close exactly once.
+//
+// Cancel first if you do not want to wait: register an abort callback, ask it
+// to stop, and the generation returns in a token or two.
 CRISPASR_CHAT_API void crispasr_chat_close(crispasr_chat_session_t s);
 
 // Clear the KV cache so the next _generate re-prefills from scratch. Call
@@ -189,6 +234,49 @@ CRISPASR_CHAT_API int32_t crispasr_chat_generate_stream(crispasr_chat_session_t 
                                                         crispasr_chat_error* err);
 
 // ---------------------------------------------------------------------------
+// Cancellation
+// ---------------------------------------------------------------------------
+// Returned by `crispasr_chat_generate_stream`, and written to `err.code` by
+// both generate entry points, when a registered abort callback stopped the
+// run. Distinct from every failure code so a caller cannot read a
+// cancellation as a decode fault — or, on the one-shot path, a NULL return
+// as an allocation failure.
+#define CRISPASR_CHAT_ERR_ABORTED 40
+
+// Return true to let the generation continue, false to abort it. Matches
+// the `whisper_encoder_begin_callback` convention on the ASR surface.
+// `user` is the pointer handed to `crispasr_chat_set_abort_callback`.
+//
+// Called on the generating thread: once before each prompt batch during
+// prefill, and once before each sampled token. On the CPU backend it is
+// additionally called from inside a running compute graph, so it can be
+// invoked many times per batch there and must be cheap and non-blocking.
+// On Metal and CUDA an in-flight batch runs to completion, so a cancel
+// takes effect at the next prompt-batch or token boundary.
+//
+// The callback must not call back into the same session — the session
+// mutex is held for the whole generation and re-entering deadlocks.
+typedef bool (*crispasr_chat_abort_callback)(void* user);
+
+// Register `cb` on the session; `user` is forwarded verbatim on every
+// call. Passing cb = NULL clears the callback. A NULL session is a no-op.
+//
+// Register before starting a generation and have the callback read your
+// own flag: this call takes the session lock, so calling it while a
+// generation is running blocks until that generation finishes rather than
+// cancelling it.
+//
+// On abort `crispasr_chat_generate` returns NULL and
+// `crispasr_chat_generate_stream` returns `CRISPASR_CHAT_ERR_ABORTED`,
+// having already delivered the partial text through `on_token`; both set
+// `err.code` to `CRISPASR_CHAT_ERR_ABORTED`. An abort flushes the session
+// back to its just-opened state — KV cache and history cleared — so the
+// next `_generate` prefills from scratch whatever messages it is given
+// and no `crispasr_chat_reset` is needed first.
+CRISPASR_CHAT_API void crispasr_chat_set_abort_callback(crispasr_chat_session_t s, crispasr_chat_abort_callback cb,
+                                                        void* user);
+
+// ---------------------------------------------------------------------------
 // Memory + introspection
 // ---------------------------------------------------------------------------
 // Returns the name of the chat template the session resolved against
@@ -198,6 +286,29 @@ CRISPASR_CHAT_API const char* crispasr_chat_template_name(crispasr_chat_session_
 
 // Returns the context window in tokens.
 CRISPASR_CHAT_API int32_t crispasr_chat_n_ctx(crispasr_chat_session_t s);
+
+// Tokens the model's own tokenizer produces for `messages` once the
+// session's chat template has been applied — the prompt length a FRESH
+// session prefills for the same `messages`, so it can be compared
+// straight against `crispasr_chat_n_ctx` when sizing a context window.
+//
+// The number covers the whole prompt: the template's control tokens, the
+// leading BOS the tokenizer adds to a new sequence, and the trailing
+// generation prompt that opens the assistant turn — everything
+// `crispasr_chat_generate` decodes before it samples its first token, and
+// nothing it generates afterwards. An empty `messages` array therefore
+// still counts the template's own opening. A session part-way through a
+// conversation re-decodes only the suffix its history does not already
+// hold, so there the count is an upper bound.
+//
+// Pure query: it neither touches the KV cache nor extends the history, so
+// it can be called freely between generations. It does take the session
+// lock, so it waits for a generation in flight to finish.
+//
+// Returns a negative value on failure and fills `err`. Mirrors
+// `whisper_token_count` on the ASR surface.
+CRISPASR_CHAT_API int32_t crispasr_chat_count_tokens(crispasr_chat_session_t s, const crispasr_chat_message* messages,
+                                                     size_t n_messages, crispasr_chat_error* err);
 
 // Pre-flight memory estimate for a GGUF chat model on disk. Returns the
 // approximate working-set in bytes (weights + KV cache + activations) or

@@ -41,6 +41,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -704,7 +705,7 @@ tada_encoder_context* tada_encoder_init(const char* path, tada_encoder_params pa
     core_gguf::free_metadata(meta);
 
     // Load weights
-    c->backend = ggml_backend_cpu_init();
+    c->backend = core_cpu_backend::init();
     if (!c->backend) {
         delete c;
         return nullptr;
@@ -810,7 +811,7 @@ int tada_encoder_encode_with_positions(tada_encoder_context* ctx, const float* a
     ggml_backend_tensor_set(pos_t, pos_ids.data(), 0, n_frames * sizeof(int32_t));
 
     // Compute
-    ggml_backend_cpu_set_n_threads(ctx->backend, ctx->params.n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend, ctx->params.n_threads);
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[tada-encoder] graph compute failed\n");
         ggml_gallocr_free(alloc);
@@ -1160,7 +1161,7 @@ float* tada_encoder_extract_stage(tada_encoder_context* ctx, const float* audio_
     ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "pos_ids");
     ggml_backend_tensor_set(pos_t, pos_ids.data(), 0, n_frames * sizeof(int32_t));
 
-    ggml_backend_cpu_set_n_threads(ctx->backend, ctx->params.n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend, ctx->params.n_threads);
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         ggml_gallocr_free(alloc);
         return nullptr;

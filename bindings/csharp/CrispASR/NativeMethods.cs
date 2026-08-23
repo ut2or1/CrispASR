@@ -165,6 +165,9 @@ namespace CrispASR
         internal static extern int crispasr_session_set_max_speech_tokens(IntPtr s, int n);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_set_min_speech_tokens(IntPtr s, int n);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_set_length_scale(IntPtr s, float scale);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]

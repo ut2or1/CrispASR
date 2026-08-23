@@ -30,6 +30,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -635,11 +636,11 @@ static htdemucs_context* htdemucs_init_impl(const char* model_path, htdemucs_par
     if (want_gpu && htdemucs_use_ggml()) {
         ctx->backend = crispasr_init_gpu_backend();
         if (!ctx->backend)
-            ctx->backend = ggml_backend_cpu_init();
+            ctx->backend = core_cpu_backend::init();
     } else {
-        ctx->backend = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
     }
-    ctx->is_gpu = !ggml_backend_is_cpu(ctx->backend);
+    ctx->is_gpu = !core_cpu_backend::is_cpu(ctx->backend);
     fprintf(stderr, "htdemucs: backend = %s\n", ggml_backend_name(ctx->backend));
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(model_path, ctx->backend, "htdemucs", wl)) {

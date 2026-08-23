@@ -246,6 +246,7 @@ struct canary_qwen_context {
 // ===========================================================================
 
 #include "core/gguf_loader.h"
+#include "core/ggml_cpu_backend.h"
 
 static ggml_tensor* try_get(canary_qwen_model& m, const char* name) {
     return core_gguf::try_get(m.tensors, name);
@@ -1292,7 +1293,7 @@ extern "C" struct canary_qwen_context* canary_qwen_init_from_file(const char* pa
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads);
 
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : nullptr;
     if (!ctx->backend)

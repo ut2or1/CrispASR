@@ -87,6 +87,7 @@ public final class CrispasrSession implements AutoCloseable {
         int     crispasr_session_set_tts_noise_temp(Pointer session, float noiseTemp);
         int     crispasr_session_set_exaggeration(Pointer session, float exaggeration);
         int     crispasr_session_set_max_speech_tokens(Pointer session, int n);
+        int     crispasr_session_set_min_speech_tokens(Pointer session, int n);
         int     crispasr_session_set_length_scale(Pointer session, float scale);
         int     crispasr_session_set_best_of(Pointer session, int n);
         int     crispasr_session_set_beam_size(Pointer session, int n);
@@ -519,6 +520,12 @@ public final class CrispasrSession implements AutoCloseable {
     public void setMaxSpeechTokens(int n) {
         int rc = Lib.INSTANCE.crispasr_session_set_max_speech_tokens(handle, n);
         if (rc != 0 && rc != -2) throw new IllegalStateException("set_max_speech_tokens failed (rc=" + rc + ")");
+    }
+
+    /** Floor on generated audio length (MOSS TTS). Units are codec frames at 12.5 Hz (80 ms each), so n=25 floors at ~2 s. Other backends no-op (rc=-2). */
+    public void setMinSpeechTokens(int n) {
+        int rc = Lib.INSTANCE.crispasr_session_set_min_speech_tokens(handle, n);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_min_speech_tokens failed (rc=" + rc + ")");
     }
 
     /** Per-phoneme length-scale / speaking-rate scalar. Honoured by kokoro today; other backends no-op. */

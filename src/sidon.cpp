@@ -23,6 +23,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 struct sidon_hparams {
     int layers = 8;
@@ -744,27 +745,28 @@ sidon_context_params sidon_context_default_params() {
 sidon_context* sidon_init_from_file(const char* path, sidon_context_params params) {
     sidon_context* ctx = new sidon_context();
     ctx->params = params;
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
     ctx->predictor_vulkan = ci_starts_with(ggml_backend_name(ctx->backend), "Vulkan");
     // Keep stage execution and synchronization independent so predictor and
     // DAC timings describe their own CUDA work rather than a shared queue.
     // Vulkan shares one backend instance so decoder weights and the predictor
     // output never cross Vulkan queues/devices merely because the stages have
     // separate schedulers.
-    ctx->decoder_backend =
-        ctx->predictor_vulkan ? ctx->backend : (params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init());
+    ctx->decoder_backend = ctx->predictor_vulkan
+                               ? ctx->backend
+                               : (params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init());
     if (!ctx->decoder_backend)
-        ctx->decoder_backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->decoder_backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     const int nt = params.n_threads > 0 ? params.n_threads : 4;
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, nt);
-    if (ggml_backend_is_cpu(ctx->decoder_backend))
-        ggml_backend_cpu_set_n_threads(ctx->decoder_backend, nt);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, nt);
+    if (core_cpu_backend::is_cpu(ctx->decoder_backend))
+        core_cpu_backend::set_n_threads(ctx->decoder_backend, nt);
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, nt);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, nt);
     if (!load_model(ctx->model, path, ctx->backend)) {
         sidon_free(ctx);
         return nullptr;

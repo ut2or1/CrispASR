@@ -287,7 +287,8 @@ private:
         }
         if (sr != 16000)
             pcm = core_audio::resample_polyphase(pcm.data(), (int)pcm.size(), sr, 16000);
-        return crispasr_ref_text::resolve_cached(p.tts_voice, pcm, p, "crispasr[cosyvoice3-tts]", ".cv3reftext");
+        return crispasr_ref_text::resolve_cached(p.tts_voice, pcm, p, "crispasr[cosyvoice3-tts]",
+                                                 crispasr_ref_cache::kCv3RefTextSuffix);
     }
 
     bool ensure_cloning_models() {

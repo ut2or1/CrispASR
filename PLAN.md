@@ -1,11 +1,172 @@
 # CrispASR — Pending work
 
+## CLAIMED 2026-08-19 — Issue #375 Canary streaming regression
+
+Root cause found + fixed 2026-08-19: NOT `73bb9b2f` (exonerated,
+byte-identical) but glint's AAC-LC decoder — window_shape discarded + TNS
+mis-decode → every real-world .aac at ~17 dB SNR since glint became the first
+AAC decoder (`f3d82d30`). Fixed upstream (glint `77738f3`), synced in-tree
+(`0e5d1344`), Tier-3 foreign-decode gate red-verified in glint. Awaiting the
+reporter's input-format confirmation on #375; full trail in
+`docs/handover/375-canary-streaming-regression.md` (fix-wiring branch).
+
+**Canary seam artifacts (pre-existing, #365/#375 fallout): FIXED by porting
+the actual blueprint.** The 8 s / 2 s LCS-prefix streaming was parakeet
+machinery grafted onto canary; canary-1b-v2's own `.transcribe()` does
+dynamic 30..40 s raw-waveform chunks with a 1 s overlap, per-chunk
+normalization, and an LCS-alignment merge (`lcs_alignment_merge_buffer`,
+`_find_optimal_chunk_size` — both ported exactly into
+`core/canary_chunk_merge.h`, pinned by `tests/test-canary-chunk-merge.cpp`
+against vectors generated from the nemo 2.7.3 Python functions). jfk_x12
+(quote ×12) now transcribes as 12 clean repetitions (legacy gate reproduces
+`ask not Ask not` ×2 etc.); fleurs_600s has zero repeated n-grams in 925
+words. Old path gated `CRISPASR_CANARY_LEGACY_STREAM=1`
+(CRISPASR_CANARY_SEAM_DEDUP applies only there). Both CLI and session
+surfaces route through the library.
+
+Decoded-output acceptance vs the Python blueprint (HARD RULE 3, Kaggle
+kernel `tools/kaggle/canary-blueprint-ref/`, nemo 2.7.3 CPU, bf16 vs our
+q4_k): word similarity jfk_x12 **1.000** (264/264), fleurs_60s **1.000**
+(92/92 — incl. the dropped trailing incomplete sentence, which the
+blueprint drops identically), fleurs_600s **0.982** (925 vs 936 words;
+diffs are proper-noun spellings + one boundary sentence — quantization-
+class variance, zero repeated bigrams on either side). Main CI green on
+the port tree.
+
+Still open on the general quality front (separate from #375): the
+pre-existing linear-resampler gap on 44.1/48 kHz compressed input via the
+glint decode paths (~28 vs ~38 dB after the decoder fix).
+
+**Canary speed audit (2026-08-19, M1 Metal, warm medians).** GPU default is
+19–25× RT (132 s in 5.34 s); CPU `-ng` is 2.7× — any doc/bench quoting ~2×
+was a `-ng` run. Quant A/B on the same clip: **q4_k is the fastest**
+(enc 399 / dec 230 ms) vs q8_0 (418/297) vs F16 (382/380) — the decoder is
+weight-bandwidth-bound, the encoder quant-INVARIANT, i.e. compute-bound at
+~600 effective GFLOPS (≈ M1 mul_mm ceiling for ~680 GFLOP per 34 s chunk of
+the 32-layer FastConformer): no encoder headroom on this hardware. Cross-KV
+already lives on the decode backend (the "CPU buffer" comment at
+`canary_build_cross_kv` is stale). Two real levers remain, both proper
+graph projects with mandatory byte-identical Metal+CPU A/B and Kaggle CUDA
+validation before any default flip:
+1. **Persistent decoder step graph** — `canary_decode_step` rebuilds +
+   sched-allocs per token (~4.2 ms/tok on Metal, mostly build/alloc/launch,
+   not FLOPs). The `core_rnnt_ggml::Decoder` pattern took parakeet decode
+   5.3× / nemotron 12.4× on P100; here decode is ~35 % of GPU wall →
+   est. ~1.3× total on Metal, more on CUDA.
+2. **Chunk-batched encode/decode for long-form** — the NeMo blueprint runs
+   chunks at batch_size=8; we encode+decode the 30–40 s chunks
+   sequentially. Mostly a CUDA/utilization win.
+
 ## CLAIMED 2026-08-13 — PR #347 GGUF weight-mapping release review
 
 Worktree: `.claude/worktrees/review-pr-352`.
 Review PR #352 end to end, validate that its long-form routing and gap repair
 do not regress any language path, add targeted unit/live coverage where needed,
 and merge or improve the change after local/SSD validation.
+
+## OPEN 2026-08-19 — vibevoice-asr 7B answers "[Silence]" on time-stretched audio
+
+The transcript-side damage is FIXED (`3b1bc0b2`, see HISTORY): `[Silence]` is a
+Content value the MODEL emits and we no longer pass it through as transcript
+text, so it cannot reach an SRT or suppress the empty-transcript warning.
+
+Still open: why the 7B says it at all. Both members of the reporter's atempo pair
+(`ko-test` stretched 3.26 s -> ~6 s at atempo 0.535 / 0.525) come back with no
+utterance, on CPU and CUDA, in EVERY arm including one with all four #369 fixes
+rolled back — so this is not something we introduced. The 1.5B BitNet checkpoint
+transcribes the same two files, so it is specific to the 7B. A 2x time-stretch is
+not exotic input, and a long recording containing a slow passage would lose it.
+
+Next: dump `speech_features` for a stretched clip against its unstretched
+original. The encoder is trustworthy now (cos 0.999926 vs upstream's own
+modules), so if the conditioning matches, the divergence is the LM's. Also check
+the prompt's duration string ("This is a 6.11 seconds audio") against the 46
+speech tokens for an inconsistency the model could read as "mostly empty".
+
+## OPEN 2026-08-19 — vibevoice-bitnet advertises caps its default output cannot support
+
+Fallout from `51b99d1b`, recorded rather than fixed on the way past. The 1.5B now
+gets its own plain-text instruction, and in that mode it returns prose rather
+than the JSON array — which is what "plain text output" means upstream. So there
+are no per-utterance timings and no speaker labels, while `vibevoice-bitnet`
+still declares `CAP_DIARIZE` and `CAP_TIMESTAMPS_CTC`.
+
+That is the same class of false claim as the `CAP_TEMPERATURE` removed in
+`23107227`: a capability bit is a promise about output the framework then acts
+on. Two defensible fixes and they need a decision, not a reflex:
+  (a) drop both caps for the 1.5B — honest, and `--diarize` then warns; or
+  (b) have the adapter switch to `CRISPASR_VIBEVOICE_ASR_PROMPT=json` when the
+      user actually asks for diarization or timestamps, trading the non-English
+      quality back for the structure they asked for.
+(b) is friendlier but makes output quality depend on an unrelated flag, which is
+the kind of thing that gets rediscovered as a bug later.
+
+## OPEN 2026-08-18 — TQ2_0 has no Metal kernels: BitNet models are silent on GPU
+
+`vibevoice-asr-bitnet-*` (TQ2_0 LM weights) yields an EMPTY transcript on Metal:
+
+    ggml_metal_library_compile_pipeline: failed to compile pipeline:
+      base = 'kernel_mul_mm_tq2_0_f32'
+    Error: Function kernel_mul_mm_tq2_0_f32 was not found in the library
+
+`ggml/src/ggml-metal/ggml-metal.metal` contains ZERO occurrences of `tq2_0` — no
+`mul_mm`, no `mul_mv`, no dequant — and `ggml-metal-device.m` has no TQ2_0 entry
+either. The type is not supported at all, yet a pipeline for it is still
+requested, so it fails hard instead of falling back.
+
+Same clip, same build, only the backend differs:
+
+    ko-mic-cue-kept.wav   CPU (-ng) -> 내일 오전에 회의 자료 교육 보내주세요.
+                          Metal     -> (nothing; pipeline compile error)
+
+Impact: every Metal user of a TQ2_0 model gets silence. Ternary/BitNet GGUFs are
+what people reach for on laptops, so this is the wrong platform to be missing.
+
+Two questions before fixing: (a) why is a TQ2_0 matmul scheduled onto Metal when
+the device declares no support — a type absent from the support switch should
+route to CPU, so something is bypassing that; (b) whether the fix is a real
+`kernel_mul_mm_tq2_0_f32` (check upstream ggml first — it may already exist) or
+an explicit unsupported-declaration so the scheduler falls back cleanly. The
+second is small and unbreaks the platform immediately.
+
+Found while reproducing #369, and NOT that issue's cause: the reporter is on
+Windows CPU/Vulkan and sees wrong-language output, not silence.
+
+## OPEN 2026-08-18 — stb_vorbis heap overflow on untrusted audio (security)
+
+Found incidentally by `linux-fuzz-smoke` on PR #371, which does not touch that
+code — fuzzing is stochastic and it happened to surface there. NOT that PR's
+fault, and it reproduces from the audio fuzzer, not from anything in the diff.
+
+    ==6684==ERROR: AddressSanitizer: heap-buffer-overflow
+    WRITE of size 13174835200 at 0x7f29bad7d000
+      #0 memset
+      #1 start_decoder(stb_vorbis*)        examples/stb_vorbis.c:3683
+      #2 stb_vorbis_open_memory            examples/stb_vorbis.c:5141
+      #3 stb_vorbis_decode_memory          examples/stb_vorbis.c:5419
+      #4 crispasr_webm_decode(...)         src/crispasr_audio.cpp:1405
+      #5 crispasr_audio_load               src/crispasr_audio.cpp:2801
+      #6 LLVMFuzzerTestOneInput            tests/fuzz/fuzz_audio_load.cpp:40
+
+    0x7f29bad7d000 is located 0 bytes after a 289933312-byte region
+    allocated by setup_malloc(stb_vorbis*, int)  examples/stb_vorbis.c:960
+
+A 13 GB `memset` past a 289 MB allocation: the size computation in
+`start_decoder` overflows or is not validated against the allocation
+`setup_malloc` actually made. Reachable through `crispasr_audio_load`, i.e. on
+ANY caller-supplied audio file — the CLI, the HTTP server's upload path, and
+every binding. That makes it a memory-safety issue on untrusted input, not just
+a fuzz curiosity.
+
+Severity note, honestly: a 13 GB write will fault almost immediately in
+practice, so the realistic outcome is a crash (DoS) rather than exploitable
+corruption. Worth fixing regardless, and worth checking whether a smaller,
+more controllable overflow is reachable from the same path.
+
+Next steps: reproduce locally with a fuzz build
+(`-DCRISPASR_FUZZ=ON -DCRISPASR_SANITIZE_ADDRESS=ON`), minimise the input, then
+decide between bounds-checking `start_decoder` and pulling a newer stb_vorbis.
+Check whether upstream stb has already fixed it before patching a vendored copy.
 
 ## Start here
 

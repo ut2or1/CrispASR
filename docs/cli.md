@@ -1899,7 +1899,7 @@ reuse, etc.) see [`tts.md`](tts.md):
   for a step solve in one batched forward, so higher `N` adds little wall-clock.
   Default `4` also applies through the C ABI / bindings / server; override there
   at runtime with `set_tts_num_candidates(n)`.
-  See [`tts.md`](tts.md#timing-quality-tada_num_candidates).
+  See [`tts.md`](tts.md#timing-quality-crispasr_tada_num_candidates).
 - `CRISPASR_TADA_DO_SAMPLE`, `CRISPASR_TADA_TEMPERATURE`, `CRISPASR_TADA_TOP_P`, `CRISPASR_TADA_TOP_K`,
   `CRISPASR_TADA_REPETITION_PENALTY` — TADA **talker** text-decoder sampling, matching
   upstream `InferenceOptions` defaults (do_sample=1, temp=0.6, top_p=0.9,

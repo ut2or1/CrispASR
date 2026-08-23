@@ -289,6 +289,10 @@ namespace CrispASR
         public void SetMaxSpeechTokens(int n)
             => Check(NativeMethods.crispasr_session_set_max_speech_tokens(Handle, n), "set_max_speech_tokens");
 
+        /// <summary>Floor on generated audio length (MOSS TTS): codec frames at 12.5 Hz (80 ms each); other backends no-op.</summary>
+        public void SetMinSpeechTokens(int n)
+            => Check(NativeMethods.crispasr_session_set_min_speech_tokens(Handle, n), "set_min_speech_tokens");
+
         /// <summary>Per-phoneme length-scale / speaking-rate scalar (kokoro).</summary>
         public void SetLengthScale(float scale)
             => Check(NativeMethods.crispasr_session_set_length_scale(Handle, scale), "set_length_scale");

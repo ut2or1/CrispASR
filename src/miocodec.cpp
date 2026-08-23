@@ -20,6 +20,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ============================================================================
 // Model hyperparameters (read from GGUF metadata)
@@ -212,7 +213,7 @@ struct miocodec_context* miocodec_init_from_file(const char* path, struct miocod
     core_gguf::free_metadata(gctx);
 
     // Pass 2: load weights
-    ctx->backend = ggml_backend_cpu_init();
+    ctx->backend = core_cpu_backend::init();
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path, ctx->backend, "miocodec", wl)) {
         fprintf(stderr, "miocodec: failed to load weights from '%s'\n", path);

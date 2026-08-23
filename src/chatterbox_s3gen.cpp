@@ -42,6 +42,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `CB_S3GEN_BENCH=1` for per-stage timings.
@@ -656,7 +657,7 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
     }
 
     // Backend
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     if (!c->backend_cpu) {
         fprintf(stderr, "s3gen: failed to init CPU backend\n");
         delete c;
@@ -672,7 +673,7 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
         if (const char* e = std::getenv("CRISPASR_CHATTERBOX_THREADS"); e && *e)
             s3_threads = std::max(1, atoi(e));
         c->n_threads = s3_threads;
-        ggml_backend_cpu_set_n_threads(c->backend_cpu, s3_threads);
+        core_cpu_backend::set_n_threads(c->backend_cpu, s3_threads);
         if (verbosity >= 1)
             fprintf(stderr, "s3gen: CPU backend threads=%d\n", s3_threads);
     }
