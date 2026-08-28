@@ -973,6 +973,19 @@ constexpr Entry k_registry[] = {
      "dots-tts-soar-vocoder-f16.gguf",
      "https://huggingface.co/cstr/dots-tts-soar-GGUF/resolve/main/dots-tts-soar-vocoder-f16.gguf",
      "~345 MB"},
+    // Confucius4-TTS (§377): NetEase Youdao zero-shot voice-cloning TTS.
+    // Three-stage: GPT-2 T2S (beam-sample, baked LlamaTokenizer vocab) →
+    // flow-matching DiT+WaveNet S2A (CAMPPlus style encoder baked under
+    // campplus.*) → BigVGAN 22.05 kHz (extras). Voice cloning via
+    // --voice ref.wav (+ CRISPASR_CONFUCIUS4_COND_DIR w2v-BERT features
+    // until that encoder is native). 14 languages, Chinese LANGUAGE_TOKEN_MAP
+    // prompts baked into the runtime.
+    {"confucius4-tts", "confucius4-tts-t2s-q4_k.gguf",
+     "https://huggingface.co/cstr/confucius4-tts-GGUF/resolve/main/confucius4-tts-t2s-q4_k.gguf",
+     "~376 MB",
+     "confucius4-tts-s2a-q4_k.gguf",
+     "https://huggingface.co/cstr/confucius4-tts-GGUF/resolve/main/confucius4-tts-s2a-q4_k.gguf",
+     "~135 MB", "Apache-2.0 (base netease-youdao/Confucius4-TTS)"},
     // Pocket TTS: Kyutai's 100M continuous-latent AR TTS (CC-BY-4.0 plus gated-use conditions).
     // Generates continuous 32-dim float vectors at 12.5 Hz via one-step LSD,
     // decoded by Mimi VAE to 24 kHz PCM. Single GGUF, no codec companion.
@@ -1348,9 +1361,21 @@ constexpr ExtraCompanion k_dots_tts_extras[] = {
     {nullptr, nullptr},
 };
 
+// Confucius4-TTS: the BigVGAN vocoder rides along; the CLI adapter discovers
+// it as a sibling (confucius4-tts-bigvgan-22k-f16.gguf) next to the T2S.
+constexpr ExtraCompanion k_confucius4_tts_extras[] = {
+    {"confucius4-tts-bigvgan-22k-f16.gguf",
+     "https://huggingface.co/cstr/confucius4-tts-GGUF/resolve/main/confucius4-tts-bigvgan-22k-f16.gguf"},
+    // encoder-only w2v-BERT 2.0 (17L): fully native --voice conditioning
+    {"confucius4-tts-w2v-f16.gguf",
+     "https://huggingface.co/cstr/confucius4-tts-GGUF/resolve/main/confucius4-tts-w2v-f16.gguf"},
+    {nullptr, nullptr},
+};
+
 constexpr ExtraList k_extras[] = {
     {"kokoro", k_kokoro_extras},
     {"dots-tts", k_dots_tts_extras},
+    {"confucius4-tts", k_confucius4_tts_extras},
     {"vibevoice-tts", k_vibevoice_tts_extras},
     {"cosyvoice3-tts", k_cosyvoice3_tts_extras},
     {"cosyvoice3-tts-rl", k_cosyvoice3_tts_extras},
@@ -1474,11 +1499,21 @@ void fill(CrispasrRegistryEntry& out, const Entry& e, const std::string& preferr
     out.backend = e.backend;
     out.filename = filename;
     out.url = replace_tail_filename(e.url, e.filename, filename);
-    out.approx_size = e.approx_size;
+    // `approx_size` describes the artifact the registry row NAMES. Once
+    // --model-quant has rewritten the filename to a different quant, that
+    // number no longer describes what would be downloaded — reporting the
+    // q4_k size for an f16 fetch understated a 4.7 GB download as "~1.3 GB"
+    // (#393). The per-quant sizes are not in the registry, and a ratio-scaled
+    // guess would be an invention (this quantizer keeps norms and embeddings
+    // at F16, so the ratio is model-dependent), so say nothing rather than
+    // something false; every consumer treats an empty size as "unknown".
+    out.approx_size = (filename == e.filename && e.approx_size) ? e.approx_size : "";
     if (e.companion_file && e.companion_url) {
         out.companion_filename = apply_quant_to_filename(e.companion_file, preferred_quant);
         out.companion_url = replace_tail_filename(e.companion_url, e.companion_file, out.companion_filename);
-        out.companion_approx_size = e.companion_size ? e.companion_size : e.approx_size;
+        out.companion_approx_size = (out.companion_filename == e.companion_file)
+                                        ? (e.companion_size ? e.companion_size : (e.approx_size ? e.approx_size : ""))
+                                        : ""; // same reasoning as approx_size above
     } else {
         out.companion_filename.clear();
         out.companion_url.clear();

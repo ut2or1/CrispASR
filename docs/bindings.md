@@ -71,7 +71,7 @@ exposes them as struct/class members on its segment type.
 | C-ABI accessor | Member (Python/Rust/Go/Dart/Java/C#/Ruby) | Notes |
 |---|---|---|
 | `result_segment_text(r, i)` | `text` / `text` / `Text` / `text` / `text` / `Text` / `:text` | The segment transcript. |
-| `result_segment_t0/t1(r, i)` | `start`,`end` / `start`,`end` / `T0`,`T1` / `start`,`end` / `t0`,`t1` / `T0`,`T1` / `:t0`,`:t1` | Centiseconds on the C ABI; Python/Rust/Dart divide to seconds. |
+| `result_segment_t0/t1(r, i)` | `start`,`end` / `start`,`end` / `T0`,`T1` / `start`,`end` / `t0`,`t1` / `T0`,`T1` / `:t0`,`:t1` | Centiseconds on the C ABI. **Python/Rust/Dart/Ruby/C# divide to seconds; Go and Java hand the raw centiseconds through** (both document the unit on the field). C# joined the seconds side after issue #291 — it had been reporting centiseconds through `Segment`/`Word`/`AlignedWord` while every other time value in that binding (`VadSpan`, the music types) was seconds (issue #291). A backend with no timing for a unit reports `-1` there, and the seconds bindings pass that sentinel through unscaled rather than reporting `-0.01`. |
 | `result_segment_no_speech_prob(r, i)` | `no_speech_prob` / … / `NoSpeechProb` / `noSpeechProb` / … / `:no_speech_prob` | Whisper only; `-1.0` sentinel = no data. |
 | `result_segment_speaker(r, i)` | `speaker` / `speaker` / `Speaker` / `speaker` / `speaker` / `Speaker` / `:speaker` | **New in v0.8.24.** Native per-segment speaker label in the `"(Speaker N) "` form, `""` when the backend does not diarize natively. |
 | `result_n_words` + `result_word_*` | `words` (list of word objects) | Per-word text/timings/confidence, plus `alts` where the backend emits them. |
@@ -207,7 +207,7 @@ Install: `pip install crispasr` (or build locally from `python/`).
 
 ```rust
 use crispasr::{
-    Session, DiarizeMethod, DiarizeOptions, DiarizeSegment,
+    Session, DiarizeMethod, DiarizeOptions, DiarizeSegment, DiarizeTurn,
     LidMethod, detect_language_pcm, align_words,
     cache_ensure_file, registry_default_bundle,
     // Diarize pipeline primitives (#107):
@@ -235,6 +235,17 @@ for s in &segs {
 }
 let labels = agglomerative_cluster(&flat, (flat.len() / emb.dim() as usize) as i32,
                                    emb.dim(), 0.5, 8)?;
+
+// #395: labels alone can only ever be as fine as the grid you send in. Ask for
+// the turns FoxNose derived from the AUDIO to split a segment that spans two
+// speakers. Segments are labelled exactly as diarize_segments() labels them;
+// the other methods return an empty Vec, which is not an error.
+let mut grid: Vec<DiarizeSegment> = /* your coarse, well-clustering segments */ vec![];
+let turns: Vec<DiarizeTurn> =
+    crispasr::diarize_segments_with_turns(&mut grid, &pcm, None, false, &opts)?;
+for t in &turns {
+    println!("{:.2}–{:.2} speaker {}", t.t0, t.t1, t.speaker); // caller's timeline
+}
 ```
 
 Crates: `crispasr-sys/` (raw FFI) + `crispasr/` (high-level) at the repo

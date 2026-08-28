@@ -16,6 +16,11 @@ FetchContent_MakeAvailable(Catch2)
 list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
 include(Catch)
 
+add_executable(test-realtime-turn-buffer test-realtime-turn-buffer.cpp)
+target_include_directories(test-realtime-turn-buffer PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-realtime-turn-buffer PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-realtime-turn-buffer PROPERTIES LABELS "unit;realtime")
+
 if (EMSCRIPTEN)
 #
 #test - crispasr - js
@@ -29,6 +34,13 @@ if (EMSCRIPTEN)
 
     return()
 endif()
+
+add_executable(test-chatterbox-f0-simd test-chatterbox-f0-simd.cpp)
+target_include_directories(test-chatterbox-f0-simd PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-chatterbox-f0-simd PRIVATE Catch2::Catch2WithMain Threads::Threads)
+catch_discover_tests(test-chatterbox-f0-simd
+    TEST_SPEC "[unit][tts][chatterbox][simd]"
+    PROPERTIES LABELS "unit;tts;chatterbox")
 
 set(TEST_TARGET test-crispasr-cli-tiny)
 add_test(NAME ${TEST_TARGET}
@@ -719,6 +731,29 @@ catch_discover_tests(test-diarize-pyannote-live
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test-diarize-foxnose-turns-live — the #395 turn-forwarding ABI ───────────
+#
+# Everything about crispasr_diarize_segments_turns_abi that needs REAL turns,
+# and therefore a real speaker embedder: well-formedness, the truncation
+# protocol, the absolute-timeline conversion, and "asking for turns does not
+# change the labels". The model-free half of the contract is in
+# test-session-abi-nulls.cpp. Opt-in via CRISPASR_TEST_FOXNOSE_WAV +
+# CRISPASR_TEST_FOXNOSE_EMBEDDER; skips cleanly without them.
+add_executable(test-diarize-foxnose-turns-live
+    test-diarize-foxnose-turns-live.cpp
+)
+target_link_libraries(test-diarize-foxnose-turns-live PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+catch_discover_tests(test-diarize-foxnose-turns-live
+    TEST_SPEC "[live]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # Agglomerative cosine clustering used by --diarize-embedder (#107 P3b).
 # Pure arithmetic on synthetic embeddings; no model, no audio.
 add_executable(test-speaker-cluster
@@ -1081,6 +1116,25 @@ catch_discover_tests(test-diarize-slice-rewalk
     TEST_SPEC "[issue324]"
     PROPERTIES LABELS "unit;diarize;issue324"
 )
+
+# ─── test-confucius4-tts-live — live integration tests for Confucius4-TTS
+if (TARGET confucius4-tts)
+add_executable(test-confucius4-tts-live
+    test_confucius4_tts_live.cpp
+)
+target_include_directories(test-confucius4-tts-live PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-confucius4-tts-live PRIVATE
+    Catch2::Catch2WithMain
+    confucius4-tts
+    indextts
+)
+catch_discover_tests(test-confucius4-tts-live
+    TEST_SPEC "[live]"
+    PROPERTIES LABELS "live;confucius4-tts"
+)
+endif()
 
 # ─── test-miotts-live — live integration tests for MioTTS backend
 add_executable(test-miotts-live
@@ -1572,6 +1626,26 @@ catch_discover_tests(test-dots-tts-params
 )
 endif()
 
+# ─── test-confucius4-tts-params — Catch2 unit tests for confucius4_tts_params
+# defaults and null-guard coverage. No GGUF required. ──────────────────────────
+if (TARGET confucius4-tts)
+add_executable(test-confucius4-tts-params
+    test-confucius4-tts-params.cpp
+)
+target_include_directories(test-confucius4-tts-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-confucius4-tts-params PRIVATE
+    Catch2::Catch2WithMain
+    confucius4-tts
+    indextts
+)
+catch_discover_tests(test-confucius4-tts-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;confucius4-tts"
+)
+endif()
+
 # ─── test-funasr-params — Catch2 unit tests for funasr_context_params defaults
 # and null-guard coverage. No GGUF required. ───────────────────────────────────
 add_executable(test-funasr-params
@@ -1978,6 +2052,23 @@ target_link_libraries(test-diarize-smooth PRIVATE
 catch_discover_tests(test-diarize-smooth
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;diarize_smooth"
+)
+
+# ─── test-parallel-for — hermetic unit tests for the shared fan-out helpers
+# in core/parallel_for.h. No model, no audio, no threads-of-convenience. ──────
+add_executable(test-parallel-for
+    test-parallel-for.cpp
+)
+target_include_directories(test-parallel-for PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-parallel-for PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-core
+)
+catch_discover_tests(test-parallel-for
+    TEST_SPEC "[parallel]"
+    PROPERTIES LABELS "unit;parallel"
 )
 
 # ─── test-spectral-diarize — hermetic unit tests for the speaker-clustering

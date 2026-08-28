@@ -171,6 +171,10 @@
 #include "miotts.h"
 #define CA_HAVE_MIOTTS 1
 #endif
+#if __has_include("confucius4_tts.h")
+#include "confucius4_tts.h"
+#define CA_HAVE_CONFUCIUS4_TTS 1
+#endif
 #if __has_include("piano_transcription.h")
 #include "piano_transcription.h"
 #define CA_HAVE_PIANO_TRANSCRIPTION 1
@@ -1866,6 +1870,9 @@ struct crispasr_session {
 #ifdef CA_HAVE_MIOTTS
     miotts_context* miotts_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_CONFUCIUS4_TTS
+    confucius4_tts_context* confucius4_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_PIANO_TRANSCRIPTION
     piano_transcription_ctx* piano_ctx = nullptr;
 #endif
@@ -3288,6 +3295,59 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_CONFUCIUS4_TTS
+    if (s->backend == "confucius4-tts" || s->backend == "confucius4_tts" || s->backend == "confucius4") {
+        s->backend = "confucius4-tts";
+        confucius4_tts_params p = confucius4_tts_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        if (g_open_temperature_tls > 0.0f)
+            p.temperature = g_open_temperature_tls;
+        p.seed = g_open_seed_tls;
+        s->confucius4_ctx = confucius4_tts_init_from_file(model_path, p);
+        if (!s->confucius4_ctx) {
+            delete s;
+            return nullptr;
+        }
+        // Auto-resolve the S2A + BigVGAN companions next to the model (the
+        // registry downloads them as siblings of the T2S).
+        {
+            std::string mp = model_path ? model_path : "";
+            auto sep = mp.find_last_of("/\\");
+            std::string dir = (sep == std::string::npos) ? std::string(".") : mp.substr(0, sep);
+            for (const char* name :
+                 {"confucius4-tts-s2a-q4_k.gguf", "confucius4-tts-s2a-q8_0.gguf", "confucius4-tts-s2a-f16.gguf"}) {
+                std::string cp = dir + "/" + name;
+                FILE* f = fopen(cp.c_str(), "rb");
+                if (f) {
+                    fclose(f);
+                    confucius4_tts_set_s2a_path(s->confucius4_ctx, cp.c_str());
+                    break;
+                }
+            }
+            for (const char* name : {"confucius4-tts-bigvgan-22k-f16.gguf", "confucius4-tts-bigvgan-22k-q8_0.gguf"}) {
+                std::string cp = dir + "/" + name;
+                FILE* f = fopen(cp.c_str(), "rb");
+                if (f) {
+                    fclose(f);
+                    confucius4_tts_set_vocoder_path(s->confucius4_ctx, cp.c_str());
+                    break;
+                }
+            }
+            for (const char* name : {"confucius4-tts-w2v-f16.gguf", "confucius4-tts-w2v-q8_0.gguf"}) {
+                std::string cp = dir + "/" + name;
+                FILE* f = fopen(cp.c_str(), "rb");
+                if (f) {
+                    fclose(f);
+                    confucius4_tts_set_w2v_path(s->confucius4_ctx, cp.c_str());
+                    break;
+                }
+            }
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_POCKET
     if (s->backend == "pocket-tts" || s->backend == "pocket_tts" || s->backend == "pocket") {
         s->backend = "pocket-tts";
@@ -4063,6 +4123,10 @@ CA_EXPORT int crispasr_session_output_sample_rate(crispasr_session* s) {
     if (s->miotts_ctx)
         return 24000;
 #endif
+#ifdef CA_HAVE_CONFUCIUS4_TTS
+    if (s->confucius4_ctx)
+        return 22050;
+#endif
 #ifdef CA_HAVE_OMNIVOICE
     if (s->omnivoice_ctx)
         return 24000;
@@ -4231,6 +4295,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_MIOTTS
     list += ",miotts";
+#endif
+#ifdef CA_HAVE_CONFUCIUS4_TTS
+    list += ",confucius4-tts";
 #endif
 #ifdef CA_HAVE_PIANO_TRANSCRIPTION
     list += ",piano-transcription";
@@ -4877,6 +4944,36 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
 // session path bounds the FastConformer encode on long audio instead of
 // building one O(T^2) full-length graph.
 
+// The one definition of the #208 progress contract: mirror the pollable
+// g_progress atomic, then the per-session callback, in lockstep — every
+// long-form path reports through here so the two cannot drift apart (#385
+// was exactly that drift: a path that updated neither).
+static void session_report_progress(crispasr_session* s, int processed, int total) {
+    g_progress.store(total > 0 ? (int)((int64_t)processed * 100 / total) : 0, std::memory_order_relaxed);
+    if (s && s->progress_cb)
+        s->progress_cb(processed, total, s->progress_ud);
+}
+
+// Issue #385: C thunk for parakeet_transcribe_streamed_progress on the LEGACY
+// inline paths (CRISPASR_SESSION_UNIFIED_DISPATCH=0, and the JA routes the
+// unified branch deliberately does not own). The terminal tick is withheld —
+// the single TDT decode runs after the last encoder window — so each caller
+// emits (n, n) itself once the decode has returned. Mirrors
+// enc_progress_bridge in parakeet_orchestrate.cpp, deliberately: the two
+// dispatch surfaces must report identically or the A/B stops meaning anything.
+static void session_enc_progress_thunk(int processed, int total, void* ud) {
+    auto* sess = static_cast<crispasr_session*>(ud);
+    if (processed < total)
+        session_report_progress(sess, processed, total);
+}
+
+// Issue #208: started(0) / idle(-1) bracket around a long-form run, RAII so
+// no exit — early return or failure — can leak a stale percentage to pollers.
+struct scoped_session_progress {
+    scoped_session_progress() { g_progress.store(0, std::memory_order_relaxed); }
+    ~scoped_session_progress() { g_progress.store(-1, std::memory_order_relaxed); }
+};
+
 // Normalize a word for boundary-dedup comparison: lowercase + drop ASCII
 // punctuation. Non-ASCII bytes (JA / accented text) are kept verbatim.
 static std::string parakeet_norm_word(const char* s) {
@@ -4916,8 +5013,7 @@ static std::string parakeet_norm_word(const char* s) {
 // (nothing dropped) with no boundary duplication.
 static void parakeet_session_chunked_merge(parakeet_context* ctx, const float* samples, int n_samples,
                                            int chunk_samples, int overlap_samples,
-                                           std::vector<crispasr_session_seg>& out,
-                                           crispasr_progress_callback prog_cb = nullptr, void* prog_ud = nullptr) {
+                                           std::vector<crispasr_session_seg>& out, crispasr_session* sess = nullptr) {
     const int SR = 16000;
     if (chunk_samples < SR)
         chunk_samples = SR; // 1 s floor
@@ -4968,11 +5064,8 @@ static void parakeet_session_chunked_merge(parakeet_context* ctx, const float* s
         }
         // Issue #208: report progress after each finished window. `end` is the
         // last input sample this window covered, so it is monotonically
-        // non-decreasing and reaches n_samples on the final window. Mirror it
-        // into the module-level atomic so pollers (Dart FFI) also see it.
-        g_progress.store((int)((int64_t)end * 100 / n_samples), std::memory_order_relaxed);
-        if (prog_cb)
-            prog_cb(end, n_samples, prog_ud);
+        // non-decreasing and reaches n_samples on the final window.
+        session_report_progress(sess, end, n_samples);
         if (end >= n_samples)
             break;
     }
@@ -5351,6 +5444,13 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             oo.chunk_overlap_seconds =
                 s->parakeet_force_overlap_seconds >= 0 ? (float)s->parakeet_force_overlap_seconds : 2.0f;
             oo.no_prints = false;
+            // Issue #385: the unified dispatch dropped the #208 progress
+            // contract — neither s->progress_cb nor the pollable g_progress
+            // atomic was touched, so chunked long-form callers saw 0 % until
+            // return. The orchestrator invokes on_progress on the calling
+            // thread, inside this call, so capturing `s` is safe.
+            oo.on_progress = [s](int done, int total) { session_report_progress(s, done, total); };
+            scoped_session_progress prog;
             for (auto& ps : parakeet_transcribe_segments(s->parakeet_ctx, pcm, n_samples, 0, is_ja, oo)) {
                 crispasr_session_seg seg;
                 seg.text = std::move(ps.text);
@@ -5468,8 +5568,12 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
                 }
                 for (auto& w : sw)
                     words.push_back(std::move(w));
-                if (s->progress_cb)
-                    s->progress_cb((int)si + 1, (int)slices.size(), s->progress_ud);
+                // Issue #385: report through the shared helper so the pollable
+                // g_progress atomic moves in lockstep with the callback — this
+                // path used to fire the callback alone, leaving Dart-style
+                // pollers at 0 % for the whole JA run. Units are slices, not
+                // samples (pre-existing on this path).
+                session_report_progress(s, (int)si + 1, (int)slices.size());
             }
             std::sort(
                 words.begin(), words.end(),
@@ -5578,15 +5682,16 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_CHUNK"))
                 enc_window = std::max(2, atoi(e));
             const int ov = s->parakeet_force_overlap_seconds >= 0 ? s->parakeet_force_overlap_seconds : 2;
-            g_progress.store(0, std::memory_order_relaxed);
-            parakeet_result* pr = parakeet_transcribe_streamed(s->parakeet_ctx, pcm, n_samples, 0, enc_window, ov);
-            g_progress.store(-1, std::memory_order_relaxed);
+            scoped_session_progress prog;
+            parakeet_result* pr = parakeet_transcribe_streamed_progress(s->parakeet_ctx, pcm, n_samples, 0, enc_window,
+                                                                        ov, &session_enc_progress_thunk, s);
             if (!pr) {
                 delete r;
                 return nullptr;
             }
             parakeet_result_to_session_segs(pr, s->parakeet_force_chunk_seconds, r->segments);
             parakeet_result_free(pr);
+            session_report_progress(s, n_samples, n_samples); // #385: 100 % once the decode is in
             return r;
         }
 
@@ -5594,10 +5699,9 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         // merge (no dropped sections, no boundary duplicates). Emits one merged
         // segment (the #208 batch-caller contract).
         if (!use_single_pass && !is_ja) {
-            g_progress.store(0, std::memory_order_relaxed); // issue #208: pollers see "started"
+            scoped_session_progress prog; // issue #208: pollers see "started"; idle again on return
             parakeet_session_chunked_merge(s->parakeet_ctx, pcm, n_samples, chunk_s * SR, overlap_s * SR, r->segments,
-                                           s->progress_cb, s->progress_ud);
-            g_progress.store(-1, std::memory_order_relaxed); // back to idle
+                                           s);
             return r;
         }
 
@@ -5609,17 +5713,30 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         if (const char* e = getenv("CRISPASR_PARAKEET_VAD_SLICE_CAP"))
             ja_cap_s = std::max(0, atoi(e));
         if (!use_single_pass && is_ja && ja_cap_s > 0 && !force_chunked) {
-            g_progress.store(0, std::memory_order_relaxed);
+            scoped_session_progress prog;
             r->segments.push_back(transcribe_ja_sliced(pcm, n_samples, SR, ja_cap_s));
-            g_progress.store(-1, std::memory_order_relaxed);
             return r;
         }
 
         // JA long audio (streamed fallback); short audio → the exact single pass.
-        parakeet_result* pr =
-            (!use_single_pass && is_ja)
-                ? parakeet_transcribe_streamed(s->parakeet_ctx, pcm, n_samples, 0, stream_chunk_s, stream_overlap_s)
-                : parakeet_transcribe_ex(s->parakeet_ctx, pcm, n_samples, 0);
+        // Issue #385: this is where a CHUNKED JA call lands — force_chunked
+        // excludes the sliced branch above — so it is the JA half of the same
+        // silent-progress bug, and reports per encoder window like every other
+        // streamed route. The single exact pass has no windows and stays silent.
+        // The started(0)/idle(-1) bracket is scoped to the STREAMED arm only:
+        // the short-audio single pass reported nothing before this change and
+        // must keep reporting nothing, or a poller starts seeing 0 % on calls
+        // that were previously idle throughout.
+        parakeet_result* pr = nullptr;
+        if (!use_single_pass && is_ja) {
+            scoped_session_progress ja_prog;
+            pr = parakeet_transcribe_streamed_progress(s->parakeet_ctx, pcm, n_samples, 0, stream_chunk_s,
+                                                       stream_overlap_s, &session_enc_progress_thunk, s);
+            if (pr)
+                session_report_progress(s, n_samples, n_samples);
+        } else {
+            pr = parakeet_transcribe_ex(s->parakeet_ctx, pcm, n_samples, 0);
+        }
         if (!pr) {
             delete r;
             return nullptr;
@@ -7285,11 +7402,30 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_vad(crispasr_sess
 // Returns 0 on success, 1 when Pyannote was requested but the model
 // failed to load, -1 on invalid arguments. `speaker = -1` in a seg
 // means the method had no information to pick a label for that segment.
+//
+// #395: crispasr_diarize_segments_turns_abi below is the same call plus the
+// audio-derived speaker turns, for callers that need to resolve a speaker
+// change INSIDE one of their own segments.
 // ---------------------------------------------------------------------------
 struct crispasr_diarize_seg_abi {
     int64_t t0_cs;
     int64_t t1_cs;
     int32_t speaker; // out: -1 if unassigned
+    int32_t _pad;
+};
+
+// #395: a speaker turn the METHOD derived from the audio, independent of the
+// caller's segment grid. Only FoxNose produces these; the other methods label
+// caller segments directly and emit none.
+//
+// Same centisecond units AND the same absolute timeline as
+// crispasr_diarize_seg_abi: the library works buffer-relative, and this ABI
+// adds `opts->slice_t0_cs` back on the way out, so a turn can be compared with
+// a caller segment without a frame conversion.
+struct crispasr_diarize_turn_abi {
+    int64_t t0_cs;
+    int64_t t1_cs;
+    int32_t speaker; // dense, zero-based; never -1
     int32_t _pad;
 };
 
@@ -7326,6 +7462,8 @@ struct crispasr_diarize_opts_abi {
 static constexpr bool k_abi_is_64bit = sizeof(void*) == 8;
 static_assert(!k_abi_is_64bit || sizeof(crispasr_diarize_seg_abi) == 24,
               "diarize seg ABI layout changed — update every binding mirror");
+static_assert(!k_abi_is_64bit || sizeof(crispasr_diarize_turn_abi) == 24,
+              "diarize turn ABI layout changed — update every binding mirror");
 static_assert(!k_abi_is_64bit || sizeof(crispasr_diarize_opts_abi) == 48,
               "diarize opts ABI layout changed — update every binding mirror");
 static_assert(!k_abi_is_64bit || offsetof(crispasr_diarize_opts_abi, pyannote_model_path) == 16,
@@ -7335,12 +7473,28 @@ static_assert(!k_abi_is_64bit || offsetof(crispasr_diarize_opts_abi, foxnose_emb
 static_assert(!k_abi_is_64bit || offsetof(crispasr_diarize_opts_abi, min_speakers) == 32,
               "diarize opts ABI layout drifted");
 
-CA_EXPORT int crispasr_diarize_segments_abi(const float* left_pcm, const float* right_pcm, int32_t n_samples,
-                                            int32_t is_stereo, crispasr_diarize_seg_abi* segs, int32_t n_segs,
-                                            const crispasr_diarize_opts_abi* opts) {
+// #395: the turn-forwarding superset of crispasr_diarize_segments_abi. Both
+// entry points share this body; the older one passes no turn buffer and is
+// byte-for-byte unchanged in behaviour.
+//
+// `out_turns` / `n_turns_cap` / `out_n_turns` are all optional:
+//   - out_n_turns non-NULL always receives the TOTAL number of turns the
+//     method derived, whether or not they fit (so a caller can size and
+//     retry — at the cost of a second full pass, since the ABI is stateless).
+//   - out_turns non-NULL receives up to n_turns_cap of them.
+// Returns 2 when a turn buffer was supplied and could not hold them all; the
+// segments are still fully labelled in that case, and the first n_turns_cap
+// turns are still written. With out_turns == NULL nothing can be truncated,
+// so the count query alone returns 0.
+static int diarize_segments_abi_impl(const float* left_pcm, const float* right_pcm, int32_t n_samples,
+                                     int32_t is_stereo, crispasr_diarize_seg_abi* segs, int32_t n_segs,
+                                     const crispasr_diarize_opts_abi* opts, crispasr_diarize_turn_abi* out_turns,
+                                     int32_t n_turns_cap, int32_t* out_n_turns) {
     if (!left_pcm || !segs || n_segs <= 0 || !opts)
         return -1;
     if (opts->method < 0 || opts->method > 4)
+        return -1;
+    if (n_turns_cap < 0)
         return -1;
 
     CrispasrDiarizeOptions lib_opts;
@@ -7361,14 +7515,69 @@ CA_EXPORT int crispasr_diarize_segments_abi(const float* left_pcm, const float* 
         lib_segs.push_back({segs[i].t0_cs, segs[i].t1_cs, segs[i].speaker});
 
     const float* r = (is_stereo && right_pcm) ? right_pcm : left_pcm;
-    const bool ok = crispasr_diarize_segments(left_pcm, r, n_samples, is_stereo != 0, lib_segs, lib_opts);
+    // Only collect turns when someone asked, so the legacy entry point keeps
+    // its allocation profile exactly.
+    std::vector<CrispasrDiarizeTurn> lib_turns;
+    const bool want_turns = (out_turns != nullptr) || (out_n_turns != nullptr);
+    const bool ok = crispasr_diarize_segments(left_pcm, r, n_samples, is_stereo != 0, lib_segs, lib_opts,
+                                              want_turns ? &lib_turns : nullptr);
     if (!ok)
         return 1;
 
     for (int i = 0; i < n_segs; i++) {
         segs[i].speaker = lib_segs[i].speaker;
     }
+
+    const int64_t n_turns = (int64_t)lib_turns.size();
+    if (out_n_turns)
+        *out_n_turns = (int32_t)std::min<int64_t>(n_turns, INT32_MAX);
+    if (out_turns) {
+        const int64_t n_copy = std::min<int64_t>(n_turns, n_turns_cap);
+        for (int64_t i = 0; i < n_copy; i++) {
+            const CrispasrDiarizeTurn& t = lib_turns[(size_t)i];
+            // Library turns are buffer-relative seconds; segments are absolute
+            // centiseconds. Hand back the frame the caller already speaks.
+            out_turns[i].t0_cs = opts->slice_t0_cs + (int64_t)std::llround(t.start_s * 100.0);
+            out_turns[i].t1_cs = opts->slice_t0_cs + (int64_t)std::llround(t.end_s * 100.0);
+            out_turns[i].speaker = t.speaker;
+            out_turns[i]._pad = 0;
+        }
+        if (n_turns > n_turns_cap)
+            return 2; // segments are labelled; the turn buffer was short
+    }
     return 0;
+}
+
+CA_EXPORT int crispasr_diarize_segments_abi(const float* left_pcm, const float* right_pcm, int32_t n_samples,
+                                            int32_t is_stereo, crispasr_diarize_seg_abi* segs, int32_t n_segs,
+                                            const crispasr_diarize_opts_abi* opts) {
+    return diarize_segments_abi_impl(left_pcm, right_pcm, n_samples, is_stereo, segs, n_segs, opts, nullptr, 0,
+                                     nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// #395: diarize AND hand back the audio-derived speaker turns.
+//
+// Identical to crispasr_diarize_segments_abi in every respect, plus the three
+// trailing turn parameters. A caller that passes NULL / 0 / NULL for them gets
+// exactly the older function.
+//
+// Why this exists: labelling alone can never resolve finer than the segment
+// grid the caller sent in — a segment straddling a speaker change is silently
+// awarded to whoever holds the majority of it. FoxNose derives its own turns
+// from the audio and already exposes them on the C++ API; callers with word
+// timestamps use them to SPLIT such a segment before labelling.
+//
+// Only FoxNose (method 4) derives turns. The other methods label the caller's
+// segments directly and report 0 turns — not an error.
+// ---------------------------------------------------------------------------
+CA_EXPORT int crispasr_diarize_segments_turns_abi(const float* left_pcm, const float* right_pcm, int32_t n_samples,
+                                                  int32_t is_stereo, crispasr_diarize_seg_abi* segs, int32_t n_segs,
+                                                  const crispasr_diarize_opts_abi* opts,
+                                                  crispasr_diarize_turn_abi* out_turns, int32_t n_turns_cap,
+                                                  int32_t* out_n_turns) {
+    return diarize_segments_abi_impl(left_pcm, right_pcm, n_samples, is_stereo, segs, n_segs, opts, out_turns,
+                                     n_turns_cap, out_n_turns);
 }
 
 // ---------------------------------------------------------------------------
@@ -8124,6 +8333,16 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
         return zonos_tts_set_voice(s->zonos_ctx, path);
     }
 #endif
+#ifdef CA_HAVE_CONFUCIUS4_TTS
+    if (s->confucius4_ctx) {
+        // Native CAMPPlus style + 22.05 kHz prompt mel from the reference WAV.
+        // T2S condition_emb additionally needs w2v-BERT features
+        // (CRISPASR_CONFUCIUS4_COND_DIR) until that encoder is native.
+        if (!ends_with_wav(path))
+            return -2;
+        return confucius4_tts_set_voice_path(s->confucius4_ctx, path);
+    }
+#endif
 #ifdef CA_HAVE_DOTS_TTS
     if (s->dots_tts_ctx) {
         // Voice cloning from a reference WAV (the speaker encoder was loaded at
@@ -8731,6 +8950,20 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
     if (s->miotts_ctx) {
         int n = 0;
         float* pcm = miotts_synthesize(s->miotts_ctx, text, &n);
+        if (out_n_samples)
+            *out_n_samples = n;
+        return pcm;
+    }
+#endif
+#ifdef CA_HAVE_CONFUCIUS4_TTS
+    if (s->confucius4_ctx) {
+        // ISO lang code drives the LANGUAGE_TOKEN_MAP prompt; "auto" must not
+        // leak into it (mirrors the CLI adapter).
+        std::string tts_lang = !s->target_language.empty() ? s->target_language : s->source_language;
+        if (tts_lang.empty() || tts_lang == "auto")
+            tts_lang = "en";
+        int n = 0;
+        float* pcm = confucius4_tts_synthesize(s->confucius4_ctx, text, tts_lang.c_str(), &n);
         if (out_n_samples)
             *out_n_samples = n;
         return pcm;
@@ -10349,6 +10582,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_MIOTTS
     if (s->miotts_ctx)
         miotts_free(s->miotts_ctx);
+#endif
+#ifdef CA_HAVE_CONFUCIUS4_TTS
+    if (s->confucius4_ctx)
+        confucius4_tts_free(s->confucius4_ctx);
 #endif
 #ifdef CA_HAVE_PIANO_TRANSCRIPTION
     if (s->piano_ctx)

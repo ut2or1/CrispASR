@@ -6,6 +6,35 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #383 Nemotron `/v1/realtime` progressive lag — native streaming + VAD, fixed 2026-08-27
+
+The realtime JSON WebSocket re-ran ASR over the entire growing turn every 0.5
+seconds. Nemotron's cache was streaming only within one inference call, so its
+`T=8,14,18...` logs were full-prefix re-encodes and CPU work grew
+quadratically. The first safety fix made the endpoint commit-only; the completed
+port replaces that mitigation for Nemotron with a per-connection native stream
+owning independent attention/convolution caches and RNN-T predictor state.
+Appends advance only newly stable encoder frames and emit real pre-commit token
+deltas; commit flushes the short tail and resets the utterance. CPU amortizes
+four native 320 ms chunks per graph build; GPU keeps the native cadence.
+
+`--vad --vad-model` now applies to `/v1/realtime`: a bounded onset buffer gates
+ASR until speech, speech-start/stopped events expose the turn, and trailing
+silence auto-commits. Client commit remains the advertised fallback without
+VAD, and backends without a native session retain bounded commit-only behavior.
+The 30-second cap is lossless across an oversized append, native-stream failure
+downgrades explicitly, and completion separates received/processed duration,
+inference, model-mutex wait, and backlog metrics. Model-backed tests pin
+byte-identical streamed/one-shot Nemotron output, bounded actual encoder-frame
+work, pre-commit partials, Silero auto-turns, and same-socket reset; the full
+unit suite passed 1,728/1,728. A from-scratch Ninja/ccache CUDA build on a
+Kaggle Tesla P100 passed the persistent-stream test (113/113) and the realtime
+WebSocket live test (7/7). The same kernel ran NVIDIA's current Transformers
+blueprint independently (six lookahead tokens, 560 ms advertised latency) and
+produced the expected JFK transcript. CrispASR retains the GGUF's configured
+three-frame right context; the comparison validates the persistent-cache and
+chunk-feeding design, not identical latency presets.
+
 ## #375 canary "repeated phrases" — two real bugs, neither where the bisect pointed, fixed 2026-08-19
 
 A reporter's canary quality regressed after an upgrade: phrases repeated a few

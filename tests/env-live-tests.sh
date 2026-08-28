@@ -52,6 +52,12 @@ export CRISPASR_MODEL_COHERE="${CRISPASR_MODEL_COHERE:-$CRISPASR_MODELS_DIR/cohe
 export CRISPASR_KOKORO_MODEL="${CRISPASR_KOKORO_MODEL:-$CRISPASR_MODELS_DIR/kokoro-82m-q8_0.gguf}"
 export CRISPASR_KOKORO_VOICE="${CRISPASR_KOKORO_VOICE:-$CRISPASR_MODELS_DIR/kokoro-voice-af_heart.gguf}"
 
+# ── Parakeet non-JA long-form guards (issues #350 / #385) ──
+# test-parakeet-longform builds its fixture from samples/jfk.wav; it only needs
+# a NON-Japanese parakeet GGUF. Without this export both the #350 coverage case
+# and the #385 progress-contract case SKIP in a live run.
+export CRISPASR_MODEL_PARAKEET="${CRISPASR_MODEL_PARAKEET:-$CRISPASR_MODELS_DIR/parakeet-tdt-0.6b-v3-q4_k.gguf}"
+
 # ── Parakeet JA long-form regression guard (issue #89) ──
 # Fixture: hf download cstr/crispasr-regression-fixtures \
 #     parakeet-tdt-0.6b-ja/reazon_baseball_14s/audio.wav --local-dir <dir>
@@ -95,6 +101,7 @@ export CRISPASR_MODEL_MOSS_DIARIZE="${CRISPASR_MODEL_MOSS_DIARIZE:-$CRISPASR_MOD
 # codebooks + transformer codec companion (validated by ASR round-trip, #249).
 # MioTTS-0.6B (Qwen3 + MioCodec, Apache-2.0)
 export CRISPASR_MODEL_MIOTTS="${CRISPASR_MODEL_MIOTTS:-$CRISPASR_MODELS_DIR/miotts-0.6b-q8_0.gguf}"
+export CRISPASR_MODEL_CONFUCIUS4_T2S="${CRISPASR_MODEL_CONFUCIUS4_T2S:-$CRISPASR_MODELS_DIR/confucius4-tts-t2s-q4_k.gguf}"
 export CRISPASR_MODEL_PIANO_TRANSCRIPTION="${CRISPASR_MODEL_PIANO_TRANSCRIPTION:-$CRISPASR_MODELS_DIR/piano-transcription-f16.gguf}"
 export CRISPASR_MODEL_MOSS_TTS="${CRISPASR_MODEL_MOSS_TTS:-$CRISPASR_MODELS_DIR/moss-tts-v1.5-q4_k.gguf}"
 export CRISPASR_MODEL_MOSS_TTS_CODEC="${CRISPASR_MODEL_MOSS_TTS_CODEC:-$CRISPASR_MODELS_DIR/moss-tts-v1.5-codec.gguf}"

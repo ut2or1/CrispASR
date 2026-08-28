@@ -12,14 +12,15 @@
 // over Wav2Vec2-BERT layer-17 features, and text_emb is a frozen
 // Embedding(32k,4096) → SiLU MLP(4096→1280) projector.
 //
-// Two GGUF files:
-//   - T2S (GPT-2 + text projector + speaker encoder): confucius4-tts-t2s-q4_k.gguf
-//   - S2A (DiT + WaveNet + length regulator):          confucius4-tts-s2a-q4_k.gguf
+// GGUF files (all auto-downloaded by `-m auto`):
+//   - T2S (GPT-2 + text projector + ECAPA + baked vocab): confucius4-tts-t2s-q4_k.gguf
+//   - S2A (DiT + WaveNet + length regulator + CAMPPlus):  confucius4-tts-s2a-q4_k.gguf
+//   - BigVGAN v2 22 kHz vocoder:                          confucius4-tts-bigvgan-22k-f16.gguf
+//   - w2v-BERT 2.0 encoder-only (17L, sidon layout):      confucius4-tts-w2v-f16.gguf
 //
-// External models (not yet ported — needed for zero-shot voice cloning):
-//   - Wav2Vec2-BERT 2.0 (semantic feature extraction from reference audio)
-//   - CAMPPlus (speaker style embedding from reference audio)
-//   - BigVGAN v2 22kHz (mel → waveform vocoder)
+// Zero-shot voice cloning (`--voice ref.wav --i-have-rights`) is fully native
+// when all four files are present. Without --voice conditioning the output is
+// unintelligible BY DESIGN — the model is a zero-shot cloner.
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -40,7 +41,8 @@ struct confucius4_tts_params {
     float repetition_penalty; // T2S repetition penalty
     int max_semantic_tokens;  // max T2S generation length; 0 = default (1520)
     int ode_steps;            // S2A flow-matching ODE steps; 0 = default (25)
-    float cfg_rate;           // S2A classifier-free guidance rate; 0 = default (0.7)
+    float cfg_rate;           // S2A classifier-free guidance rate; 0 = default (0.7),
+                              // negative = disable CFG (single conditioned pass)
     uint64_t seed;            // RNG seed (0 = random)
 };
 
@@ -52,6 +54,26 @@ struct confucius4_tts_context* confucius4_tts_init_from_file(const char* path_t2
 // Load the S2A model (required before synthesis). Returns 0 on success.
 int confucius4_tts_set_s2a_path(struct confucius4_tts_context* ctx, const char* path_s2a);
 
+// Load the BigVGAN vocoder (optional companion GGUF for mel → PCM).
+// Without this, synthesis outputs silence at the correct duration.
+// Returns 0 on success.
+int confucius4_tts_set_vocoder_path(struct confucius4_tts_context* ctx, const char* path_vocoder);
+
+// Load the encoder-only w2v-BERT 2.0 GGUF (confucius4-tts-w2v-f16.gguf,
+// sidon layout, 17 layers). With it loaded, confucius4_tts_set_voice_path
+// computes the T2S condition_emb fully natively (layer-17 hidden states,
+// z-normalised with the baked stats, through the ECAPA encoder).
+// Returns 0 on success.
+int confucius4_tts_set_w2v_path(struct confucius4_tts_context* ctx, const char* path_w2v);
+
+// Native voice conditioning from a reference WAV (`--voice ref.wav`): computes
+// the CAMPPlus style embedding and the 22.05 kHz prompt mel in-process (needs
+// the campplus.* bake in the S2A GGUF). The T2S condition_emb still requires
+// externally-computed w2v-BERT features (CRISPASR_CONFUCIUS4_COND_DIR or
+// confucius4_tts_set_speaker) until w2v-BERT is ported natively.
+// Returns 0 on success.
+int confucius4_tts_set_voice_path(struct confucius4_tts_context* ctx, const char* wav_path);
+
 // Set reference speaker conditioning from pre-computed Wav2Vec2-BERT features.
 // `semantic_features` is (n_frames, 1024) float32 — layer-17 hidden states,
 // z-normalised with the baked mean/var. `style_embedding` is (192,) float32
@@ -59,6 +81,18 @@ int confucius4_tts_set_s2a_path(struct confucius4_tts_context* ctx, const char* 
 // Returns 0 on success.
 int confucius4_tts_set_speaker(struct confucius4_tts_context* ctx, const float* semantic_features, int n_frames,
                                const float* style_embedding);
+
+// Set pre-computed speaker conditioning directly, bypassing the (unported)
+// Wav2Vec2-BERT and ECAPA-TDNN speaker encoders.
+//   condition_embedding: (model_dim,) = speaker_encoder(w2v_bert layer 17) in
+//                        the reference; prepended to the GPT-2 prefix.
+//   style_embedding:     (spk_embed_dim,) from CAMPPlus; the DiT's `spks`.
+//   prompt_mel:          (n_prompt_frames, mel_dim) reference mel; prepended to
+//                        the flow-matching state and stripped from the output.
+// Any pointer may be null to leave that part unset. Returns 0 on success.
+int confucius4_tts_set_conditioning(struct confucius4_tts_context* ctx, const float* condition_embedding, int cond_dim,
+                                    const float* style_embedding, int style_dim, const float* prompt_mel,
+                                    int n_prompt_frames, int mel_dim);
 
 // Synthesize text to 22050 Hz mono float32 PCM.
 // `lang` is a language code (e.g. "en", "zh", "ja", "ko").

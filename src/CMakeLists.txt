@@ -859,6 +859,7 @@ add_library(crispasr-core STATIC
             # Speaker-count estimation + spectral clustering (#324). Lives in
             # crispasr-core because both the diarizer and its unit tests use it
             # and it depends on nothing but the standard library.
+            core/parallel_for.h
             core/spectral_diarize.h
             core/spectral_diarize.cpp
             core/diarize_smooth.h
@@ -2138,7 +2139,7 @@ add_library(confucius4-tts STATIC confucius4_tts.h confucius4_tts.cpp)
 set_target_properties(confucius4-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(confucius4-tts PUBLIC .)
 target_compile_features   (confucius4-tts PUBLIC cxx_std_17)
-target_link_libraries     (confucius4-tts PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
+target_link_libraries     (confucius4-tts PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu chatterbox sidon)
 if(NOT MSVC)
     target_compile_options(confucius4-tts PRIVATE -O3)
 endif()
@@ -2916,6 +2917,9 @@ if (TARGET dia-tts)
 endif()
 if (TARGET dots-tts)
     target_link_libraries(crispasr-lib PUBLIC dots-tts)
+endif()
+if (TARGET confucius4-tts)
+    target_link_libraries(crispasr-lib PUBLIC confucius4-tts)
 endif()
 if (TARGET irodori-tts)
     target_link_libraries(crispasr-lib PUBLIC irodori-tts)

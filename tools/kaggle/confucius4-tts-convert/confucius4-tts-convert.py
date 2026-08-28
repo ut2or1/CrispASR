@@ -202,7 +202,7 @@ writer.add_uint32("confucius4.t2s.start_semantic_token", 8192)
 writer.add_uint32("confucius4.t2s.stop_semantic_token", 8193)
 writer.add_uint32("confucius4.sample_rate", 22050)
 
-# Add tokenizer model
+# Add tokenizer model (raw SentencePiece bytes)
 tok_model_path = os.path.join(src, "tokenizer.model")
 if os.path.exists(tok_model_path):
     with open(tok_model_path, "rb") as f:
@@ -210,15 +210,61 @@ if os.path.exists(tok_model_path):
     writer.add_array("tokenizer.model", list(tok_data_raw))
     print(f"  baked tokenizer.model ({len(tok_data_raw)} bytes)")
 
+# Bake BPE vocab + merges from tokenizer.json (core/bpe.h compatible)
+tok_json_path = os.path.join(src, "tokenizer.json")
+if os.path.exists(tok_json_path):
+    import json as _json
+    with open(tok_json_path) as f:
+        tok_j = _json.load(f)
+    model = tok_j.get("model", {})
+    vocab_dict = model.get("vocab", {})
+    merges_list = model.get("merges", [])
+    # Newer tokenizer.json stores merges as ["a", "b"] pairs; the C GGUF
+    # reader rejects nested arrays (invalid type 9), and core/bpe keys its
+    # rank table on the textual "a b" form — join.
+    merges_list = [" ".join(m) if isinstance(m, (list, tuple)) else m for m in merges_list]
+    # Build ordered token list by ID
+    tokens = [""] * len(vocab_dict)
+    for token, idx in vocab_dict.items():
+        tokens[idx] = token
+    writer.add_array("tokenizer.ggml.tokens", tokens)
+    if merges_list:
+        writer.add_array("tokenizer.ggml.merges", merges_list)
+    print(f"  baked BPE vocab: {len(tokens)} tokens, {len(merges_list)} merges")
+
 # Add wav2vec2bert stats
 writer.add_array("confucius4.w2v_bert.mean", stats["mean"].float().numpy().tolist())
 writer.add_array("confucius4.w2v_bert.var", stats["var"].float().numpy().tolist())
 
 # Write tensors from T2S safetensors (lazy per-tensor loading)
+# GPT-2 Conv1D stores weights as (in_features, out_features) — the TRANSPOSE
+# of PyTorch's normal nn.Linear (out_features, in_features). ggml mul_mat(A,B)
+# computes B @ A.T and requires A.ne[0] == B.ne[0] == in_features. So Conv1D
+# weights must be transposed before writing to GGUF: numpy (in, out) → (out, in)
+# → ggml ne[0]=in, ne[1]=out.
+GPT2_CONV1D_WEIGHTS = {
+    "transformer.h.", ".attn.c_attn.weight",
+    "transformer.h.", ".attn.c_proj.weight",
+    "transformer.h.", ".mlp.c_fc.weight",
+    "transformer.h.", ".mlp.c_proj.weight",
+}
+def is_gpt2_conv1d(name):
+    """Check if this tensor is a GPT-2 Conv1D weight that needs transposing."""
+    return (name.startswith("transformer.h.") and
+            (name.endswith(".attn.c_attn.weight") or
+             name.endswith(".attn.c_proj.weight") or
+             name.endswith(".mlp.c_fc.weight") or
+             name.endswith(".mlp.c_proj.weight")))
+
 n_written = 0
+n_transposed = 0
 with safe_open(t2s_path, framework="pt") as f:
     for name in sorted(f.keys()):
         t = f.get_tensor(name).float().numpy()
+        # Transpose GPT-2 Conv1D weights: (in, out) → (out, in)
+        if t.ndim == 2 and is_gpt2_conv1d(name):
+            t = t.T.copy()
+            n_transposed += 1
         # 1-D tensors (biases, norms) stay F32; everything else → F16
         if t.ndim == 1:
             writer.add_tensor(name, t)
@@ -227,6 +273,8 @@ with safe_open(t2s_path, framework="pt") as f:
         n_written += 1
         if n_written % 50 == 0:
             print(f"  wrote {n_written} tensors...", flush=True)
+
+print(f"  transposed {n_transposed} GPT-2 Conv1D weights")
 
 print(f"  wrote {n_written} tensors total")
 writer.write_header_to_file()
@@ -319,6 +367,32 @@ for name in sorted(s2a_state.keys()):
         print(f"  wrote {n_written} tensors...", flush=True)
 
 print(f"  wrote {n_written} S2A tensors total")
+
+# ── CAMPPlus style encoder baked into the S2A GGUF ──────────────────────────
+# The reference's style_embedding comes from funasr/campplus
+# (campplus_cn_common.bin, CAMPPlus(feat_dim=80, embedding_size=192)); the
+# runtime rebinds it through chatterbox_campplus with the `campplus.` prefix
+# (dots-tts pattern). BN running stats and 1-D tensors stay F32; the F16
+# 2-D+ weights must be excluded from quantization (quantize rule: keep
+# `campplus.` at F16 — the whole encoder is ~28 MB).
+from huggingface_hub import hf_hub_download as _dl
+campplus_path = _dl("funasr/campplus", filename="campplus_cn_common.bin", token=hf_token)
+spk_state = torch.load(campplus_path, map_location="cpu", weights_only=True)
+if isinstance(spk_state, dict) and "state_dict" in spk_state:
+    spk_state = spk_state["state_dict"]
+n_spk = 0
+for name in sorted(spk_state.keys()):
+    if name.endswith("num_batches_tracked"):
+        continue
+    t = spk_state[name].float().numpy()
+    if t.ndim == 1:
+        s2a_writer.add_tensor("campplus." + name, t)
+    else:
+        s2a_writer.add_tensor("campplus." + name, t.astype(np.float16))
+    n_spk += 1
+print(f"  baked {n_spk} CAMPPlus tensors under campplus.*")
+del spk_state
+
 s2a_writer.write_header_to_file()
 s2a_writer.write_kv_data_to_file()
 s2a_writer.write_tensors_to_file()
