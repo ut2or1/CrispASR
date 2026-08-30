@@ -730,6 +730,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.g2p_dict = ARGV_NEXT;
     } else if (arg == "--tts-trim-silence") {
         params.tts_trim_silence = true;
+    } else if (arg == "--tts-pad-silence-ms") {
+        params.tts_pad_silence_ms = std::stoi(ARGV_NEXT);
     } else if (arg == "--tts-play") {
         params.tts_play = true;
     } else if (arg == "--tts-play-device") {
@@ -810,6 +812,12 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.stream_partial_decode_ms = std::stoi(ARGV_NEXT);
         if (params.stream_partial_decode_ms < 0) {
             fprintf(stderr, "crispasr: --stream-partial-decode-ms must be >= 0\n");
+            exit(2);
+        }
+    } else if (arg == "--stream-partial-tail-sec") {
+        params.stream_partial_tail_sec = std::stoi(ARGV_NEXT);
+        if (params.stream_partial_tail_sec < 0) {
+            fprintf(stderr, "crispasr: --stream-partial-tail-sec must be >= 0\n");
             exit(2);
         }
     } else if (arg == "--stream-punc") {
@@ -1303,6 +1311,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "  --stream-partial-decode-ms N      [%-7d] JSON+VAD minimum interval between partial ASR decodes; 0 = "
             "every step\n",
             params.stream_partial_decode_ms);
+    fprintf(stderr,
+            "  --stream-partial-tail-sec N       [%-7d] JSON+VAD cap partial decodes to the last N s of the open "
+            "utterance (0 = full slice)\n",
+            params.stream_partial_tail_sec);
     fprintf(stderr, "  --stream-punc MODE                [%-7s] JSON+VAD FireRedPunc mode: off, final, or partial\n",
             params.stream_punc.c_str());
     fprintf(stderr,
@@ -1468,6 +1480,9 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.tts_speed);
     fprintf(stderr, "             --tts-trim-silence       [%-7s] trim leading silence from TTS output\n",
             params.tts_trim_silence ? "true" : "false");
+    fprintf(stderr,
+            "             --tts-pad-silence-ms N   [%-7d] prepend N ms of silence (useful for VLC C2PA buffer drop)\n",
+            params.tts_pad_silence_ms);
     fprintf(stderr, "             --tts-play               [%-7s] play synthesised audio on the local speaker\n",
             params.tts_play ? "true" : "false");
     fprintf(stderr, "             --tts-play-device N      [%-7d] speaker device index (-1 = default)\n",

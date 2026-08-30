@@ -42,6 +42,20 @@ catch_discover_tests(test-chatterbox-f0-simd
     TEST_SPEC "[unit][tts][chatterbox][simd]"
     PROPERTIES LABELS "unit;tts;chatterbox")
 
+add_executable(test-chatterbox-hift-simdconv test-chatterbox-hift-simdconv.cpp)
+target_include_directories(test-chatterbox-hift-simdconv PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-chatterbox-hift-simdconv PRIVATE Catch2::Catch2WithMain Threads::Threads)
+catch_discover_tests(test-chatterbox-hift-simdconv
+    TEST_SPEC "[unit][tts][chatterbox][hift][simdconv]"
+    PROPERTIES LABELS "unit;tts;chatterbox")
+
+add_executable(test-cosyvoice3-hift-simdconv test-cosyvoice3-hift-simdconv.cpp)
+target_include_directories(test-cosyvoice3-hift-simdconv PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-cosyvoice3-hift-simdconv PRIVATE Catch2::Catch2WithMain Threads::Threads)
+catch_discover_tests(test-cosyvoice3-hift-simdconv
+    TEST_SPEC "[unit][tts][cosyvoice3][simdconv]"
+    PROPERTIES LABELS "unit;tts;cosyvoice3")
+
 set(TEST_TARGET test-crispasr-cli-tiny)
 add_test(NAME ${TEST_TARGET}
     COMMAND $<TARGET_FILE:crispasr-cli>
@@ -603,6 +617,7 @@ add_executable(test-stream-finalize
 )
 target_include_directories(test-stream-finalize PRIVATE
     ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
 )
 target_link_libraries(test-stream-finalize PRIVATE
     Catch2::Catch2WithMain
@@ -4894,6 +4909,17 @@ set_tests_properties(test-server-tts PROPERTIES
     LABELS "live;server;tts"
     TIMEOUT 600)
 
+# ─── test-server-progress — live: GET /progress contract (#408): idle -1,
+# busy with 0..100 during a running job, reset after, and auth-gated like the
+# other introspection routes. Auto-discovers a small whisper/moonshine model;
+# SKIPs (exit 0) otherwise.
+add_test(NAME test-server-progress
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-server-progress.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-server-progress PROPERTIES
+    LABELS "live;server"
+    TIMEOUT 600)
+
 # ─── test-server-stream-resilience — live: the detached streaming-TTS worker
 # must not crash the server on an exception. Forces a worker throw
 # (CRISPASR_TEST_STREAM_THROW=1 + magic input) and asserts the server survives +
@@ -5092,6 +5118,31 @@ target_include_directories(test-btc-vocab PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(test-btc-vocab PRIVATE Catch2::Catch2WithMain)
 catch_discover_tests(test-btc-vocab
     TEST_SPEC "[btc]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-htdemucs-binbcast — issue #398 CUDA binbcast F16-src1 guard (hermetic, unit)
+add_executable(test-htdemucs-binbcast test-htdemucs-binbcast.cpp)
+target_include_directories(test-htdemucs-binbcast PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-htdemucs-binbcast PRIVATE Catch2::Catch2WithMain ggml)
+catch_discover_tests(test-htdemucs-binbcast
+    TEST_SPEC "[htdemucs]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-chatterbox-attn-policy — issue #402 T3 attention decision table (hermetic, unit)
+add_executable(test-chatterbox-attn-policy test-chatterbox-attn-policy.cpp)
+target_include_directories(test-chatterbox-attn-policy PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-chatterbox-attn-policy PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-chatterbox-attn-policy
+    TEST_SPEC "[attn-policy]"
     PROPERTIES
         LABELS unit
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
