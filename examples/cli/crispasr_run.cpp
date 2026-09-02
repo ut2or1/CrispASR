@@ -2890,7 +2890,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
     // PLAN #74a — chatterbox-family auto-route by --language. Pure
     // English variants ("chatterbox" / "chatterbox-turbo" / aliases)
     // get swapped to the language-matching sibling when the user passes
-    // `-l de` (kartoffelbox-turbo) or `-l ar` (lahgtna-chatterbox), but
+    // `-l de` (kartoffelbox-turbo), `-l ar` (lahgtna-chatterbox), or
+    // `-l fi` (chatterbox-finnish-nano), but
     // only when -m auto is in effect — if the user passed an explicit
     // model path they've already picked the variant. Mirrors the kokoro
     // `-l de` German-backbone routing convention. No-op when the user
@@ -2906,6 +2907,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 routed = "kartoffelbox-turbo";
             } else if (params.language == "ar") {
                 routed = "lahgtna-chatterbox";
+            } else if (params.language == "fi") {
+                routed = "chatterbox-finnish-nano";
             }
             if (!routed.empty()) {
                 if (!params.no_prints) {
@@ -2915,6 +2918,34 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 backend_name = routed;
                 params.backend = routed;
             }
+        }
+    }
+
+    // #411 — Pocket-TTS publishes a separate checkpoint per language. Keep
+    // the simple `--backend pocket-tts -m auto -l xx` interface and select
+    // the matching registry entry before model resolution. An explicit model
+    // path remains authoritative.
+    if (model_is_auto && !params.language.empty() && params.language != "auto" &&
+        (backend_name == "pocket-tts" || backend_name == "pocket_tts" || backend_name == "pockettts" ||
+         backend_name == "pocket")) {
+        std::string routed;
+        if (params.language == "de")
+            routed = "pocket-tts-de";
+        else if (params.language == "es")
+            routed = "pocket-tts-es";
+        else if (params.language == "it")
+            routed = "pocket-tts-it";
+        else if (params.language == "pt")
+            routed = "pocket-tts-pt";
+        else if (params.language == "fr")
+            routed = "pocket-tts-fr";
+        if (!routed.empty()) {
+            if (!params.no_prints) {
+                fprintf(stderr, "crispasr: -l %s with --backend %s — auto-routing to %s\n", params.language.c_str(),
+                        backend_name.c_str(), routed.c_str());
+            }
+            backend_name = routed;
+            params.backend = routed;
         }
     }
 
@@ -3213,6 +3244,26 @@ int crispasr_run_backend(const whisper_params& params_in) {
     }
 
     warn_unsupported(*backend, params);
+
+    // A monolingual backend can only ever emit sole_language(); asking it for a
+    // different one is not a warning, it is a request it cannot satisfy. Before
+    // this, `crispasr -m moonshine.gguf -l de audio.wav` transcribed ENGLISH and
+    // exited 0 — the wrong-language output looked like a model quality problem
+    // rather than a rejected flag. Compared through whisper_lang_id() so the
+    // spelled-out form (`-l german`) is caught the same way, with a raw string
+    // compare as the fallback for codes outside whisper's table.
+    if (const char* sole_lang = backend->sole_language(); sole_lang && params.language != "auto") {
+        const int want = whisper_lang_id(params.language.c_str());
+        const int have = whisper_lang_id(sole_lang);
+        const bool same = (want != -1 && have != -1) ? (want == have) : (params.language == sole_lang);
+        if (!same) {
+            fprintf(stderr,
+                    "crispasr: error: backend '%s' is %s-only and cannot transcribe '%s'. "
+                    "Use -l %s, or -l auto, or pick a multilingual backend.\n",
+                    backend->name(), sole_lang, params.language.c_str(), sole_lang);
+            return 14;
+        }
+    }
 
     if (!backend->init(params)) {
         fprintf(stderr, "crispasr: error: failed to initialise backend '%s'\n", backend_name.c_str());
@@ -4053,13 +4104,17 @@ int crispasr_run_backend(const whisper_params& params_in) {
         const int tail_slack_samples = std::max(tail_cap_samples / 2, crispasr::kStreamRedecodeMinSamples);
         int64_t tail_anchor_abs = -1;
         std::string tail_committed;
-        // CRISPASR_STREAM_SLICE_MEMO=1 (#404): memoize per-slice partial
+        // CRISPASR_STREAM_SLICE_MEMO (#404): memoize per-slice partial
         // decodes by their ABSOLUTE sample range. A VAD-closed slice keeps the
         // same (start, end) while it stays in the rolling window, and the
         // decode is deterministic, so re-decoding it every step repeats
         // byte-identical work — the bulk of the RFC's "194 full transcribes".
         // The still-growing slice changes its end every step and always
-        // misses. Exact by construction; default off per the perf-gate rule.
+        // misses. Exact by construction. DEFAULT ON since the quiet-box A/B
+        // (chr1str/crispasr-stream404-ab, P100 + Xeon): finals byte-equal in
+        // every arm, wall −12.2 % (multi-utterance CPU) / −5.9 % (GPU), never
+        // a regression beyond noise. Set =0 to restore the re-decode path
+        // (the gate stays per the never-remove-gates rule).
         struct StreamSliceMemo {
             int64_t s = 0, e = 0;
             std::vector<crispasr_segment> segs; // pristine, pre-post-chain
@@ -4067,7 +4122,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
         std::vector<StreamSliceMemo> slice_memo;
         const bool slice_memo_on = [] {
             const char* e = getenv("CRISPASR_STREAM_SLICE_MEMO");
-            return e && *e && *e != '0';
+            return !e || !*e || *e != '0';
         }();
         const int64_t utterance_max_samples = (int64_t)params.stream_utterance_max_sec * SR;
         const int64_t partial_decode_interval_samples =

@@ -17,7 +17,7 @@ per-backend porting detail (Per-model port notes + the family cross-reference).
 Reach for the topic groups when you are stuck on a *technique*, and the
 cross-reference when you already know which model you are touching.
 
-## Index by topic (294 lessons)
+## Index by topic (297 lessons)
 
 **Security & untrusted input** (2)
 
@@ -244,7 +244,7 @@ cross-reference when you already know which model you are touching.
 - L15527 — #300 streaming diarization SHIPPED
 - L16123 — #89 parakeet-ja long-form FIXED
 
-**Tokenizers, prompts, language & text** (17)
+**Tokenizers, prompts, language & text** (18)
 
 - L974 — MOSS-TTS-Local 4B stop runaway was a PROMPT-TOKENIZATION bug — non-compositional BPE, not the forward (#249, 2026-07)
 - L1024 — Cross-lingual TTS needs the target language plumbed through /v1/audio/speech (#249/#304, 2026-07)
@@ -263,8 +263,9 @@ cross-reference when you already know which model you are touching.
 - L15820 — #329 TTS target language
 - L16894 — cohere language whitelist + probe LID
 - L17012 — CV3 phase 6 speech_tokenizer_v3 ggml port
+- L18715 — Wrong-language conditioning makes canary TRANSLITERATE — a silent failure that reads like a tokenizer bug
 
-**Mel, codecs & the audio front-end** (16)
+**Mel, codecs & the audio front-end** (17)
 
 - L241 — The audio front door resampled with linear interpolation
 - L2051 — A one-frame error in a codec ENCODER shifts every RoPE position and shows up as an onset artifact, not a gradual drift — and a padding scheme faithful to one codec can be wrong for another
@@ -282,6 +283,7 @@ cross-reference when you already know which model you are touching.
 - L15402 — #245/§232 qwen3-tts CP_DIRECT + codec FASTCONV DONE
 - L17727 — glint MP3+AAC TTS output §225 SHIPPED
 - L18210 — voxcpm2 CausalTransposeConv1d kwargs gotcha
+- L18676 — The #52 fallback died silently when name and description split — and the encoder half of a symmetric codec never inherited it
 
 **Process, triage & documentation discipline** (19)
 
@@ -352,11 +354,12 @@ cross-reference when you already know which model you are touching.
 - L18186 — Four bugs that together caused empty/garbage transcripts; all patched in src/vibevoice.cpp +…
 - L18411 — "Verified byte-identical at 225 s" verified a clip, not a length — and a decoder that drops spans needs a repair pass, not a better cap
 
-**Uncategorised** (3)
+**Uncategorised** (4)
 
 - L195 — An arm that fails under every condition cannot discriminate a fix
 - L216 — Hardcoded token ids need a guard that DECODES them
 - L267 — Model-emitted sentinels are not transcript text
+- L18638 — An ISA gate that "safely refuses" the only CPU module ships a process that cannot run — and every safety layer downstream assumed the layer above had fired
 
 ## Cross-reference by model / family
 
@@ -368,7 +371,7 @@ lookup, not a partition.
 - **cosyvoice3** (9) — L1114, L9428, L13446, L14494, L14943, L15820, L16053, L17012, L17040
 - **vibevoice** (15) — L216, L1039, L2190, L3097, L5665, L6434, L8945, L13297, L13332, L13375, L14051, L15507, L15527, L15758, L18186
 - **tada** (9) — L1520, L1893, L2237, L2287, L2301, L13446, L13709, L16435, L18138
-- **whisper** (22) — L714, L2406, L3384, L4184, L4368, L4441, L4577, L5084, L6025, L7996, L8364, L13208, L15066, L15572, L15615, L15681, L16123, L16671, L17012, L17768, L17828, L17944
+- **whisper** (23) — L714, L2406, L3384, L4184, L4368, L4441, L4577, L5084, L6025, L7996, L8364, L13208, L15066, L15572, L15615, L15681, L16123, L16671, L17012, L17768, L17828, L17944, L18638
 - **parakeet / TDT** (18) — L485, L1247, L2406, L2439, L3508, L4441, L4787, L6885, L8879, L11197, L11282, L12322, L13880, L15023, L15066, L16123, L17944, L18411
 - **moss** (13) — L974, L1170, L1662, L1864, L2039, L2045, L2336, L2361, L2386, L3508, L14686, L15441, L15459
 - **firered** (9) — L1831, L4993, L5084, L5665, L5832, L6696, L13827, L15572, L15615

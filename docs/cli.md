@@ -1422,11 +1422,17 @@ beats and you never have to merge two lists to reconstruct the grid.
 
 Another standalone task: audio in, **note events** out — onset, offset, MIDI
 pitch, name and velocity. Routes to its own dispatcher before any ASR backend
-is built, like `--pitch` / `--chords` / `--separate`.
+is built, like `--pitch` / `--chords` / `--separate`. Two backends share the
+surface, selected by GGUF architecture: **`piano-transcription`** (ByteDance
+CRNN, 88-key piano, the higher-accuracy piano specialist) and
+**`basic-pitch`** (Spotify, ~110 KB, polyphonic any-instrument, #250 — no
+pedal events).
 
 ```bash
 crispasr --piano -m auto --auto-download -f piano.wav
 crispasr --piano --piano-format json -m piano-transcription-f16.gguf -f piano.wav
+# any-instrument polyphonic, tiny model:
+crispasr --piano --backend basic-pitch -m auto --auto-download -f guitar.wav
 ```
 
 Default output is one tab-separated line per note — `onset_sec`, `offset_sec`,
@@ -1655,6 +1661,8 @@ default quantized model for the selected backend into
 | orpheus | `cstr/orpheus-3b-0.1-ft-GGUF` (Q8_0) + SNAC codec | ~3.7 GB + ~80 MB | Llama-3 based; US-English |
 | chatterbox | `cstr/chatterbox-GGUF` (Q8_0 T3 + Q8_0 S3Gen) | ~610 MB + ~349 MB | S3Gen + T3; multilingual |
 | chatterbox-nano | `cstr/chatterbox-nano-GGUF` (Q8_0 T3) + Turbo S3Gen companion | ~345 MB + ~627 MB | GPT2-small T3 on the Turbo S3Gen (#382); English |
+| raon | `cstr/raon-opentts-0.3b-GGUF` (F16, single GGUF) | ~959 MB | KRAFTON Raon-OpenTTS 0.3B on the F5 runtime; EN zero-shot cloning; **CC-BY-NC-4.0** (non-commercial, license gate) |
+| chatterbox-finnish-nano | `JJarvinen/chatterbox-finnish-nano-GGUF` (Q8_0 T3) + Turbo S3Gen companion | ~329 MB + ~627 MB | Finnish-only Nano v0.1.3; MIT |
 | piper | `cstr/piper-en_US-lessac-medium-GGUF` (F16) | ~30 MB | Lightweight, many voices via `--voice` |
 | tada-1b | `cstr/tada-tts-1b-GGUF` (Q4_K + F16 codec) | ~1.7 GB + ~250 MB | English-only; `--voice tada-ref.gguf` |
 | tada / tada-3b-ml | `cstr/tada-tts-3b-ml-GGUF` (F16 + F16 codec) | ~6.6 GB + ~250 MB | 9 languages; `-l fr` auto-downloads `tada-ref-fr.gguf` — see [tts.md §TADA](tts.md#tada--multilingual-and-voice-cloning) |
@@ -1750,7 +1758,7 @@ Per-backend coverage:
 | kyutai-stt | ✔ (native flash_attn_ext, quant-safe by construction) |
 | orpheus | ✔ |
 | qwen3-tts | ✔ (talker only) |
-| chatterbox / chatterbox-turbo / chatterbox-nano / kartoffelbox-turbo / lahgtna-chatterbox | ✔ (T3 LM side; S3Gen Conformer attention is F32 by design) |
+| chatterbox / chatterbox-turbo / chatterbox-nano / chatterbox-finnish-nano / kartoffelbox-turbo / lahgtna-chatterbox | ✔ (T3 LM side; S3Gen Conformer attention is F32 by design) |
 | vibevoice | F16-only — flag is read but the σ-VAE attention path uses `ggml_cpy(K_perm, view)` write that's incompatible with quant K/V. Migration recipe is the canary/cohere flash_attn_ext port (see PERFORMANCE.md "Where the gaps are"). |
 | granite-4.1-nar | — (non-autoregressive variant, no LLM decode path) |
 | whisper / parakeet / fc-ctc / wav2vec2 / hubert / data2vec / firered-asr / moonshine / moonshine-streaming / omniasr-CTC | — (no KV cache: CTC / transducer / encoder-only) |

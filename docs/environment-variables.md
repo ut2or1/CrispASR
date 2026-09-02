@@ -149,7 +149,7 @@ surviving artifact. Applied on both the CLI and the session C-ABI.
 | `CRISPASR_VAD_FAILOVER` | `0` disables the VAD sanity check. On by default: if a clip over 120 s comes back with under 1% speech coverage (or a couple of segments covering under 10% of a very long clip), the VAD is wrong and the run falls back to fixed full-clip chunks rather than losing the transcript. |
 | `CRISPASR_NGRAM_LOOPFIX_OFF` | `1` disables the repeated-n-gram collapse entirely, exposing the RAW decoded text. Diagnostic: for telling whether a loop originates in the decode itself or is merely being masked. |
 | `CRISPASR_ORDER_WARN` | `0` disables the one-shot "segment timestamps go backwards" warning. On by default; detect + warn only. Cues that merely *overlap* are deliberately not flagged (gap-fill jitter). |
-| `CRISPASR_ALIGN_NO_ROMANIZE` | `1` passes non-Latin reference text through raw instead of auto-romanizing it for a CTC aligner with a Latin vocabulary (#252). |
+| `CRISPASR_ALIGN_NO_ROMANIZE` | `1` passes non-Latin reference text through raw instead of auto-romanizing it for a CTC aligner with a Latin vocabulary (#252). Since #419 the romanization is only the aligner's internal label — aligned words hand back the original script, so srt/vtt/`-sp`/`-sow` output no longer flips Cyrillic/CJK transcripts to transliteration. |
 | `CRISPASR_ALIGN_DEBUG` | `1` prints the romanized reference transcript the aligner actually used. |
 
 ### Decoding / beam search (shared)
@@ -160,6 +160,7 @@ surviving artifact. Applied on both the CLI and the session C-ABI.
 | `CRISPASR_TDT_BATCH` / `CRISPASR_RNNT_BATCH` | Batch the TDT / RNNT joint decode. |
 | `CRISPASR_RNNT_GGML_PERSTEP` | Per-step (vs. persistent-graph) ggml RNNT decode. |
 | `CRISPASR_NGRAM_LOOPFIX_OFF` | Disable the n-gram decode-loop breaker. |
+| `CRISPASR_STREAM_SLICE_MEMO` | Memoize per-slice streaming partial decodes by absolute sample range (#404). **Default ON** — finals byte-equal, wall −12 % CPU / −6 % GPU in the quiet-box A/B; `=0` re-decodes closed slices every step. |
 | `CRISPASR_GAP_FILL` / `_GAP_FILL_MIN_CS` | Re-transcribe spans a first pass left empty (long audio); on by default for parakeet, threshold non-JA 300 cs / JA 100 cs. |
 
 ### G2P / phonemizer
@@ -401,6 +402,10 @@ suffixes.
 - `CRISPASR_CHATTERBOX_FORCE_GPU`
 - `CRISPASR_CHATTERBOX_FULL_CPU`
 - `CRISPASR_CHATTERBOX_LANG`
+- `CRISPASR_CHATTERBOX_KV_CONT` — materialize GPT-2 K/V layer views before
+  flash attention, reproducing the pre-PR-410 path for correctness/performance
+  A/Bs. The default passes the views directly; naive attention still
+  materializes them because its matrix operations require that layout.
 - `CRISPASR_CHATTERBOX_NAIVE_ATTN` — force the explicit softmax(QK^T)V T3
   attention on every backend (debug gate; outranks `_FLASH_ATTN`).
 - `CRISPASR_CHATTERBOX_S3GEN_CPU`
@@ -424,7 +429,7 @@ suffixes.
 - `CRISPASR_S3GEN_ENCODER_CPU`
 - `CRISPASR_S3GEN_FASTCONV`
 - `CRISPASR_S3GEN_FASTCONV_DEBUG`
-- `CRISPASR_S3GEN_SIMDCONV` — opt into the CPU HiFT packed SIMD path for all 72 ResBlock Conv1d kernels; default off.
+- \`CRISPASR_S3GEN_SIMDCONV\` — opt into the CPU HiFT packed SIMD path for all 72 ResBlock Conv1d kernels; default off. Stays OPT-IN deliberately: the Kaggle A/B measured a 5.4 % s3gen REGRESSION on Xeon avx512f against the contributor's 1.25x win on Zen 4 — micro-arch dependent; A/B on your own hardware before enabling.
 - `CRISPASR_S3GEN_SIMDCONV_DEBUG` — print pack count, selected ISA, and CPU/GPU fallback status.
 - `CRISPASR_S3GEN_RC_AS_MUL_MAT`
 - `CRISPASR_S3GEN_VOCODER_CPU`
@@ -503,7 +508,7 @@ suffixes.
 - `CRISPASR_COSYVOICE3_DUMP_TOKENS`
 - `CRISPASR_COSYVOICE3_FASTCONV`
 - `CRISPASR_COSYVOICE3_FASTCONV_DEBUG`
-- `CRISPASR_COSYVOICE3_SIMDCONV` — opt into the CPU-only direct SIMD Conv1d path for the 72 HiFT ResBlock convolutions; default off.
+- `CRISPASR_COSYVOICE3_SIMDCONV` — CPU-only direct SIMD Conv1d path for the 72 HiFT ResBlock convolutions; **default ON** since the Kaggle quiet-box A/B (1.07x on Xeon avx512f, 1.34x on Zen 4, output 1-LSB-equal, roundtrip exact). Set `=0` for the ggml path.
 - `CRISPASR_COSYVOICE3_SIMDCONV_DEBUG` — print pack count, selected ISA, and GPU fallback status.
 - `CRISPASR_COSYVOICE3_FLOW_STEPS`
 - `CRISPASR_COSYVOICE3_FORCE_GALLOCR`
@@ -593,6 +598,11 @@ suffixes.
 - `CRISPASR_F5_DURATION_CLAMP` — clamp the per-char speech rate into a sane English band so a reference whose audio/transcript lengths are mismatched can't truncate (or balloon) the output (#294). Default on; set `0` to restore the exact upstream `ref_T / ref_text_len * gen_text_len / speed` estimate.
 - `CRISPASR_F5_EMBED_GPU`
 - `CRISPASR_F5_F16_ACT`
+- `CRISPASR_F5_HIFIGAN_CPU` — `1` restores the pre-`a72fb66d` CPU-loop
+  HiFi-GAN decode (A/B fallback; the default ggml `core_hifigan` graph path
+  is ~250x faster on GPU and cosine-1.000000 identical).
+- `CRISPASR_F5_VOCODE_MEL` — debug probe: vocode this mel dump directly,
+  bypassing the DiT (used for the CPU-vs-graph vocoder parity A/B).
 - `CRISPASR_F5_FORCE_SCALAR`
 - `CRISPASR_F5_REF_MAX_SEC` — clip the reference audio to this many seconds before it drives the duration estimate (upstream parity: 12 s). Default `12`; set `0` to disable the clip.
 - `CRISPASR_F5_REF_TRIM_SILENCE` — strip leading/trailing silence and collapse internal silences >~1 s in the reference audio (upstream parity). Default on; set `0` to disable.
@@ -649,7 +659,13 @@ suffixes.
 - `CRISPASR_FUNASR_LLM_LAYERS`
 - `CRISPASR_FUNASR_NAN_CHECK`
 - `CRISPASR_FUNASR_NO_FA`
-- `CRISPASR_FUNASR_STEP_CACHE`
+- `CRISPASR_FUNASR_ENC_CACHE` — `0` disables the exact-T_lfr encoder graph
+  cache (repeat-length calls skip the 7.5–23.9 ms graph rebuild). Default on.
+- `CRISPASR_FUNASR_STEP_BUCKET` — width of the cached decode-graph Lk buckets
+  (default 16, the measured optimum; `>= kv_max_ctx` reproduces the old
+  fixed-Lk design, which is a ~69% decode regression — A/B arm only).
+- `CRISPASR_FUNASR_STEP_CACHE` — `0` disables the bucketed per-step decode
+  graph cache (bit-identical either way). Default on.
 
 ### Gemma-4 E2B
 
@@ -696,13 +712,16 @@ suffixes.
 - `CRISPASR_HTDEMUCS_WCACHE` — cache F32 copies of weight tensors by pointer
   (default **ON**). `=0` re-reads and re-converts on every access, which the
   DConv stacks do ~6k times per encoder layer.
-- `CRISPASR_HTDEMUCS_GGML` — run the CrossTransformer as a ggml graph instead of
-  the CPU/BLAS path (default **OFF**). Verified correct on CPU and Metal (45/45
-  stages, every layer cos 1.000000) but not yet proven faster overall, so it
-  stays opt-in per the inverse-default rule.
-- `CRISPASR_HTDEMUCS_GPU` — request a GPU backend (CUDA > Metal > Vulkan, CPU
-  fallback). Only meaningful together with `_GGML=1`: under the CPU/BLAS path
-  the weights would sit on the device and every kernel would pay a read back.
+- `CRISPASR_HTDEMUCS_GGML` — run the ggml graph path instead of CPU/BLAS.
+  Since #414 the default is **AUTO**: ON exactly when a real GPU backend is
+  present and permitted (where the fused graph measured ~20x faster than
+  BLAS — RTF 0.37 vs 7.4 on an RTX 3090 Ti), OFF on CPU-only hosts (where
+  graphs measured slower than BLAS). `=1`/`=0` force either way.
+- `CRISPASR_HTDEMUCS_GPU` — GPU permission (CUDA > Metal > Vulkan). Default
+  AUTO follows the caller's use_gpu (CLI default on); an explicit `=0`/`=1`
+  beats the caller in both directions — so `=0` genuinely opts out even
+  though the CLI defaults `use_gpu=true` (#414 review catch). On GPU-less
+  hosts everything resolves to the BLAS path regardless.
 - `CRISPASR_HTDEMUCS_NO_BCAST_CAST` — disable the issue-#398 fix that casts
   non-F32 affine/bias weights to F32 in-graph before broadcast add/mul sites
   (bisection aid). With `=1` the pre-fix graph is rebuilt, which on CUDA
@@ -712,9 +731,11 @@ suffixes.
   forward pass (stft / enc / transformer / dec / istft).
 - `CRISPASR_HTDEMUCS_DEBUG` — verbose per-layer shape and NaN diagnostics.
 - `CRISPASR_HTDEMUCS_SKIP_TIME` — skip the time branch (bisection aid).
-- `CRISPASR_HTDEMUCS_FUSED` — per-layer fused ggml graphs (default **OFF**): the
-  host↔device roundtrip per layer measured slower than CPU+Accelerate for the
-  encoder, even though the transformer alone is 3.3–6x faster.
+- `CRISPASR_HTDEMUCS_FUSED` — single fused graph (encoder+transformer+decoder
+  on-device, no per-layer host↔device roundtrips). Default **AUTO**: ON with
+  the GPU graph path (#414), OFF otherwise. `=1` alone implies the graph path
+  it needs; `=0` on GPU keeps the per-layer-graph bisection arm.
+  The full decision table is unit-locked in tests/test-htdemucs-gates.cpp.
 - `CRISPASR_HTDEMUCS_MEMSTATS` — log each weight-cache admission and the running
   cache total in MB.
 - `CRISPASR_HTDEMUCS_NO_SEGMENT` — process the whole track in one pass instead of
@@ -1101,6 +1122,11 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_PARLER_PROMPT_IDS`
 - `CRISPASR_PARLER_TTS_BENCH`
 
+### Piano transcription
+
+- `CRISPASR_PIANO_SERIAL` — `1` restores the single-threaded conv/GRU/linear
+  compute (the default parallel path is bit-identical; #305, ~1.7x).
+
 ### Piper
 
 - `CRISPASR_PIPER_FORCE_SCALAR`
@@ -1153,6 +1179,12 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_QWEN3_TTS_CODEC_FORCE_METAL`
 - `CRISPASR_QWEN3_TTS_CODEC_GGUF`
 - `CRISPASR_QWEN3_TTS_CODEC_GPU`
+- `CRISPASR_QWEN3_TTS_HIP_CODEC_NATIVE` — bypass the #337 ROCm codec-encoder
+  correctness fallback and run it natively on HIP. Diagnostic/A/B only until
+  the triggering Daphne spans pass on a real AMD GPU.
+- `CRISPASR_QWEN3_TTS_HIP_CP_NATIVE` — bypass the #337 CPU fallback for the
+  ROCm 0.6B-F16 code predictor. Diagnostic/A/B only; its native gfx1100 path
+  was observed to emit all-NaN logits.
 - `CRISPASR_QWEN3_TTS_CODEC_TRACE`
 - `CRISPASR_QWEN3_TTS_CP_BACKEND`
 - `CRISPASR_QWEN3_TTS_CP_DIRECT`
@@ -1350,6 +1382,13 @@ end-to-end cosine cannot do.
 - `CRISPASR_VIBEVOICE_BITNET_ACT_QUANT`
 - `CRISPASR_VIBEVOICE_DEBUG`
 - `CRISPASR_VIBEVOICE_DUMP_DIR`
+- `CRISPASR_VIBEVOICE_ENC_BACKEND` — `{auto|cpu|gpu}` backend for the σ-VAE
+  tokenizer ENCODERS (the ASR direction). `auto` (default) diverts them to CPU
+  on Vulkan devices with a 65535 `maxComputeWorkGroupCount` (Intel Arc/Iris/
+  UHD, llvmpipe), where the conv dispatches over long audio overflow and abort
+  (issue #418 — the ASR twin of the decoder's #52 fallback,
+  `CRISPASR_VIBEVOICE_VAE_BACKEND`). `gpu` forces the active backend (the
+  repro arm); `cpu` forces the fallback anywhere.
 - `CRISPASR_VIBEVOICE_ENCODER_CHUNK_SECONDS`
 - `CRISPASR_VIBEVOICE_ENCODER_CONTEXT_SECONDS`
 - `CRISPASR_VIBEVOICE_GELU_TANH`
@@ -1468,4 +1507,3 @@ end-to-end cosine cannot do.
 - `CRISPASR_ZONOS_TTS_BENCH`
 - `CRISPASR_ZONOS_TTS_TEXT`
 - `CRISPASR_ZONOS_VULKAN_NATIVE`
-

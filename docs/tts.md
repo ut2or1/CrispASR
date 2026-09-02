@@ -1,7 +1,8 @@
 # Text-to-Speech (TTS)
 
-CrispASR ships **thirty-five open-weights TTS engine families** (55 registered
-TTS backends once variants are counted — see `docs/feature-matrix.md`) behind
+CrispASR ships **62 registered open-weights TTS backends** — roughly three
+dozen distinct engine families once variants are folded; the authoritative
+auto-generated list is [`docs/feature-matrix.md`](feature-matrix.md) — behind
 the same `crispasr` binary, each with a distinct voice / quality / footprint
 trade-off:
 
@@ -18,7 +19,7 @@ trade-off:
 - [Kokoro](#kokoro--multilingual-smallest) — multilingual, smallest
 - [Qwen3-TTS](#qwen3-tts--voice-cloning-highest-fidelity) — voice cloning, highest fidelity
   - [qwen3-tts environment switches](#qwen3-tts-environment-switches)
-  - [pocket-tts voices and environment switches](#pocket-tts-voices-and-environment-switches)
+  - [pocket-tts languages, voices, and environment switches](#pocket-tts-languages-voices-and-environment-switches)
 - [VibeVoice](#vibevoice--realtime-streaming-tts) — realtime streaming TTS
 - [VibeVoice 1.5B](#vibevoice-15b--base-tts-with-wav-cloning) — base TTS with WAV cloning
 - [Orpheus](#orpheus--llama-32-3b--snac-codec) — Llama-3.2-3B + SNAC codec
@@ -42,7 +43,7 @@ trade-off:
 | Backend | Why pick it | Voice cloning | First-run download |
 |---|---|---|---|
 | **`melotts`** | Multilingual VITS2 (MeloTTS). 4 English speakers (US/BR/India/AU). 44.1 kHz output, ~102 MB GGUF. Neural G2P + CMU dict. BERT companion (Q4_K 52 MB) auto-downloads with `-m auto`; also via `--codec-model` or `CRISPASR_MELOTTS_BERT` env. | No (per-speaker ID) | ~154 MB via `-m auto` |
-| **`piper`** | Tiniest footprint (30 MB). rhasspy/piper VITS; 250+ community voices across 30+ languages. Built-in G2P (CMUdict + LTS rules) for English — no espeak-ng needed. Optional espeak-ng for other langs (loaded via dlopen). 22 kHz output. Use `--g2p-dict` to select dictionary source. | No (per-voice GGUF) | Manual `wget` |
+| [`piper`](#piper--community-voices) | Tiniest footprint (30 MB). rhasspy/piper VITS; 250+ community voices across 30+ languages. Built-in G2P (CMUdict + LTS rules) for English — no espeak-ng needed. Optional espeak-ng for other langs (loaded via dlopen). 22 kHz output. Use `--g2p-dict` to select dictionary source. | No (per-voice GGUF) | ~30 MB default via `-m auto`; other voices are manual downloads |
 | [`kokoro`](#kokoro--multilingual-smallest) | Smallest + fastest. 82 M-param StyleTTS2-derived model. Multilingual via built-in G2P or espeak-ng (dlopen/popen fallback). | No (preset voice packs) | Manual `wget` (no `-m auto`) |
 | [`qwen3-tts`](#qwen3-tts--voice-cloning-highest-fidelity) | Highest fidelity / strongest cloning. Speech-LLM (talker + code predictor + 12 Hz codec). Default voice auto-downloaded with `-m auto`; or supply your own WAV + ref-text. | Optional (auto default voice; or WAV + ref-text or baked voice GGUF) | ~1.3 GB via `-m auto` |
 | **`miotts`** | MioTTS-0.6B (Qwen3 LLM + MioCodec-v2). EN/JA. Single GGUF, 24 kHz output. Codec-aware mixed quantization (LLM Q4_K + codec F16). | Yes — `--voice preset.emb.gguf` (preset speaker embeddings) | 502 MB Q4_K via `-m auto` |
@@ -55,9 +56,54 @@ trade-off:
 | [`chatterbox`](#chatterbox--flow-matching-tts-voice-cloning--multilingual) | T3 AR + S3Gen flow-matching + HiFTGenerator. Built-in voice baked into the T3 GGUF; clones via a baked voice GGUF (see workflow below). EN/AR/DE variants share runtime. | Yes (`--voice <voice.gguf>`, baked from a WAV with `models/bake-chatterbox-voice-from-wav.py`) | ~880 MB via `-m auto` (T3 Q8 + S3Gen Q8) |
 | **`outetts`** | OuteTTS-0.3-1B: OLMo-1B LLM + WavTokenizer single-codebook VQ-GAN. CC-BY-NC-SA-4.0 (non-commercial, ShareAlike). 24 kHz output. | Yes (`--voice <speaker.json>`, created with `tools/reference_backends/outetts_create_speaker.py`) | ~2.5 GB via `-m auto` (talker F16 + WavTokenizer decoder) |
 | [`f5-tts`](#f5-tts--dit-flow-matching-voice-cloning) | F5-TTS v1 Base: 22-layer DiT flow-matching TTS + Vocos iSTFT vocoder. MIT license. High-quality zero-shot voice cloning from 3-15s reference audio. 24 kHz output. English + Chinese (built-in pinyin g2p, #294). | Yes (`--voice <ref.wav> --ref-text "transcript"`) | ~953 MB via `-m auto` (single F16 GGUF, DiT + Vocos) |
+| [`raon`](#f5-tts--dit-flow-matching-voice-cloning) | Raon-OpenTTS 0.3B (KRAFTON): F5-TTS DiT on the same runtime, paired with a 16 kHz HiFi-GAN vocoder (sbhifigan16k, slaney mel). English zero-shot voice cloning. **CC-BY-NC-4.0** (non-commercial; auto-download prints the restriction). TTS→ASR roundtrip validated (0.90). Note: CPU vocoder ~40s/utterance. | Yes (`--voice <ref.wav> --ref-text "transcript"`) | ~959 MB via `-m auto` (single GGUF: DiT + HiFi-GAN) |
 | [`irodori-tts`](#irodori-tts--japanese-voice-cloning--emoji-emotion-control) | Irodori-TTS: RF-DiT flow-matching TTS with LowRankAdaLN + JointAttention + half-RoPE + SwiGLU. 48 kHz via Semantic-DACVAE-Japanese-32dim codec. MIT license. Japanese-focused (llm-jp-3 tokenizer). Zero-shot voice cloning from any reference WAV (DAC-VAE encoder + speaker CFG); emoji emotion control; duration predictor for output length. **VoiceDesign** (600M-v3): adds caption encoder for style/emotion control via text descriptions (`--instruct "calm adult male, deep voice"`); independent text/speaker/caption CFG. | Yes (`--voice <ref.wav> --i-have-rights`) | ~526 MB Q4_K (VoiceDesign) / ~852 MB Q4_K (base) + DAC-VAE codec |
 | [`indextts`](#indextts--chineseenglish-voice-cloning) | IndexTTS-1.5: GPT-2 AR (24L/1280d) mel-code generator + BigVGAN vocoder. Designed for Chinese+English. Zero-shot voice cloning from any reference WAV. | Yes (`--voice <ref.wav>`) | ~2.4 GB via `-m auto` (GPT F16 + BigVGAN F16) |
 | [`cosyvoice3-tts`](#cosyvoice3--voice-cloning-from-a-wav) | Fun-CosyVoice3-0.5B-2512: Qwen2-0.5B AR speech-token LM + DiT-CFM (10-step Euler) + HiFT (NSF + iSTFT) @ 24 kHz. 9 languages + 18 Chinese dialects. Ships an 8-voice baked bank (`zero_shot` + `fleurs-{en,de,zh,ja,fr,es,ko}`). | Yes — baked-bank name via `--voice <name>`, **or** native arbitrary-WAV cloning via `--voice <ref.wav> --ref-text "..."` (ports speech_tokenizer_v3 + CAMPPlus + matcha mel to ggml; speech tokens byte-exact vs ONNX). | ~1.2 GB via `-m auto` (Q4_K LLM + Q8_0 flow + HiFT + s3tok + campplus + voices) |
+
+## Piper — community voices
+
+The default US Lessac voice needs no manual model download:
+
+```powershell
+.\crispasr.exe --backend piper -m auto --tts "Hello from Piper." --tts-output piper.wav
+```
+
+For another voice, download its GGUF from
+[`cstr/piper-voices-GGUF`](https://huggingface.co/cstr/piper-voices-GGUF).
+Either pass the full path, or put it in `CRISPASR_MODELS_DIR` and pass its bare
+filename. CrispASR resolves that exact file; it does not replace an unknown
+community voice with the registered US default (#397).
+
+```powershell
+$env:CRISPASR_MODELS_DIR = 'D:\ai\crispasr'
+.\crispasr.exe --backend piper -m piper-en_GB-cori-medium-f16.gguf `
+  --tts "Hello from the Cori voice." --tts-output cori.wav
+```
+
+For the HTTP server and PowerShell, keep `-t 8` separate from `-l en` and call
+the real curl executable (PowerShell aliases `curl` in some versions):
+
+```powershell
+.\crispasr.exe --server --backend piper `
+  -m piper-en_GB-cori-medium-f16.gguf -l en -t 8 --port 8089 `
+  --no-spoken-disclaimer --accept-marking-responsibility
+
+curl.exe -sS http://localhost:8089/v1/audio/speech `
+  -H 'Content-Type: application/json' `
+  --data-raw '{"model":"piper","input":"Hello, how are you today?","spoken_disclaimer":false,"response_format":"wav"}' `
+  --output piper-server.wav
+```
+
+Writing a WAV with `--output` avoids sending binary audio through PowerShell's
+object pipeline. To test raw streaming in `cmd.exe`, request
+`"stream":true,"response_format":"pcm"` and pipe `curl.exe` to
+`ffplay.exe -f s16le -ar 22050 -ac 1 -nodisp -`.
+
+## More TTS backends
+
+| Backend | Why pick it | Voice cloning | First-run download |
+|---|---|---|---|
 | **`csm`** | Sesame CSM-1B: Llama-3.2 1B backbone (first-codebook AR) + 100M depth decoder (codebooks 1–31) + Kyutai Mimi codec (32-codebook RVQ → SEANet) @ 24 kHz. Single GGUF. Apache-2.0. | No (single built-in voice) | ~1.4 GB via `-m auto` (single Q4_K GGUF) |
 | **`dia`** | Nari Labs Dia 1.6B: byte-level text encoder (12L) + AR audio decoder (18L GQA) + 9-codebook DAC codec @ 44.1 kHz. CFG-guided, dialogue-style with `[S1]`/`[S2]` speaker tags. Apache-2.0. | No (dialogue via speaker tags) | ~1.6 GB via `-m auto` |
 | **`zonos-tts`** | Zyphra Zonos-v0.1-transformer: 26-layer GQA AR transformer → 9-codebook DAC @ 44.1 kHz. Rich conditioning: speaker embedding + text + emotion + FWHM pitch/tempo. CFG guided. Voice cloning from any reference WAV (pass via `CRISPASR_ZONOS_SPEAKER_EMB_PATH` or `--voice <ref.wav>`). Apache-2.0. | Yes (`--voice <ref.wav>`) | ~1.6 GB Q8_0 (default) or ~931 MB selective-Q4_K (heads/embeddings kept F16, auto-retry guard) or ~3.0 GB F16, via `-m auto` + 104 MB DAC codec. |
@@ -67,13 +113,13 @@ trade-off:
 | **`bananamind-tts`** | BananaMind-TTS-V2.1 13M: Tacotron-lite (char tokenizer + Conv1d+BN+ReLU encoder + BiLSTM + AR GRU decoder with location-sensitive attention + postnet) + HiFi-GAN @ 22 kHz. English (LJ Speech) and German (ThorstenVoice). Apache-2.0. Runtime is designed as a template for standard Tacotron2 ports — add `decoder_rnn_type=lstm` to the GGUF to switch to the LSTM decoder path ([architecture notes](architecture.md#bananamind-tts)). | No (fixed voice per locale) | ~40 MB Q8_0 / ~50 MB F32 per locale |
 | [`parler-tts`](#parler-tts--prompt-conditioned-voice-description) | Parler TTS Mini v1.1 (~900M): T5 encoder + MusicGen decoder + DAC 44.1 kHz. Apache-2.0. Prompt-conditioned: describe the voice in natural language via `--instruct`. | No (prompt-conditioned) | ~900 MB via `-m auto` (Q8_0 GGUF) |
 | **`voxcpm2-tts`** | VoxCPM2: 2B Qwen2 backbone + flow matching + VAE decoder @ 48 kHz. Zero-shot voice cloning via `--voice <ref.wav>`. | Yes | ~2.4 GB via `-m auto` |
-| [`pocket-tts`](#pocket-tts-voices-and-environment-switches) | Kyutai Pocket TTS 100M: continuous-latent AR @ 12.5 Hz + one-step LSD flow head + Mimi VAE decoder → 24 kHz. CC-BY-4.0 plus gated-use conditions. Voice cloning via `--voice ref.wav`. | Yes (`--voice`) | ~220 MB via `-m auto` (F16 GGUF) |
+| [`pocket-tts`](#pocket-tts-languages-voices-and-environment-switches) | Kyutai Pocket TTS 100M: continuous-latent AR @ 12.5 Hz + one-step LSD flow head + Mimi VAE decoder → 24 kHz. English, German, Spanish, Italian, Portuguese, plus the upstream French 24L preview. CC-BY-4.0 plus gated-use conditions. Voice cloning via `--voice ref.wav`. | Yes (`--voice`) | ~124 MB Q8_0 per non-English 6L model; English F16 ~220 MB; French 24L Q8_0 ~365 MB |
 | **`kugelaudio`** | KugelAudio-0-Open: 7B Qwen2.5 backbone + 4-layer DiT diffusion head (20-step SDE-DPMSolver++) + acoustic VAE decoder → 24 kHz. 23 languages. MIT. | Pre-encoded voices (`--voice voice.gguf`) | ~17.3 GB F16 via `-m auto` — needs >16 GB VRAM, else `--no-gpu`. The ~5.7 GB Q4_K is **not** a usable substitute: it stutters and loops (WER 0.72 vs 0.056 for F16) |
 | [`tada-1b`](#tada--multilingual-and-voice-cloning) | HumeAI TADA 1B: Llama-3.2-1B backbone + per-token flow-matching diffusion head + TADA codec → 24 kHz. **English-only.** `-m auto` downloads model + default `tada-ref.gguf`. | Yes (`--voice <tada-ref.gguf>`, English voice refs only) | ~1.7 GB Q4_K + ~1 GB codec |
 | [`tada` / `tada-3b-ml`](#tada--multilingual-and-voice-cloning) | HumeAI TADA 3B Multilingual: same architecture, 3B params. Supports **ar, ch, de, es, fr, it, ja, pl, pt** in addition to English. `-l <lang>` auto-downloads `tada-ref-<lang>.gguf`. | Yes (`--voice <tada-ref.gguf>`) | ~4 GB Q4_K + ~1 GB codec |
 | **`lfm2-audio`** | LiquidAI LFM2.5-Audio 1.5B: FastConformer encoder + LFM2 hybrid conv+attention backbone + 6L depthformer (8-codebook Mimi) + ISTFT detokenizer → 24 kHz. Interleaved text+audio generation. Also does ASR and speech-to-speech. LFM Open License v1.0 ($10M revenue cap). | No | ~1.5 GB Q4_K (JP) / ~1.6 GB Q5_K (EN) + ~157 MB detokenizer companion |
 | [`dots-tts`](#dotstts--voice-cloning-and-performance) | rednote-hilab dots.tts-soar: Qwen2.5-1.5B LLM + 24L VAESemanticEncoder + 18L DiT flow-matching head (16-step Euler CFG) + BigVGAN vocoder → 48 kHz. Continuous-latent AR (patch-by-patch). Apache-2.0. **The CFG flow-match needs an F16 DiT — a full-q8 core derails; use the mixed quant (`crispasr-quantize` keeps the DiT at F16, quantizes the LLM+PatchEncoder to Q8_0 or Q4_K).** CAM++ reference-WAV voice cloning is supported when the speaker companion is present. | Yes (`--voice ref.wav --i-have-rights`) | ~3.1 GB mixed-Q8 / ~2.2 GB mixed-Q4_K core + 330–345 MB vocoder companion |
-| **`confucius4-tts`** | NetEase Youdao Confucius4-TTS: GPT-2 T2S (24L/1280d, beam-sample num_beams=3, LlamaTokenizer vocab baked) + flow-matching DiT+WaveNet S2A (25-step Euler CFG 0.7, CAMPPlus style + reference-mel prompt) + BigVGAN vocoder → 22.05 kHz. Zero-shot voice cloning; 14 languages via Chinese `LANGUAGE_TOKEN_MAP` prompts (`-l <lang>`). Apache-2.0. **Zero-shot only: without `--voice` conditioning the output is unintelligible by design.** T2S `condition_emb` additionally needs external w2v-BERT features (`CRISPASR_CONFUCIUS4_COND_DIR`) until that encoder is native. | Yes (`--voice ref.wav --i-have-rights`) | ~376 MB Q4_K T2S + ~135 MB S2A + ~214 MB BigVGAN via `-m auto` |
+| **`confucius4-tts`** | NetEase Youdao Confucius4-TTS: GPT-2 T2S (24L/1280d, beam-sample num_beams=3, LlamaTokenizer vocab baked) + flow-matching DiT+WaveNet S2A (25-step Euler CFG 0.7, native w2v-BERT + CAMPPlus style/reference-mel conditioning) + BigVGAN vocoder → 22.05 kHz. Zero-shot voice cloning; 14 languages via Chinese `LANGUAGE_TOKEN_MAP` prompts (`-l <lang>`). Apache-2.0. **Zero-shot only: without `--voice` conditioning the output is unintelligible by design.** | Yes (`--voice ref.wav --i-have-rights`) | ~376 MB Q4_K T2S + ~135 MB S2A + ~214 MB BigVGAN + w2v companion via `-m auto` |
 | **`mini-omni2`** | gpt-omni/mini-omni2: Whisper-small encoder + Qwen2-0.5B LLM with 8-stream architecture + SNAC 24 kHz decoder → 24 kHz. Also does ASR and speech-to-speech. MIT license. Requires `--codec-model snac-24khz.gguf` companion. | No | ~1.0 GB Q4_K + ~80 MB SNAC companion |
 | **`voxtral-tts`** | Mistral Voxtral-4B-TTS-2603: Ministral-3B AR backbone (26L GQA, NORMAL/adjacent-pair RoPE) + 3L bidirectional flow-matching acoustic transformer (8-step Euler ODE + CFG α=1.2, no positional encoding) + Voxtral codec decoder (ALiBi sliding-window attention + reflect-causal conv + ConvTranspose upsampling) → 24 kHz. 20 preset voices across 9 languages (en/fr/de/es/it/pt/nl/ar/hi); strong on French technical text. CC-BY-NC-4.0. | No (20 preset voices via `--voice <name>`, e.g. `fr_female`) | ~2.4 GB Q4_K / ~4.3 GB Q8_0 / ~8.2 GB F16 via `-m auto` |
 
@@ -939,16 +985,39 @@ defaults reproduce the validated, end-to-end-tested code path.
 | `CRISPASR_QWEN3_TTS_CODEC_CTX` | `128` (`96` on CUDA) | Left-context codec frames prepended to each chunk. Values below the codec sliding window are raised; CUDA clamps larger values unless `CRISPASR_QWEN3_TTS_CODEC_ALLOW_FULL=1` is set. |
 | `CRISPASR_QWEN3_TTS_SKIP_REF_DECODE` | **on** (set `=0` to opt out) | Skip the codec decode of the reference audio in `qwen3_tts_synthesize`. The default-on path emits `codec_decode_codes(gen)` directly; the opt-out path concatenates `ref_codes + gen_codes`, decodes both, then trims the ref portion. With a 26 s reference (~334 codec frames at 12 Hz), the ref half adds ~16 s of constant codec compute regardless of how much new audio is generated (Jetson Orin AGX, issue #64). End-to-end RTF on Orin drops from ~7-9 → ~1.5; the win compounds N× under `/v1/audio/speech` long-form chunking. Bit-identity verified 2026-05-05 on Apple Silicon Metal, qwen3-tts-customvoice 0.6B Q8_0: max\|diff\| = 0, cosine similarity = 1.0 — equivalence holds because the codec is a straight-line forward pass with no rolling state. Set `CRISPASR_QWEN3_TTS_SKIP_REF_DECODE=0` only for A/B verification or if a future codec graph variant grows rolling state. |
 
-### pocket-tts voices and environment switches
+### pocket-tts languages, voices, and environment switches
 
-Voice cloning takes a reference WAV via `--voice`. Three forms are accepted:
+Pocket-TTS uses one checkpoint per language. With `-m auto`, the base backend
+routes `-l de`, `es`, `it`, `pt`, or `fr` to the corresponding model; omit
+`-l` (or use `-l en`) for English. The explicit backend names are
+`pocket-tts-de`, `pocket-tts-es`, `pocket-tts-it`, `pocket-tts-pt`, and
+`pocket-tts-fr`. French is Kyutai's 24-layer preview checkpoint; the other new
+languages are the distilled 6-layer releases.
+
+```bash
+./build/bin/crispasr --backend pocket-tts -m auto -l es \
+  --accept-license pocket-tts-terms \
+  --tts "Hola, este modelo ya habla español." \
+  --voice samples/jfk.wav --i-have-rights --tts-output pocket-es.wav
+```
+
+`--voice` accepts either reference audio or Kyutai's prepared voice states:
 
 - **Absolute/relative path** — `--voice /path/to/ref.wav` (requires `--i-have-rights`).
+- **Official embedding** — `--voice alba.safetensors`. Files from Kyutai's
+  `embeddings_v3` directory are prefilled transformer K/V states, so they work
+  even with a GGUF that omits the Mimi voice-cloning encoder. Match the
+  embedding to the model language/layer count.
 - **Bare name + `--voice-dir`** — `--voice alice --voice-dir voices/` resolves to
-  `voices/alice.wav`. This is what `--server` / `{"voice": "<name>"}` requests use,
-  so a single server can serve multiple voices from one directory (issue #255).
+  `voices/alice.safetensors` when present, then `voices/alice.wav`. This is what
+  `--server` / `{"voice": "<name>"}` requests use, so a single server can serve
+  multiple voices from one directory (issues #255 and #411).
 - **Unset** — auto-loads `samples/jfk.wav` as a default; without any voice the
   output is near-silent.
+
+Prepared embeddings are preset identities, not a claim that the voice is safe
+to impersonate. CrispASR retains its disclosure/marking warning; follow the
+embedding publisher's license and personality-rights terms.
 
 | Variable | Default | Effect when set |
 |---|---|---|
@@ -1061,6 +1130,10 @@ and the GPT-2-T3 path (turbo/kartoffelbox-turbo):
 # Nano (#382): GPT2-small T3 (12L/768, ~345 MB Q8) on the SAME Turbo S3Gen —
 # the registry auto-downloads the Turbo S3Gen as companion:
 ./build/bin/crispasr --backend chatterbox-nano -m auto --tts "..." --tts-output out.wav
+
+# Finnish Nano v0.1.3 (#382 reporter fine-tune; same Turbo S3Gen companion):
+./build/bin/crispasr --backend chatterbox-finnish-nano -m auto -l fi \
+    --tts "Hyvää huomenta. Tämä on Chatterbox Finnish Nano." --tts-output out-fi.wav
 
 # German fine-tune of Turbo (SebastianBodza/Kartoffelbox_Turbo):
 ./build/bin/crispasr --backend kartoffelbox-turbo -m auto -l de \

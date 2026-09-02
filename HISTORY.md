@@ -6,6 +6,185 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #411 Pocket-TTS official prepared voices, fixed 2026-09-01
+
+Added native loading of Kyutai `embeddings_v3/*.safetensors` prepared
+transformer K/V voice states to the Pocket runtime, CLI/server adapter, and C
+session ABI. Bare `--voice` names prefer `<voice-dir>/<name>.safetensors`
+before WAV; malformed or model-incompatible cache shapes fail closed. Local
+real-asset synthesis was non-silent and roundtripped exactly as `Hola mundo.`;
+hosted run
+[33486783999](https://github.com/CrispStrobe/CrispASR/actions/runs/33486783999)
+passed 4,789 assertions and all five multilingual ASR roundtrips, including
+the Alba Spanish prepared voice (four decoded content stems).
+
+## #397 Piper community voices on Windows — exact lookup, clean-install G2P, and live proof, fixed 2026-08-31
+
+Fixed the reporter's `piper-en_GB-cori-medium-f16.gguf` command end to end.
+An explicit bare filename is now searched unchanged in the normal model/cache
+directories before registry fallback, so a community voice in
+`CRISPASR_MODELS_DIR` is selected and Piper is inferred from its filename;
+it is never silently replaced by the registry's Lessac default. The shared C
+resolver has the same behavior. Piper's pre-generated IPA and CMU dictionaries
+are again downloadable because their cache dependency now lives in and is
+linked from `crispasr-core`. The audit also repaired native Windows downloads:
+WinHTTP now follows Hugging Face's root-relative redirects without corrupting
+UTF conversions, while curl/wget fallback headers are quoted for cmd.exe.
+The Piper docs include copyable PowerShell server and JSON request examples.
+
+Hosted Windows Server 2022 run 33444762281 is the release-independent proof:
+a clean portable CPU build found the exact Cori GGUF, inferred `piper`,
+downloaded and loaded 126,051 IPA entries, synthesized a 2.54-second 22.05 kHz
+WAV, and Whisper recovered “The quick brown fox…”; the server arm recovered
+“You did a great job today” and passed nonempty chunked `audio/pcm`. Local
+proof additionally covered the registry (4,789 assertions), five resolution
+cases, standalone cache/Piper linkage, real CLI/server synthesis, and HTTP WAV
+and streaming roundtrips.
+
+## #411 Pocket-TTS multilingual registry — five languages model-proven, fixed 2026-08-31
+
+Added Kyutai's German, Spanish, Italian, Portuguese, and French Pocket-TTS
+checkpoints to the public GGUF repository and wired `-m auto -l de|es|it|pt|fr`
+through the registry, CLI factory/router, and C session ABI. The four distilled
+6-layer Q8_0 models are ~124 MB each; the undistilled French 24-layer preview is
+~365 MB. The converter now downloads only one language at a time and explicitly
+records French's 24 layers because the gated weights repository omits the
+source YAML. Direct inspection of the published GGUF confirmed architecture,
+language, and `num_layers=24` metadata.
+
+Hosted run 33371566746 passed 4,787 registry assertions, capability/static
+tests, the complete backend-wiring audit, public gated-license auto-download,
+and CPU synthesis plus multilingual Whisper roundtrip for all five models.
+Decoded proof: German “Guten Morgen … die Sonne”; Spanish “Buenos días … el
+sol”; Italian “un giorno … splendere il sole”; Portuguese target-exact; French
+“Bonjour. Aujourd'hui, le soleil …”. WAV and log artifacts are retained on the
+run. F16 and Q8_0 voice-cloning GGUFs and the multilingual model card are
+published at `cstr/pocket-tts-GGUF`.
+
+## #382 Finnish Chatterbox Nano — registry and live proof, fixed 2026-08-30
+
+Registered `JJarvinen/chatterbox-finnish-nano-GGUF` v0.1.3 with its shared
+Turbo S3Gen companion; wired the CLI factory/list, `-m auto -l fi` routing,
+C ABI aliases, capabilities, docs, and generated feature matrix. The audit
+also found that previously shipped Nano/Turbo/fine-tune aliases appeared in
+the CLI but were not openable through the C ABI, and repaired the whole
+family. Finnish Nano is monolingual: `-l fi` selects it without injecting the
+nonexistent `[fi]` multilingual token. Hosted run 33334395303 passed the
+4,677-assertion registry suite, static/capability tests, full backend-wiring
+audit, both public auto-downloads, and CPU synthesis of a 4.84 s / 24 kHz WAV.
+
+## #410 Chatterbox direct KV-cache views — merged and model-proven 2026-08-30
+
+PR #410 removed redundant `ggml_cont()` copies around each Chatterbox T3
+flash-attention K/V layer view. Audit confirmed that each selected layer is
+logically contiguous and only carries a nonzero base offset. Follow-up
+coverage builds a real CPU ggml graph over a nonzero-offset cache layer and
+compares the direct view with the former materialized path (71 assertions).
+Hosted live run 33333867440 used public Nano Q4_K plus Turbo S3Gen Q4_K: both
+paths emitted the same 40-token trajectory and byte-identical decoded PCM.
+`CRISPASR_CHATTERBOX_KV_CONT=1` retains the old path as a diagnostic A/B.
+
+## #419 canary Russian-as-translit — root mechanism found, diagnostics shipped, 2026-09-02 (issue open pending reporter data)
+
+The reported symptom (Russian recognized correctly but emitted in Latin
+translit) could NOT be reproduced with the registry canary-1b-v2-q4_k under
+any constructible condition: CPU, CUDA (P100 kernel
+`chr1s4/crispasr-issue419-canary-ru-gpu`), Vulkan/llvmpipe, single-pass,
+streamed 56 s, 0.8-3 s VAD-sized slices, 44.1 kHz stereo input, and the
+reporter's exact flags — all proper Cyrillic. The vocab carries 2175
+Cyrillic pieces + `<|ru|>`, and the prompt builder hard-fails on unknown
+tokens. The one arm that reproduces the symptom exactly is `-l en` on
+Russian audio: wrong-language conditioning makes the model render the words
+it heard in Latin, fluently and silently. (The reverse is robust: `-l ru`
+on English audio TRANSLATES into Cyrillic Russian.)
+
+Shipped so the failure diagnoses itself from any log: a one-line
+`canary: languages src=.. tgt=..` effective-conditioning print, and a
+wrong-script warning (`core/script_mismatch.h`, hermetic decision table in
+tests/test-script-mismatch.cpp — ru/uk/bg/el vs a UTF-8 letter-script
+census, 20-letter evidence bar, code-switch tolerant) that names the likely
+causes when a Cyrillic/Greek target produces Latin-dominated text. The
+issue stays open until the reporter can share the resolved-model line and
+a sample; the leading hypothesis is that their frontend's -l/--source-lang
+never reached the process.
+
+## #418 VibeVoice-ASR aborted on Intel Arc Vulkan — encoder CPU fallback + BitNet TQ guard, fixed 2026-09-01
+
+An Arc B580 user transcribing a 1-hour file hit `ggml-vulkan
+GGML_ASSERT(wg0 <= maxComputeWorkGroupCount…)` on every VAD slice, for both
+the q4_k and bitnet ASR models — and correctly guessed the cause: the σ-VAE
+DECODER got a CPU fallback for exactly this device class in issue #52, but
+the ENCODERS (the ASR direction) missed it. The acoustic/semantic tokenizer
+encoders dispatch convs over the raw 24 kHz waveform; on drivers whose
+`maxComputeWorkGroupCount` is 65535 per dimension (Intel ANV, llvmpipe —
+NVIDIA reports 2^31) even an 11 s slice overflows.
+
+Fix 1: `vibevoice_backend_policy.h` — a pure, unit-tested decision table
+(`CRISPASR_VIBEVOICE_ENC_BACKEND={auto|cpu|gpu}`); auto pins the encoder
+graphs to the CPU backend on Vulkan+Intel/llvmpipe via
+`ggml_backend_sched_set_tensor_backend`, the same mechanism as the #52
+decoder fallback. Metal is deliberately NOT diverted. Along the way the #52
+decoder matcher turned out to be silently dead: it matched
+`ggml_backend_dev_name()`, which for Vulkan is the registry label
+("Vulkan0") — the marketing string with "Intel"/"llvmpipe" lives in
+`ggml_backend_dev_description()`. Both policies now check both strings.
+
+Fix 2 (second finding while proving the first): BitNet TQ1_0/TQ2_0 weights
+have no Vulkan kernels at all — post-encoder the load aborted with
+"pre-allocated tensor (lm.tok_emb.weight) in a buffer (Vulkan0) that cannot
+run the operation" (ggml-backend.cpp:940). The loader now scans tensor types
+and routes a TQ model entirely to CPU under Vulkan with a clear message
+(`CRISPASR_VIBEVOICE_TQ_VULKAN=1` keeps Vulkan for when kernels land).
+
+Proof, all on this VPS with mesa lavapipe (llvmpipe reports the same 65535
+limit as Intel; ggml hides CPU-class Vulkan devices unless
+`GGML_VK_VISIBLE_DEVICES=0`): the pre-fix behaviour
+(`CRISPASR_VIBEVOICE_ENC_BACKEND=gpu`) reproduces the reporter's abort
+bit-for-bit (rc=134, same assert, right after the encoder banner, on 33 s
+AND 11 s clips); the fixed defaults run the same 33 s clip end-to-end to the
+correct JFK transcript (encoder-diversion log line + TQ-guard log line both
+firing). Local Vulkan builds on this 8 GB box need the generated SPIR-V
+blob TUs compiled -O0 (a ~120 MB initializer file OOMs cc1plus at -O3) —
+kept as an uncommitted ggml-submodule note, not shipped.
+
+## #405 CUDA package on a pre-AVX2 CPU had NO cpu backend — variant CPU modules + graceful no-CPU failure, fixed 2026-08-30
+
+A Tesla P40 user (old pre-AVX2 Xeon) crashed on every run of the
+linux-x86_64-cuda package: `--no-gpu` died at `ggml-backend.cpp:471
+GGML_ASSERT(backend)` inside `core_gguf::load_weights` (parakeet), the GPU
+run died at `:595 GGML_ASSERT(device)` inside whisper LID's
+`make_buft_list`. Root cause chain: the CUDA legs built ONE `libggml-cpu.so`
+at AVX2+FMA+F16C; under `GGML_BACKEND_DL` its `ggml_backend_score()`
+(correctly) returns 0 on that host, ggml refuses the module, and the
+registry registers only CUDA — `registered backends: 1` in the report. The
+#380 ISA fail-fast could not fire because `has_feature()` needs the very
+module that was refused; `core_cpu_backend::init()` returned null; and both
+abort sites deref'd it. Reproduced bit-for-bit from the shipped v0.8.30
+tarball under `qemu-x86_64 -cpu Nehalem` (rc=134, same assert line).
+
+Fix, two layers. (1) Packaging: the CUDA legs now build
+`GGML_CPU_ALL_VARIANTS` — 14 `libggml-cpu-<variant>.so` modules from the
+always-works `x64` baseline up; the loader scores and picks the best at
+runtime, so the reporter's box gets sse42 and CUDA inference works. The
+package step asserts the x64 baseline shipped. (2) Robustness when no CPU
+module loads at all: `load_weights` rejects a null backend with a clean
+error (hermetic guard: tests/test-gguf-null-backend.cpp — the pre-fix test
+binary dies on the GGML_ASSERT), `make_buft_list` tolerates the missing CPU
+device with whisper/VAD loads failing properly, `cpu_device()` prints a
+one-time diagnosis naming the cause, and the CLI + server probe the CPU
+backend at startup and exit 1 with the `-cpu-legacy` pointer.
+
+Proof: `.github/workflows/linux-isa-fallback-verify.yml` (runs on every push
+touching the involved files) — native arm picks an AVX2+ variant and
+transcribes jfk.wav; the `qemu -cpu Nehalem` arm picks x64/sse42 and still
+transcribes; the no-modules arm exits 1 with the diagnosis instead of
+SIGABRT. Locally: skylakex picked natively, arm A exit 1 verified, and the
+shipped-tarball repro above. Kaggle P100
+(`chr1s4/crispasr-issue405-cuda-variants`) builds the exact release-CUDA-leg
+shape and runs parakeet-on-CUDA + whisper-LID end-to-end with the variant
+set, plus the graceful no-CPU arm. Also documented: `mise` installs get the
+default AVX2 asset — flavor guidance now in docs/install.md.
+
 ## #398 htdemucs GPU path aborted in ggml-cuda binbcast — F32-cast broadcast weights, fixed 2026-08-29
 
 The first `/v1/audio/separation` under `CRISPASR_HTDEMUCS_GGML=1` +
@@ -272,6 +451,29 @@ matrix; the graceful-degradation fix needs `GGML_BACKEND_DL`, which is a
 406-site refactor across 104 files, so it stays open. #337: no AMD hardware, so
 bounded rather than fixed — the length trigger does not reproduce on Metal at
 T=419.
+
+## #337 Qwen3-TTS HIP correctness fallback — 2026-08-30
+
+The reporter's later RX 7900 XTX traces isolated two native-HIP defects rather
+than the earlier suspected talker trajectory divergence: content-dependent
+codec-encoder drift on the Daphne reference, and all-NaN code-predictor logits
+for the 0.6B F16 talker. `3fb042e0` makes the shipping path fail-safe: ROCm
+routes the codec encoder to CPU and routes that affected predictor shape to CPU,
+while explicit native-HIP environment switches preserve the A/B diagnostic
+paths. Every predictor logit is now checked for finiteness before sampling, so a
+backend failure aborts instead of silently selecting token 30. The shared model
+runtime owns this routing, so CLI, C ABI, sessions, server, and bindings receive
+the same behavior.
+
+Proof is deliberately split. Hermetic qwen3-tts policy tests passed 17/17 with
+the available unit tier; CI run 33316132718 passed; release run 33316140657
+compiled and packaged the HIP leg. `.github/workflows/qwen3-tts-hip-proof.yml`
+is the real gfx1100 end-to-end gate (public 0.6B F16 model + Daphne clip + ASR
+round-trip), but it requires a self-hosted runner labelled `gfx1100`. GitHub has
+no AMD hosted runner for this repository and no self-hosted runner is currently
+registered, so these results prove the safe routing and HIP compilation, not
+that the two native kernels are repaired. Kaggle's NVIDIA workers cannot close
+that evidence gap.
 
 ## #343 / #361 / #362 docs TOC and the chat ABI bindings — merged 2026-08-16
 

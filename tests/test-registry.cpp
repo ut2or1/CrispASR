@@ -8,6 +8,8 @@
 #include "crispasr_model_registry.h"
 
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 
 TEST_CASE("registry: lookup known backend returns valid entry", "[unit][registry]") {
@@ -288,6 +290,11 @@ TEST_CASE("registry: chatterbox family keeps multilingual and finetunes separate
     REQUIRE(e.filename.find("kartoffelbox-turbo-t3") != std::string::npos);
     REQUIRE(e.companion_filename == "chatterbox-turbo-s3gen-f16.gguf");
 
+    REQUIRE(crispasr_registry_lookup("chatterbox-finnish-nano", e));
+    REQUIRE(e.filename == "chatterbox-finnish-nano-v0.1.3-t3-q8_0.gguf");
+    REQUIRE(e.url.find("JJarvinen/chatterbox-finnish-nano-GGUF") != std::string::npos);
+    REQUIRE(e.companion_filename == "chatterbox-turbo-s3gen-q8_0.gguf");
+
     REQUIRE(crispasr_registry_lookup("lahgtna-chatterbox", e));
     REQUIRE(e.filename == "chatterbox-t3-f16.gguf");
     REQUIRE(e.companion_filename == "chatterbox-s3gen-q8_0.gguf");
@@ -434,6 +441,24 @@ TEST_CASE("registry: piper has entry", "[unit][registry]") {
     REQUIRE(crispasr_registry_lookup("piper", e));
 }
 
+TEST_CASE("resolver: exact unregistered Piper voice wins over backend default (#397)", "[unit][registry]") {
+    const std::filesystem::path cache = "test-registry-piper-cache";
+    const std::string filename = "piper-en_GB-cori-medium-f16.gguf";
+    std::filesystem::create_directories(cache);
+    {
+        std::ofstream fixture(cache / filename, std::ios::binary);
+        fixture << "fixture";
+    }
+
+    const std::string resolved = crispasr_resolve_model(filename, "piper", /*quiet=*/true, cache.string(),
+                                                        /*allow_download=*/false);
+    CHECK(resolved == (cache / filename).string());
+    CHECK(resolved.find("lessac") == std::string::npos);
+
+    std::filesystem::remove(cache / filename);
+    std::filesystem::remove(cache);
+}
+
 TEST_CASE("registry: csm (sesame) has entry", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("csm", e));
@@ -442,6 +467,21 @@ TEST_CASE("registry: csm (sesame) has entry", "[unit][registry]") {
 TEST_CASE("registry: pocket-tts has entry", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("pocket-tts", e));
+}
+
+TEST_CASE("registry: Pocket-TTS language checkpoints are wired", "[unit][registry]") {
+    const std::pair<const char*, const char*> variants[] = {
+        {"pocket-tts-de", "pocket-tts-german-q8_0.gguf"},     {"pocket-tts-es", "pocket-tts-spanish-q8_0.gguf"},
+        {"pocket-tts-it", "pocket-tts-italian-q8_0.gguf"},    {"pocket-tts-pt", "pocket-tts-portuguese-q8_0.gguf"},
+        {"pocket-tts-fr", "pocket-tts-french_24l-q8_0.gguf"},
+    };
+    for (const auto& [backend, filename] : variants) {
+        CAPTURE(backend);
+        CrispasrRegistryEntry e;
+        REQUIRE(crispasr_registry_lookup(backend, e));
+        REQUIRE(e.filename == filename);
+        REQUIRE(e.url.find("cstr/pocket-tts-GGUF") != std::string::npos);
+    }
 }
 
 TEST_CASE("registry: speecht5 has entry", "[unit][registry]") {

@@ -42,6 +42,21 @@ catch_discover_tests(test-chatterbox-f0-simd
     TEST_SPEC "[unit][tts][chatterbox][simd]"
     PROPERTIES LABELS "unit;tts;chatterbox")
 
+# #421: these two suites memcmp three arms (hand reference, scalar kernel,
+# SIMD kernel) for BIT-exactness. On aarch64 GCC defaults to
+# -ffp-contract=fast and contracts the reference loop and the kernel loop
+# DIFFERENTLY (different mul/fmadd pairings), so the memcmp fails by
+# 2-6e-6 — a too-strict test, not a kernel bug (proven by cross-compiled
+# repro: 6/6 fail at default, 0/6 with contraction off; x86 agrees only
+# by accident because baseline x86-64 has no FMA). Pinning contraction
+# off for the TEST TUs keeps bit-exactness meaningful — all compared arms
+# live in this one TU — while shipped kernels keep fmadd (faster and more
+# accurate). MSVC does not contract by default, hence the guard.
+if (NOT MSVC)
+    set_source_files_properties(test-chatterbox-hift-simdconv.cpp test-cosyvoice3-hift-simdconv.cpp
+                                PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
+
 add_executable(test-chatterbox-hift-simdconv test-chatterbox-hift-simdconv.cpp)
 target_include_directories(test-chatterbox-hift-simdconv PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(test-chatterbox-hift-simdconv PRIVATE Catch2::Catch2WithMain Threads::Threads)
@@ -3288,6 +3303,22 @@ catch_discover_tests(test-loopfix-wiring
     PROPERTIES LABELS "unit;ngram-loop"
 )
 
+# ─── test-htdemucs-gates — unit tests for the #413/#414 path-selection
+# table (AUTO fused-GPU on real-GPU hosts, BLAS otherwise, env overrides).
+add_executable(test-htdemucs-gates
+    test-htdemucs-gates.cpp
+)
+target_include_directories(test-htdemucs-gates PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-htdemucs-gates PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-htdemucs-gates
+    TEST_SPEC "[htdemucs]"
+    PROPERTIES LABELS "unit;htdemucs"
+)
+
 # ─── test-uroman — Catch2 unit tests for core/uroman.h romanization.
 # Validates Arabic + Cyrillic romanization for CTC forced alignment (#252).
 add_executable(test-uroman
@@ -4297,6 +4328,22 @@ catch_discover_tests(test-kv-quant-roundtrip
     PROPERTIES LABELS "unit"
 )
 
+# PR #410: Chatterbox passes a per-layer KV-cache view directly to
+# flash_attn_ext. Pin both the non-zero layer offset and output equivalence to
+# the former materialized-contiguous path without requiring a model download.
+add_executable(test-flash-attn-kv-view test-flash-attn-kv-view.cpp)
+target_include_directories(test-flash-attn-kv-view PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-flash-attn-kv-view PRIVATE
+    Catch2::Catch2WithMain
+    ggml ggml-base crispasr_link_ggml_cpu
+)
+catch_discover_tests(test-flash-attn-kv-view
+    TEST_SPEC "[unit][chatterbox][attention]"
+    PROPERTIES LABELS "unit;chatterbox"
+)
+
 # ─── test-core-adaln — core/adaln.h AdaLN-Zero modulation (ggml graph) ────────
 add_executable(test-core-adaln test-core-adaln.cpp)
 target_include_directories(test-core-adaln PRIVATE
@@ -4810,14 +4857,43 @@ set_tests_properties(test-progress-output PROPERTIES
     LABELS "live;progress"
     TIMEOUT 300)
 
+# ─── test-arg-validation — offline regression: argument validation must run
+# BEFORE backend dispatch. The --diarize/--tinydiarize conflict and the
+# --language check used to sit after every crispasr_run_backend() early
+# return, so any dispatched run (-m auto, any --backend, a non-whisper GGUF)
+# skipped them and accepted the bad argument with exit 0. Also guards the
+# opposite hazard: whisper's 100-entry language table must NOT be applied to
+# backends it does not govern. No models, no network.
+add_test(NAME test-arg-validation
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-arg-validation.sh
+            $<TARGET_FILE:crispasr-cli>
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-arg-validation PROPERTIES
+    LABELS "unit;cli"
+    TIMEOUT 60)
+
+# ─── test-help-stdout — offline regression (#420): an explicitly requested
+# --help is program OUTPUT, so it must go to stdout with exit 0 and be
+# pipeable (`crispasr --help | less`). Usage printed for a usage ERROR must go
+# to stderr with a non-zero status instead. Parses args only — no models, no
+# network; SKIPs if the binary is absent.
+add_test(NAME test-help-stdout
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-help-stdout.sh
+            $<TARGET_FILE:crispasr-cli>
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-help-stdout PROPERTIES
+    LABELS "unit;cli"
+    TIMEOUT 60)
+
 # ─── test-dry-run-resolve — offline regression: --dry-run-resolve must preview
 # the same model a real `-m <alias>` would load (sub-variant keys, §166).
 # Needs only the built binary (no models / network); SKIPs if absent.
 add_test(NAME test-dry-run-resolve
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-dry-run-resolve.sh
+            $<TARGET_FILE:crispasr-cli>
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 set_tests_properties(test-dry-run-resolve PROPERTIES
-    LABELS "cli"
+    LABELS "unit;cli"
     TIMEOUT 60)
 
 # ─── test-bundle-linux-runtime — the Linux packaging bundler. Registered as a
@@ -4998,6 +5074,25 @@ set_tests_properties(test-omnivoice-seed PROPERTIES
     LABELS "live;tts;omnivoice;determinism"
     TIMEOUT 600)
 
+# ─── test-htdemucs-separate-live — #413/#414 htdemucs live test: BLAS
+# default on CPU hosts, forced fused-graph arm, per-stem parity between
+# them. SKIPs cleanly without the model.
+add_test(NAME test-htdemucs-separate-live
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-htdemucs-separate-live.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-htdemucs-separate-live PROPERTIES
+    LABELS "live;htdemucs"
+    TIMEOUT 900)
+
+# ─── test-quds-fa-live — #387 Quds v4 Persian ASR: exact-transcript check
+# on the bundled CC0 Common Voice clip. SKIPs without the model.
+add_test(NAME test-quds-fa-live
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-quds-fa-live.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-quds-fa-live PROPERTIES
+    LABELS "live;quds"
+    TIMEOUT 300)
+
 # ─── test-separate-live — §248 source separation smoke test. SKIPs cleanly
 # without a mel-band-roformer model (CRISPASR_MBR_MODEL / CRISPASR_MODELS_DIR).
 add_test(NAME test-separate-live
@@ -5143,6 +5238,56 @@ target_include_directories(test-chatterbox-attn-policy PRIVATE ${PROJECT_SOURCE_
 target_link_libraries(test-chatterbox-attn-policy PRIVATE Catch2::Catch2WithMain)
 catch_discover_tests(test-chatterbox-attn-policy
     TEST_SPEC "[attn-policy]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-gguf-null-backend — issue #405 null-backend load guard (hermetic, unit)
+add_executable(test-gguf-null-backend test-gguf-null-backend.cpp)
+target_include_directories(test-gguf-null-backend PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-gguf-null-backend PRIVATE Catch2::Catch2WithMain crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
+catch_discover_tests(test-gguf-null-backend
+    TEST_SPEC "[null-backend]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-vibevoice-enc-policy — issue #418 encoder-backend decision table (hermetic, unit)
+add_executable(test-vibevoice-enc-policy test-vibevoice-enc-policy.cpp)
+target_include_directories(test-vibevoice-enc-policy PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-vibevoice-enc-policy PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-vibevoice-enc-policy
+    TEST_SPEC "[enc-policy]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-silero-lid-quant-refusal — #409 tail: quantized silero weights refused (hermetic, unit)
+add_executable(test-silero-lid-quant-refusal test-silero-lid-quant-refusal.cpp)
+target_include_directories(test-silero-lid-quant-refusal PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-silero-lid-quant-refusal PRIVATE Catch2::Catch2WithMain silero-lid)
+catch_discover_tests(test-silero-lid-quant-refusal
+    TEST_SPEC "[silero-quant]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-script-mismatch — issue #419 wrong-script warning decision table (hermetic, unit)
+add_executable(test-script-mismatch test-script-mismatch.cpp)
+target_include_directories(test-script-mismatch PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-script-mismatch PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-script-mismatch
+    TEST_SPEC "[script-mismatch]"
     PROPERTIES
         LABELS unit
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
@@ -5312,6 +5457,26 @@ target_link_libraries(test-piano-transcription PRIVATE
 )
 catch_discover_tests(test-piano-transcription
     TEST_SPEC "[piano-transcription]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test - basic-pitch — live integration tests (#250)
+add_executable(test-basic-pitch
+    test_basic_pitch_live.cpp
+)
+target_include_directories(test-basic-pitch PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-basic-pitch PRIVATE
+    Catch2::Catch2WithMain
+    basic-pitch
+)
+catch_discover_tests(test-basic-pitch
+    TEST_SPEC "[basic-pitch]"
     PROPERTIES
         LABELS live
         SKIP_RETURN_CODE 4

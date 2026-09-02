@@ -370,13 +370,13 @@ Drop-in DE checkpoint variants:
 - `--backend kartoffel-orpheus-de-synthetic` — [`cstr/kartoffel-orpheus-3b-german-synthetic-GGUF`](https://huggingface.co/cstr/kartoffel-orpheus-3b-german-synthetic-GGUF), 4 speakers + 12 emotions + 5 outbursts via `{Speaker} - {Emotion}: {text}` syntax
 - `--backend lex-au-orpheus-de` — `lex-au/Orpheus-3b-German-FT-Q8_0.gguf`
 
-### chatterbox / chatterbox-turbo / kartoffelbox-turbo / lahgtna-chatterbox
+### chatterbox / chatterbox-turbo / chatterbox-nano / chatterbox-finnish-nano / kartoffelbox-turbo / lahgtna-chatterbox
 
 Two-GGUF runtime: T3 AR text→speech-tokens + S3Gen flow-matching
 speech-tokens→24 kHz waveform.
 
 **T3 (Text-to-Tokens)**: Llama-30L for base/lahgtna, GPT-2-24L for
-turbo/kartoffelbox-turbo.
+turbo/kartoffelbox-turbo, and GPT-2-small for Nano and its Finnish fine-tune.
 
 **S3Gen (Tokens-to-Speech)**: UpsampleConformerEncoder + UNet1D CFM +
 HiFTGenerator vocoder. Turbo uses 2-step meanflow CFM (vs 10-step cosine
@@ -425,6 +425,8 @@ are rejected at load time. They pin ResembleAI revision
 Variants:
 - [`cstr/chatterbox-GGUF`](https://huggingface.co/cstr/chatterbox-GGUF) — base multilingual v3
 - [`cstr/chatterbox-turbo-GGUF`](https://huggingface.co/cstr/chatterbox-turbo-GGUF) — 350M distilled, meanflow
+- [`cstr/chatterbox-nano-GGUF`](https://huggingface.co/cstr/chatterbox-nano-GGUF) — GPT-2-small T3, reusing Turbo S3Gen
+- [`JJarvinen/chatterbox-finnish-nano-GGUF`](https://huggingface.co/JJarvinen/chatterbox-finnish-nano-GGUF) — Finnish-only Nano v0.1.3 fine-tune, reusing Turbo S3Gen
 - [`cstr/kartoffelbox-turbo-GGUF`](https://huggingface.co/cstr/kartoffelbox-turbo-GGUF) — German fine-tune of turbo
 - [`cstr/lahgtna-chatterbox-v1-GGUF`](https://huggingface.co/cstr/lahgtna-chatterbox-v1-GGUF) — Arabic fine-tune of base
 
@@ -955,7 +957,8 @@ Kyutai Pocket TTS (100M, CC-BY-4.0 plus gated-use conditions). Continuous-latent
 architecturally unique: no codebook, no RVQ, no softmax.
 
 Pipeline: SentencePiece (4000 vocab) → 4001×1024 embedding LUT →
-6-layer causal transformer (1024D, 16H, RoPE, pre-norm LN, GELU FFN)
+6-layer causal transformer (24 layers for the French preview; 1024D, 16H,
+RoPE, pre-norm LN, GELU FFN)
 → consistency head (SimpleMLPAdaLN: 6 ResBlocks + FinalLayer, 512D,
 AdaLN conditioning from timestep embeddings + backbone output) →
 one-step Lagrangian Self Distillation (LSD) decode → continuous 32-dim
@@ -966,6 +969,11 @@ mono PCM. Voice cloning: ref audio → Mimi VAE encoder → linear project
 → prepend to transformer KV cache. Model:
 `kyutai/pocket-tts-without-voice-cloning` (no encoder weights) or
 `kyutai/pocket-tts` (full, with encoder for voice cloning).
+
+The registry ships English plus the upstream German, Spanish, Italian,
+Portuguese, and French checkpoints. `--backend pocket-tts -m auto -l <code>`
+selects the matching GGUF before download; the runtime itself remains a single
+metadata-driven implementation, including the checkpoint's layer count.
 
 ### parler-tts
 

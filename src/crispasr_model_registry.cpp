@@ -93,6 +93,21 @@ constexpr Entry k_registry[] = {
      "~458 MB", nullptr, nullptr},
     {"parakeet", "parakeet-tdt-0.6b-v3-q4_k.gguf",
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF/resolve/main/parakeet-tdt-0.6b-v3-q4_k.gguf", "~467 MB", nullptr, nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)"},
+    // Quds v4 (#387): Persian ASR, FastConformer-RNNT fine-tune of the
+    // CC-BY-4.0 NVIDIA stt_fa base, by hojreh (converted from the author's
+    // ONNX export — models/convert-nemo-rnnt-onnx-to-gguf.py). Rides the
+    // parakeet runtime (pred_layers=1, no CTC head in the export). Q8_0 is
+    // transcript-identical to F16 on the CV-fa validation clips.
+    {"quds", "quds-v4-fa-q8_0.gguf",
+     "https://huggingface.co/cstr/quds-v4-fa-GGUF/resolve/main/quds-v4-fa-q8_0.gguf", "~122 MB", nullptr, nullptr,
+     nullptr,
+     "CC-BY-NC-4.0 — NON-COMMERCIAL use only (Quds v4 by hojreh, "
+     "https://huggingface.co/hojreh/Quds-v4-onnx; base model nvidia/stt_fa_fastconformer_hybrid_large, CC-BY-4.0)"},
+    {"quds-fa", "quds-v4-fa-q8_0.gguf",
+     "https://huggingface.co/cstr/quds-v4-fa-GGUF/resolve/main/quds-v4-fa-q8_0.gguf", "~122 MB", nullptr, nullptr,
+     nullptr,
+     "CC-BY-NC-4.0 — NON-COMMERCIAL use only (Quds v4 by hojreh, "
+     "https://huggingface.co/hojreh/Quds-v4-onnx; base model nvidia/stt_fa_fastconformer_hybrid_large, CC-BY-4.0)"},
     {"canary", "canary-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/canary-1b-v2-GGUF/resolve/main/canary-1b-v2-q4_k.gguf", "~600 MB", nullptr, nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/nvidia/canary-1b-v2)"},
     {"canary-qwen", "canary-qwen-2.5b-q8_0.gguf",
@@ -730,6 +745,14 @@ constexpr Entry k_registry[] = {
     {"piano-transcription", "piano-transcription-f16.gguf",
      "https://huggingface.co/cstr/piano-transcription-GGUF/resolve/main/piano-transcription-f16.gguf",
      "~77 MB"},
+    // Basic Pitch (Spotify, ICASSP 2022, Apache-2.0): polyphonic note events.
+    // Tiny — the CQT kernels are most of the file. NOTE: the HF repo is not
+    // uploaded yet, so auto-download will 404; build the GGUF locally with
+    // models/convert-basic-pitch-to-gguf.py against the nmp.onnx that ships
+    // inside the basic-pitch package.
+    {"basic-pitch", "basic-pitch-f16.gguf",
+     "https://huggingface.co/cstr/basic-pitch-GGUF/resolve/main/basic-pitch-f16.gguf",
+     "~110 KB"},
     {"moss-tts", "moss-tts-v1.5-q4_k.gguf",
      "https://huggingface.co/cstr/moss-tts-v1.5-GGUF/resolve/main/moss-tts-v1.5-q4_k.gguf",
      "~5 GB",
@@ -939,6 +962,14 @@ constexpr Entry k_registry[] = {
      "chatterbox-turbo-s3gen-q8_0.gguf",
      "https://huggingface.co/cstr/chatterbox-turbo-GGUF/resolve/main/chatterbox-turbo-s3gen-q8_0.gguf",
      "~627 MB"},
+    // Finnish-only Nano fine-tune, published and live-tested by the model
+    // author. It uses the unchanged Turbo MeanFlow S3Gen companion.
+    {"chatterbox-finnish-nano", "chatterbox-finnish-nano-v0.1.3-t3-q8_0.gguf",
+     "https://huggingface.co/JJarvinen/chatterbox-finnish-nano-GGUF/resolve/main/chatterbox-finnish-nano-v0.1.3-t3-q8_0.gguf",
+     "~329 MB",
+     "chatterbox-turbo-s3gen-q8_0.gguf",
+     "https://huggingface.co/cstr/chatterbox-turbo-GGUF/resolve/main/chatterbox-turbo-s3gen-q8_0.gguf",
+     "~627 MB"},
     // Kartoffelbox-Turbo: SebastianBodza's German fine-tune of
     // chatterbox-turbo. Same GPT-2 T3 arch as Turbo; reuses the
     // chatterbox-turbo S3Gen verbatim (companion points at the Turbo
@@ -1006,6 +1037,23 @@ constexpr Entry k_registry[] = {
     {"pocket-tts", "pocket-tts-english-f16.gguf",
      "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-english-f16.gguf",
      "~220 MB"},
+    {"pocket-tts-de", "pocket-tts-german-q8_0.gguf",
+     "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-german-q8_0.gguf",
+     "~124 MB"},
+    {"pocket-tts-es", "pocket-tts-spanish-q8_0.gguf",
+     "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-spanish-q8_0.gguf",
+     "~124 MB"},
+    {"pocket-tts-it", "pocket-tts-italian-q8_0.gguf",
+     "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-italian-q8_0.gguf",
+     "~124 MB"},
+    {"pocket-tts-pt", "pocket-tts-portuguese-q8_0.gguf",
+     "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-portuguese-q8_0.gguf",
+     "~124 MB"},
+    // French is upstream's 24-layer preview checkpoint; the other languages
+    // use the distilled 6-layer releases.
+    {"pocket-tts-fr", "pocket-tts-french_24l-q8_0.gguf",
+     "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-french_24l-q8_0.gguf",
+     "~365 MB"},
     // IndexTTS-1.5: GPT-2 AR mel-code generator + BigVGAN vocoder.
     // Voice cloning via Conformer+Perceiver conditioning on reference audio.
     // Two-file setup: GPT (mel codes) + BigVGAN (vocoder). Q8_0 recommended
@@ -1033,6 +1081,17 @@ constexpr Entry k_registry[] = {
     {"f5-tts", "f5-tts-v1-base-f16.gguf",
      "https://huggingface.co/cstr/f5-tts-GGUF/resolve/main/f5-tts-v1-base-f16.gguf",
      "~953 MB", nullptr, nullptr},
+    // Raon-OpenTTS 0.3B (#387-adj): KRAFTON's F5-TTS DiT + sbhifigan16k
+    // HiFi-GAN, English zero-shot voice cloning. Rides the f5-tts runtime
+    // (same DiT; norm_type=rmsnorm is dead metadata with post_norm=False).
+    // Single GGUF carries DiT + HiFi-GAN + the shipped slaney mel fb/window.
+    // TTS→ASR roundtrip validated on Kaggle (word overlap 0.90). CPU vocoder
+    // is slow (~40s/utterance); a GPU build runs the DiT on-device.
+    {"raon", "raon-opentts-0.3b-f16.gguf",
+     "https://huggingface.co/cstr/raon-opentts-0.3b-GGUF/resolve/main/raon-opentts-0.3b-f16.gguf",
+     "~959 MB", nullptr, nullptr, nullptr,
+     "CC-BY-NC-4.0 — NON-COMMERCIAL use only (KRAFTON/Raon-OpenTTS-0.3B, "
+     "https://huggingface.co/KRAFTON/Raon-OpenTTS-1B)"},
     // Irodori-TTS v3 500M: RF-DiT flow-matching TTS with zero-shot voice
     // cloning via DAC-VAE latents. 48 kHz output, Japanese-focused.
     {"irodori-tts", "irodori-tts-500m-v3-q4_k.gguf",
@@ -1549,7 +1608,7 @@ static std::string effective_license(const Entry& e) {
         return "CC-BY-4.0 (see the original model card)";
     if (b == "outetts")
         return "CC-BY-NC-SA-4.0 (see https://huggingface.co/OuteAI/OuteTTS-0.3-1B)";
-    if (b == "pocket-tts")
+    if (b == "pocket-tts" || b.rfind("pocket-tts-", 0) == 0)
         return "pocket-tts-terms (CC-BY-4.0 plus gated-use conditions; see https://huggingface.co/kyutai/pocket-tts)";
     if (b == "lid-fasttext176")
         return "CC-BY-NC-4.0 (see https://huggingface.co/facebook/fasttext-language-identification)";
@@ -1825,6 +1884,14 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
         if (f) {
             fclose(f);
             return model_arg;
+        }
+        // A bare explicit filename is also allowed to live in the configured
+        // model roots.  Preserve its exact identity: do this before registry
+        // matching, whose backend fallback may name a different voice (#397).
+        if (model_arg.find_first_of("/\\") == std::string::npos) {
+            const std::string cached_explicit = crispasr_cache::probe_cached_file(model_arg, cache_dir_override);
+            if (!cached_explicit.empty())
+                return cached_explicit;
         }
 
         // File not found — try registry-based download when permitted.

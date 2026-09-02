@@ -179,6 +179,10 @@
 #include "piano_transcription.h"
 #define CA_HAVE_PIANO_TRANSCRIPTION 1
 #endif
+#if __has_include("basic_pitch.h")
+#include "basic_pitch.h"
+#define CA_HAVE_BASIC_PITCH 1
+#endif
 #if __has_include("moss_tts.h")
 #include "moss_tts.h"
 #define CA_HAVE_MOSS_TTS 1
@@ -1878,6 +1882,12 @@ struct crispasr_session {
 #ifdef CA_HAVE_PIANO_TRANSCRIPTION
     piano_transcription_ctx* piano_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_BASIC_PITCH
+    // Second model behind the same note-event surface. It is NOT
+    // piano-specific, but the task and the flat note layout are identical, so
+    // it reuses crispasr_session_piano* rather than growing a parallel API.
+    basic_pitch_ctx* basic_pitch_ctx_ = nullptr;
+#endif
 #ifdef CA_HAVE_MOSS_TTS
     moss_tts_context* moss_tts_ctx = nullptr;
 #endif
@@ -2814,6 +2824,20 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_BASIC_PITCH
+    if (s->backend == "basic-pitch" || s->backend == "basic_pitch") {
+        basic_pitch_params p = basic_pitch_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = s->use_gpu;
+        s->basic_pitch_ctx_ = basic_pitch_init_from_file(model_path, p);
+        if (!s->basic_pitch_ctx_) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_MOSS_TTS
     if (s->backend == "moss-tts" || s->backend == "moss_tts" || s->backend == "mosstts") {
         moss_tts_context_params p = moss_tts_context_default_params();
@@ -3086,8 +3110,11 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
     }
 #endif
 #ifdef CA_HAVE_CHATTERBOX
-    if (s->backend == "chatterbox" || s->backend == "chatterbox-tts" || s->backend == "kartoffelbox" ||
-        s->backend == "chatterbox_turbo") {
+    if (s->backend == "chatterbox" || s->backend == "chatterbox-tts" || s->backend == "chatterbox-turbo" ||
+        s->backend == "chatterbox_turbo" || s->backend == "chatterbox-nano" || s->backend == "chatterbox_nano" ||
+        s->backend == "chatterbox-finnish-nano" || s->backend == "chatterbox_finnish_nano" ||
+        s->backend == "kartoffelbox" || s->backend == "kartoffelbox-turbo" || s->backend == "kartoffelbox_turbo" ||
+        s->backend == "lahgtna" || s->backend == "lahgtna-chatterbox" || s->backend == "lahgtna-chatterbox-v1") {
         s->backend = "chatterbox";
         chatterbox_context_params p = chatterbox_context_default_params();
         p.n_threads = s->n_threads;
@@ -3351,7 +3378,9 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
     }
 #endif
 #ifdef CA_HAVE_POCKET
-    if (s->backend == "pocket-tts" || s->backend == "pocket_tts" || s->backend == "pocket") {
+    if (s->backend == "pocket-tts" || s->backend == "pocket_tts" || s->backend == "pocket" ||
+        s->backend == "pocket-tts-de" || s->backend == "pocket-tts-es" || s->backend == "pocket-tts-it" ||
+        s->backend == "pocket-tts-pt" || s->backend == "pocket-tts-fr") {
         s->backend = "pocket-tts";
         pocket_tts_context_params p = pocket_tts_context_default_params();
         p.n_threads = s->n_threads;
@@ -4304,6 +4333,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #ifdef CA_HAVE_PIANO_TRANSCRIPTION
     list += ",piano-transcription";
 #endif
+#ifdef CA_HAVE_BASIC_PITCH
+    list += ",basic-pitch";
+#endif
 #ifdef CA_HAVE_MOSS_TTS
     list += ",moss-tts";
 #endif
@@ -4368,7 +4400,8 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
     list += ",kokoro";
 #endif
 #ifdef CA_HAVE_CHATTERBOX
-    list += ",chatterbox";
+    list +=
+        ",chatterbox,chatterbox-turbo,chatterbox-nano,chatterbox-finnish-nano,kartoffelbox-turbo,lahgtna-chatterbox";
 #endif
 #ifdef CA_HAVE_BANANAMIND_TTS
     list += ",bananamind-tts";
@@ -4389,7 +4422,7 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
     list += ",dots-tts";
 #endif
 #ifdef CA_HAVE_POCKET
-    list += ",pocket-tts";
+    list += ",pocket-tts,pocket-tts-de,pocket-tts-es,pocket-tts-it,pocket-tts-pt,pocket-tts-fr";
 #endif
 #ifdef CA_HAVE_FASTPITCH
     list += ",fastpitch";
@@ -4892,9 +4925,61 @@ static void apply_session_hygiene(crispasr_session_result* r, bool include_merge
     r->segments = std::move(res);
 }
 
+// Session mirror of the CLI's sole_language() guard (0face104): the C ABI
+// reimplements dispatch inline and never routes through the CLI adapters, so
+// bindings callers could still ask moonshine for German and get English back
+// at rc 0 — the classic three-surface trap. Table mirrors the adapters'
+// sole_language() overrides; comparison goes through whisper_lang_id() so
+// "german" is caught like "de", raw string compare as the out-of-table
+// fallback — the same semantics as examples/cli/crispasr_run.cpp.
+static const char* session_sole_language(const std::string& backend, const std::string& model_path) {
+    if (backend == "moonshine" || backend == "moonshine-streaming") {
+        // Fine-tune variants (moonshine-base-de etc.) share the arch string, so
+        // a session can legitimately hold a non-English moonshine under the
+        // plain backend name. A filename hint of a language variant means the
+        // en-only claim is not safe — no guard rather than a false reject
+        // (mirrors the CLI's filename-detect fix for moonshine-de).
+        auto has = [&](const char* n) { return model_path.find(n) != std::string::npos; };
+        if (has("-de") || has("_de") || has("-ar") || has("_ar"))
+            return nullptr;
+        return "en";
+    }
+    if (backend == "gigaam")
+        return "ru";
+    // Upstream card: English-only preview; zh/de audio yields rough English
+    // translations at rc 0 without this (verified 2026-09-02). The diarize
+    // sibling is a different checkpoint and is deliberately NOT listed here.
+    if (backend == "moss-transcribe")
+        return "en";
+    return nullptr;
+}
+
+static bool session_language_satisfiable(const crispasr_session* s, const char* per_call_lang) {
+    const char* sole = session_sole_language(s->backend, s->model_path);
+    if (!sole)
+        return true;
+    // Per-call hint wins over the sticky source_language, matching the
+    // precedence transcribe itself uses.
+    const std::string want = (per_call_lang && *per_call_lang) ? per_call_lang : s->source_language;
+    if (want.empty() || want == "auto")
+        return true;
+    const int want_id = whisper_lang_id(want.c_str());
+    const int have_id = whisper_lang_id(sole);
+    const bool same = (want_id != -1 && have_id != -1) ? (want_id == have_id) : (want == sole);
+    if (!same) {
+        fprintf(stderr,
+                "crispasr[session]: backend '%s' is %s-only and cannot transcribe '%s'; "
+                "set language to '%s' or 'auto', or pick a multilingual backend\n",
+                s->backend.c_str(), sole, want.c_str(), sole);
+    }
+    return same;
+}
+
 CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_session* s, const float* pcm,
                                                                     int n_samples, const char* language) {
     if (!s || !pcm || n_samples <= 0)
+        return nullptr;
+    if (!session_language_satisfiable(s, language))
         return nullptr;
 
     // Best-of-N: run N independent transcriptions and keep the one with the
@@ -8208,6 +8293,16 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
         return (tail[0] == '.' && (tail[1] == 'w' || tail[1] == 'W') && (tail[2] == 'a' || tail[2] == 'A') &&
                 (tail[3] == 'v' || tail[3] == 'V'));
     };
+    auto ends_with_safetensors = [](const char* p) {
+        static const char suffix[] = ".safetensors";
+        size_t n = std::strlen(p), m = sizeof(suffix) - 1;
+        if (n < m)
+            return false;
+        for (size_t i = 0; i < m; ++i)
+            if (std::tolower((unsigned char)p[n - m + i]) != suffix[i])
+                return false;
+        return true;
+    };
 
     // Record whether this is a voice CLONE (reference WAV) as opposed to a
     // preset/bank voice name. Every backend arm below reaches the same
@@ -8562,6 +8657,8 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
 #endif
 #ifdef CA_HAVE_POCKET
     if (s->pocket_tts_ctx) {
+        if (ends_with_safetensors(path))
+            return pocket_tts_load_voice_embedding(s->pocket_tts_ctx, path);
         // Pocket TTS (Mimi encoder) expects 24 kHz. Load directly at that
         // rate — avoids the lossy 16k→24k double-resample.
         if (!ends_with_wav(path))
@@ -10457,13 +10554,35 @@ CA_EXPORT int crispasr_session_piano(crispasr_session* s, const float* pcm_16k, 
         return n;
     }
 #endif
+#ifdef CA_HAVE_BASIC_PITCH
+    if (s->basic_pitch_ctx_) {
+        // NOTE THE PARAMETER NAME: `pcm_16k` is a piano-transcription-ism.
+        // Basic Pitch wants 22050 Hz — callers must ask
+        // crispasr_session_piano_sample_rate() rather than assume 16 kHz.
+        s->piano_last_notes.clear();
+        basic_pitch_result res{};
+        if (basic_pitch_transcribe(s->basic_pitch_ctx_, pcm_16k, n_samples, &res) != 0)
+            return -1;
+        s->piano_last_notes.reserve((size_t)res.n_notes * 4);
+        for (int i = 0; i < res.n_notes; i++) {
+            const basic_pitch_note_event& e = res.notes[i];
+            s->piano_last_notes.push_back(e.start_time * 1000.0f);
+            s->piano_last_notes.push_back(e.end_time * 1000.0f);
+            s->piano_last_notes.push_back((float)e.midi_note);
+            s->piano_last_notes.push_back((float)e.velocity);
+        }
+        const int n = res.n_notes;
+        basic_pitch_result_free(&res);
+        return n;
+    }
+#endif
     return -1;
 }
 
 CA_EXPORT int crispasr_session_piano_n_notes(crispasr_session* s) {
     if (!s)
         return 0;
-#ifdef CA_HAVE_PIANO_TRANSCRIPTION
+#if defined(CA_HAVE_PIANO_TRANSCRIPTION) || defined(CA_HAVE_BASIC_PITCH)
     return (int)(s->piano_last_notes.size() / 4);
 #else
     return 0;
@@ -10492,6 +10611,10 @@ CA_EXPORT int crispasr_session_piano_sample_rate(crispasr_session* s) {
 #ifdef CA_HAVE_PIANO_TRANSCRIPTION
     if (s->piano_ctx)
         return (int)piano_transcription_sample_rate(s->piano_ctx);
+#endif
+#ifdef CA_HAVE_BASIC_PITCH
+    if (s->basic_pitch_ctx_)
+        return (int)basic_pitch_sample_rate(s->basic_pitch_ctx_);
 #endif
     return 0;
 }
@@ -10625,6 +10748,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_PIANO_TRANSCRIPTION
     if (s->piano_ctx)
         piano_transcription_free(s->piano_ctx);
+#endif
+#ifdef CA_HAVE_BASIC_PITCH
+    if (s->basic_pitch_ctx_)
+        basic_pitch_free(s->basic_pitch_ctx_);
 #endif
 #ifdef CA_HAVE_MOSS_TTS
     if (s->moss_tts_ctx)
@@ -12138,6 +12265,35 @@ CA_EXPORT int32_t crispasr_speaker_db_enroll2(const char* dir_path, const char* 
     if (!consent_attested)
         return 2;
     return speaker_db_enroll(dir_path, name, embedding, dim, /*consent_attested=*/true) ? 0 : 1;
+}
+
+// Enroll through an OPEN handle (writes the .spkr AND updates the handle's
+// in-memory profiles, honouring a retained roster — see speaker_db.h).
+// rc: 0 = enrolled and matchable on this handle; 1 = write failed;
+// 2 = consent refused; 3 = written to disk but outside this handle's
+// retained roster (reopen with the name claimed to match against it).
+CA_EXPORT int32_t crispasr_speaker_db_enroll_into(void* db, const char* name, const float* embedding, int32_t dim,
+                                                  int32_t consent_attested) {
+    if (!consent_attested)
+        return 2;
+    auto* sdb = (struct speaker_db*)db;
+    const int32_t before = (int32_t)speaker_db_count(sdb);
+    if (!speaker_db_enroll_into(sdb, name, embedding, dim, /*consent_attested=*/true))
+        return 1;
+    // Distinguish "matchable now" from "on disk only" so bindings can
+    // surface the roster note instead of a silent non-match later.
+    const int32_t after = (int32_t)speaker_db_count(sdb);
+    if (after == before) {
+        // Not added: either it replaced an existing profile (matchable —
+        // fine) or the roster excluded it. Probe by name.
+        for (int32_t i = 0; i < after; i++) {
+            const char* n = speaker_db_name(sdb, i);
+            if (n && std::strcmp(n, name) == 0)
+                return 0;
+        }
+        return 3;
+    }
+    return 0;
 }
 
 // Legacy ungated enrollment — removed (issue #266); fails loudly at runtime.

@@ -32,6 +32,7 @@
 
 #include "cosyvoice3_prompt_policy.h" // #334 min/max token-per-text laws
 
+#include "core/quant_bcast.h"
 #include "core/attention.h"
 #include "core/bpe.h"
 #include "core/ffn.h"
@@ -533,6 +534,7 @@ inline bool cv3_sched_alloc(cosyvoice3_tts_context* ctx, ggml_cgraph* gf) {
                                 : ggml_backend_sched_alloc_graph(ctx->sched, gf);
 }
 inline ggml_status cv3_sched_compute(cosyvoice3_tts_context* ctx, ggml_cgraph* gf) {
+    core_quant_bcast::audit(gf, "cosyvoice3");
     if (ctx->dispatch_cpu) // §304 hybrid: compute HiFT on the CPU backend
         return ggml_backend_graph_compute(ctx->backend_cpu, gf);
     return ctx->use_gpu_gallocr ? ggml_backend_graph_compute(ctx->backend, gf)
@@ -3114,6 +3116,22 @@ ggml_tensor* cv3_dit_block_apply(ggml_context* ctx0, ggml_tensor* x, ggml_tensor
 // Batch-aware variant used by the CFM classifier-free-guidance path. x is
 // [d,T,B]; modulation is shared across the batch because both CFG branches
 // use the same Euler timestep.
+// #416: in the CFG-batched DiT block every activation carries B in ne2 (B=2 by
+// default), so each quantized weight below is a BROADCASTING mul_mat src0. The
+// runtime detector counts 133 per graph — q/k/v/o and both FFN layers across all
+// 22 blocks — far more than reading the source suggested. Gated; the fold is an
+// exact restatement (a linear is per-token independent). See core/quant_bcast.h.
+static inline ggml_tensor* CV3MM(ggml_context* c, ggml_tensor* w, ggml_tensor* x) {
+    // Default ON: verified on the shipped q4_k LLM + q8_0 flow — the detector
+    // reports 133 broadcasting quantized matmuls per graph without the fold and
+    // 0 with it, and the synthesized audio is equivalent (identical RMS
+    // 0.084879, magnitude-spectrum correlation 1.000000; not byte-identical
+    // because a flow-matching ODE amplifies reduction-order differences).
+    // CRISPASR_COSYVOICE3_FOLD_BCAST=0 restores the legacy path.
+    static const bool fold = core_quant_bcast::fold_enabled("CRISPASR_COSYVOICE3_FOLD_BCAST", true);
+    return fold ? core_quant_bcast::mul_mat_fold_batch(c, w, x) : ggml_mul_mat(c, w, x);
+}
+
 ggml_tensor* cv3_dit_block_apply_batched(ggml_context* ctx0, ggml_tensor* x, ggml_tensor* t_silu,
                                          ggml_tensor* positions, const cv3_dit_block& b, int d, int n_h, int hd,
                                          float rope_theta) {
@@ -3136,9 +3154,9 @@ ggml_tensor* cv3_dit_block_apply_batched(ggml_context* ctx0, ggml_tensor* x, ggm
     ggml_tensor* h_a = ggml_add(ctx0, lnx_a, ggml_mul(ctx0, lnx_a, scale_msa));
     h_a = ggml_add(ctx0, h_a, shift_msa);
 
-    ggml_tensor* Q = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_q_w, h_a), b.attn_q_b);
-    ggml_tensor* K = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_k_w, h_a), b.attn_k_b);
-    ggml_tensor* V = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_v_w, h_a), b.attn_v_b);
+    ggml_tensor* Q = ggml_add(ctx0, CV3MM(ctx0, b.attn_q_w, h_a), b.attn_q_b);
+    ggml_tensor* K = ggml_add(ctx0, CV3MM(ctx0, b.attn_k_w, h_a), b.attn_k_b);
+    ggml_tensor* V = ggml_add(ctx0, CV3MM(ctx0, b.attn_v_w, h_a), b.attn_v_b);
     Q = ggml_reshape_4d(ctx0, Q, d, 1, T, B);
     K = ggml_reshape_4d(ctx0, K, d, 1, T, B);
     Q = ggml_rope_ext(ctx0, Q, positions, nullptr, hd, GGML_ROPE_TYPE_NORMAL, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f,
@@ -3153,15 +3171,19 @@ ggml_tensor* cv3_dit_block_apply_batched(ggml_context* ctx0, ggml_tensor* x, ggm
     V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
     ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, attn_scale, 0.0f, 0.0f);
     attn = ggml_reshape_3d(ctx0, attn, d, T, B);
-    attn = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_o_w, attn), b.attn_o_b);
+    // #416: attn_o_w is quantized and `attn` carries B in ne2 — B=2 whenever CFG
+    // batching is on, which is the default. This is the only one of the four
+    // attn_o_w sites with a 3-D src1; the others reshape to 2-D and are
+    // unaffected. Gated OFF — see src/core/quant_bcast.h.
+    attn = ggml_add(ctx0, CV3MM(ctx0, b.attn_o_w, attn), b.attn_o_b);
     ggml_tensor* x_after_attn = ggml_add(ctx0, x, ggml_mul(ctx0, attn, gate_msa));
 
     ggml_tensor* lnx_f = ggml_norm(ctx0, x_after_attn, ln_eps);
     ggml_tensor* h_f = ggml_add(ctx0, lnx_f, ggml_mul(ctx0, lnx_f, scale_mlp));
     h_f = ggml_add(ctx0, h_f, shift_mlp);
-    ggml_tensor* ff = ggml_add(ctx0, ggml_mul_mat(ctx0, b.ffn_l1_w, h_f), b.ffn_l1_b);
+    ggml_tensor* ff = ggml_add(ctx0, CV3MM(ctx0, b.ffn_l1_w, h_f), b.ffn_l1_b);
     ff = ggml_gelu(ctx0, ff);
-    ff = ggml_add(ctx0, ggml_mul_mat(ctx0, b.ffn_l2_w, ff), b.ffn_l2_b);
+    ff = ggml_add(ctx0, CV3MM(ctx0, b.ffn_l2_w, ff), b.ffn_l2_b);
     return ggml_add(ctx0, x_after_attn, ggml_mul(ctx0, ff, gate_mlp));
 }
 
@@ -3212,7 +3234,7 @@ ggml_cgraph* cv3_build_dit_full_graph(cosyvoice3_tts_context* ctx, int T_mel) {
     ggml_set_output(normed);
 
     // proj_out: Linear(dit_dim, mel_dim).
-    ggml_tensor* mel_out = ggml_mul_mat(ctx0, f.dit_proj_out_w, normed); // (mel_dim, T_mel)
+    ggml_tensor* mel_out = CV3MM(ctx0, f.dit_proj_out_w, normed); // (mel_dim, T_mel)
     mel_out = ggml_add(ctx0, mel_out, f.dit_proj_out_b);
     ggml_set_name(mel_out, "dit_full_out");
     ggml_set_output(mel_out);
@@ -3433,7 +3455,7 @@ ggml_cgraph* cv3_build_estimator_full_graph(cosyvoice3_tts_context* ctx, int T_m
     normed = ggml_add(ctx0, normed, nshift);
 
     // ---- proj_out: Linear(dit_dim, mel_dim) ----
-    ggml_tensor* dphi = ggml_mul_mat(ctx0, f.dit_proj_out_w, normed); // (mel, T_mel)
+    ggml_tensor* dphi = CV3MM(ctx0, f.dit_proj_out_w, normed); // (mel, T_mel)
     dphi = ggml_add(ctx0, dphi, f.dit_proj_out_b);
     ggml_set_name(dphi, "est_dphi");
     ggml_set_output(dphi);
@@ -3517,7 +3539,7 @@ ggml_cgraph* cv3_build_estimator_cfg_graph(cosyvoice3_tts_context* ctx, int T_me
     ggml_tensor* lnx = ggml_norm(ctx0, h, ln_eps);
     ggml_tensor* normed = ggml_add(ctx0, lnx, ggml_mul(ctx0, lnx, nscale));
     normed = ggml_add(ctx0, normed, nshift);
-    ggml_tensor* dphi = ggml_add(ctx0, ggml_mul_mat(ctx0, f.dit_proj_out_w, normed), f.dit_proj_out_b);
+    ggml_tensor* dphi = ggml_add(ctx0, CV3MM(ctx0, f.dit_proj_out_w, normed), f.dit_proj_out_b);
     ggml_set_name(dphi, "cfg_dphi");
     ggml_set_output(dphi);
     ggml_build_forward_expand(gf, dphi);
@@ -4901,8 +4923,14 @@ extern "C" int cosyvoice3_tts_init_hift_from_file(struct cosyvoice3_tts_context*
     // Shared core_hift_simdconv handles validation, tensor dequantization and
     // rollback; this model adapter contributes only the bound tensors + causal padding.
     {
+        // DEFAULT ON since the quiet-box A/B (chr1str/crispasr-simdconv-cpu-ab,
+        // Xeon avx512f, packed 72/72): hift_vocoder median 4400→4114 ms
+        // (1.07x), on top of the contributor's 1.34x on Zen 4 — wins on every
+        // platform measured, output within 1 int16 LSB, roundtrip exact.
+        // Set =0 to restore the ggml path. (Chatterbox's sibling gate stays
+        // OPT-IN: the same kernel REGRESSED s3gen 5.4 % on this Xeon.)
         const char* env2 = crispasr_env::get("CRISPASR_COSYVOICE3_SIMDCONV");
-        const bool requested = env2 && *env2 && *env2 != '0';
+        const bool requested = !env2 || !*env2 || *env2 != '0';
         const bool cpu_hift = core_cpu_backend::is_cpu(hift_backend);
         core_hift_simdconv::Packer pack(requested && cpu_hift);
         const int dilations[3] = {1, 3, 5};

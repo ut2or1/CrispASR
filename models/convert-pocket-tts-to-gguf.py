@@ -325,8 +325,19 @@ def remap_mimi_from_original(key: str) -> str | None:
 # ── Main converter ──────────────────────────────────────────────────
 
 def convert(args):
-    model_dir = load_model_dir(args.input)
     lang = args.language
+    # A repository contains every language checkpoint and each includes the
+    # shared Mimi stack. Pulling the broad ``*.safetensors`` pattern wastes
+    # several GB and can exhaust a conversion runner. Keep this conversion
+    # strictly language-local while retaining both current and legacy layouts.
+    model_dir = load_model_dir(args.input, [
+        f"languages/{lang}/*",
+        f"pocket_tts/config/{lang}.yaml",
+        f"config/{lang}.yaml",
+        f"{lang}.yaml",
+        "model.safetensors",
+        "tokenizer.model",
+    ])
 
     # Find config YAML
     config_path = None
@@ -361,6 +372,14 @@ def convert(args):
     flow_head = dict(FLOW_HEAD_HPARAMS)
     mimi = dict(MIMI_HPARAMS)
     seanet_ratios = list(SEANET_RATIOS)
+
+    # The gated weights repository does not carry the YAML files from the
+    # pocket-tts source repository. All distilled releases match the English
+    # 6-layer defaults above; the French preview is deliberately undistilled.
+    # Without this override its 24 transformer blocks are written but runtime
+    # metadata says six, silently discarding three quarters of the model.
+    if config is None and lang == "french_24l":
+        hparams["num_layers"] = 24
 
     if config:
         fl = config.get('flow_lm', {})

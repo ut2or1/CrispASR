@@ -42,6 +42,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_glm_asr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_kyutai_stt_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_firered_asr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_backend_lang(const char* sole_lang);
 std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_streaming_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_gemma4_e2b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_omniasr_backend();
@@ -65,6 +66,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_sensevoice_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_sidon_backend();
 std::unique_ptr<CrispasrBackend> crispasr_create_miotts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_create_piano_transcription_backend();
+std::unique_ptr<CrispasrBackend> crispasr_create_basic_pitch_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_voxcpm2_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_voxcpm2_vae_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_cosyvoice3_tts_backend();
@@ -116,7 +118,7 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
     if (name == "nemotron" || name == "nemotron-streaming" || name == "nemotron-3.5" || name == "nemotron-asr" ||
         name == "nemotron-speech-streaming")
         return crispasr_make_nemotron_backend();
-    if (name == "parakeet" || name == "reazonspeech")
+    if (name == "parakeet" || name == "reazonspeech" || name == "quds" || name == "quds-fa")
         return crispasr_make_parakeet_backend();
     if (name == "canary")
         return crispasr_make_canary_backend();
@@ -167,6 +169,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_create_miotts_backend();
     if (name == "piano-transcription" || name == "piano_transcription" || name == "piano-trans")
         return crispasr_create_piano_transcription_backend();
+    if (name == "basic-pitch" || name == "basic_pitch" || name == "basicpitch")
+        return crispasr_create_basic_pitch_backend();
     if (name == "moss-tts-local" || name == "moss_tts_local" || name == "moss-tts-local-v1.5" ||
         name == "mosstts-local" || name == "moss-tts-local-transformer")
         return crispasr_make_moss_tts_local_backend();
@@ -180,7 +184,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_orpheus_backend();
     if (name == "chatterbox" || name == "chatterbox-tts" || name == "chatterbox-base" || name == "chatterbox-turbo" ||
         name == "chatterbox_turbo" || name == "chatterbox-nano" || name == "chatterbox_nano" ||
-        name == "kartoffelbox" || name == "kartoffelbox-turbo" || name == "kartoffelbox_turbo" || name == "lahgtna" ||
+        name == "chatterbox-finnish-nano" || name == "chatterbox_finnish_nano" || name == "kartoffelbox" ||
+        name == "kartoffelbox-turbo" || name == "kartoffelbox_turbo" || name == "lahgtna" ||
         name == "lahgtna-chatterbox" || name == "lahgtna-chatterbox-v1")
         return crispasr_make_chatterbox_backend();
     if (name == "tada" || name == "tada-tts" || name == "tada-1b" || name == "tada-tts-1b" || name == "tada-3b" ||
@@ -198,11 +203,15 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
     if (name == "outetts" || name == "outetts-tts" || name == "oute-tts" || name == "outetts-0.3-1b")
         return crispasr_make_outetts_backend();
 #endif
-    if (name == "f5-tts" || name == "f5_tts" || name == "f5tts" || name == "f5")
+    if (name == "f5-tts" || name == "f5_tts" || name == "f5tts" || name == "f5" || name == "raon" || name == "raon-1b")
         return crispasr_make_f5_tts_backend();
     if (name == "irodori-tts" || name == "irodori_tts" || name == "irodori")
         return crispasr_make_irodori_tts_backend();
-    if (name == "pocket-tts" || name == "pocket_tts" || name == "pockettts" || name == "pocket")
+    if (name == "pocket-tts" || name == "pocket_tts" || name == "pockettts" || name == "pocket" ||
+        name == "pocket-tts-de" || name == "pocket-tts-german" || name == "pocket-tts-es" ||
+        name == "pocket-tts-spanish" || name == "pocket-tts-it" || name == "pocket-tts-italian" ||
+        name == "pocket-tts-pt" || name == "pocket-tts-portuguese" || name == "pocket-tts-fr" ||
+        name == "pocket-tts-french")
         return crispasr_make_pocket_tts_backend();
     if (name == "fastpitch" || name == "fastpitch-tts" || name == "fastpitch_tts")
         return crispasr_make_fastpitch_backend();
@@ -248,7 +257,12 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_moonshine_streaming_backend();
     if (name == "gemma4-e2b" || name == "gemma4e2b" || name == "gemma4")
         return crispasr_make_gemma4_e2b_backend();
-    if (name == "moonshine" || name == "moonshine-de" || name == "moonshine-tiny-de")
+    // The de fine-tunes share the runtime but are NOT en-only — the variant's
+    // language must ride along or the sole-language guard rejects `-l de` and
+    // the #227 auto shortcut mislabels output (found 2026-09-02).
+    if (name == "moonshine-de" || name == "moonshine-tiny-de")
+        return crispasr_make_moonshine_backend_lang("de");
+    if (name == "moonshine")
         return crispasr_make_moonshine_backend();
     if (name.rfind("omniasr", 0) == 0)
         return crispasr_make_omniasr_backend();
@@ -303,6 +317,7 @@ std::vector<std::string> crispasr_list_backends() {
         "gigaam",
         "parakeet",
         "reazonspeech",
+        "quds-fa",
         "canary",
         "canary-qwen",
         "lfm2-audio",
@@ -329,6 +344,7 @@ std::vector<std::string> crispasr_list_backends() {
         "qwen3-tts",
         "miotts",
         "piano-transcription",
+        "basic-pitch",
         "moss-tts",
         "moss-tts-local",
         "vibevoice-1.5b",
@@ -343,6 +359,7 @@ std::vector<std::string> crispasr_list_backends() {
         "chatterbox",
         "chatterbox-turbo",
         "chatterbox-nano",
+        "chatterbox-finnish-nano",
         "kartoffelbox-turbo",
         "lahgtna-chatterbox",
         "tada",
@@ -351,7 +368,13 @@ std::vector<std::string> crispasr_list_backends() {
         "tada-3b-ml",
         "indextts",
         "f5-tts",
+        "raon",
         "pocket-tts",
+        "pocket-tts-de",
+        "pocket-tts-es",
+        "pocket-tts-it",
+        "pocket-tts-pt",
+        "pocket-tts-fr",
         "fastpitch",
         "kokoro",
         "melotts",
@@ -632,6 +655,9 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "parakeet";
     if (contains_ci("reazonspeech"))
         return "parakeet";
+    if (contains_ci("quds"))
+        return "parakeet"; // #387: Persian FastConformer-RNNT rides the parakeet runtime
+
     // Check "fastconformer-ctc" / "stt_en_fc_ctc" style filenames before
     // the broader "canary" match so users who drop a NeMo standalone
     // model next to a canary aligner pick the right backend.
@@ -680,8 +706,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "outetts";
     if (contains_ci("indextts"))
         return "indextts";
-    if (contains_ci("f5-tts") || contains_ci("f5tts") || contains_ci("F5TTS"))
-        return "f5-tts";
+    if (contains_ci("f5-tts") || contains_ci("f5tts") || contains_ci("F5TTS") || contains_ci("raon"))
+        return "f5-tts"; // #387 Raon-OpenTTS rides the f5-tts runtime
     if (contains_ci("pocket-tts") || contains_ci("pocket_tts") || contains_ci("pockettts"))
         return "pocket-tts";
     if (contains_ci("fastpitch"))
@@ -726,6 +752,11 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "gemma4-e2b";
     if (contains_ci("moonshine") && contains_ci("streaming"))
         return "moonshine-streaming";
+    // The de fine-tune must resolve to its variant name so the factory hands
+    // it the right sole language (a plain "moonshine" would be treated as
+    // en-only by the pre-dispatch guard).
+    if (contains_ci("moonshine") && contains_ci("-de"))
+        return "moonshine-de";
     if (contains_ci("moonshine"))
         return "moonshine";
     if (contains_ci("fun-asr") || contains_ci("funasr") || contains_ci("fun_asr"))
@@ -766,6 +797,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "miotts";
     if (contains_ci("piano") && contains_ci("transcription"))
         return "piano-transcription";
+    if (contains_ci("basic") && contains_ci("pitch"))
+        return "basic-pitch";
     if (contains_ci("gigaam"))
         return "gigaam";
     if (contains_ci("ggml-") && contains_ci(".bin"))

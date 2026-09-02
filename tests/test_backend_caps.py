@@ -61,6 +61,8 @@ _SRC_TGT_BACKENDS = {
     "cosyvoice3-tts",
     "chatterbox",
     "chatterbox-turbo",
+    "chatterbox-nano",
+    "chatterbox-finnish-nano",
     "kartoffelbox-turbo",
     "lahgtna-chatterbox",
     "qwen3-tts",
@@ -82,6 +84,8 @@ _SRC_TGT_BACKENDS = {
 _VOICE_CLONING_BACKENDS = {
     "chatterbox",
     "chatterbox-turbo",
+    "chatterbox-nano",
+    "chatterbox-finnish-nano",
     "kartoffelbox-turbo",
     "lahgtna-chatterbox",
     "vibevoice-1.5b",
@@ -99,6 +103,7 @@ class TestVoiceCloningSessionDispatch(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         source = (REPO / "src" / "crispasr_c_api.cpp").read_text(encoding="utf-8")
+        cls.c_api_source = source
         cls.set_codec = source.split("CA_EXPORT int crispasr_session_set_codec_path", 1)[1].split(
             "CA_EXPORT int crispasr_session_set_voice", 1
         )[0]
@@ -108,6 +113,51 @@ class TestVoiceCloningSessionDispatch(unittest.TestCase):
         cls.synthesize = source.split("static float* crispasr_session_synthesize_raw_impl", 1)[1].split(
             "static int crispasr_session_set_prompt", 1
         )[0]
+
+    def test_chatterbox_aliases_are_openable_and_advertised_by_the_c_abi(self):
+        for backend in (
+            "chatterbox-turbo",
+            "chatterbox-nano",
+            "chatterbox-finnish-nano",
+            "kartoffelbox-turbo",
+            "lahgtna-chatterbox",
+        ):
+            with self.subTest(backend=backend):
+                self.assertIn(f's->backend == "{backend}"', self.c_api_source)
+                available = self.c_api_source.split("CA_EXPORT int crispasr_session_available_backends", 1)[1]
+                self.assertIn(backend, available)
+
+    def test_pocket_tts_language_variants_are_openable_and_advertised_by_the_c_abi(self):
+        available = self.c_api_source.split("CA_EXPORT int crispasr_session_available_backends", 1)[1]
+        for backend in (
+            "pocket-tts-de",
+            "pocket-tts-es",
+            "pocket-tts-it",
+            "pocket-tts-pt",
+            "pocket-tts-fr",
+        ):
+            with self.subTest(backend=backend):
+                self.assertIn(f's->backend == "{backend}"', self.c_api_source)
+                self.assertIn(backend, available)
+
+    def test_pocket_tts_language_selects_registry_variant_before_download(self):
+        run_source = (REPO / "examples" / "cli" / "crispasr_run.cpp").read_text(encoding="utf-8")
+        route = run_source.index("#411 — Pocket-TTS")
+        resolve = run_source.index("crispasr_resolve_model_cli", route)
+        for language, backend in (
+            ("de", "pocket-tts-de"),
+            ("es", "pocket-tts-es"),
+            ("it", "pocket-tts-it"),
+            ("pt", "pocket-tts-pt"),
+            ("fr", "pocket-tts-fr"),
+        ):
+            self.assertIn(f'params.language == "{language}"', run_source[route:resolve])
+            self.assertIn(f'routed = "{backend}"', run_source[route:resolve])
+
+    def test_pocket_tts_french_preview_keeps_all_24_layers(self):
+        converter = (REPO / "models" / "convert-pocket-tts-to-gguf.py").read_text(encoding="utf-8")
+        self.assertIn('lang == "french_24l"', converter)
+        self.assertIn('hparams["num_layers"] = 24', converter)
 
     def test_omnivoice_dispatches_audio_tokenizer(self):
         self.assertIn(
@@ -146,6 +196,11 @@ class TestVoiceCloningSessionDispatch(unittest.TestCase):
             "core_tts_lang::is_cross_lingual(output_lang, s->tts_reference_language)",
             self.synthesize,
         )
+
+    def test_finnish_nano_does_not_inject_a_nonexistent_language_token(self):
+        source = (REPO / "examples" / "cli" / "crispasr_backend_chatterbox.cpp").read_text(encoding="utf-8")
+        self.assertIn('contains_ci(params.backend, "finnish-nano")', source)
+        self.assertIn("if (!finnish_nano && !output_lang.empty()", source)
 
     def test_omnivoice_dispatches_wav_and_reference_text(self):
         self.assertIn(
