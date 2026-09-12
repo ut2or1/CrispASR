@@ -25,6 +25,13 @@ on:
         required: false
         default: ''
         type: string
+      cuda12_probe_arch:
+        description: >-
+          Dry-run diagnostic only: override the Windows CUDA 12 architecture
+          list to shorten a package probe. Empty keeps the release matrix.
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -2040,7 +2047,7 @@ jobs:
           files: release/crispasr-windows-x86_64-cpu-legacy.zip
           fail_on_unmatched_files: true
 
-  # ── Windows CUDA (dynamic, requires NVIDIA driver on target machine) ─────────
+  # ── Windows CUDA (dynamic, driverless CPU fallback) ──────────────────────────
   build-windows-cuda:
     if: ${{ !inputs.only || inputs.only == 'build-windows-cuda' }}
     # Pin to windows-2022 — CUDA 12.8 doesn't support VS 2026 (MSVC 14.51).
@@ -2082,7 +2089,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_CUDA=ON ^
             -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
-            -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual" ^
+            -DCMAKE_CUDA_ARCHITECTURES="${{ (inputs.tag == '' && inputs.cuda12_probe_arch) || '60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual' }}" ^
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j %NUMBER_OF_PROCESSORS%
 
@@ -2139,6 +2146,31 @@ jobs:
           }
           $hashLines | Set-Content release\crispasr-windows-x86_64-cuda-runtime-sha256.txt
 
+          # The hosted runner has no NVIDIA driver. This simultaneously proves
+          # that nvcuda.dll is delay-loaded (the process reaches main) and that
+          # both user-facing diagnostic surfaces identify the CUDA 12 build.
+          function Invoke-CrispProbe([string]$argument, [string]$stem) {
+            $stdout = Join-Path $env:RUNNER_TEMP "$stem.stdout.txt"
+            $stderr = Join-Path $env:RUNNER_TEMP "$stem.stderr.txt"
+            $probe = Start-Process -FilePath "$full\crispasr.exe" -ArgumentList $argument `
+              -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+            $output = (Get-Content -Raw $stdout) + (Get-Content -Raw $stderr)
+            Write-Host $output
+            if ($probe.ExitCode -ne 0) { throw "$argument exited $($probe.ExitCode)" }
+            return $output
+          }
+          $version = Invoke-CrispProbe '--version' 'crispasr-cuda12-version'
+          if ($version -notmatch 'cuda toolkit\s*:\s*12\.' -or
+              $version -notmatch 'cuda runtime ABI\s*:\s*12\b') {
+            throw 'Packaged CUDA 12 --version does not identify its toolkit/runtime ABI'
+          }
+          $diagnostics = Invoke-CrispProbe '--diagnostics' 'crispasr-cuda12-diagnostics'
+          if ($diagnostics -notmatch 'cuda toolkit\s*:\s*12\.' -or
+              $diagnostics -notmatch 'cuda runtime ABI\s*:\s*12\b') {
+            throw 'Packaged CUDA 12 --diagnostics does not identify its toolkit/runtime ABI'
+          }
+          Write-Host 'WIN_CUDA12_REPORT_OK — driverless --version and --diagnostics identify CUDA 12'
+
       - uses: actions/upload-artifact@v4
         with:
           name: crispasr-windows-x86_64-cuda
@@ -2164,7 +2196,7 @@ jobs:
             release/crispasr-windows-x86_64-cuda-runtime-sha256.txt
           fail_on_unmatched_files: true
 
-  # ── Windows CUDA 13 (dynamic, requires NVIDIA driver on target machine) ──────
+  # ── Windows CUDA 13 (dynamic, driverless CPU fallback) ───────────────────────
   # #400: CUDA-13-native companion to build-windows-cuda above. CUDA 13 ships
   # cudart64_13.dll / cublas64_13.dll / cublasLt64_13.dll — NOT ABI-compatible
   # with the *_12 runtime — so users on a CUDA-13-era driver/toolkit get a
@@ -2263,6 +2295,13 @@ jobs:
           Copy-Item LICENSE $split\
           Copy-Item THIRD_PARTY_NOTICES.txt $split\
           Compress-Archive -Path $split -DestinationPath release\crispasr-windows-x86_64-cuda13-non-cuda.zip -CompressionLevel Optimal
+
+          $version = (& "$full\crispasr.exe" --version 2>&1) -join "`n"
+          Write-Host $version
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch 'cuda toolkit\s*:\s*13\.' -or
+              $version -notmatch 'cuda runtime ABI\s*:\s*13\b') {
+            throw 'Packaged CUDA 13 executable does not identify its CUDA 13 toolkit/runtime ABI'
+          }
 
           $hashLines = $cudaDlls | ForEach-Object {
             $hash = (Get-FileHash (Join-Path $runtime $_.Name) -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -2490,6 +2529,15 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           NOTES="RELEASE_NOTES_${TAG}.md"
-          if [ -f "$NOTES" ]; then
-            gh release edit "$TAG" --notes-file "$NOTES"
+          # Hard-fail rather than skip. `if [ -f ]` meant a tag cut without its
+          # notes file published GitHub's auto-generated commit list as the
+          # release body and reported success — the one step whose whole job is
+          # the human-facing text, silently doing nothing. Old tags are
+          # unaffected: a re-run checks out that tag's own tree, which carries
+          # its own notes file even after main stops keeping the older ones.
+          if [ ! -f "$NOTES" ]; then
+            echo "::error::$NOTES is missing at $TAG. Write it, or attach the body by hand:"
+            echo "::error::  gh release edit $TAG --notes-file <file>"
+            exit 1
           fi
+          gh release edit "$TAG" --notes-file "$NOTES"

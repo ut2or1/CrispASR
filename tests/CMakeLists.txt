@@ -3319,6 +3319,41 @@ catch_discover_tests(test-htdemucs-gates
     PROPERTIES LABELS "unit;htdemucs"
 )
 
+# ─── test-sidon-rpe-gates — unit tests for the #416 follow-up length-aware
+# relative-position-bias selection (AUTO expand on GPU while its extra
+# transient footprint fits the budget, bucket-direct otherwise; an explicit
+# CRISPASR_SIDON_RPE is never auto-overridden).
+add_executable(test-sidon-rpe-gates
+    test-sidon-rpe-gates.cpp
+)
+target_include_directories(test-sidon-rpe-gates PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-sidon-rpe-gates PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-sidon-rpe-gates
+    TEST_SPEC "[sidon]"
+    PROPERTIES LABELS "unit;sidon"
+)
+
+# ─── test-mel-band-gates — unit tests for the Change-176 path-selection
+# table (mirrors test-htdemucs-gates; AUTO fused-graph-GPU on real-GPU hosts,
+# CPU path otherwise, env overrides, #414 review semantics).
+add_executable(test-mel-band-gates
+    test-mel-band-gates.cpp
+)
+target_include_directories(test-mel-band-gates PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-mel-band-gates PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-mel-band-gates
+    TEST_SPEC "[mel-band]"
+    PROPERTIES LABELS "unit;mel-band"
+)
+
 # ─── test-uroman — Catch2 unit tests for core/uroman.h romanization.
 # Validates Arabic + Cyrillic romanization for CTC forced alignment (#252).
 add_executable(test-uroman
@@ -4213,6 +4248,19 @@ catch_discover_tests(test-core-cqt
     PROPERTIES LABELS "unit;core"
 )
 
+# ─── test-core-midi-writer — core/midi_writer.h Standard MIDI File output ─────
+# Parses the produced bytes back with an independent reader rather than
+# diffing a golden blob: the failures that matter (stuck notes, a note-off
+# ordered after the next note-on at the same tick, zero-length notes) are
+# structural. Header-only, so no backend link.
+add_executable(test-core-midi-writer test-core-midi-writer.cpp)
+target_include_directories(test-core-midi-writer PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-core-midi-writer PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-core-midi-writer
+    TEST_PREFIX "core-midi-writer: "
+    PROPERTIES LABELS "unit;core"
+)
+
 # ─── test-core-istft — core/istft.h inverse-STFT overlap-add ──────────────────
 # Verifies the extracted iSTFT against an independent full-DFT reference
 # (fuzzed) + a forward-STFT→iSTFT sinusoid round-trip.
@@ -4634,6 +4682,10 @@ function(add_ggml_audio_ops_backend_test TEST_TARGET BACKEND_DEF BACKEND_TARGET)
         SKIP_RETURN_CODE 4)
 endfunction()
 
+add_ggml_audio_ops_backend_test(test_ggml_audio_ops_cpu
+    CRISPASR_TEST_BACKEND_CPU
+    crispasr_link_ggml_cpu)
+
 if(APPLE AND TARGET ggml-metal)
     add_ggml_audio_ops_backend_test(test_ggml_audio_ops_metal
         "CRISPASR_TEST_BACKEND_METAL;CRISPASR_TEST_COL2IM_F16"
@@ -4884,6 +4936,32 @@ add_test(NAME test-help-stdout
 set_tests_properties(test-help-stdout PROPERTIES
     LABELS "unit;cli"
     TIMEOUT 60)
+
+# ─── test-asr-env-parity — offline regression for the generic environment
+# parity harness. A fake CLI verifies mismatch/error classification, environment
+# scrubbing, aggregate variants, collision-free artifacts, and output-dir safety.
+add_test(NAME test-asr-env-parity
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-asr-env-parity.sh
+            ${PROJECT_SOURCE_DIR}/tools/asr-env-parity.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-asr-env-parity PROPERTIES
+    LABELS "unit;cli;parity"
+    TIMEOUT 60)
+
+# ─── test-input-exit-code — an undecodable input must reach the EXIT CODE.
+# cli.cpp's LEGACY whisper path (no --backend, a .bin model) printed to stderr
+# and `continue`d, so a run where every file failed still exited 0, against
+# docs/cli.md's published "rc 0 <=> every required stage succeeded". The unified
+# dispatcher already returned 20; only this path was affected. Labelled
+# unit;gh — NOT live — and pointed at the committed models/for-tests-ggml-tiny.bin
+# so it genuinely executes in CI (`ctest -L "gh|unit" -E live`) rather than
+# skipping, which is how the cli-labelled tests stayed dead (70112d10).
+add_test(NAME test-input-exit-code
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-input-exit-code.sh $<TARGET_FILE:crispasr-cli>
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-input-exit-code PROPERTIES
+    LABELS "unit;gh;cli"
+    TIMEOUT 300)
 
 # ─── test-dry-run-resolve — offline regression: --dry-run-resolve must preview
 # the same model a real `-m <alias>` would load (sub-variant keys, §166).
@@ -5457,6 +5535,26 @@ target_link_libraries(test-piano-transcription PRIVATE
 )
 catch_discover_tests(test-piano-transcription
     TEST_SPEC "[piano-transcription]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test - mt3 — live integration tests (#250, multi-instrument)
+# Stage parity is the crispasr-diff mt3 harness's job; this covers the C ABI
+# contract, the decode-budget knob and the drum/instrument invariants.
+add_executable(test-mt3 test_mt3_live.cpp)
+target_include_directories(test-mt3 PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-mt3 PRIVATE
+    Catch2::Catch2WithMain
+    mt3
+)
+catch_discover_tests(test-mt3
+    TEST_SPEC "[mt3]"
     PROPERTIES
         LABELS live
         SKIP_RETURN_CODE 4

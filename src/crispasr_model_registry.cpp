@@ -350,6 +350,9 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/data2vec-audio-960h-GGUF/resolve/main/data2vec-audio-base-960h-q4_k.gguf", "~60 MB", nullptr, nullptr},
     {"vibevoice", "vibevoice-asr-q4_k.gguf",
      "https://huggingface.co/cstr/vibevoice-asr-GGUF/resolve/main/vibevoice-asr-q4_k.gguf", "~4.5 GB", nullptr, nullptr},
+    {"vibevoice-streaming", "vibevoice-asr-streaming-1.5b-q4_k.gguf",
+     "https://huggingface.co/cstr/vibevoice-asr-streaming-1.5b-GGUF/resolve/main/vibevoice-asr-streaming-1.5b-q4_k.gguf",
+     "~1.86 GB", nullptr, nullptr},
     {"vibevoice-bitnet", "vibevoice-asr-bitnet-tq2.gguf",
      "https://huggingface.co/cstr/vibevoice-asr-bitnet-GGUF/resolve/main/vibevoice-asr-bitnet-tq2.gguf", "~1.6 GB",
      nullptr, nullptr},
@@ -753,6 +756,16 @@ constexpr Entry k_registry[] = {
     {"basic-pitch", "basic-pitch-f16.gguf",
      "https://huggingface.co/cstr/basic-pitch-GGUF/resolve/main/basic-pitch-f16.gguf",
      "~110 KB"},
+    // Magenta MT3 (ISMIR 2021 / ICLR 2022, Apache-2.0): multi-instrument
+    // transcription — every note carries a General-MIDI program. The GGUF is
+    // published (d8bdabcd) and auto-download resolves; an earlier note here
+    // said the repo was not uploaded and `-m auto` would 404, which stopped
+    // being true and would now send a reader to build it by hand for nothing.
+    // models/convert-mt3-to-gguf.py still rebuilds it from the T5X checkpoint
+    // at gs://mt3/checkpoints/mt3 if you want your own.
+    {"mt3", "mt3-f16.gguf",
+     "https://huggingface.co/cstr/mt3-GGUF/resolve/main/mt3-f16.gguf",
+     "~96 MB"},
     {"moss-tts", "moss-tts-v1.5-q4_k.gguf",
      "https://huggingface.co/cstr/moss-tts-v1.5-GGUF/resolve/main/moss-tts-v1.5-q4_k.gguf",
      "~5 GB",
@@ -1085,12 +1098,21 @@ constexpr Entry k_registry[] = {
     // HiFi-GAN, English zero-shot voice cloning. Rides the f5-tts runtime
     // (same DiT; norm_type=rmsnorm is dead metadata with post_norm=False).
     // Single GGUF carries DiT + HiFi-GAN + the shipped slaney mel fb/window.
-    // TTS→ASR roundtrip validated on Kaggle (word overlap 0.90). CPU vocoder
-    // is slow (~40s/utterance); a GPU build runs the DiT on-device.
+    // TTS→ASR roundtrip validated on Kaggle (word overlap 0.90). The HiFi-GAN
+    // vocoder runs through the shared GPU-capable core_hifigan graph (#387);
+    // the DiT ODE loop is the remaining cost and runs on-device in a GPU build.
     {"raon", "raon-opentts-0.3b-f16.gguf",
      "https://huggingface.co/cstr/raon-opentts-0.3b-GGUF/resolve/main/raon-opentts-0.3b-f16.gguf",
      "~959 MB", nullptr, nullptr, nullptr,
      "CC-BY-NC-4.0 — NON-COMMERCIAL use only (KRAFTON/Raon-OpenTTS-0.3B, "
+     "https://huggingface.co/KRAFTON/Raon-OpenTTS-0.3B)"},
+    // Raon-OpenTTS 1B: larger DiT (dim=1408 depth=28 heads=24x64 ff_mult=4);
+    // same sbhifigan16k mel + HiFi-GAN vocoder as the 0.3B. Roundtrip validated
+    // on Kaggle. Use --backend raon-1b (or -m auto with this key).
+    {"raon-1b", "raon-opentts-1b-f16.gguf",
+     "https://huggingface.co/cstr/raon-opentts-1b-GGUF/resolve/main/raon-opentts-1b-f16.gguf",
+     "~2.8 GB", nullptr, nullptr, nullptr,
+     "CC-BY-NC-4.0 — NON-COMMERCIAL use only (KRAFTON/Raon-OpenTTS-1B, "
      "https://huggingface.co/KRAFTON/Raon-OpenTTS-1B)"},
     // Irodori-TTS v3 500M: RF-DiT flow-matching TTS with zero-shot voice
     // cloning via DAC-VAE latents. 48 kHz output, Japanese-focused.

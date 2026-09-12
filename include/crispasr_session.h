@@ -339,6 +339,19 @@ CRISPASR_SESSION_API int crispasr_registry_lookup_by_filename_abi(const char* fi
                                                                   int32_t filename_cap, char* out_url, int32_t url_cap,
                                                                   char* out_size, int32_t size_cap);
 CRISPASR_SESSION_API int crispasr_registry_list_backends_abi(char* out_csv, int32_t out_cap);
+
+// #433: what VERBS can this backend perform? detect_backend() returns a name
+// only, and several backends serve more than one purpose (voxcpm: tts + s2s;
+// gemma: asr + translate). Capabilities are comma-separated names such as
+// "tts,voice-cloning,auto-download".
+//   crispasr_backend_caps_abi:      one backend. >=0 = length, -3 = unknown name.
+//   crispasr_backend_caps_list_abi: all of them, "<name>\t<caps>\n" per line.
+//                                   Call with (nullptr, 0) to SIZE it: the return
+//                                   is the negative required byte count. A too-small
+//                                   buffer returns the same, so a caller never has
+//                                   to guess and a truncation can never pass as data.
+CRISPASR_SESSION_API int crispasr_backend_caps_abi(const char* backend, char* out_csv, int32_t out_cap);
+CRISPASR_SESSION_API int crispasr_backend_caps_list_abi(char* out_buf, int32_t out_cap);
 typedef enum crispasr_registry_artifact_kind {
     CRISPASR_REGISTRY_ARTIFACT_PRIMARY = 0,
     CRISPASR_REGISTRY_ARTIFACT_COMPANION = 1,
@@ -411,6 +424,17 @@ CRISPASR_SESSION_API int crispasr_session_set_codec_path(crispasr_session* s, co
 // has no voice-setting implementation.
 CRISPASR_SESSION_API int crispasr_session_set_voice(crispasr_session* s, const char* path,
                                                     const char* ref_text_or_null);
+
+// #432: same thing, from samples you already hold — no temp file of your own.
+// `pcm` is mono float32 at `sample_rate`; `ref_text_or_null` follows the same
+// rule as above (required for WAV-style cloning on backends that need it).
+//
+// The library serialises the samples to a temp WAV internally and routes them
+// through crispasr_session_set_voice, so consent handling and the Art. 50(4)
+// marking behave identically for both entry points — a clone must not acquire a
+// different audit trail by arriving as a buffer instead of a path.
+CRISPASR_SESSION_API int crispasr_session_set_voice_samples(crispasr_session* s, const float* pcm, int32_t n_samples,
+                                                            int32_t sample_rate, const char* ref_text_or_null);
 // #201: configure the TADA encoder + aligner GGUFs used for on-the-fly voice
 // cloning, i.e. crispasr_session_set_voice(s, "ref.wav", "<transcript>") on a
 // TADA session. The .wav clone path is opt-in (experimental) — enable it with

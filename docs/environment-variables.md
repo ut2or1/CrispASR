@@ -159,6 +159,7 @@ surviving artifact. Applied on both the CLI and the session C-ABI.
 | `CRISPASR_MAES_BETA` / `_MAES_GAMMA` / `_MAES_NUM_STEPS` | MAES beam-search parameters. |
 | `CRISPASR_TDT_BATCH` / `CRISPASR_RNNT_BATCH` | Batch the TDT / RNNT joint decode. |
 | `CRISPASR_RNNT_GGML_PERSTEP` | Per-step (vs. persistent-graph) ggml RNNT decode. |
+| `CRISPASR_RNNT_GPU_ENC_PROJ` | Parakeet's backend encoder-to-joint projection is default on CUDA. `0` restores the scalar CPU projection; `1` opts other GPU backends in. |
 | `CRISPASR_NGRAM_LOOPFIX_OFF` | Disable the n-gram decode-loop breaker. |
 | `CRISPASR_STREAM_SLICE_MEMO` | Memoize per-slice streaming partial decodes by absolute sample range (#404). **Default ON** — finals byte-equal, wall −12 % CPU / −6 % GPU in the quiet-box A/B; `=0` re-decodes closed slices every step. |
 | `CRISPASR_GAP_FILL` / `_GAP_FILL_MIN_CS` | Re-transcribe spans a first pass left empty (long audio); on by default for parakeet, threshold non-JA 300 cs / JA 100 cs. |
@@ -844,7 +845,34 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 
 ### Mel-Band RoFormer (source separation)
 
-- `CRISPASR_MBR_PROFILE`
+- `CRISPASR_MBR_PROFILE` — print a per-stage wall-time breakdown of one forward
+  pass (stft+pack / band_split / run_time / run_freq / mask_est / synthesize).
+- `CRISPASR_MELBAND_GGML` — run the ggml graph path instead of the legacy CPU
+  path. Since the Change-176 graph port the default is **AUTO**: ON exactly
+  when a real GPU backend is present and permitted (the fused single graph
+  measured ~112x faster than the per-layer graphs — RTF ~0.09 vs ~10 on an
+  RTX 3090 Ti), OFF on CPU-only hosts. `=1`/`=0` force either way.
+- `CRISPASR_MELBAND_GPU` — GPU permission (CUDA > Metal > Vulkan). Default
+  AUTO follows the caller's use_gpu (CLI default on); an explicit `=0`/`=1`
+  beats the caller in both directions — so `=0` genuinely opts out even
+  though the CLI defaults `use_gpu=true` (#414 review semantics). On GPU-less
+  hosts everything resolves to the CPU path regardless.
+- `CRISPASR_MELBAND_FUSED` — single fused graph: band-split + the full
+  time/freq transformer stack + mask estimator on-device in one graph, no
+  per-layer host↔device roundtrips (the measured-fastest path on GPU).
+  Default **AUTO**: ON with the GPU graph path, OFF otherwise. `=1` alone
+  implies the graph path it needs; `=0` on GPU keeps the per-layer-graph
+  bisection arm. The full decision table is unit-locked in
+  tests/test-mel-band-gates.cpp.
+- `CRISPASR_MELBAND_SEG_S` — override the Demucs-style segment length in
+  seconds (`params.segment_seconds`; <=0 → the checkpoint's trained
+  `chunk_size` from GGUF metadata, 8 s Kim fallback — do NOT expect 10 s: the
+  earlier hardcoded 10 s ran RoPE 25% past the trained window, review #422).
+  The attention matrix is O(T²·bands·heads), so long inputs are split into
+  segments with 25% overlap and a triangular weight (bounds VRAM; the
+  unsegmented whole-buffer path OOMs on any clip beyond ~10 s).
+- `CRISPASR_MELBAND_NO_SEGMENT` — process the whole track in one pass instead
+  of the segmented overlap-add schedule (A/B against the old behaviour).
 
 ### MeloTTS
 
@@ -1229,9 +1257,18 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 
 - `CRISPASR_SIDON_FASTCONV` — DAC convolution mode (`off`, `k1-f16`, `k1-f32`, or `full`). Unset defaults to
   `k1-f16` on CUDA and `off` on Vulkan/CPU.
-- `CRISPASR_SIDON_RPE` — relative-position-bias formulation: `bucket-direct` (default), `bucket`, or `expand`
-  (legacy `[head_dim, T, T]` expansion, ~1 GiB more predictor workspace at `T≈2825`; keeps the Vulkan
-  `mul_mat` batching branch). All three are algebraically equivalent.
+- `CRISPASR_SIDON_RPE` — relative-position-bias formulation: `bucket-direct`, `bucket`, or `expand` (legacy
+  `[head_dim, T, T]` expansion; keeps the Vulkan `mul_mat` batching branch). All three are algebraically
+  equivalent. Unset defaults to **AUTO**, resolved per graph build because the choice depends on the input
+  length: `expand` on a GPU backend while its extra transient footprint (`4·T²·(head_dim+1−heads)`, i.e.
+  `196·T²` bytes for the shipped model — 58 MiB at `T=557`, 1.64 GiB at the 3000-frame cap) fits
+  `CRISPASR_SIDON_RPE_BUDGET_MB`, and `bucket-direct` otherwise. AUTO exists because `expand` measured **2.7×
+  faster in the predictor** on the #416 reporter's GTX 1660 SUPER (213.80 ms vs 575.25 ms at `T=557`, same
+  file and binary). AUTO stays off on CPU: that speedup is one device's measurement and CPU behaviour is
+  left exactly as it was. An explicit value is honoured as given and never auto-overridden — it is the #416
+  bisection handle. The decision table is unit-locked in `tests/test-sidon-rpe-gates.cpp`.
+- `CRISPASR_SIDON_RPE_BUDGET_MB` — AUTO's budget in MiB for `expand`'s extra transient footprint (default
+  `256`, which admits `expand` up to `T≈1170`, ~23 s of audio). `0` disables AUTO, pinning `bucket-direct`.
 - `CRISPASR_SIDON_DECODER_CHUNK_FRAMES` — maximum DAC core size in feature frames (default `512`). `0` decodes
   the whole utterance in one graph (~4.5 GiB at `T≈2825` vs ~0.79 GiB chunked). Chunked output is bit-exact
   against the whole-utterance decode.
@@ -1376,7 +1413,9 @@ end-to-end cosine cannot do.
 ### VibeVoice
 
 - `CRISPASR_VIBEVOICE_ASR_PROMPT`
-- `CRISPASR_VIBEVOICE_ASR_SAMPLE`
+- `CRISPASR_VIBEVOICE_ASR_SAMPLE` — streaming ASR samples the acoustic
+  posterior by default, matching upstream. Set `0` for deterministic
+  posterior-mean reference diffs or `1` to force sampling.
 - `CRISPASR_VIBEVOICE_ATTN_PREC`
 - `CRISPASR_VIBEVOICE_BENCH`
 - `CRISPASR_VIBEVOICE_BITNET_ACT_QUANT`
